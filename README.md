@@ -1,4 +1,4 @@
-# context-mode-go
+# ctxmode
 
 A 100% NPM/NodeJS-free, Go implementation of Mert Koseoglu's [context-mode](https://github.com/mksglu/context-mode).
 

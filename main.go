@@ -1,4 +1,4 @@
-// context-mode-go: a Go MCP server that virtualizes tool output to save context tokens.
+// ctxmode: a Go MCP server that virtualizes tool output to save context tokens.
 // Registers: ctx_execute, ctx_index, ctx_search, ctx_stats.
 package main
 
@@ -63,7 +63,7 @@ func main() {
 	}
 	s.excludeFromGit()
 
-	srv := mcp.NewServer(&mcp.Implementation{Name: "context-mode-go", Version: "0.1.0"}, nil)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: "0.1.0"}, nil)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_execute",
@@ -398,7 +398,7 @@ func (s *server) excludeFromGit() {
 			f, err := os.OpenFile(excludePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err == nil {
 				defer f.Close()
-				_, _ = f.WriteString("\n# context-mode-go local database\n.context_mode_db.json\n.context_mode_db.json.tmp\n")
+				_, _ = f.WriteString("\n# ctxmode local database\n.context_mode_db.json\n.context_mode_db.json.tmp\n")
 			}
 		}
 	}

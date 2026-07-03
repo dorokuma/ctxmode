@@ -1,4 +1,4 @@
-module github.com/dorokuma/context-mode-go
+module github.com/dorokuma/ctxmode
 
 go 1.25.0
 
