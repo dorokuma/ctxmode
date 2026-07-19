@@ -1,0 +1,379 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// ---------- data types ----------
+
+type batchCommand struct {
+	Label   string `json:"label"`
+	Command string `json:"command"`
+}
+
+type batchArgs struct {
+	Commands    []batchCommand `json:"commands" jsonschema:"Array of {label, command} objects"`
+	Queries     []string       `json:"queries,omitempty" jsonschema:"Search queries over indexed output"`
+	Concurrency int            `json:"concurrency,omitempty" jsonschema:"Max parallel commands (1-8, default 1)"`
+	CWD         string         `json:"cwd,omitempty" jsonschema:"Working directory"`
+	Timeout     int            `json:"timeout,omitempty" jsonschema:"Max execution time in ms"`
+	QueryScope  string         `json:"query_scope,omitempty" jsonschema:"Search scope (batch or global, default batch)"`
+}
+
+type batchResult struct {
+	Label      string `json:"label"`
+	Command    string `json:"command"`
+	Success    bool   `json:"success"`
+	ExitCode   int    `json:"exit_code"`
+	Truncated  bool   `json:"truncated,omitempty"`
+	Size       int    `json:"size"`
+	Error      string `json:"error,omitempty"`
+	IndexError string `json:"index_error,omitempty"`
+}
+
+type batchResponse struct {
+	Commands       []batchResult          `json:"commands"`
+	Indexed        int                    `json:"indexed"`
+	IndexFailures  int                    `json:"index_failures,omitempty"`
+	Truncated      bool                   `json:"truncated"`
+	Search         map[string][]searchHit `json:"search,omitempty"`
+}
+
+type searchHit struct {
+	Path    string `json:"path"`
+	Snippet string `json:"snippet"`
+}
+
+const (
+	batchIndexPrefix = "batch:"
+	maxOutputSize    = 100 * 1024 // 100KB
+)
+
+// ---------- command execution ----------
+
+// executeCommand runs a shell command with the given context and working directory.
+// It captures stdout and stderr separately, then merges them.
+// Returns merged output, exit code, and any execution error.
+func (s *server) executeCommand(ctx context.Context, command, cwd string) (output string, exitCode int, execErr error) {
+	var cmd *exec.Cmd
+	if os.Getenv("SHELL") != "" {
+		cmd = exec.Command(os.Getenv("SHELL"), "-c", command)
+	} else {
+		cmd = exec.Command("sh", "-c", command)
+	}
+	cmd.Dir = cwd
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	// Start the command.
+	if err := cmd.Start(); err != nil {
+		return "", -1, fmt.Errorf("failed to start command: %w", err)
+	}
+
+	// Wait for completion or context cancellation.
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Context was cancelled (timeout or parent cancellation).
+		// Kill the entire process group so subprocesses are also cleaned up.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// Drain the wait channel.
+		<-done
+		return stdoutBuf.String() + stderrBuf.String(), -1, fmt.Errorf("command cancelled: %w", ctx.Err())
+
+	case err := <-done:
+		stdout := stdoutBuf.String()
+		stderr := stderrBuf.String()
+
+		if err != nil {
+			// The process exited with a non-zero status or was killed.
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				exitCode = exitErr.ExitCode()
+			} else {
+				exitCode = -1
+			}
+			// Merge output even on failure.
+			output = stdout
+			if stderr != "" {
+				if output != "" {
+					output += "\n"
+				}
+				output += stderr
+			}
+			return output, exitCode, nil
+		}
+
+		// Success.
+		output = stdout
+		if stderr != "" {
+			if output != "" {
+				output += "\n"
+			}
+			output += stderr
+		}
+		return output, cmd.ProcessState.ExitCode(), nil
+	}
+}
+
+// ---------- MCP tool handler ----------
+
+func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, args batchArgs) (*mcp.CallToolResult, any, error) {
+	// Validate commands.
+	if len(args.Commands) == 0 {
+		return nil, nil, fmt.Errorf("commands is required")
+	}
+
+	// Validate concurrency.
+	concurrency := args.Concurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > 8 {
+		concurrency = 8
+	}
+
+	// Resolve working directory.
+	cwd := s.workdir
+	if args.CWD != "" {
+		resolved, err := s.resolvePath(args.CWD)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid cwd: %w", err)
+		}
+		cwd = resolved
+	}
+
+	// Validate query_scope.
+	queryScope := strings.ToLower(args.QueryScope)
+	if queryScope != "batch" && queryScope != "global" {
+		queryScope = "batch" // default
+	}
+
+	// Parse timeout.
+	var timeout time.Duration
+	if args.Timeout > 0 {
+		timeout = time.Duration(args.Timeout) * time.Millisecond
+	}
+
+	// Pre-allocate results slice.
+	results := make([]batchResult, len(args.Commands))
+
+	// ---------- execute commands ----------
+
+	if concurrency == 1 {
+		// Serial execution with a shared timeout.
+		s.executeBatchSerial(ctx, args.Commands, cwd, timeout, results)
+	} else {
+		// Concurrent execution with per-command timeouts.
+		s.executeBatchConcurrent(ctx, args.Commands, cwd, timeout, concurrency, results)
+	}
+
+	// Count indexed commands, failures, and check for truncation.
+	totalIndexed := 0
+	indexFailures := 0
+	anyTruncated := false
+	for _, r := range results {
+		if r.Size > 0 && r.IndexError == "" {
+			totalIndexed++
+		}
+		if r.IndexError != "" {
+			indexFailures++
+		}
+		if r.Truncated {
+			anyTruncated = true
+		}
+	}
+
+	// ---------- handle queries ----------
+
+	var searchResults map[string][]searchHit
+	if len(args.Queries) > 0 {
+		searchResults = make(map[string][]searchHit)
+		for _, q := range args.Queries {
+			q = strings.TrimSpace(q)
+			if q == "" {
+				continue
+			}
+
+			if queryScope == "batch" {
+				// For batch scope: request more results, then filter by batch prefix.
+				hits, err := s.store.Search(q, 50)
+				if err != nil {
+					continue
+				}
+				var filtered []SearchResult
+				for _, h := range hits {
+					if strings.HasPrefix(h.Path, batchIndexPrefix) {
+						filtered = append(filtered, h)
+					}
+				}
+				if len(filtered) > 5 {
+					filtered = filtered[:5]
+				}
+				for _, h := range filtered {
+					searchResults[q] = append(searchResults[q], searchHit{Path: h.Path, Snippet: h.Snippet})
+				}
+			} else {
+				// Global scope: search the entire store.
+				hits, err := s.store.Search(q, 5)
+				if err != nil {
+					continue
+				}
+				for _, h := range hits {
+					searchResults[q] = append(searchResults[q], searchHit{Path: h.Path, Snippet: h.Snippet})
+				}
+			}
+		}
+	}
+
+	// ---------- build response ----------
+
+	resp := batchResponse{
+		Commands:      results,
+		Indexed:       totalIndexed,
+		IndexFailures: indexFailures,
+		Truncated:     anyTruncated,
+		Search:        searchResults,
+	}
+
+	js, _ := json.MarshalIndent(resp, "", "  ")
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: string(js)}},
+	}, nil, nil
+}
+
+// ---------- execution strategies ----------
+
+// executeBatchSerial runs commands one by one with a shared timeout.
+// If the shared context expires mid-way, remaining commands are marked as skipped.
+func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, results []batchResult) {
+	var cmdCtx context.Context
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		cmdCtx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		cmdCtx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
+
+	for i, cmd := range commands {
+		// Check if the shared context has expired.
+		if err := cmdCtx.Err(); err != nil {
+			results[i] = batchResult{
+				Label:    cmd.Label,
+				Command:  cmd.Command,
+				Success:  false,
+				ExitCode: -1,
+				Error:    fmt.Sprintf("skipped: shared timeout exceeded (%v)", err),
+			}
+			continue
+		}
+
+		out, exitCode, execErr := s.executeCommand(cmdCtx, cmd.Command, cwd)
+
+		r := batchResult{
+			Label:    cmd.Label,
+			Command:  cmd.Command,
+			ExitCode: exitCode,
+			Size:     len(out),
+		}
+
+		if execErr != nil {
+			r.Success = false
+			r.Error = execErr.Error()
+		} else {
+			r.Success = exitCode == 0
+		}
+
+		if len(out) > maxOutputSize {
+			r.Truncated = true
+		}
+
+		// Index the full output (even if truncated in the response).
+		if out != "" {
+			s.mu.Lock()
+			if err := s.store.Index(batchIndexPrefix+cmd.Label, out); err != nil {
+				r.IndexError = err.Error()
+			}
+			s.mu.Unlock()
+		}
+
+		results[i] = r
+	}
+}
+
+// executeBatchConcurrent runs commands in parallel with per-command timeouts.
+// Concurrency is limited by a semaphore. Store writes are serialized with a mutex.
+func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, concurrency int, results []batchResult) {
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	for i, cmd := range commands {
+		wg.Add(1)
+		go func(idx int, c batchCommand) {
+			defer wg.Done()
+			sem <- struct{}{}        // acquire
+			defer func() { <-sem }() // release
+
+			// Per-command context with its own timeout.
+			var cmdCtx context.Context
+			var cmdCancel context.CancelFunc
+			if timeout > 0 {
+				cmdCtx, cmdCancel = context.WithTimeout(ctx, timeout)
+			} else {
+				cmdCtx, cmdCancel = context.WithCancel(ctx)
+			}
+			defer cmdCancel()
+
+			out, exitCode, execErr := s.executeCommand(cmdCtx, c.Command, cwd)
+
+			r := batchResult{
+				Label:    c.Label,
+				Command:  c.Command,
+				ExitCode: exitCode,
+				Size:     len(out),
+			}
+
+			if execErr != nil {
+				r.Success = false
+				r.Error = execErr.Error()
+			} else {
+				r.Success = exitCode == 0
+			}
+
+			if len(out) > maxOutputSize {
+				r.Truncated = true
+			}
+
+			// Index with mutex protection (SQLite only allows one writer at a time).
+			if out != "" {
+				s.mu.Lock()
+				if err := s.store.Index(batchIndexPrefix+c.Label, out); err != nil {
+					r.IndexError = err.Error()
+				}
+				s.mu.Unlock()
+			}
+
+			results[idx] = r
+		}(i, cmd)
+	}
+
+	wg.Wait()
+}

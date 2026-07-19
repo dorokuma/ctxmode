@@ -1,5 +1,5 @@
 // ctxmode: a Go MCP server that virtualizes tool output to save context tokens.
-// Registers: ctx_execute, ctx_index, ctx_search, ctx_stats.
+// Registers: ctx_execute, ctx_execute_file, ctx_index, ctx_search, ctx_stats, ctx_fetch_and_index, ctx_batch_execute, ctx_doctor, ctx_purge.
 package main
 
 import (
@@ -9,30 +9,23 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-type Document struct {
-	Path      string    `json:"path"`
-	Content   string    `json:"content"`
-	IndexedAt time.Time `json:"indexed_at"`
-}
-
 type server struct {
-	workdir     string
-	mu          sync.Mutex
-	documents   map[string]Document
-	dbPath      string
-	totalInput  int64
-	totalOutput int64
+	workdir        string
+	mu             sync.Mutex
+	store          *Store
+	floodGuard     *FloodGuard
+	searchPipeline *SearchPipeline
+	totalInput     int64
+	totalOutput    int64
 }
 
 func main() {
@@ -53,21 +46,31 @@ func main() {
 	}
 	workdir = absWd
 
-	s := &server{
-		workdir:   workdir,
-		documents: make(map[string]Document),
-		dbPath:    filepath.Join(workdir, ".context_mode_db.json"),
+	store, err := NewStore(filepath.Join(workdir, "context_mode.db"))
+	if err != nil {
+		log.Fatalf("failed to open database: %v", err)
 	}
-	if err := s.loadDB(); err != nil {
-		log.Fatalf("failed to load database: %v", err)
+	defer store.Close()
+
+	floodGuard := NewFloodGuard(60 * time.Second)
+	searchPipeline := NewSearchPipeline(store, floodGuard)
+
+	s := &server{
+		workdir:        workdir,
+		store:          store,
+		floodGuard:     floodGuard,
+		searchPipeline: searchPipeline,
+	}
+	if err := s.migrateFromJSON(); err != nil {
+		log.Fatalf("failed to migrate database: %v", err)
 	}
 	s.excludeFromGit()
 
-	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: "0.1.0"}, nil)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: "1.0.0"}, nil)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_execute",
-		Description: "Run a shell command in a sandboxed way. Heavy outputs (logs, build traces) are compressed and saved locally to prevent flooding the context window.",
+		Description: "Run code in a sandboxed subprocess. Supports 12 languages (javascript, typescript, python, shell, go, rust, php, perl, ruby, r, elixir, csharp). Heavy outputs are auto-indexed to prevent flooding the context window.",
 	}, s.toolExecute)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -85,6 +88,31 @@ func main() {
 		Description: "Report token saving statistics of the current context virtualization session.",
 	}, s.toolStats)
 
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_fetch_and_index",
+		Description: "Fetch URL content, convert to markdown, and index into knowledge base. Cache hits are returned immediately.",
+	}, s.toolFetchAndIndex)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_batch_execute",
+		Description: "Run multiple commands in ONE call. Every command's output is auto-indexed into the knowledge base; if you also pass queries, the matching sections come back in the same round trip.",
+	}, s.toolBatchExecute)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_execute_file",
+		Description: "Read a file into a FILE_CONTENT variable and run code over it. Languages: javascript, python, shell, go, rust, php, perl, ruby, r, elixir, csharp. Supports auto-indexing for large output.",
+	}, s.toolExecuteFile)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_doctor",
+		Description: "Diagnose context-mode installation. Checks runtimes, FTS5, storage, and version.",
+	}, s.toolDoctor)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_purge",
+		Description: "DESTRUCTIVE: permanently delete indexed content. Cannot be undone. Requires confirm:true.",
+	}, s.toolPurge)
+
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatalf("server exited: %v", err)
 	}
@@ -93,7 +121,12 @@ func main() {
 // ---------- tool implementations ----------
 
 type executeArgs struct {
-	Command string `json:"command" jsonschema:"shell command to execute"`
+	Command    string `json:"command,omitempty" jsonschema:"Command or code to execute"`
+	Language   string `json:"language,omitempty" jsonschema:"Runtime language (javascript/python/shell/go/...)"`
+	Timeout    int    `json:"timeout,omitempty" jsonschema:"Max execution time in ms"`
+	Background bool   `json:"background,omitempty" jsonschema:"Keep running after timeout (for servers/daemons)"`
+	Intent     string `json:"intent,omitempty" jsonschema:"What you're looking for in the output (for auto-indexing)"`
+	CWD        string `json:"cwd,omitempty" jsonschema:"Working directory"`
 }
 
 func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args executeArgs) (*mcp.CallToolResult, any, error) {
@@ -101,62 +134,101 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		return nil, nil, fmt.Errorf("command is required")
 	}
 
-	var cmd *exec.Cmd
-	if os.Getenv("SHELL") != "" {
-		cmd = exec.Command(os.Getenv("SHELL"), "-c", args.Command)
-	} else {
-		cmd = exec.Command("sh", "-c", args.Command)
+	// Default language is shell (backward compatible).
+	language := args.Language
+	if language == "" {
+		language = "shell"
 	}
-	cmd.Dir = s.workdir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	done := make(chan struct{})
-	defer close(done)
+	// Parse timeout.
+	var timeout time.Duration
+	if args.Timeout > 0 {
+		timeout = time.Duration(args.Timeout) * time.Millisecond
+	}
 
-	go func() {
-		select {
-		case <-ctx.Done():
-			if cmd.Process != nil {
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			}
-		case <-done:
+	// Resolve working directory.
+	cwd := s.workdir
+	if args.CWD != "" {
+		resolved, err := s.resolvePath(args.CWD)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid cwd: %w", err)
 		}
-	}()
-
-	out, err := cmd.CombinedOutput()
-	rawOutput := string(out)
-	if err != nil && rawOutput == "" {
-		rawOutput = fmt.Sprintf("Command failed to execute: %v", err)
+		cwd = resolved
 	}
 
+	// Execute code in the sandbox.
+	result, err := runCode(language, args.Command, cwd, timeout, args.Background)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Track stats.
 	s.mu.Lock()
 	s.totalInput += int64(len(args.Command))
-	s.totalOutput += int64(len(rawOutput))
+	s.totalOutput += int64(len(result.Stdout) + len(result.Stderr))
 	s.mu.Unlock()
 
-	// Virtualization limit: if output exceeds 40KB, intercept and summarize
-	limit := 40_000
-	if len(rawOutput) > limit {
-		// truncate safe to rune boundary
-		truncAt := limit
-		for truncAt > 0 && !utf8.ValidString(rawOutput[:truncAt]) {
-			truncAt--
+	// Build output text.
+	outputText := result.Stdout
+	if result.Stderr != "" {
+		if outputText != "" {
+			outputText += "\n"
 		}
-		truncated := rawOutput[:truncAt]
-		savedPath := filepath.Join(os.TempDir(), fmt.Sprintf("context_mode_log_%d.log", time.Now().UnixNano()))
-		_ = os.WriteFile(savedPath, out, 0600)
+		outputText += result.Stderr
+	}
+	if result.ExitCode != 0 && !strings.HasPrefix(outputText, "Process started in background") {
+		if outputText != "" {
+			outputText += "\n"
+		}
+		outputText += fmt.Sprintf("(exited with code %d)", result.ExitCode)
+	}
 
-		summary := fmt.Sprintf(
-			"Command executed successfully.\nWarning: Output is too large (%d bytes).\nSaved full log to: %s\n\n--- [First %d bytes] ---\n%s\n--- [Truncated] ---",
-			len(rawOutput), savedPath, limit, truncated,
-		)
+	// Auto-indexing logic.
+	const (
+		autoIndexThreshold = 100 * 1024 // 100KB
+		intentThreshold    = 5 * 1024  // 5KB
+	)
+
+	if len(outputText) > autoIndexThreshold {
+		// Unconditionally index large outputs.
+		label := fmt.Sprintf("execute:%d", time.Now().UnixNano())
+		if args.Intent != "" {
+			label = "execute:" + args.Intent
+		}
+		if err := s.storeIndexLocked(label, outputText); err == nil {
+			result.Indexed = true
+			result.IndexLabel = label
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{
+				Text: fmt.Sprintf("Output is too large (%d bytes). Indexed as %q. Use ctx_search(queries: [%q]) to search the indexed content.",
+					len(outputText), label, args.Intent),
+			}},
+		}, nil, nil
+	}
+
+	if len(outputText) > intentThreshold && args.Intent != "" {
+		// Index and return a preview.
+		label := "execute:" + args.Intent
+		if err := s.storeIndexLocked(label, outputText); err == nil {
+			result.Indexed = true
+			result.IndexLabel = label
+		}
+
+		preview := outputText
+		if len(preview) > 2000 {
+			preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
+		}
+		summary := fmt.Sprintf("Output (%d bytes) indexed as %q. Use ctx_search(queries: [%q]) to search.\n\n--- Preview ---\n%s",
+			len(outputText), label, args.Intent, preview)
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: summary}},
 		}, nil, nil
 	}
 
+	// Normal return.
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: rawOutput}},
+		Content: []mcp.Content{&mcp.TextContent{Text: outputText}},
 	}, nil, nil
 }
 
@@ -180,19 +252,24 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 	}
 
 	indexedCount := 0
+	skippedCount := 0
 	if info.IsDir() {
 		err = filepath.Walk(target, func(path string, info os.FileInfo, err error) error {
 			if err != nil || info.IsDir() {
 				return nil
 			}
 			if strings.Contains(path, "/.git/") || strings.Contains(path, "/node_modules/") {
+				skippedCount++
 				return nil
 			}
 			if isProbablyBinary(info.Name()) || info.Size() > 1*1024*1024 {
+				skippedCount++
 				return nil
 			}
 			if err := s.indexFile(path); err == nil {
 				indexedCount++
+			} else {
+				skippedCount++
 			}
 			return nil
 		})
@@ -203,6 +280,8 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 		err = s.indexFile(target)
 		if err == nil {
 			indexedCount = 1
+		} else {
+			skippedCount = 1
 		}
 	}
 
@@ -210,10 +289,13 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 		return nil, nil, err
 	}
 
-	s.saveDB()
-
+	msg := fmt.Sprintf("Indexed %d file(s)", indexedCount)
+	if skippedCount > 0 {
+		msg += fmt.Sprintf(" (%d skipped)", skippedCount)
+	}
+	msg += "."
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Successfully indexed %d file(s) into local database.", indexedCount)}},
+		Content: []mcp.Content{&mcp.TextContent{Text: msg}},
 	}, nil, nil
 }
 
@@ -226,45 +308,50 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		return nil, nil, fmt.Errorf("query is required")
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var results []string
-	queryLower := strings.ToLower(args.Query)
-
-	for _, doc := range s.documents {
-		if strings.Contains(strings.ToLower(doc.Content), queryLower) {
-			// Find matching lines
-			lines := strings.Split(doc.Content, "\n")
-			matchedLines := 0
-			var snippet []string
-			for idx, line := range lines {
-				if strings.Contains(strings.ToLower(line), queryLower) {
-					snippet = append(snippet, fmt.Sprintf("  Line %d: %s", idx+1, strings.TrimSpace(line)))
-					matchedLines++
-					if matchedLines >= 5 {
-						snippet = append(snippet, "  ...")
-						break
-					}
-				}
-			}
-			rel, _ := filepath.Rel(s.workdir, doc.Path)
-			if rel == "" {
-				rel = doc.Path
-			}
-			results = append(results, fmt.Sprintf("Matches in file %s:\n%s", rel, strings.Join(snippet, "\n")))
+	results, meta, err := s.searchPipeline.Search(args.Query, 20)
+	if err != nil {
+		// If blocked by flood guard, return a friendly message.
+		if meta != nil && meta.FloodStatus == "blocked" {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: "Search blocked: too many requests in a short time. Use ctx_batch_execute to batch your searches, or wait a moment."}},
+			}, nil, nil
 		}
+		return nil, nil, fmt.Errorf("search failed: %w", err)
 	}
 
 	if len(results) == 0 {
+		msg := "No matches found."
+		if meta != nil && meta.Corrected {
+			msg = "No matches found (fuzzy search attempted)."
+		}
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "No matches found."}},
+			Content: []mcp.Content{&mcp.TextContent{Text: msg}},
 		}, nil, nil
 	}
 
-	text := strings.Join(results, "\n\n")
+	var lines []string
+
+	// Add throttle warning if present.
+	if meta != nil && meta.ThrottleMsg != "" {
+		lines = append(lines, "⚠️  "+meta.ThrottleMsg)
+	}
+
+	// Add fuzzy correction notice.
+	if meta != nil && meta.Corrected {
+		lines = append(lines, "ℹ️  Fuzzy search applied (results may include similar terms)")
+	}
+
+	for _, r := range results {
+		rel, _ := filepath.Rel(s.workdir, r.Path)
+		if rel == "" {
+			rel = r.Path
+		}
+		lines = append(lines, fmt.Sprintf("Matches in file %s:\n  Snippet: %s", rel, r.Snippet))
+	}
+
+	text := strings.Join(lines, "\n\n")
 	if len(text) > 40_000 {
-		text = text[:40_000] + "\n... (truncated search results)"
+		text = truncateUTF8(text, 40_000) + "\n... (truncated search results)"
 	}
 
 	return &mcp.CallToolResult{
@@ -272,30 +359,189 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 	}, nil, nil
 }
 
+// statsResult is the detailed response for ctx_stats.
+type statsResult struct {
+	DocsIndexed        int   `json:"docs_indexed"`
+	CacheEntries       int   `json:"cache_entries"`
+	DBSizeBytes        int64 `json:"db_size_bytes"`
+	TotalInput         int64 `json:"total_input_bytes"`
+	TotalOutput        int64 `json:"total_output_bytes"`
+	SavedEstimateBytes int64 `json:"saved_estimate_bytes"`
+	SearchCallsWindow  int   `json:"search_calls_60s,omitempty"`
+}
+
 type statsArgs struct{}
 
 func (s *server) toolStats(ctx context.Context, _ *mcp.CallToolRequest, _ statsArgs) (*mcp.CallToolResult, any, error) {
+	// Get flood guard count outside server lock (has its own mutex).
+	windowCount := s.floodGuard.WindowCount()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	docCount, dbSize, err := s.store.Stats()
+	if err != nil {
+		docCount = 0
+	}
+
+	cacheCount, err := s.store.CacheCount()
+	if err != nil {
+		cacheCount = 0
+	}
 
 	savedBytes := s.totalOutput - s.totalInput
 	if savedBytes < 0 {
 		savedBytes = 0
 	}
-	// Estimate token saving: roughly 1 token = 4 characters/bytes
-	estimatedTokens := savedBytes / 4
 
-	res := map[string]any{
-		"total_command_inputs_bytes": s.totalInput,
-		"total_raw_outputs_bytes":    s.totalOutput,
-		"saved_context_bytes":        savedBytes,
-		"estimated_tokens_saved":     estimatedTokens,
-		"indexed_documents_count":    len(s.documents),
+	res := statsResult{
+		DocsIndexed:        docCount,
+		CacheEntries:       cacheCount,
+		DBSizeBytes:        dbSize,
+		TotalInput:         s.totalInput,
+		TotalOutput:        s.totalOutput,
+		SavedEstimateBytes: savedBytes,
+		SearchCallsWindow:  windowCount,
 	}
 
 	js, _ := json.MarshalIndent(res, "", "  ")
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: string(js)}},
+	}, nil, nil
+}
+
+// ---------- ctx_execute_file ----------
+
+type executeFileArgs struct {
+	Path     string `json:"path" jsonschema:"File path to read into FILE_CONTENT variable"`
+	Language string `json:"language,omitempty" jsonschema:"Runtime language (javascript/python/shell/go/...)"`
+	Code     string `json:"code" jsonschema:"Code that processes FILE_CONTENT variable"`
+	Timeout  int    `json:"timeout,omitempty" jsonschema:"Max execution time in ms"`
+	Intent   string `json:"intent,omitempty" jsonschema:"What you're looking for in the output"`
+	CWD      string `json:"cwd,omitempty" jsonschema:"Working directory"`
+}
+
+func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, args executeFileArgs) (*mcp.CallToolResult, any, error) {
+	if args.Path == "" {
+		return nil, nil, fmt.Errorf("path is required")
+	}
+	if args.Code == "" {
+		return nil, nil, fmt.Errorf("code is required")
+	}
+
+	// Resolve file path.
+	target, err := s.resolvePath(args.Path)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Check file size before reading to prevent OOM on huge files.
+	info, err := os.Stat(target)
+	if err != nil {
+		return nil, nil, fmt.Errorf("stat file: %w", err)
+	}
+	if info.Size() > 10*1024*1024 {
+		return nil, nil, fmt.Errorf("file %q is too large (%d bytes, max 10MB)", target, info.Size())
+	}
+	if isProbablyBinary(info.Name()) {
+		return nil, nil, fmt.Errorf("file %q appears to be binary, refusing to read as code input", target)
+	}
+
+	// Read file content.
+	fileContent, err := os.ReadFile(target)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read file: %w", err)
+	}
+
+	// Default language.
+	language := args.Language
+	if language == "" {
+		language = "javascript"
+	}
+
+	// Parse timeout.
+	var timeout time.Duration
+	if args.Timeout > 0 {
+		timeout = time.Duration(args.Timeout) * time.Millisecond
+	}
+
+	// Resolve working directory.
+	cwd := s.workdir
+	if args.CWD != "" {
+		resolved, err := s.resolvePath(args.CWD)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid cwd: %w", err)
+		}
+		cwd = resolved
+	}
+
+	// Inject FILE_CONTENT into user code.
+	injectedCode := injectFileContent(language, args.Code, string(fileContent))
+
+	// Execute the injected code.
+	result, err := runCode(language, injectedCode, cwd, timeout, false)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Track stats.
+	s.mu.Lock()
+	s.totalInput += int64(len(args.Code) + len(target))
+	s.totalOutput += int64(len(result.Stdout) + len(result.Stderr))
+	s.mu.Unlock()
+
+	// Build output text.
+	outputText := result.Stdout
+	if result.Stderr != "" {
+		if outputText != "" {
+			outputText += "\n"
+		}
+		outputText += result.Stderr
+	}
+
+	// Auto-indexing logic (same as toolExecute).
+	const (
+		autoIndexThreshold = 100 * 1024 // 100KB
+		intentThreshold    = 5 * 1024  // 5KB
+	)
+
+	if len(outputText) > autoIndexThreshold {
+		label := "execute_file:" + filepath.Base(target)
+		if args.Intent != "" {
+			label = "execute_file:" + args.Intent
+		}
+		if err := s.storeIndexLocked(label, outputText); err == nil {
+			result.Indexed = true
+			result.IndexLabel = label
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{
+				Text: fmt.Sprintf("Output is too large (%d bytes). Indexed as %q. Use ctx_search to search.",
+					len(outputText), label),
+			}},
+		}, nil, nil
+	}
+
+	if len(outputText) > intentThreshold && args.Intent != "" {
+		label := "execute_file:" + args.Intent
+		if err := s.storeIndexLocked(label, outputText); err == nil {
+			result.Indexed = true
+			result.IndexLabel = label
+		}
+
+		preview := outputText
+		if len(preview) > 2000 {
+			preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
+		}
+		summary := fmt.Sprintf("Output (%d bytes) indexed as %q. Use ctx_search to search.\n\n--- Preview ---\n%s",
+			len(outputText), label, preview)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: summary}},
+		}, nil, nil
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: outputText}},
 	}, nil, nil
 }
 
@@ -306,43 +552,62 @@ func (s *server) indexFile(path string) error {
 	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	s.documents[path] = Document{
-		Path:      path,
-		Content:   string(data),
-		IndexedAt: time.Now(),
-	}
-	s.mu.Unlock()
-	return nil
+	return s.storeIndexLocked(path, string(data))
 }
 
-func (s *server) loadDB() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *server) migrateFromJSON() error {
+	oldPath := filepath.Join(s.workdir, ".context_mode_db.json")
 
-	data, err := os.ReadFile(s.dbPath)
+	data, err := os.ReadFile(oldPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+		return fmt.Errorf("read old JSON db: %w", err)
 	}
-	return json.Unmarshal(data, &s.documents)
+
+	// Check if we already have data in SQLite.
+	docCount, _, err := s.store.Stats()
+	if err != nil {
+		return fmt.Errorf("check store stats: %w", err)
+	}
+	if docCount > 0 {
+		// Already migrated; just backup the old file.
+		_ = os.Rename(oldPath, oldPath+".bak")
+		return nil
+	}
+
+	// Parse old JSON format: map[string]Document
+	var oldDocs map[string]Document
+	if err := json.Unmarshal(data, &oldDocs); err != nil {
+		return fmt.Errorf("parse old JSON: %w", err)
+	}
+
+	for _, doc := range oldDocs {
+		if err := s.storeIndexLocked(doc.Path, doc.Content); err != nil {
+			return fmt.Errorf("migrate document %q: %w", doc.Path, err)
+		}
+	}
+
+	// Rename old file as backup.
+	_ = os.Rename(oldPath, oldPath+".bak")
+	return nil
 }
 
-func (s *server) saveDB() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	data, err := json.Marshal(s.documents)
-	if err != nil {
-		return
+// truncateUTF8 truncates a string to the given byte limit at a valid UTF-8 boundary.
+// If the limit falls in the middle of a multi-byte rune, it backs up to the
+// previous complete rune boundary.
+func truncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
 	}
-	tmpPath := s.dbPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return
+	// Truncate to maxBytes, then step back to a valid rune boundary.
+	// Invalid UTF-8 at the end is almost always a truncated multi-byte rune.
+	s = s[:maxBytes]
+	for len(s) > 0 && !utf8.Valid([]byte(s)) {
+		s = s[:len(s)-1]
 	}
-	_ = os.Rename(tmpPath, s.dbPath)
+	return s
 }
 
 func isProbablyBinary(name string) bool {
@@ -363,6 +628,16 @@ func isProbablyBinary(name string) bool {
 		}
 	}
 	return false
+}
+
+// storeIndexLocked wraps store.Index with the server mutex, ensuring that
+// concurrent writes from different goroutines are serialized. Combined with
+// SetMaxOpenConns(1) in the store, this prevents SQLITE_BUSY on concurrent
+// index operations.
+func (s *server) storeIndexLocked(path, content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.store.Index(path, content)
 }
 
 // resolvePath converts a user-supplied path into an absolute path within the workspace.
@@ -394,11 +669,11 @@ func (s *server) excludeFromGit() {
 		if err == nil {
 			content = string(data)
 		}
-		if !strings.Contains(content, ".context_mode_db.json") {
+		if !strings.Contains(content, "context_mode.db") {
 			f, err := os.OpenFile(excludePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err == nil {
 				defer f.Close()
-				_, _ = f.WriteString("\n# ctxmode local database\n.context_mode_db.json\n.context_mode_db.json.tmp\n")
+				_, _ = f.WriteString("\n# ctxmode local database\ncontext_mode.db\ncontext_mode.db-wal\ncontext_mode.db-shm\n")
 			}
 		}
 	}
