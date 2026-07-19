@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Hard pre-push gate — scans all outgoing commits for secrets and noise.
+set -euo pipefail
+RED='\033[0;31m'; NC='\033[0m'
+die() { echo -e "${RED}❌ PUSH REJECTED:${NC} $*"; exit 1; }
+
+SECRET_PATTERNS=(
+  'ghp_[a-zA-Z0-9]{36}' 'gho_[a-zA-Z0-9]{36}'
+  'ghu_[a-zA-Z0-9]{36}' 'ghs_[a-zA-Z0-9]{36}'
+  'xox[baprs]-[a-zA-Z0-9-]+' 'sk-[a-zA-Z0-9]{32,}'
+  'AKIA[0-9A-Z]{16}' '-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----'
+  'password\s*[:=]\s*\S+' 'api_key\s*[:=]\s*\S+' 'secret\s*[:=]\s*\S+'
+)
+
+while read -r _local _remote; do
+  for sha in $(git rev-list "$_local" "^$_remote" 2>/dev/null || true); do
+    diff=$(git show "$sha" 2>/dev/null || true)
+    msg=$(git log -1 --format=%B "$sha" 2>/dev/null || true)
+    combined="$diff $msg"
+    for pat in "${SECRET_PATTERNS[@]}"; do
+      if echo "$combined" | grep -qiE "$pat"; then
+        die "commit $sha contains a secret matching: \"$pat\""
+      fi
+    done
+    if echo "$msg" | grep -Pn '[^\x00-\x7F]' > /dev/null 2>&1; then
+      die "commit $sha has non-ASCII characters in message. English only."
+    fi
+  done
+done
+
+exit 0
