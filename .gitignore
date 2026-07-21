@@ -1,3 +1,7 @@
 /ctxmode
 /context-mode-go
 REPLICATION_PLAN.md
+/bin/
+context_mode.db
+context_mode.db-shm
+context_mode.db-wal
