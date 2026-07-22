@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -67,15 +66,24 @@ const (
 // Returns merged output, exit code, and any execution error.
 func (s *server) executeCommand(ctx context.Context, command, cwd string) (output string, exitCode int, execErr error) {
 	var cmd *exec.Cmd
-	if os.Getenv("SHELL") != "" {
-		cmd = exec.Command(os.Getenv("SHELL"), "-c", command)
+	shellPath := os.Getenv("SHELL")
+	if shellPath != "" {
+		parts := strings.Fields(shellPath)
+		if len(parts) == 0 {
+			cmd = exec.Command("sh", "-c", command)
+		} else {
+			args := append(parts[1:], "-c", command)
+			cmd = exec.Command(parts[0], args...)
+		}
 	} else {
 		cmd = exec.Command("sh", "-c", command)
 	}
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	var stdoutBuf, stderrBuf bytes.Buffer
+	var stdoutBuf, stderrBuf limitedBuffer
+	stdoutBuf.limit = maxCmdOutput
+	stderrBuf.limit = maxCmdOutput
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
@@ -93,10 +101,16 @@ func (s *server) executeCommand(ctx context.Context, command, cwd string) (outpu
 	select {
 	case <-ctx.Done():
 		// Context was cancelled (timeout or parent cancellation).
-		// Kill the entire process group so subprocesses are also cleaned up.
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		// Drain the wait channel.
-		<-done
+		// Two-stage kill: SIGTERM first for graceful shutdown, then SIGKILL after 3s.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		select {
+		case <-done:
+			// Process exited gracefully after SIGTERM.
+		case <-time.After(3 * time.Second):
+			// Force-kill and drain to release pipe resources.
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			<-done
+		}
 		return stdoutBuf.String() + stderrBuf.String(), -1, fmt.Errorf("command cancelled: %w", ctx.Err())
 
 	case err := <-done:
@@ -140,6 +154,18 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 	if len(args.Commands) == 0 {
 		return nil, nil, fmt.Errorf("commands is required")
 	}
+	if len(args.Commands) > 50 {
+		return nil, nil, fmt.Errorf("too many commands: %d (max 50)", len(args.Commands))
+	}
+
+	// Check for duplicate labels (Index uses label as key).
+	seen := make(map[string]bool, len(args.Commands))
+	for _, cmd := range args.Commands {
+		if seen[cmd.Label] {
+			return nil, nil, fmt.Errorf("duplicate command label: %q", cmd.Label)
+		}
+		seen[cmd.Label] = true
+	}
 
 	// Validate concurrency.
 	concurrency := args.Concurrency
@@ -170,6 +196,9 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 	var timeout time.Duration
 	if args.Timeout > 0 {
 		timeout = time.Duration(args.Timeout) * time.Millisecond
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
 	}
 
 	// Pre-allocate results slice.

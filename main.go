@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,8 +25,17 @@ type server struct {
 	store          *Store
 	floodGuard     *FloodGuard
 	searchPipeline *SearchPipeline
+	httpClient     *http.Client
 	totalInput     int64
 	totalOutput    int64
+}
+
+func fatal(s *Store, format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	if s != nil {
+		s.Close()
+	}
+	os.Exit(1)
 }
 
 func main() {
@@ -42,7 +52,7 @@ func main() {
 	}
 	absWd, err := filepath.Abs(workdir)
 	if err != nil {
-		log.Fatalf("bad workdir: %v", err)
+		fatal(nil, "bad workdir: %v", err)
 	}
 	workdir = absWd
 
@@ -52,7 +62,7 @@ func main() {
 	}
 	defer store.Close()
 
-	floodGuard := NewFloodGuard(60 * time.Second)
+	floodGuard := NewFloodGuard(60*time.Second, 64)
 	searchPipeline := NewSearchPipeline(store, floodGuard)
 
 	s := &server{
@@ -60,9 +70,10 @@ func main() {
 		store:          store,
 		floodGuard:     floodGuard,
 		searchPipeline: searchPipeline,
+		httpClient:     newHTTPClient(),
 	}
 	if err := s.migrateFromJSON(); err != nil {
-		log.Fatalf("failed to migrate database: %v", err)
+		fatal(store, "failed to migrate database: %v", err)
 	}
 	s.excludeFromGit()
 
@@ -114,7 +125,7 @@ func main() {
 	}, s.toolPurge)
 
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
-		log.Fatalf("server exited: %v", err)
+		fatal(store, "server exited: %v", err)
 	}
 }
 
@@ -367,7 +378,7 @@ type statsResult struct {
 	TotalInput         int64 `json:"total_input_bytes"`
 	TotalOutput        int64 `json:"total_output_bytes"`
 	SavedEstimateBytes int64 `json:"saved_estimate_bytes"`
-	SearchCallsWindow  int   `json:"search_calls_60s,omitempty"`
+	SearchCallsWindow  int   `json:"search_calls_60s,omitempty" jsonschema:"number of OK search calls in the 60s sliding window (counts only allowed calls, not throttled or blocked)"`
 }
 
 type statsArgs struct{}
@@ -595,19 +606,38 @@ func (s *server) migrateFromJSON() error {
 }
 
 // truncateUTF8 truncates a string to the given byte limit at a valid UTF-8 boundary.
-// If the limit falls in the middle of a multi-byte rune, it backs up to the
-// previous complete rune boundary.
+// Fast path: if the full string is valid UTF-8, the only possible issue is at the
+// truncation boundary — use DecodeLastRuneInString (O(1) per step) to back up.
+// Slow path: if the full string has mid-string invalid bytes, scan forward to find
+// the longest valid UTF-8 prefix (single pass, O(n)).
 func truncateUTF8(s string, maxBytes int) string {
 	if len(s) <= maxBytes {
 		return s
 	}
-	// Truncate to maxBytes, then step back to a valid rune boundary.
-	// Invalid UTF-8 at the end is almost always a truncated multi-byte rune.
-	s = s[:maxBytes]
-	for len(s) > 0 && !utf8.Valid([]byte(s)) {
-		s = s[:len(s)-1]
+	truncated := s[:maxBytes]
+
+	// Fast path: full string is valid UTF-8, only truncation boundary matters.
+	if utf8.ValidString(s) {
+		for len(truncated) > 0 {
+			r, size := utf8.DecodeLastRuneInString(truncated)
+			if r != utf8.RuneError || size == 0 {
+				break
+			}
+			truncated = truncated[:len(truncated)-1]
+		}
+		return truncated
 	}
-	return s
+
+	// Slow path: original has mid-string invalid bytes.
+	// Single forward pass to find the longest valid UTF-8 prefix.
+	for i := 0; i < len(truncated); {
+		r, size := utf8.DecodeRuneInString(truncated[i:])
+		if r == utf8.RuneError && size <= 1 {
+			return truncated[:i]
+		}
+		i += size
+	}
+	return truncated
 }
 
 func isProbablyBinary(name string) bool {
@@ -642,6 +672,7 @@ func (s *server) storeIndexLocked(path, content string) error {
 
 // resolvePath converts a user-supplied path into an absolute path within the workspace.
 // It guarantees the result is inside s.workdir, preventing path traversal.
+// Note: filepath.Clean does not resolve symlinks; a symlink inside workdir pointing outside is not detected.
 func (s *server) resolvePath(p string) (string, error) {
 	if p == "" {
 		return s.workdir, nil
@@ -661,20 +692,37 @@ func (s *server) resolvePath(p string) (string, error) {
 // excludeFromGit appends the local database files to .git/info/exclude to avoid workspace pollution.
 func (s *server) excludeFromGit() {
 	gitDir := filepath.Join(s.workdir, ".git")
-	if info, err := os.Stat(gitDir); err == nil && info.IsDir() {
-		excludePath := filepath.Join(gitDir, "info", "exclude")
-		_ = os.MkdirAll(filepath.Dir(excludePath), 0755)
-		data, err := os.ReadFile(excludePath)
-		content := ""
-		if err == nil {
-			content = string(data)
-		}
-		if !strings.Contains(content, "context_mode.db") {
-			f, err := os.OpenFile(excludePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err == nil {
-				defer f.Close()
-				_, _ = f.WriteString("\n# ctxmode local database\ncontext_mode.db\ncontext_mode.db-wal\ncontext_mode.db-shm\n")
-			}
-		}
+	info, err := os.Stat(gitDir)
+	if err != nil || !info.IsDir() {
+		return
+	}
+	excludePath := filepath.Join(gitDir, "info", "exclude")
+	if err := os.MkdirAll(filepath.Dir(excludePath), 0755); err != nil {
+		log.Printf("excludeFromGit: MkdirAll %s: %v", filepath.Dir(excludePath), err)
+		return
+	}
+	data, err := os.ReadFile(excludePath)
+	if err != nil && !os.IsNotExist(err) {
+		log.Printf("excludeFromGit: ReadFile %s: %v", excludePath, err)
+	}
+	content := ""
+	if err == nil {
+		content = string(data)
+	}
+	if strings.Contains(content, "context_mode.db") {
+		return
+	}
+	f, err := os.OpenFile(excludePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("excludeFromGit: OpenFile %s: %v", excludePath, err)
+		return
+	}
+	defer f.Close()
+	if _, err := f.WriteString("\n# ctxmode local database\ncontext_mode.db\ncontext_mode.db-wal\ncontext_mode.db-shm\n"); err != nil {
+		log.Printf("excludeFromGit: WriteString %s: %v", excludePath, err)
+		return
+	}
+	if err := f.Sync(); err != nil {
+		log.Printf("excludeFromGit: Sync %s: %v", excludePath, err)
 	}
 }

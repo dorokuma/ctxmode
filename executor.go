@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -19,9 +21,17 @@ func init() {
 	if err != nil {
 		return
 	}
+	now := time.Now()
 	for _, e := range entries {
 		name := e.Name()
-		if strings.HasPrefix(name, "ctxmode_") {
+		if !strings.HasPrefix(name, "ctxmode_") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) > 24*time.Hour {
 			os.Remove(filepath.Join(os.TempDir(), name))
 		}
 	}
@@ -49,7 +59,7 @@ type executeResult struct {
 // runtimes maps language name to its configuration.
 var runtimes = map[string]runtimeConfig{
 	"javascript": {Exe: "node", Ext: ".js", Wrap: jsWrapper},
-	"typescript": {Exe: "npx", Ext: ".ts", Wrap: tsWrapper},
+	"typescript": {Exe: "ts-node", Ext: ".ts", Wrap: tsWrapper},
 	"python":     {Exe: "python3", Ext: ".py", Wrap: pyWrapper},
 	"shell":      {Exe: "sh", Ext: ".sh", Wrap: shellWrapper},
 	"go":         {Exe: "go", Ext: ".go", Wrap: goWrapper},
@@ -136,9 +146,48 @@ func csWrapper(code string) string {
 
 // ---------- runtime checking ----------
 
+// tsNodeAvailable caches typescript runtime detection result.
+var (
+	tsNodeAvailable  bool
+	tsNodePath       string
+	tsNodeCheckOnce  sync.Once
+	tsNodePathMu     sync.Mutex
+)
+
+// detectTsNode probes for a local ts-node installation without network access.
+// Returns whether it's available and the path to the executable.
+func detectTsNode() (bool, string) {
+	// 1. Check for global ts-node binary
+	if p, err := exec.LookPath("ts-node"); err == nil {
+		return true, p
+	}
+	// 2. Check cwd/node_modules/.bin/ts-node
+	cwd, err := os.Getwd()
+	if err == nil {
+		p := filepath.Join(cwd, "node_modules", ".bin", "ts-node")
+		if _, err := os.Stat(p); err == nil {
+			return true, p
+		}
+	}
+	// 3. Fall back to npm ls (local only, reads package.json)
+	if exec.Command("npm", "ls", "ts-node", "--depth=0").Run() == nil {
+		// ts-node is installed locally; use the local path
+		cwd, _ := os.Getwd()
+		p := filepath.Join(cwd, "node_modules", ".bin", "ts-node")
+		if _, err := os.Stat(p); err == nil {
+			return true, p
+		}
+		// Last resort: assume it's resolvable by name
+		return true, "ts-node"
+	}
+	return false, ""
+}
+
 // checkRuntime checks if the runtime executable for the given language is
 // available on the system PATH. Shell is always available.
-func checkRuntime(language string) bool {
+// When useCache is true, TypeScript detection is cached via sync.Once
+// (for execution gating). When false, detection runs fresh (for doctor).
+func checkRuntime(language string, useCache bool) bool {
 	if language == "shell" {
 		return true
 	}
@@ -152,8 +201,24 @@ func checkRuntime(language string) bool {
 		// go version exits 0
 		return exec.Command(rt.Exe, "version").Run() == nil
 	case "typescript":
-		// Check that ts-node is available (not just npx).
-		return exec.Command(rt.Exe, "ts-node", "--version").Run() == nil
+		if useCache {
+			tsNodeCheckOnce.Do(func() {
+				av, p := detectTsNode()
+				tsNodePathMu.Lock()
+				tsNodeAvailable = av
+				tsNodePath = p
+				tsNodePathMu.Unlock()
+			})
+			return tsNodeAvailable
+		}
+		// Fresh detection for doctor — update cached path for execution use.
+		avail, p := detectTsNode()
+		if avail {
+			tsNodePathMu.Lock()
+			tsNodePath = p
+			tsNodePathMu.Unlock()
+		}
+		return avail
 	default:
 		// Use Go standard library instead of external "which" command.
 		_, err := exec.LookPath(rt.Exe)
@@ -187,15 +252,22 @@ func injectFileContent(language, code, fileContent string) string {
 %s`, escaped, code)
 
 	case "javascript", "typescript":
-		// Backtick template literal; escape backticks and ${} interpolation.
-		escaped := strings.ReplaceAll(fileContent, "`", "\\`")
+		// Backtick template literal; escape backslash, backticks, and ${} interpolation.
+		// Order matters: backslash first so we don't re-escape injected backslashes.
+		escaped := strings.ReplaceAll(fileContent, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, "`", "\\`")
 		escaped = strings.ReplaceAll(escaped, "${", "\\${")
 		return "const FILE_CONTENT = `" + escaped + "`;\n" + code
 
 	case "python":
-		// Triple-quoted raw string; escape any triple quotes.
-		escaped := strings.ReplaceAll(fileContent, `"""`, `\"\"\"`)
-		return `FILE_CONTENT = r"""` + escaped + `"""` + "\n" + code
+		// Triple-quoted raw string. Raw strings cannot escape triple
+		// quotes, and a trailing quote would prematurely close the literal.
+		// Fall back to base64 if content contains """ or ends with a quote.
+		if strings.Contains(fileContent, `"""`) || strings.HasSuffix(fileContent, `"`) {
+			encoded := base64.StdEncoding.EncodeToString([]byte(fileContent))
+			return "import base64\nFILE_CONTENT = base64.b64decode(\"" + encoded + "\").decode()\n" + code
+		}
+		return "FILE_CONTENT = r\"\"\"" + fileContent + "\"\"\"\n" + code
 
 	case "go":
 		// Go raw string literal (backtick-delimited); cannot contain backticks.
@@ -249,10 +321,13 @@ func injectFileContent(language, code, fileContent string) string {
 		return "FILE_CONTENT <- '" + escaped + "'\n" + code
 
 	case "elixir":
-		// Triple-double-quoted string in Elixir.
-		escaped := strings.ReplaceAll(fileContent, `\`, `\\`)
-		escaped = strings.ReplaceAll(escaped, `"""`, `\"\"\"`)
-		return "FILE_CONTENT = \"\"\"\n" + escaped + "\n\"\"\"\n" + code
+		// ~S sigil disables interpolation and escapes.
+		// Triple-quote cannot be escaped inside ~S, so fall back to base64.
+		if strings.Contains(fileContent, `"""`) {
+			encoded := base64.StdEncoding.EncodeToString([]byte(fileContent))
+			return "FILE_CONTENT = Base.decode64!(\"" + encoded + "\")\n" + code
+		}
+		return "FILE_CONTENT = ~S\"\"\"\n" + fileContent + "\n\"\"\"\n" + code
 
 	case "csharp":
 		// Verbatim string literal (@"").
@@ -274,7 +349,7 @@ func runCode(language, code, cwd string, timeout time.Duration, background bool)
 		return nil, fmt.Errorf("unsupported language: %q (supported: javascript, typescript, python, shell, go, rust, php, perl, ruby, r, elixir, csharp)", language)
 	}
 
-	if !checkRuntime(language) {
+	if !checkRuntime(language, true) {
 		return nil, fmt.Errorf("runtime %q is not available for language %q — install it first or use a different language", rt.Exe, language)
 	}
 
@@ -314,8 +389,15 @@ func runCode(language, code, cwd string, timeout time.Duration, background bool)
 // runShell executes code directly via "sh -c".
 func runShell(code, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
 	var cmd *exec.Cmd
-	if os.Getenv("SHELL") != "" {
-		cmd = exec.Command(os.Getenv("SHELL"), "-c", code)
+	shellPath := os.Getenv("SHELL")
+	if shellPath != "" {
+		parts := strings.Fields(shellPath)
+		if len(parts) == 0 {
+			cmd = exec.Command("sh", "-c", code)
+		} else {
+			args := append(parts[1:], "-c", code)
+			cmd = exec.Command(parts[0], args...)
+		}
 	} else {
 		cmd = exec.Command("sh", "-c", code)
 	}
@@ -328,6 +410,7 @@ func runShell(code, cwd string, timeout time.Duration, background bool) (*execut
 // runCompiled executes a language that uses a temp source file.
 func runCompiled(language string, rt runtimeConfig, tmpPath, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
 	var cmd *exec.Cmd
+	var cleanups []string
 
 	switch language {
 	case "rust":
@@ -335,9 +418,17 @@ func runCompiled(language string, rt runtimeConfig, tmpPath, cwd string, timeout
 		outPath := tmpPath + "_bin"
 		if !background {
 			defer os.Remove(outPath)
+		} else {
+			cleanups = append(cleanups, outPath)
 		}
 
-		compileCmd := exec.Command("rustc", "-o", outPath, tmpPath)
+		compileCtx := context.Background()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			compileCtx, cancel = context.WithTimeout(compileCtx, timeout)
+			defer cancel()
+		}
+		compileCmd := exec.CommandContext(compileCtx, "rustc", "-o", outPath, tmpPath)
 		compileCmd.Dir = cwd
 		if compileOutput, err := compileCmd.CombinedOutput(); err != nil {
 			return &executeResult{
@@ -350,7 +441,13 @@ func runCompiled(language string, rt runtimeConfig, tmpPath, cwd string, timeout
 		cmd.Dir = cwd
 
 	case "typescript":
-		cmd = exec.Command("npx", "ts-node", tmpPath)
+		tsNodePathMu.Lock()
+		exe := tsNodePath
+		tsNodePathMu.Unlock()
+		if exe == "" {
+			exe = "ts-node"
+		}
+		cmd = exec.Command(exe, tmpPath)
 		cmd.Dir = cwd
 
 	case "go":
@@ -363,7 +460,10 @@ func runCompiled(language string, rt runtimeConfig, tmpPath, cwd string, timeout
 	}
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	return runCmd(cmd, timeout, background)
+	if background {
+		cleanups = append(cleanups, tmpPath)
+	}
+	return runCmd(cmd, timeout, background, cleanups...)
 }
 
 // maxCmdOutput is the maximum number of bytes captured from a subprocess's
@@ -398,7 +498,7 @@ func (lb *limitedBuffer) String() string {
 // runCmd is the shared execution loop for all languages.
 // It starts the process, optionally waits with a timeout, and returns
 // the combined stdout/stderr and exit code.
-func runCmd(cmd *exec.Cmd, timeout time.Duration, background bool) (*executeResult, error) {
+func runCmd(cmd *exec.Cmd, timeout time.Duration, background bool, cleanups ...string) (*executeResult, error) {
 	var stdoutBuf, stderrBuf limitedBuffer
 	stdoutBuf.limit = maxCmdOutput
 	stderrBuf.limit = maxCmdOutput
@@ -411,10 +511,13 @@ func runCmd(cmd *exec.Cmd, timeout time.Duration, background bool) (*executeResu
 
 	if background {
 		// Detach: let the process continue running independently.
-		// We reap it in a goroutine to avoid zombie processes.
+		// We reap it in a goroutine to avoid zombie processes, and
+		// clean up temp files after the process exits.
 		go func() {
 			_ = cmd.Wait()
-			// Temp file cleanup happens via defer in the caller.
+			for _, p := range cleanups {
+				os.Remove(p)
+			}
 		}()
 		return &executeResult{
 			Stdout:   fmt.Sprintf("Process started in background (PID: %d)", cmd.Process.Pid),
@@ -436,9 +539,17 @@ func runCmd(cmd *exec.Cmd, timeout time.Duration, background bool) (*executeResu
 
 	select {
 	case <-timer.C:
-		// Timeout: kill the entire process group.
+		// Timeout: send SIGTERM first for graceful shutdown, then SIGKILL.
 		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+			select {
+			case <-done:
+				// Process exited gracefully after SIGTERM.
+			case <-time.After(3 * time.Second):
+				// Force-kill and drain to release pipe resources.
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				<-done
+			}
 		}
 		stdout := stdoutBuf.String()
 		stderr := stderrBuf.String()
@@ -478,7 +589,7 @@ func runCmd(cmd *exec.Cmd, timeout time.Duration, background bool) (*executeResu
 func availableLanguages() []string {
 	var langs []string
 	for name := range runtimes {
-		if checkRuntime(name) {
+		if checkRuntime(name, false) {
 			langs = append(langs, name)
 		}
 	}

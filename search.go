@@ -121,51 +121,6 @@ func proximityRerank(results []SearchResult) []SearchResult {
 	return sorted
 }
 
-// ---------- Levenshtein distance ----------
-
-// levenshtein computes the edit distance between two strings using
-// a standard two-row DP approach (Wagner-Fischer).
-func levenshtein(a, b string) int {
-	ra, rb := []rune(a), []rune(b)
-	m, n := len(ra), len(rb)
-
-	// Use two rows for O(min(m,n)) space.
-	if m < n {
-		ra, rb = rb, ra
-		m, n = n, m
-	}
-
-	prev := make([]int, n+1)
-	curr := make([]int, n+1)
-
-	for j := 0; j <= n; j++ {
-		prev[j] = j
-	}
-
-	for i := 1; i <= m; i++ {
-		curr[0] = i
-		for j := 1; j <= n; j++ {
-			cost := 0
-			if ra[i-1] != rb[j-1] {
-				cost = 1
-			}
-			del := prev[j] + 1
-			ins := curr[j-1] + 1
-			sub := prev[j-1] + cost
-			curr[j] = del
-			if ins < curr[j] {
-				curr[j] = ins
-			}
-			if sub < curr[j] {
-				curr[j] = sub
-			}
-		}
-		prev, curr = curr, prev
-	}
-
-	return prev[n]
-}
-
 // ---------- SearchMeta ----------
 
 // SearchMeta contains metadata about a search operation, including
@@ -197,6 +152,9 @@ func NewSearchPipeline(store *Store, floodGuard *FloodGuard) *SearchPipeline {
 
 // Search runs the complete enhanced search pipeline.
 func (sp *SearchPipeline) Search(query string, limit int) ([]SearchResult, *SearchMeta, error) {
+	if limit < 0 {
+		limit = 0
+	}
 	start := time.Now()
 	meta := &SearchMeta{}
 

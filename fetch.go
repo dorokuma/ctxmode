@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	md "github.com/JohannesKaufmann/html-to-markdown/v2"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -29,6 +30,15 @@ const (
 	defaultTTL         = 24 * time.Hour
 	maxConcurrency     = 8
 )
+
+// fetchGroup deduplicates concurrent fetches for the same URL+source.
+var fetchGroup singleflight.Group
+
+// fetchResultData carries results between singleflight-merged callers.
+type fetchResultData struct {
+	content    string
+	chunkCount int
+}
 
 // ---------- data types ----------
 
@@ -51,8 +61,6 @@ type fetchArgs struct {
 	Force      bool     `json:"force,omitempty" jsonschema:"Skip cache and re-fetch"`
 	MaxBytes   int      `json:"maxBytes,omitempty" jsonschema:"Max bytes to return (default 50KB)"`
 	TimeoutMs  int      `json:"timeoutMs,omitempty" jsonschema:"Timeout in ms (default 150000)"`
-	Links      bool     `json:"links,omitempty" jsonschema:"Include page hyperlinks (not yet implemented)"`
-	ImageLinks bool     `json:"image_links,omitempty" jsonschema:"Include image URLs (not yet implemented)"`
 	TTL        *int     `json:"ttl,omitempty" jsonschema:"Cache TTL in ms (0 = skip cache, omit = 24h default)"`
 } 
 
@@ -93,10 +101,13 @@ func validateURL(rawURL string, strict bool) error {
 }
 
 // checkIP returns an error if the IP is in a blocked range.
-// Hard-blocked: 169.254.x.x (link-local/IMDS), 224.0.0.0/4 (multicast),
-// 0.0.0.0/8 (unspecified), 127.0.0.0/8 (loopback).
-// Strict mode: additionally blocks 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
-// and IPv6 loopback (::1).
+// Always blocked: 0.0.0.0/8 (unspecified), 127.0.0.0/8 (loopback),
+// 169.254.0.0/16 (link-local/IMDS), 224.0.0.0/4 (multicast),
+// 240.0.0.0/4 (reserved), 10.0.0.0/8 / 172.16.0.0/12 / 192.168.0.0/16 (private),
+// 100.64.0.0/10 (CGNAT), 198.18.0.0/15 (benchmark),
+// IPv6 link-local, unspecified, and multicast.
+// Strict mode (CTX_FETCH_STRICT=1): additionally blocks IPv6 loopback (::1)
+// and IPv6 private addresses.
 func checkIP(ip net.IP, strict bool) error {
 	if ip == nil {
 		return fmt.Errorf("nil IP")
@@ -122,20 +133,29 @@ func checkIP(ip net.IP, strict bool) error {
 		if v4[0] >= 224 && v4[0] <= 239 {
 			return fmt.Errorf("224.0.0.0/4 (multicast)")
 		}
-
-		if strict {
-			// 10.0.0.0/8 — private
-			if v4[0] == 10 {
-				return fmt.Errorf("10.0.0.0/8 (private) blocked in strict mode")
-			}
-			// 172.16.0.0/12 — private
-			if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 {
-				return fmt.Errorf("172.16.0.0/12 (private) blocked in strict mode")
-			}
-			// 192.168.0.0/16 — private
-			if v4[0] == 192 && v4[1] == 168 {
-				return fmt.Errorf("192.168.0.0/16 (private) blocked in strict mode")
-			}
+		// 240.0.0.0/4 — reserved (formerly Class E)
+		if v4[0] >= 240 {
+			return fmt.Errorf("240.0.0.0/4 (reserved)")
+		}
+		// 10.0.0.0/8 — private (RFC 1918)
+		if v4[0] == 10 {
+			return fmt.Errorf("10.0.0.0/8 (private)")
+		}
+		// 172.16.0.0/12 — private (RFC 1918)
+		if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 {
+			return fmt.Errorf("172.16.0.0/12 (private)")
+		}
+		// 192.168.0.0/16 — private (RFC 1918)
+		if v4[0] == 192 && v4[1] == 168 {
+			return fmt.Errorf("192.168.0.0/16 (private)")
+		}
+		// 100.64.0.0/10 — CGNAT (RFC 6598)
+		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+			return fmt.Errorf("100.64.0.0/10 (CGNAT)")
+		}
+		// 198.18.0.0/15 — benchmark / testing (RFC 2544)
+		if v4[0] == 198 && v4[1] >= 18 && v4[1] <= 19 {
+			return fmt.Errorf("198.18.0.0/15 (benchmark)")
 		}
 	} else {
 		// IPv6
@@ -162,46 +182,22 @@ func checkIP(ip net.IP, strict bool) error {
 	return nil
 }
 
-// ---------- HTTP fetch ----------
+// ---------- HTTP client (singleton) ----------
 
-// fetchURL performs an HTTP GET request with redirect limits and body size limit.
-// It includes DNS rebinding protection: DNS is resolved inside DialContext and
-// the resolved IP is verified against SSRF rules right before connecting, closing
-// the TOCTOU window between validateURL and the actual TCP connection.
-func fetchURL(ctx context.Context, rawURL string, timeout time.Duration) (body []byte, contentType string, err error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, "", fmt.Errorf("parse URL: %w", err)
-	}
-	host := u.Hostname()
-	strict := os.Getenv("CTX_FETCH_STRICT") == "1"
-
-	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
-	if err != nil {
-		return nil, "", fmt.Errorf("create request: %w", err)
-	}
-
-	// Set a friendly User-Agent.
-	req.Header.Set("User-Agent", "ctxmode/1.0 (MCP context server)")
-
-	dialer := &net.Dialer{}
-
-	// Use a custom transport that resolves DNS inside DialContext and verifies
-	// the resolved IP is safe. This prevents DNS rebinding attacks (TOCTOU
-	// between validateURL above and the actual TCP connection).
-	cli := &http.Client{
-		Timeout: timeout,
+// newHTTPClient creates the singleton HTTP client with SSRF protection,
+// connection reuse, and simplified redirect checking.
+// DialContext is the SSRF gate — it resolves DNS and checks IPs on every
+// connection (including redirects). CheckRedirect only enforces max redirects
+// and scheme whitelist (no redundant DNS or validateURL calls).
+func newHTTPClient() *http.Client {
+	return &http.Client{
 		Transport: &http.Transport{
+			ResponseHeaderTimeout: 30 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				// Re-resolve DNS inside DialContext to close TOCTOU window.
 				hostFromAddr, portFromAddr, err := net.SplitHostPort(addr)
 				if err != nil {
-					hostFromAddr = addr
-					if u.Scheme == "https" {
-						portFromAddr = "443"
-					} else {
-						portFromAddr = "80"
-					}
+					return nil, fmt.Errorf("invalid address %q: %w", addr, err)
 				}
 
 				ips, err := net.DefaultResolver.LookupIPAddr(ctx, hostFromAddr)
@@ -209,6 +205,7 @@ func fetchURL(ctx context.Context, rawURL string, timeout time.Duration) (body [
 					return nil, fmt.Errorf("DNS resolution in DialContext: %w", err)
 				}
 
+				strict := os.Getenv("CTX_FETCH_STRICT") == "1"
 				var safeIP net.IP
 				for _, ip := range ips {
 					if err := checkIP(ip.IP, strict); err == nil {
@@ -221,25 +218,41 @@ func fetchURL(ctx context.Context, rawURL string, timeout time.Duration) (body [
 				}
 
 				safeAddr := net.JoinHostPort(safeIP.String(), portFromAddr)
-				return dialer.DialContext(ctx, network, safeAddr)
-			},
-			TLSClientConfig: &tls.Config{
-				ServerName: host, // SNI: original hostname for TLS virtual hosting
+				return (&net.Dialer{}).DialContext(ctx, network, safeAddr)
 			},
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= maxRedirects {
 				return fmt.Errorf("too many redirects (max %d)", maxRedirects)
 			}
-			// Validate redirect target for SSRF.
-			if err := validateURL(req.URL.String(), strict); err != nil {
-				return fmt.Errorf("redirect blocked by SSRF check: %w", err)
+			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+				return fmt.Errorf("redirect to scheme %q not allowed", req.URL.Scheme)
 			}
 			return nil
 		},
 	}
+}
 
-	resp, err := cli.Do(req)
+// ---------- HTTP fetch ----------
+
+// fetchURL performs an HTTP GET request with redirect limits and body size limit.
+// Uses the server-level singleton HTTP client for connection reuse (SSRF via DialContext).
+func (s *server) fetchURL(ctx context.Context, rawURL string, timeout time.Duration) (body []byte, contentType string, err error) {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("create request: %w", err)
+	}
+
+	// Set a friendly User-Agent.
+	req.Header.Set("User-Agent", "ctxmode/1.0 (MCP context server)")
+
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("HTTP request failed: %w", err)
 	}
@@ -263,8 +276,23 @@ func fetchURL(ctx context.Context, rawURL string, timeout time.Duration) (body [
 
 // ---------- content processing ----------
 
-// processContent converts raw bytes into indexable markdown/text based on content type.
-func processContent(body []byte, contentType string) (string, error) {
+// processContent converts raw bytes into indexable text based on explicit format
+// (when non-empty) or Content-Type detection as fallback.
+func processContent(body []byte, contentType, format string) (string, error) {
+	// If format is explicitly specified, use it.
+	if format != "" {
+		switch format {
+		case "markdown":
+			return htmlToMarkdown(body)
+		case "html":
+			return string(body), nil
+		case "json":
+			return formatJSON(body)
+		default:
+			return "", fmt.Errorf("unknown format: %q", format)
+		}
+	}
+	// Fallback: detect from Content-Type.
 	switch {
 	case strings.Contains(contentType, "text/html"):
 		return htmlToMarkdown(body)
@@ -280,8 +308,7 @@ func processContent(body []byte, contentType string) (string, error) {
 func htmlToMarkdown(body []byte) (string, error) {
 	mdContent, err := md.ConvertString(string(body))
 	if err != nil {
-		// Fallback: try basic text extraction
-		return string(body), nil
+		return "", fmt.Errorf("html-to-markdown conversion failed: %w", err)
 	}
 	return mdContent, nil
 }
@@ -341,26 +368,33 @@ func chunkContent(content string) []string {
 // ---------- fetch and index (single URL) ----------
 
 // fetchAndIndex fetches a URL, processes the content, and indexes it into the store.
-func (s *server) fetchAndIndex(ctx context.Context, rawURL, source string, force bool, ttl int, timeout time.Duration) (*FetchResult, error) {
+func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format string, force bool, ttl int, timeout time.Duration) (*FetchResult, error) {
 	result := &FetchResult{
 		URL:    rawURL,
 		Source: source,
 	}
 
 	// Determine effective TTL.
-	// ttl=-1 means use default (24h), ttl=0 means skip cache.
+	// ttl=-1 means use default (24h), ttl=0 means skip cache entirely.
+	// force=true skips cache read (forced re-fetch) but still writes back to refresh cache.
+	// S24: split skipCache into skipCacheRead (force || ttl==0) and skipCacheWrite (ttl==0 only).
 	effectiveTTL := defaultTTL
-	skipCache := force
+	skipCacheRead := force
+	skipCacheWrite := false
 	if ttl >= 0 {
 		if ttl == 0 {
-			skipCache = true
+			skipCacheRead = true
+			skipCacheWrite = true
 		} else {
 			effectiveTTL = time.Duration(ttl) * time.Millisecond
 		}
 	}
 
-	if !skipCache {
-		cached, err := s.store.GetCached(rawURL, source)
+	// Build cache key with format dimension (S26).
+	cacheSource := source + "|" + format
+
+	if !skipCacheRead {
+		cached, err := s.store.GetCached(rawURL, cacheSource)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "cache lookup error: %v\n", err)
 		}
@@ -382,49 +416,89 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source string, force
 		return result, nil
 	}
 
-	// Fetch.
-	body, contentType, err := fetchURL(ctx, rawURL, timeout)
-	if err != nil {
-		result.Error = fmt.Sprintf("fetch failed: %v", err)
+	// Check context before proceeding.
+	if err := ctx.Err(); err != nil {
+		result.Error = fmt.Sprintf("cancelled: %v", err)
 		return result, nil
 	}
 
-	// Process content.
-	content, err := processContent(body, contentType)
-	if err != nil {
-		result.Error = fmt.Sprintf("content processing failed: %v", err)
+	// Fetch, process, and index.
+	// skipCacheWrite=true (ttl==0): direct fetch (no singleflight merge, no cache write).
+	// skipCacheWrite=false (normal or force): use singleflight to merge concurrent fetches for the same URL+source.
+	if skipCacheWrite {
+		body, contentType, err := s.fetchURL(ctx, rawURL, timeout)
+		if err != nil {
+			result.Error = fmt.Sprintf("fetch failed: %v", err)
+			return result, nil
+		}
+
+		content, err := processContent(body, contentType, format)
+		if err != nil {
+			result.Error = fmt.Sprintf("content processing failed: %v", err)
+			return result, nil
+		}
+		result.Content = content
+
+		// Index into store.
+		docPath := source + ":" + rawURL
+		chunks := chunkContent(content)
+		result.ChunkCount = len(chunks)
+		for i, chunk := range chunks {
+			chunkPath := docPath
+			if len(chunks) > 1 {
+				chunkPath = fmt.Sprintf("%s#chunk-%d", docPath, i)
+			}
+			if err := s.storeIndexLocked(chunkPath, chunk); err != nil {
+				fmt.Fprintf(os.Stderr, "index chunk %d failed: %v\n", i, err)
+			}
+		}
+		// skipCacheWrite=true: no cache write.
 		return result, nil
 	}
 
-	result.Content = content
-
-	// Index into store.
-	// Use source:url as the document path for uniqueness.
-	docPath := source + ":" + rawURL
-
-	// For indexing, we chunk the content for better search granularity.
-	chunks := chunkContent(content)
-	result.ChunkCount = len(chunks)
-
-	for i, chunk := range chunks {
-		chunkPath := docPath
-		if len(chunks) > 1 {
-			chunkPath = fmt.Sprintf("%s#chunk-%d", docPath, i)
+	// skipCacheWrite=false: use singleflight to merge concurrent fetches.
+	sfKey := rawURL + "|" + cacheSource
+	sfResult, err, _ := fetchGroup.Do(sfKey, func() (interface{}, error) {
+		body, contentType, err := s.fetchURL(ctx, rawURL, timeout)
+		if err != nil {
+			return nil, fmt.Errorf("fetch failed: %w", err)
 		}
-		if err := s.storeIndexLocked(chunkPath, chunk); err != nil {
-			// Log but continue with remaining chunks.
-			fmt.Fprintf(os.Stderr, "index chunk %d failed: %v\n", i, err)
-		}
-	}
 
-	// Write to cache (with mutex protection against concurrent fetch goroutines).
-	s.mu.Lock()
-	if err := s.store.SetCache(rawURL, source, content); err != nil {
-		fmt.Fprintf(os.Stderr, "cache write failed: %v\n", err)
+		content, err := processContent(body, contentType, format)
+		if err != nil {
+			return nil, fmt.Errorf("content processing failed: %w", err)
+		}
+
+		// Index into store.
+		docPath := source + ":" + rawURL
+		chunks := chunkContent(content)
+		for i, chunk := range chunks {
+			chunkPath := docPath
+			if len(chunks) > 1 {
+				chunkPath = fmt.Sprintf("%s#chunk-%d", docPath, i)
+			}
+			if err := s.storeIndexLocked(chunkPath, chunk); err != nil {
+				fmt.Fprintf(os.Stderr, "index chunk %d failed: %v\n", i, err)
+			}
+		}
+
+		// Write to cache (with mutex protection).
+		s.mu.Lock()
+		if err := s.store.SetCache(rawURL, cacheSource, content); err != nil {
+			fmt.Fprintf(os.Stderr, "cache write failed: %v\n", err)
+		}
+		_ = s.store.PruneCache(7 * 24 * time.Hour)
+		s.mu.Unlock()
+
+		return &fetchResultData{content: content, chunkCount: len(chunks)}, nil
+	})
+	if err != nil {
+		result.Error = err.Error()
+		return result, nil
 	}
-	// Prune old cache entries occasionally (every fetch, but cheap DELETE).
-	_ = s.store.PruneCache(7 * 24 * time.Hour)
-	s.mu.Unlock()
+	data := sfResult.(*fetchResultData)
+	result.Content = data.content
+	result.ChunkCount = data.chunkCount
 
 	return result, nil
 }
@@ -439,7 +513,7 @@ func countChunks(content string) int {
 // batchFetchAndIndex fetches and indexes multiple URLs concurrently.
 // Results are returned in the same order as the input URLs.
 // Concurrency is limited by a semaphore (max 8).
-func (s *server) batchFetchAndIndex(ctx context.Context, urls []string, source string, force bool, ttl int, timeout time.Duration) []*FetchResult {
+func (s *server) batchFetchAndIndex(ctx context.Context, urls []string, source, format string, force bool, ttl int, timeout time.Duration) []*FetchResult {
 	if len(urls) == 0 {
 		return nil
 	}
@@ -470,7 +544,7 @@ func (s *server) batchFetchAndIndex(ctx context.Context, urls []string, source s
 				return
 			}
 
-			result, err := s.fetchAndIndex(ctx, url, source, force, ttl, timeout)
+			result, err := s.fetchAndIndex(ctx, url, source, format, force, ttl, timeout)
 			if err != nil {
 				results[idx] = &FetchResult{
 					URL:   url,
@@ -489,17 +563,24 @@ func (s *server) batchFetchAndIndex(ctx context.Context, urls []string, source s
 // ---------- MCP tool handler ----------
 
 func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, args fetchArgs) (*mcp.CallToolResult, any, error) {
-	// Collect URLs to fetch.
+	// Collect and deduplicate URLs.
+	seen := make(map[string]bool)
 	var urls []string
 	if args.URL != "" {
-		urls = append(urls, args.URL)
+		if !seen[args.URL] {
+			seen[args.URL] = true
+			urls = append(urls, args.URL)
+		}
 	}
-	if len(args.URLs) > 0 {
-		urls = append(urls, args.URLs...)
+	for _, u := range args.URLs {
+		if u != "" && !seen[u] {
+			seen[u] = true
+			urls = append(urls, u)
+		}
 	}
 
 	if len(urls) == 0 {
-		return nil, nil, fmt.Errorf("either 'url' or 'urls' is required")
+		return nil, nil, fmt.Errorf("at least one non-empty URL is required in 'url' or 'urls'")
 	}
 
 	if len(urls) > 10 {
@@ -519,7 +600,7 @@ func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, 
 	}
 
 	// Batch fetch.
-	results := s.batchFetchAndIndex(ctx, urls, args.Source, args.Force, ttl, timeout)
+	results := s.batchFetchAndIndex(ctx, urls, args.Source, args.Format, args.Force, ttl, timeout)
 
 	// Apply maxBytes limit to returned content.
 	maxBytes := defaultMaxBytes

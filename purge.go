@@ -14,6 +14,7 @@ type purgeArgs struct {
 	Confirm   bool   `json:"confirm" jsonschema:"MUST be true. Destructive operation; false returns 'purge cancelled'."`
 	Scope     string `json:"scope,omitempty" jsonschema:"'session' or 'project'"`
 	SessionID string `json:"sessionId,omitempty" jsonschema:"UUID of session to purge (for scope='session')"`
+	DryRun    bool   `json:"dryRun,omitempty" jsonschema:"If true, preview what would be deleted without actually deleting"`
 }
 
 // purgeResult holds the result of a purge operation.
@@ -22,9 +23,15 @@ type purgeResult struct {
 	DeletedDocs  int    `json:"deleted_docs"`
 	DeletedCache int    `json:"deleted_cache,omitempty"`
 	FreedBytes   int64  `json:"freed_bytes,omitempty"`
+	Warning      string `json:"warning,omitempty"`
 }
 
 func (s *server) toolPurge(ctx context.Context, _ *mcp.CallToolRequest, args purgeArgs) (*mcp.CallToolResult, any, error) {
+	// DryRun: preview only, no actual deletion.
+	if args.DryRun {
+		return s.purgeDryRun(args.Scope, args.SessionID)
+	}
+
 	// Must confirm.
 	if !args.Confirm {
 		return &mcp.CallToolResult{
@@ -49,10 +56,13 @@ func (s *server) toolPurge(ctx context.Context, _ *mcp.CallToolRequest, args pur
 
 func (s *server) purgeProject() (*mcp.CallToolResult, any, error) {
 	// Get DB size before purge for freed bytes calculation.
+	// Include WAL and SHM files for accurate measurement.
 	dbPath := s.store.DBPath()
 	var beforeSize int64
-	if fi, err := os.Stat(dbPath); err == nil {
-		beforeSize = fi.Size()
+	for _, ext := range []string{"", "-wal", "-shm"} {
+		if fi, err := os.Stat(dbPath + ext); err == nil {
+			beforeSize += fi.Size()
+		}
 	}
 
 	deletedDocs, deletedCache, err := s.store.PurgeAll()
@@ -60,15 +70,20 @@ func (s *server) purgeProject() (*mcp.CallToolResult, any, error) {
 		return nil, nil, fmt.Errorf("purge project: %w", err)
 	}
 
-	// Run VACUUM to reclaim space.
+	// Run VACUUM to reclaim space. VACUUM cannot run inside a transaction,
+	// so it is called separately here. If VACUUM fails, the documents have
+	// already been deleted successfully — we report a warning, not an error.
+	var warning string
 	if err := s.store.Vacuum(); err != nil {
-		return nil, nil, fmt.Errorf("vacuum after purge: %w", err)
+		warning = fmt.Sprintf("vacuum after purge failed (documents deleted, space not reclaimed): %v", err)
 	}
 
-	// Calculate freed bytes.
+	// Calculate freed bytes (include WAL and SHM files).
 	var afterSize int64
-	if fi, err := os.Stat(dbPath); err == nil {
-		afterSize = fi.Size()
+	for _, ext := range []string{"", "-wal", "-shm"} {
+		if fi, err := os.Stat(dbPath + ext); err == nil {
+			afterSize += fi.Size()
+		}
 	}
 	freedBytes := beforeSize - afterSize
 	if freedBytes < 0 {
@@ -80,6 +95,7 @@ func (s *server) purgeProject() (*mcp.CallToolResult, any, error) {
 		DeletedDocs:  deletedDocs,
 		DeletedCache: deletedCache,
 		FreedBytes:   freedBytes,
+		Warning:      warning,
 	}
 
 	js, _ := json.MarshalIndent(res, "", "  ")
@@ -93,16 +109,11 @@ func (s *server) purgeSession(sessionID string) (*mcp.CallToolResult, any, error
 		return nil, nil, fmt.Errorf("sessionId is required when scope='session'")
 	}
 
-	// Delete documents whose path starts with known index prefixes.
-	// NOTE: session isolation is not yet fully implemented — execute/execute_file
-	// labels currently use timestamps or intent strings, not sessionID.
-	// For now, session scope deletes anything under session:/batch:/execute:/execute_file:
-	// with a caller-chosen sessionID. For full cleanup, use scope="project".
+	// session scope only cleans the session: namespace.
+	// execute/batch/execute_file output does not belong to session semantics;
+	// use scope=project for full cleanup.
 	prefixes := []string{
 		"session:" + sessionID,
-		"batch:" + sessionID,
-		"execute_file:" + sessionID,
-		"execute:" + sessionID,
 	}
 
 	totalDeleted := 0
@@ -123,4 +134,50 @@ func (s *server) purgeSession(sessionID string) (*mcp.CallToolResult, any, error
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: string(js)}},
 	}, nil, nil
+}
+
+// purgeDryRun counts what would be deleted without actually deleting anything.
+func (s *server) purgeDryRun(scope, sessionID string) (*mcp.CallToolResult, any, error) {
+	if scope == "" {
+		return nil, nil, fmt.Errorf("must specify scope: 'session' or 'project'")
+	}
+
+	switch scope {
+	case "project":
+		docCount, _, err := s.store.Stats()
+		if err != nil {
+			return nil, nil, fmt.Errorf("dryRun count: %w", err)
+		}
+		cacheCount, err := s.store.CacheCount()
+		if err != nil {
+			return nil, nil, fmt.Errorf("dryRun cache count: %w", err)
+		}
+		res := purgeResult{
+			Scope:        "project",
+			DeletedDocs:  docCount,
+			DeletedCache: cacheCount,
+		}
+		js, _ := json.MarshalIndent(res, "", "  ")
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("DRY RUN — would delete:\n%s", string(js))}},
+		}, nil, nil
+	case "session":
+		if sessionID == "" {
+			return nil, nil, fmt.Errorf("sessionId is required when scope='session'")
+		}
+		n, err := s.store.CountByPrefix("session:" + sessionID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("dryRun count: %w", err)
+		}
+		res := purgeResult{
+			Scope:       "session",
+			DeletedDocs: n,
+		}
+		js, _ := json.MarshalIndent(res, "", "  ")
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("DRY RUN — would delete:\n%s", string(js))}},
+		}, nil, nil
+	default:
+		return nil, nil, fmt.Errorf("invalid scope %q: must be 'session' or 'project'", scope)
+	}
 }

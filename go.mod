@@ -3,13 +3,14 @@ module github.com/dorokuma/ctxmode
 go 1.25.0
 
 require (
+	github.com/JohannesKaufmann/html-to-markdown/v2 v2.5.2
 	github.com/modelcontextprotocol/go-sdk v1.6.1
+	golang.org/x/sync v0.22.0
 	modernc.org/sqlite v1.54.0
 )
 
 require (
 	github.com/JohannesKaufmann/dom v0.3.1 // indirect
-	github.com/JohannesKaufmann/html-to-markdown/v2 v2.5.2 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect

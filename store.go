@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -41,6 +42,17 @@ func NewStore(dbPath string) (*Store, error) {
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("set WAL: %w", err)
+	}
+
+	// Busy timeout: wait up to 5s on SQLITE_BUSY instead of failing immediately.
+	// Synchronous=NORMAL is safe in WAL mode and improves write performance.
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set busy_timeout: %w", err)
+	}
+	if _, err := db.Exec("PRAGMA synchronous=NORMAL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set synchronous: %w", err)
 	}
 
 	// Limit to a single connection to avoid SQLITE_BUSY on concurrent writes.
@@ -172,18 +184,22 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("create fetch_cache table: %w", err)
 	}
 
-	// Rebuild both FTS5 indices to fix any rowid inconsistencies.
-	// This is safe to call on every startup and is a no-op if the index is already clean.
-	if _, err := db.Exec(`INSERT INTO documents_fts(documents_fts) VALUES('rebuild')`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("rebuild fts5: %w", err)
-	}
-	if _, err := db.Exec(`INSERT INTO documents_trigram(documents_trigram) VALUES('rebuild')`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("rebuild trigram fts5: %w", err)
+	// Only rebuild FTS on startup if inconsistency detected.
+	// FTS5Health checks row count parity between documents and FTS tables;
+	// triggers normally keep them in sync.
+	s := &Store{db: db}
+	if err := s.FTS5Health(); err != nil {
+		if _, err2 := db.Exec(`INSERT INTO documents_fts(documents_fts) VALUES('rebuild')`); err2 != nil {
+			db.Close()
+			return nil, fmt.Errorf("rebuild fts5: %w", err2)
+		}
+		if _, err2 := db.Exec(`INSERT INTO documents_trigram(documents_trigram) VALUES('rebuild')`); err2 != nil {
+			db.Close()
+			return nil, fmt.Errorf("rebuild trigram fts5: %w", err2)
+		}
 	}
 
-	return &Store{db: db}, nil
+	return s, nil
 }
 
 // Index inserts or replaces a document in the store. The FTS5 index is
@@ -227,14 +243,14 @@ func (s *Store) Get(path string) (*Document, error) {
 // This is the simple entry point used by batch.go and other internal callers.
 // For the full pipeline (flood guard, fuzzy, proximity), use SearchPipeline.
 func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
-	porterResults, err := s.searchPorter(query, limit*3)
-	if err != nil {
-		porterResults = nil
+	if limit < 0 {
+		limit = 0
 	}
+	porterResults, porterErr := s.searchPorter(query, limit*3)
+	trigramResults, trigramErr := s.searchTrigram(query, limit*3)
 
-	trigramResults, err := s.searchTrigram(query, limit*3)
-	if err != nil {
-		trigramResults = nil
+	if porterErr != nil && trigramErr != nil {
+		return nil, fmt.Errorf("porter: %v / trigram: %v", porterErr, trigramErr)
 	}
 
 	if len(porterResults) == 0 && len(trigramResults) == 0 {
@@ -292,8 +308,9 @@ func (s *Store) searchTrigram(query string, limit int) ([]SearchResult, error) {
 
 	rows, err := s.db.Query(sqlQuery, ftsQuery, limit)
 	if err != nil {
-		// Trigram is more tolerant; try the raw query as fallback.
-		rows, err = s.db.Query(sqlQuery, query, limit)
+		// Trigram is more tolerant; try per-term escaping as fallback.
+		fallbackQuery := fts5LiteralEscape(query)
+		rows, err = s.db.Query(sqlQuery, fallbackQuery, limit)
 		if err != nil {
 			return nil, fmt.Errorf("trigram search: %w", err)
 		}
@@ -348,6 +365,34 @@ func (s *Store) Stats() (docCount int, dbSize int64, err error) {
 	}
 
 	return docCount, dbSize, nil
+}
+
+// FTS5Health checks the production FTS5 tables for integrity.
+// It verifies that both FTS5 virtual tables (porter and trigram) are accessible
+// and that their row counts match the documents table.
+func (s *Store) FTS5Health() error {
+	var docRows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM documents`).Scan(&docRows); err != nil {
+		return fmt.Errorf("count documents: %w", err)
+	}
+
+	var ftsRows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM documents_fts`).Scan(&ftsRows); err != nil {
+		return fmt.Errorf("documents_fts not accessible: %w", err)
+	}
+	if ftsRows != docRows {
+		return fmt.Errorf("documents_fts row count mismatch: fts=%d docs=%d", ftsRows, docRows)
+	}
+
+	var trigramRows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM documents_trigram`).Scan(&trigramRows); err != nil {
+		return fmt.Errorf("documents_trigram not accessible: %w", err)
+	}
+	if trigramRows != docRows {
+		return fmt.Errorf("documents_trigram row count mismatch: trigram=%d docs=%d", trigramRows, docRows)
+	}
+
+	return nil
 }
 
 // CachedResult represents a cached fetch entry.
@@ -414,8 +459,14 @@ func (s *Store) DBPath() string {
 // PurgeAll deletes all documents and cache entries.
 // Returns the number of deleted documents and cache entries.
 func (s *Store) PurgeAll() (deletedDocs int, deletedCache int, err error) {
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Delete all documents — the AFTER DELETE triggers clean up FTS tables automatically.
-	res, err := s.db.Exec(`DELETE FROM documents`)
+	res, err := tx.Exec(`DELETE FROM documents`)
 	if err != nil {
 		return 0, 0, fmt.Errorf("purge documents: %w", err)
 	}
@@ -424,28 +475,37 @@ func (s *Store) PurgeAll() (deletedDocs int, deletedCache int, err error) {
 
 	// Rebuild both FTS indices to guarantee consistency even if triggers were
 	// missing or disabled during the DELETE.
-	_, _ = s.db.Exec(`INSERT INTO documents_fts(documents_fts) VALUES('rebuild')`)
-	_, _ = s.db.Exec(`INSERT INTO documents_trigram(documents_trigram) VALUES('rebuild')`)
+	if _, err := tx.Exec(`INSERT INTO documents_fts(documents_fts) VALUES('rebuild')`); err != nil {
+		return 0, 0, fmt.Errorf("rebuild fts5 after purge: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO documents_trigram(documents_trigram) VALUES('rebuild')`); err != nil {
+		return 0, 0, fmt.Errorf("rebuild trigram after purge: %w", err)
+	}
 
 	// Delete all cache entries.
-	res, err = s.db.Exec(`DELETE FROM fetch_cache`)
+	res, err = tx.Exec(`DELETE FROM fetch_cache`)
 	if err != nil {
 		return deletedDocs, 0, fmt.Errorf("purge cache: %w", err)
 	}
 	cacheRows, _ := res.RowsAffected()
 	deletedCache = int(cacheRows)
 
+	if err := tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("commit purge: %w", err)
+	}
 	return deletedDocs, deletedCache, nil
 }
 
 // PurgeByPrefix deletes documents whose path starts with the given prefix.
 // Returns the number of deleted documents.
 func (s *Store) PurgeByPrefix(prefix string) (deleted int, err error) {
-	// Escape LIKE wildcards in the prefix so that literal % and _ are not
-	// interpreted as pattern characters.
-	escaped := strings.ReplaceAll(prefix, "%", `\%`)
-	escaped = strings.ReplaceAll(escaped, "_", `\_`)
-	res, err := s.db.Exec(`DELETE FROM documents WHERE path LIKE ?`, escaped+"%")
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(`DELETE FROM documents WHERE path >= ? AND path < ?`, prefix, prefix+"\U0010ffff")
 	if err != nil {
 		return 0, fmt.Errorf("purge by prefix: %w", err)
 	}
@@ -453,10 +513,32 @@ func (s *Store) PurgeByPrefix(prefix string) (deleted int, err error) {
 	deleted = int(rows)
 	// Rebuild FTS indexes to guarantee consistency after selective deletions.
 	if deleted > 0 {
-		_, _ = s.db.Exec(`INSERT INTO documents_fts(documents_fts) VALUES('rebuild')`)
-		_, _ = s.db.Exec(`INSERT INTO documents_trigram(documents_trigram) VALUES('rebuild')`)
+		if _, err := tx.Exec(`INSERT INTO documents_fts(documents_fts) VALUES('rebuild')`); err != nil {
+			return 0, fmt.Errorf("rebuild fts5 after prefix purge: %w", err)
+		}
+		if _, err := tx.Exec(`INSERT INTO documents_trigram(documents_trigram) VALUES('rebuild')`); err != nil {
+			return 0, fmt.Errorf("rebuild trigram after prefix purge: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit prefix purge: %w", err)
 	}
 	return deleted, nil
+}
+
+// CountByPrefix returns the number of documents whose path starts with the
+// given prefix. It uses the same range comparison as PurgeByPrefix but does
+// not delete anything.
+func (s *Store) CountByPrefix(prefix string) (int, error) {
+	var count int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM documents WHERE path >= ? AND path < ?`,
+		prefix, prefix+"\U0010ffff",
+	).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count by prefix: %w", err)
+	}
+	return count, nil
 }
 
 // Vacuum rebuilds the database file to reclaim space after deletions.
