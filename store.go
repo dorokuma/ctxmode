@@ -33,7 +33,21 @@ type Store struct {
 // NewStore opens or creates a SQLite database at dbPath and initializes
 // the schema (documents table, FTS5 virtual table, and sync triggers).
 func NewStore(dbPath string) (*Store, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	// Build DSN with per-connection pragmas so every new connection gets
+	// busy_timeout and synchronous settings, not just the first one.
+	dsn := dbPath
+	if dbPath != ":memory:" {
+		if strings.HasPrefix(dbPath, "file:") {
+			sep := "&"
+			if !strings.Contains(dbPath, "?") {
+				sep = "?"
+			}
+			dsn = dbPath + sep + "_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
+		} else {
+			dsn = "file:" + dbPath + "?_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
+		}
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -42,17 +56,6 @@ func NewStore(dbPath string) (*Store, error) {
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("set WAL: %w", err)
-	}
-
-	// Busy timeout: wait up to 5s on SQLITE_BUSY instead of failing immediately.
-	// Synchronous=NORMAL is safe in WAL mode and improves write performance.
-	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("set busy_timeout: %w", err)
-	}
-	if _, err := db.Exec("PRAGMA synchronous=NORMAL"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("set synchronous: %w", err)
 	}
 
 	// Limit to a single connection to avoid SQLITE_BUSY on concurrent writes.
@@ -291,7 +294,10 @@ func (s *Store) searchPorter(query string, limit int) ([]SearchResult, error) {
 		}
 		results = append(results, r)
 	}
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 // searchTrigram searches the trigram FTS5 index (substring matching).
@@ -325,7 +331,10 @@ func (s *Store) searchTrigram(query string, limit int) ([]SearchResult, error) {
 		}
 		results = append(results, r)
 	}
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 // List returns all documents in the store.
@@ -370,6 +379,11 @@ func (s *Store) Stats() (docCount int, dbSize int64, err error) {
 // FTS5Health checks the production FTS5 tables for integrity.
 // It verifies that both FTS5 virtual tables (porter and trigram) are accessible
 // and that their row counts match the documents table.
+//
+// Note: row count equality is a necessary but not sufficient condition for
+// FTS integrity. Stale FTS content with matching row counts would pass this
+// check. In normal operation the AFTER DELETE/INSERT/UPDATE triggers
+// guarantee consistency, so this is a best-effort sanity check.
 func (s *Store) FTS5Health() error {
 	var docRows int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM documents`).Scan(&docRows); err != nil {
@@ -473,19 +487,10 @@ func (s *Store) PurgeAll() (deletedDocs int, deletedCache int, err error) {
 	docRows, _ := res.RowsAffected()
 	deletedDocs = int(docRows)
 
-	// Rebuild both FTS indices to guarantee consistency even if triggers were
-	// missing or disabled during the DELETE.
-	if _, err := tx.Exec(`INSERT INTO documents_fts(documents_fts) VALUES('rebuild')`); err != nil {
-		return 0, 0, fmt.Errorf("rebuild fts5 after purge: %w", err)
-	}
-	if _, err := tx.Exec(`INSERT INTO documents_trigram(documents_trigram) VALUES('rebuild')`); err != nil {
-		return 0, 0, fmt.Errorf("rebuild trigram after purge: %w", err)
-	}
-
 	// Delete all cache entries.
 	res, err = tx.Exec(`DELETE FROM fetch_cache`)
 	if err != nil {
-		return deletedDocs, 0, fmt.Errorf("purge cache: %w", err)
+		return 0, 0, fmt.Errorf("purge cache: %w", err)
 	}
 	cacheRows, _ := res.RowsAffected()
 	deletedCache = int(cacheRows)
@@ -511,16 +516,6 @@ func (s *Store) PurgeByPrefix(prefix string) (deleted int, err error) {
 	}
 	rows, _ := res.RowsAffected()
 	deleted = int(rows)
-	// Rebuild FTS indexes to guarantee consistency after selective deletions.
-	if deleted > 0 {
-		if _, err := tx.Exec(`INSERT INTO documents_fts(documents_fts) VALUES('rebuild')`); err != nil {
-			return 0, fmt.Errorf("rebuild fts5 after prefix purge: %w", err)
-		}
-		if _, err := tx.Exec(`INSERT INTO documents_trigram(documents_trigram) VALUES('rebuild')`); err != nil {
-			return 0, fmt.Errorf("rebuild trigram after prefix purge: %w", err)
-		}
-	}
-
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit prefix purge: %w", err)
 	}

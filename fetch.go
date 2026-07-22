@@ -24,9 +24,10 @@ import (
 
 const (
 	defaultFetchTimeout = 150 * time.Second
-	maxRedirects       = 5
-	maxBodySize        = 50 * 1024 * 1024 // 50 MB
-	defaultMaxBytes    = 50 * 1024        // 50 KB return limit
+	clientTimeout       = 5 * time.Minute
+	maxRedirects        = 5
+	maxBodySize         = 10 * 1024 * 1024 // 10 MB
+	defaultMaxBytes     = 50 * 1024        // 50 KB return limit
 	defaultTTL         = 24 * time.Hour
 	maxConcurrency     = 8
 )
@@ -38,6 +39,7 @@ var fetchGroup singleflight.Group
 type fetchResultData struct {
 	content    string
 	chunkCount int
+	truncated  bool
 }
 
 // ---------- data types ----------
@@ -49,6 +51,7 @@ type FetchResult struct {
 	Content    string `json:"content,omitempty"`
 	Cached     bool   `json:"cached"`
 	ChunkCount int    `json:"chunkCount,omitempty"`
+	Truncated  bool   `json:"truncated,omitempty"`
 	Error      string `json:"error,omitempty"`
 }
 
@@ -191,6 +194,7 @@ func checkIP(ip net.IP, strict bool) error {
 // and scheme whitelist (no redundant DNS or validateURL calls).
 func newHTTPClient() *http.Client {
 	return &http.Client{
+		Timeout: clientTimeout,
 		Transport: &http.Transport{
 			ResponseHeaderTimeout: 30 * time.Second,
 			IdleConnTimeout:       90 * time.Second,
@@ -237,7 +241,7 @@ func newHTTPClient() *http.Client {
 
 // fetchURL performs an HTTP GET request with redirect limits and body size limit.
 // Uses the server-level singleton HTTP client for connection reuse (SSRF via DialContext).
-func (s *server) fetchURL(ctx context.Context, rawURL string, timeout time.Duration) (body []byte, contentType string, err error) {
+func (s *server) fetchURL(ctx context.Context, rawURL string, timeout time.Duration) (body []byte, contentType string, truncated bool, err error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -246,7 +250,7 @@ func (s *server) fetchURL(ctx context.Context, rawURL string, timeout time.Durat
 
 	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("create request: %w", err)
+		return nil, "", false, fmt.Errorf("create request: %w", err)
 	}
 
 	// Set a friendly User-Agent.
@@ -254,15 +258,19 @@ func (s *server) fetchURL(ctx context.Context, rawURL string, timeout time.Durat
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("HTTP request failed: %w", err)
+		return nil, "", false, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Read body with size limit.
-	limited := io.LimitReader(resp.Body, maxBodySize)
+	// Read body with size limit + 1 to detect truncation.
+	limited := io.LimitReader(resp.Body, maxBodySize+1)
 	body, err = io.ReadAll(limited)
 	if err != nil {
-		return nil, "", fmt.Errorf("read body: %w", err)
+		return nil, "", false, fmt.Errorf("read body: %w", err)
+	}
+	truncated = len(body) > maxBodySize
+	if truncated {
+		body = body[:maxBodySize]
 	}
 
 	contentType = resp.Header.Get("Content-Type")
@@ -271,14 +279,16 @@ func (s *server) fetchURL(ctx context.Context, rawURL string, timeout time.Durat
 		contentType = strings.TrimSpace(contentType[:idx])
 	}
 
-	return body, contentType, nil
+	return body, contentType, truncated, nil
 }
 
 // ---------- content processing ----------
 
 // processContent converts raw bytes into indexable text based on explicit format
 // (when non-empty) or Content-Type detection as fallback.
-func processContent(body []byte, contentType, format string) (string, error) {
+func processContent(body []byte, contentType, format string, truncated bool) (string, error) {
+	// Clean Content-Type: case-insensitive matching.
+	ct := strings.ToLower(strings.TrimSpace(contentType))
 	// If format is explicitly specified, use it.
 	if format != "" {
 		switch format {
@@ -287,17 +297,17 @@ func processContent(body []byte, contentType, format string) (string, error) {
 		case "html":
 			return string(body), nil
 		case "json":
-			return formatJSON(body)
+			return formatJSON(body, truncated)
 		default:
 			return "", fmt.Errorf("unknown format: %q", format)
 		}
 	}
 	// Fallback: detect from Content-Type.
 	switch {
-	case strings.Contains(contentType, "text/html"):
+	case strings.Contains(ct, "text/html"):
 		return htmlToMarkdown(body)
-	case strings.Contains(contentType, "application/json"):
-		return formatJSON(body)
+	case strings.Contains(ct, "application/json"):
+		return formatJSON(body, truncated)
 	default:
 		// text/plain, text/markdown, application/xml, etc.
 		return string(body), nil
@@ -314,9 +324,12 @@ func htmlToMarkdown(body []byte) (string, error) {
 }
 
 // formatJSON pretty-prints JSON content for indexing.
-func formatJSON(body []byte) (string, error) {
+func formatJSON(body []byte, truncated bool) (string, error) {
 	var buf bytes.Buffer
 	if err := json.Indent(&buf, body, "", "  "); err != nil {
+		if truncated {
+			return "", fmt.Errorf("JSON content was truncated and cannot be parsed")
+		}
 		// If it's not valid JSON, index as text
 		return string(body), nil
 	}
@@ -426,13 +439,14 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 	// skipCacheWrite=true (ttl==0): direct fetch (no singleflight merge, no cache write).
 	// skipCacheWrite=false (normal or force): use singleflight to merge concurrent fetches for the same URL+source.
 	if skipCacheWrite {
-		body, contentType, err := s.fetchURL(ctx, rawURL, timeout)
+		body, contentType, truncated, err := s.fetchURL(ctx, rawURL, timeout)
 		if err != nil {
 			result.Error = fmt.Sprintf("fetch failed: %v", err)
 			return result, nil
 		}
+		result.Truncated = truncated
 
-		content, err := processContent(body, contentType, format)
+		content, err := processContent(body, contentType, format, truncated)
 		if err != nil {
 			result.Error = fmt.Sprintf("content processing failed: %v", err)
 			return result, nil
@@ -458,13 +472,15 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 
 	// skipCacheWrite=false: use singleflight to merge concurrent fetches.
 	sfKey := rawURL + "|" + cacheSource
+	var sfTruncated bool
 	sfResult, err, _ := fetchGroup.Do(sfKey, func() (interface{}, error) {
-		body, contentType, err := s.fetchURL(ctx, rawURL, timeout)
+		body, contentType, truncated, err := s.fetchURL(ctx, rawURL, timeout)
 		if err != nil {
 			return nil, fmt.Errorf("fetch failed: %w", err)
 		}
+		sfTruncated = truncated
 
-		content, err := processContent(body, contentType, format)
+		content, err := processContent(body, contentType, format, truncated)
 		if err != nil {
 			return nil, fmt.Errorf("content processing failed: %w", err)
 		}
@@ -490,15 +506,17 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 		_ = s.store.PruneCache(7 * 24 * time.Hour)
 		s.mu.Unlock()
 
-		return &fetchResultData{content: content, chunkCount: len(chunks)}, nil
+		return &fetchResultData{content: content, chunkCount: len(chunks), truncated: truncated}, nil
 	})
 	if err != nil {
 		result.Error = err.Error()
+		result.Truncated = sfTruncated
 		return result, nil
 	}
 	data := sfResult.(*fetchResultData)
 	result.Content = data.content
 	result.ChunkCount = data.chunkCount
+	result.Truncated = data.truncated
 
 	return result, nil
 }
@@ -585,6 +603,11 @@ func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, 
 
 	if len(urls) > 10 {
 		return nil, nil, fmt.Errorf("maximum 10 URLs per call")
+	}
+
+	// Validate format before fetching.
+	if args.Format != "" && args.Format != "markdown" && args.Format != "html" && args.Format != "json" {
+		return nil, nil, fmt.Errorf("format must be markdown, html, or json, got %q", args.Format)
 	}
 
 	// Default timeout.

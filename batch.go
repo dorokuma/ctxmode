@@ -23,10 +23,10 @@ type batchCommand struct {
 
 type batchArgs struct {
 	Commands    []batchCommand `json:"commands" jsonschema:"Array of {label, command} objects"`
-	Queries     []string       `json:"queries,omitempty" jsonschema:"Search queries over indexed output"`
+	Queries     []string       `json:"queries,omitempty" jsonschema:"Search queries over indexed output (max 20)"`
 	Concurrency int            `json:"concurrency,omitempty" jsonschema:"Max parallel commands (1-8, default 1)"`
 	CWD         string         `json:"cwd,omitempty" jsonschema:"Working directory"`
-	Timeout     int            `json:"timeout,omitempty" jsonschema:"Max execution time in ms"`
+	Timeout     int            `json:"timeout,omitempty" jsonschema:"Max execution time in ms (serial: total budget; concurrent: per-command budget)"`
 	QueryScope  string         `json:"query_scope,omitempty" jsonschema:"Search scope (batch or global, default batch)"`
 }
 
@@ -161,6 +161,9 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 	// Check for duplicate labels (Index uses label as key).
 	seen := make(map[string]bool, len(args.Commands))
 	for _, cmd := range args.Commands {
+		if strings.TrimSpace(cmd.Label) == "" {
+			return nil, nil, fmt.Errorf("command label must not be empty")
+		}
 		if seen[cmd.Label] {
 			return nil, nil, fmt.Errorf("duplicate command label: %q", cmd.Label)
 		}
@@ -192,9 +195,17 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 		queryScope = "batch" // default
 	}
 
-	// Parse timeout.
+	// Validate queries max (fast-fail before executing commands).
+	if len(args.Queries) > 20 {
+		return nil, nil, fmt.Errorf("too many queries: %d (max 20)", len(args.Queries))
+	}
+
+	// Parse timeout (capped at 1 hour).
 	var timeout time.Duration
 	if args.Timeout > 0 {
+		if args.Timeout > 3600000 {
+			return nil, nil, fmt.Errorf("timeout %dms exceeds maximum allowed (1 hour)", args.Timeout)
+		}
 		timeout = time.Duration(args.Timeout) * time.Millisecond
 	}
 	if timeout <= 0 {
@@ -243,7 +254,7 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 
 			if queryScope == "batch" {
 				// For batch scope: request more results, then filter by batch prefix.
-				hits, err := s.store.Search(q, 50)
+				hits, _, err := s.searchPipeline.Search(q, 50)
 				if err != nil {
 					continue
 				}
@@ -261,7 +272,7 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 				}
 			} else {
 				// Global scope: search the entire store.
-				hits, err := s.store.Search(q, 5)
+				hits, _, err := s.searchPipeline.Search(q, 5)
 				if err != nil {
 					continue
 				}
@@ -291,6 +302,7 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 // ---------- execution strategies ----------
 
 // executeBatchSerial runs commands one by one with a shared timeout.
+// The timeout is the total budget for all commands combined.
 // If the shared context expires mid-way, remaining commands are marked as skipped.
 func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, results []batchResult) {
 	var cmdCtx context.Context
@@ -349,6 +361,7 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 }
 
 // executeBatchConcurrent runs commands in parallel with per-command timeouts.
+// Each command gets its own timeout budget (the full timeout value).
 // Concurrency is limited by a semaphore. Store writes are serialized with a mutex.
 func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, concurrency int, results []batchResult) {
 	sem := make(chan struct{}, concurrency)

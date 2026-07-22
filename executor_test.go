@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -132,7 +133,7 @@ func TestLimitedBuffer_String(t *testing.T) {
 // ============================================================================
 
 func TestRunShell_NormalCompletion(t *testing.T) {
-	result, err := runShell("echo hello", "/tmp", 5*time.Second, false)
+	result, err := runShell(context.Background(), "echo hello", "/tmp", 5*time.Second, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -145,7 +146,7 @@ func TestRunShell_NormalCompletion(t *testing.T) {
 }
 
 func TestRunShell_NonZeroExit(t *testing.T) {
-	result, err := runShell("exit 42", "/tmp", 5*time.Second, false)
+	result, err := runShell(context.Background(), "exit 42", "/tmp", 5*time.Second, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -155,7 +156,7 @@ func TestRunShell_NonZeroExit(t *testing.T) {
 }
 
 func TestRunShell_Stderr(t *testing.T) {
-	result, err := runShell("echo to_stderr >&2", "/tmp", 5*time.Second, false)
+	result, err := runShell(context.Background(), "echo to_stderr >&2", "/tmp", 5*time.Second, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -174,7 +175,7 @@ func TestRunShell_Stderr(t *testing.T) {
 func TestRunShell_TimeoutSIGTERM_GracefulExit(t *testing.T) {
 	// S10: 子进程收到 SIGTERM 后优雅退出，runCmd 在 3s 内收到 done。
 	script := `trap 'echo SIGTERM_RECEIVED; exit 0' TERM; sleep 60`
-	result, err := runShell(script, "/tmp", 200*time.Millisecond, false)
+	result, err := runShell(context.Background(), script, "/tmp", 200*time.Millisecond, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -190,7 +191,7 @@ func TestRunShell_TimeoutSIGKILL_ForceKill(t *testing.T) {
 	// S13: 子进程忽略 SIGTERM，runCmd 等 3s 后发送 SIGKILL 强杀。
 	script := `trap '' TERM; sleep 60`
 	start := time.Now()
-	result, err := runShell(script, "/tmp", 200*time.Millisecond, false)
+	result, err := runShell(context.Background(), script, "/tmp", 200*time.Millisecond, false)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -216,7 +217,7 @@ func TestRunShell_SHELLWithArgs(t *testing.T) {
 	os.Setenv("SHELL", "/bin/bash -l")
 
 	// bash -l 会设置一些 login shell 环境，echo 基本命令应正常执行
-	result, err := runShell("echo hello_from_bash", "/tmp", 5*time.Second, false)
+	result, err := runShell(context.Background(), "echo hello_from_bash", "/tmp", 5*time.Second, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -234,7 +235,7 @@ func TestRunShell_EmptySHELL_FallbackSh(t *testing.T) {
 	defer os.Setenv("SHELL", origShell)
 	os.Unsetenv("SHELL")
 
-	result, err := runShell("echo hello_from_sh", "/tmp", 5*time.Second, false)
+	result, err := runShell(context.Background(), "echo hello_from_sh", "/tmp", 5*time.Second, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -257,7 +258,7 @@ func TestRunShell_SIGKILLDoneDrain(t *testing.T) {
 	script := `trap '' TERM; sleep 60`
 	done := make(chan struct{}, 1)
 	go func() {
-		runShell(script, "/tmp", 100*time.Millisecond, false)
+		runShell(context.Background(), script, "/tmp", 100*time.Millisecond, false)
 		done <- struct{}{}
 	}()
 	select {

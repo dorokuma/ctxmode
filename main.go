@@ -111,7 +111,7 @@ func main() {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_execute_file",
-		Description: "Read a file into a FILE_CONTENT variable and run code over it. Languages: javascript, python, shell, go, rust, php, perl, ruby, r, elixir, csharp. Supports auto-indexing for large output.",
+		Description: "Read a file into a FILE_CONTENT variable and run code over it. Languages: javascript, typescript, python, shell, go, rust, php, perl, ruby, r, elixir, csharp. Supports auto-indexing for large output.",
 	}, s.toolExecuteFile)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -151,9 +151,12 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		language = "shell"
 	}
 
-	// Parse timeout.
+	// Parse timeout (capped at 1 hour).
 	var timeout time.Duration
 	if args.Timeout > 0 {
+		if args.Timeout > 3600000 {
+			return nil, nil, fmt.Errorf("timeout %dms exceeds maximum allowed (1 hour)", args.Timeout)
+		}
 		timeout = time.Duration(args.Timeout) * time.Millisecond
 	}
 
@@ -168,7 +171,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 	}
 
 	// Execute code in the sandbox.
-	result, err := runCode(language, args.Command, cwd, timeout, args.Background)
+	result, err := runCode(ctx, language, args.Command, cwd, timeout, args.Background)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -192,6 +195,12 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 			outputText += "\n"
 		}
 		outputText += fmt.Sprintf("(exited with code %d)", result.ExitCode)
+	}
+	if result.Truncated {
+		if outputText != "" {
+			outputText += "\n"
+		}
+		outputText += "[WARNING: output truncated at 10MB — indexed content may be incomplete]"
 	}
 
 	// Auto-indexing logic.
@@ -315,11 +324,12 @@ type searchArgs struct {
 }
 
 func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, any, error) {
-	if args.Query == "" {
+	q := strings.TrimSpace(args.Query)
+	if q == "" {
 		return nil, nil, fmt.Errorf("query is required")
 	}
 
-	results, meta, err := s.searchPipeline.Search(args.Query, 20)
+	results, meta, err := s.searchPipeline.Search(q, 20)
 	if err != nil {
 		// If blocked by flood guard, return a friendly message.
 		if meta != nil && meta.FloodStatus == "blocked" {
@@ -470,9 +480,12 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		language = "javascript"
 	}
 
-	// Parse timeout.
+	// Parse timeout (capped at 1 hour).
 	var timeout time.Duration
 	if args.Timeout > 0 {
+		if args.Timeout > 3600000 {
+			return nil, nil, fmt.Errorf("timeout %dms exceeds maximum allowed (1 hour)", args.Timeout)
+		}
 		timeout = time.Duration(args.Timeout) * time.Millisecond
 	}
 
@@ -490,7 +503,7 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	injectedCode := injectFileContent(language, args.Code, string(fileContent))
 
 	// Execute the injected code.
-	result, err := runCode(language, injectedCode, cwd, timeout, false)
+	result, err := runCode(ctx, language, injectedCode, cwd, timeout, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -508,6 +521,12 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 			outputText += "\n"
 		}
 		outputText += result.Stderr
+	}
+	if result.Truncated {
+		if outputText != "" {
+			outputText += "\n"
+		}
+		outputText += "[WARNING: output truncated at 10MB — indexed content may be incomplete]"
 	}
 
 	// Auto-indexing logic (same as toolExecute).

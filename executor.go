@@ -170,7 +170,9 @@ func detectTsNode() (bool, string) {
 		}
 	}
 	// 3. Fall back to npm ls (local only, reads package.json)
-	if exec.Command("npm", "ls", "ts-node", "--depth=0").Run() == nil {
+	npmCtx, npmCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer npmCancel()
+	if exec.CommandContext(npmCtx, "npm", "ls", "ts-node", "--depth=0").Run() == nil {
 		// ts-node is installed locally; use the local path
 		cwd, _ := os.Getwd()
 		p := filepath.Join(cwd, "node_modules", ".bin", "ts-node")
@@ -293,6 +295,7 @@ func injectFileContent(language, code, fileContent string) string {
 		escaped := strings.ReplaceAll(fileContent, `\`, `\\`)
 		escaped = strings.ReplaceAll(escaped, `"`, `\"`)
 		escaped = strings.ReplaceAll(escaped, "\n", `\n`)
+		escaped = strings.ReplaceAll(escaped, "\r", `\r`)
 		return `    let FILE_CONTENT = "` + escaped + `";` + "\n" + code
 
 	case "php":
@@ -343,7 +346,7 @@ func injectFileContent(language, code, fileContent string) string {
 
 // runCode executes code in the specified language sandbox.
 // It handles temp file creation, runtime selection, timeout, and background mode.
-func runCode(language, code, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
+func runCode(ctx context.Context, language, code, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
 	rt, ok := runtimes[language]
 	if !ok {
 		return nil, fmt.Errorf("unsupported language: %q (supported: javascript, typescript, python, shell, go, rust, php, perl, ruby, r, elixir, csharp)", language)
@@ -361,7 +364,7 @@ func runCode(language, code, cwd string, timeout time.Duration, background bool)
 
 	// Shell is handled specially — no temp file needed.
 	if language == "shell" {
-		return runShell(wrapped, cwd, timeout, background)
+		return runShell(ctx, wrapped, cwd, timeout, background)
 	}
 
 	// Create a temp file with the appropriate extension.
@@ -383,11 +386,11 @@ func runCode(language, code, cwd string, timeout time.Duration, background bool)
 	tmpFile.Close()
 
 	// Build and run the command based on language.
-	return runCompiled(language, rt, tmpPath, cwd, timeout, background)
+	return runCompiled(ctx, language, rt, tmpPath, cwd, timeout, background)
 }
 
 // runShell executes code directly via "sh -c".
-func runShell(code, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
+func runShell(ctx context.Context, code, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
 	var cmd *exec.Cmd
 	shellPath := os.Getenv("SHELL")
 	if shellPath != "" {
@@ -404,11 +407,11 @@ func runShell(code, cwd string, timeout time.Duration, background bool) (*execut
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	return runCmd(cmd, timeout, background)
+	return runCmd(ctx, cmd, timeout, background)
 }
 
 // runCompiled executes a language that uses a temp source file.
-func runCompiled(language string, rt runtimeConfig, tmpPath, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
+func runCompiled(ctx context.Context, language string, rt runtimeConfig, tmpPath, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
 	var cmd *exec.Cmd
 	var cleanups []string
 
@@ -422,23 +425,74 @@ func runCompiled(language string, rt runtimeConfig, tmpPath, cwd string, timeout
 			cleanups = append(cleanups, outPath)
 		}
 
-		compileCtx := context.Background()
+		compileStart := time.Now()
+		compileCtx := ctx
 		if timeout > 0 {
 			var cancel context.CancelFunc
-			compileCtx, cancel = context.WithTimeout(compileCtx, timeout)
+			compileCtx, cancel = context.WithTimeout(ctx, timeout)
 			defer cancel()
 		}
-		compileCmd := exec.CommandContext(compileCtx, "rustc", "-o", outPath, tmpPath)
+		compileCmd := exec.Command("rustc", "-o", outPath, tmpPath)
 		compileCmd.Dir = cwd
-		if compileOutput, err := compileCmd.CombinedOutput(); err != nil {
+		compileCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		var compileOutBuf limitedBuffer
+		compileOutBuf.limit = maxCmdOutput
+		compileCmd.Stdout = &compileOutBuf
+		compileCmd.Stderr = &compileOutBuf
+		if err := compileCmd.Start(); err != nil {
+			if background {
+				os.Remove(tmpPath)
+				os.Remove(outPath)
+			}
 			return &executeResult{
-				Stdout:   string(compileOutput),
+				Stdout:   compileOutBuf.String(),
 				Stderr:   fmt.Sprintf("compilation failed: %v", err),
+				ExitCode: -1,
+			}, nil
+		}
+		compileDone := make(chan error, 1)
+		go func() { compileDone <- compileCmd.Wait() }()
+		var compileErr error
+		if timeout > 0 {
+			select {
+			case compileErr = <-compileDone:
+			case <-compileCtx.Done():
+				if compileCmd.Process != nil {
+					_ = syscall.Kill(-compileCmd.Process.Pid, syscall.SIGTERM)
+					select {
+					case compileErr = <-compileDone:
+					case <-time.After(3 * time.Second):
+						_ = syscall.Kill(-compileCmd.Process.Pid, syscall.SIGKILL)
+						compileErr = <-compileDone
+					}
+				} else {
+					compileErr = <-compileDone
+				}
+			}
+		} else {
+			compileErr = <-compileDone
+		}
+		if compileErr != nil {
+			if background {
+				os.Remove(tmpPath)
+				os.Remove(outPath)
+			}
+			return &executeResult{
+				Stdout:   compileOutBuf.String(),
+				Stderr:   fmt.Sprintf("compilation failed: %v", compileErr),
 				ExitCode: -1,
 			}, nil
 		}
 		cmd = exec.Command(outPath)
 		cmd.Dir = cwd
+		// Deduct compilation time from the runtime budget.
+		if timeout > 0 {
+			elapsed := time.Since(compileStart)
+			timeout -= elapsed
+			if timeout <= 0 {
+				timeout = time.Nanosecond
+			}
+		}
 
 	case "typescript":
 		tsNodePathMu.Lock()
@@ -463,7 +517,7 @@ func runCompiled(language string, rt runtimeConfig, tmpPath, cwd string, timeout
 	if background {
 		cleanups = append(cleanups, tmpPath)
 	}
-	return runCmd(cmd, timeout, background, cleanups...)
+	return runCmd(ctx, cmd, timeout, background, cleanups...)
 }
 
 // maxCmdOutput is the maximum number of bytes captured from a subprocess's
@@ -475,18 +529,21 @@ const maxCmdOutput = 10 * 1024 * 1024 // 10 MB
 // writes after the limit is reached. This prevents unbounded memory growth
 // from misbehaving subprocesses.
 type limitedBuffer struct {
-	buf   bytes.Buffer
-	limit int
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
 }
 
 func (lb *limitedBuffer) Write(p []byte) (int, error) {
 	if lb.buf.Len() >= lb.limit {
+		lb.truncated = true
 		return len(p), nil
 	}
 	remaining := lb.limit - lb.buf.Len()
 	if len(p) <= remaining {
 		return lb.buf.Write(p)
 	}
+	lb.truncated = true
 	_, _ = lb.buf.Write(p[:remaining])
 	return len(p), nil
 }
@@ -498,7 +555,7 @@ func (lb *limitedBuffer) String() string {
 // runCmd is the shared execution loop for all languages.
 // It starts the process, optionally waits with a timeout, and returns
 // the combined stdout/stderr and exit code.
-func runCmd(cmd *exec.Cmd, timeout time.Duration, background bool, cleanups ...string) (*executeResult, error) {
+func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, background bool, cleanups ...string) (*executeResult, error) {
 	var stdoutBuf, stderrBuf limitedBuffer
 	stdoutBuf.limit = maxCmdOutput
 	stderrBuf.limit = maxCmdOutput
@@ -537,6 +594,8 @@ func runCmd(cmd *exec.Cmd, timeout time.Duration, background bool, cleanups ...s
 		defer timer.Stop()
 	}
 
+	truncated := false
+
 	select {
 	case <-timer.C:
 		// Timeout: send SIGTERM first for graceful shutdown, then SIGKILL.
@@ -556,10 +615,36 @@ func runCmd(cmd *exec.Cmd, timeout time.Duration, background bool, cleanups ...s
 		if stderr == "" {
 			stderr = fmt.Sprintf("Process timed out after %v", timeout)
 		}
+		truncated = stdoutBuf.truncated || stderrBuf.truncated
 		return &executeResult{
-			Stdout:   stdout,
-			Stderr:   stderr,
-			ExitCode: -1,
+			Stdout:    stdout,
+			Stderr:    stderr,
+			ExitCode:  -1,
+			Truncated: truncated,
+		}, nil
+
+	case <-ctx.Done():
+		// Context cancelled: same two-stage kill as timeout.
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				<-done
+			}
+		}
+		stdout := stdoutBuf.String()
+		stderr := stderrBuf.String()
+		if stderr == "" {
+			stderr = fmt.Sprintf("process cancelled: %v", ctx.Err())
+		}
+		truncated = stdoutBuf.truncated || stderrBuf.truncated
+		return &executeResult{
+			Stdout:    stdout,
+			Stderr:    stderr,
+			ExitCode:  -1,
+			Truncated: truncated,
 		}, nil
 
 	case err := <-done:
@@ -575,10 +660,12 @@ func runCmd(cmd *exec.Cmd, timeout time.Duration, background bool, cleanups ...s
 			}
 		}
 
+		truncated = stdoutBuf.truncated || stderrBuf.truncated
 		return &executeResult{
-			Stdout:   stdout,
-			Stderr:   stderr,
-			ExitCode: exitCode,
+			Stdout:    stdout,
+			Stderr:    stderr,
+			ExitCode:  exitCode,
+			Truncated: truncated,
 		}, nil
 	}
 }
