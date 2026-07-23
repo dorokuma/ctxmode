@@ -17,10 +17,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"gopkg.in/yaml.v3"
 )
 
 type server struct {
-	workdir        string
+	workdirs       []string
 	mu             sync.Mutex
 	store          *Store
 	floodGuard     *FloodGuard
@@ -40,23 +41,55 @@ func fatal(s *Store, format string, args ...any) {
 
 func main() {
 	var workdir string
+	var configPath string
 	flag.StringVar(&workdir, "workdir", "", "workspace root (default: cwd)")
+	flag.StringVar(&configPath, "config", "", "path to config file")
 	flag.Parse()
 
-	if workdir == "" {
-		wd, err := os.Getwd()
-		if err != nil {
-			log.Fatalf("cannot get cwd: %v", err)
-		}
-		workdir = wd
-	}
-	absWd, err := filepath.Abs(workdir)
+	// Load workdirs from config file (or fall back to cwd).
+	workdirs, err := loadConfig(configPath)
 	if err != nil {
-		fatal(nil, "bad workdir: %v", err)
+		log.Fatalf("failed to load config: %v", err)
 	}
-	workdir = absWd
 
-	store, err := NewStore(filepath.Join(workdir, "context_mode.db"))
+	// If -workdir flag was given, prepend it (backward compatibility).
+	if workdir != "" {
+		absWd, err := filepath.Abs(workdir)
+		if err != nil {
+			fatal(nil, "bad workdir: %v", err)
+		}
+		hasWd := false
+		for _, wd := range workdirs {
+			if wd == absWd {
+				hasWd = true
+				break
+			}
+		}
+		if !hasWd {
+			workdirs = append([]string{absWd}, workdirs...)
+		}
+	}
+
+	// Deduplicate and absolutize all workdirs.
+	seen := make(map[string]bool)
+	var unique []string
+	for _, wd := range workdirs {
+		absWd, err := filepath.Abs(wd)
+		if err != nil {
+			fatal(nil, "bad workdir %q: %v", wd, err)
+		}
+		if !seen[absWd] {
+			seen[absWd] = true
+			unique = append(unique, absWd)
+		}
+	}
+	workdirs = unique
+
+	if len(workdirs) == 0 {
+		fatal(nil, "no workspace directories configured")
+	}
+
+	store, err := NewStore(filepath.Join(workdirs[0], "context_mode.db"))
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
 	}
@@ -66,7 +99,7 @@ func main() {
 	searchPipeline := NewSearchPipeline(store, floodGuard)
 
 	s := &server{
-		workdir:        workdir,
+		workdirs:       workdirs,
 		store:          store,
 		floodGuard:     floodGuard,
 		searchPipeline: searchPipeline,
@@ -129,6 +162,60 @@ func main() {
 	}
 }
 
+// ---------- configuration ----------
+
+// loadConfig reads workdirs from a YAML config file.
+// Priority: -config flag > $CTXMODE_CONFIG env > ./ctxmode-config.yaml > ~/.config/ctxmode/config.yaml.
+// If no config file is found, falls back to a single workdir from cwd (backward compatible).
+func loadConfig(configFlag string) ([]string, error) {
+	var configPath string
+	switch {
+	case configFlag != "":
+		configPath = configFlag
+	case os.Getenv("CTXMODE_CONFIG") != "":
+		configPath = os.Getenv("CTXMODE_CONFIG")
+	default:
+		if _, err := os.Stat("ctxmode-config.yaml"); err == nil {
+			configPath = "ctxmode-config.yaml"
+		} else if home, err := os.UserHomeDir(); err == nil {
+			candidate := filepath.Join(home, ".config", "ctxmode", "config.yaml")
+			if _, err := os.Stat(candidate); err == nil {
+				configPath = candidate
+			}
+		}
+	}
+
+	if configPath == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("cannot get cwd: %w", err)
+		}
+		return []string{wd}, nil
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("read config %q: %w", configPath, err)
+	}
+
+	var cfg struct {
+		Workdirs []string `yaml:"workdirs"`
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config %q: %w", configPath, err)
+	}
+
+	if len(cfg.Workdirs) == 0 {
+		wd, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("no workdirs in config and cannot get cwd: %w", err)
+		}
+		return []string{wd}, nil
+	}
+
+	return cfg.Workdirs, nil
+}
+
 // ---------- tool implementations ----------
 
 type executeArgs struct {
@@ -161,7 +248,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 	}
 
 	// Resolve working directory.
-	cwd := s.workdir
+	cwd := s.workdirs[0]
 	if args.CWD != "" {
 		resolved, err := s.resolvePath(args.CWD)
 		if err != nil {
@@ -363,7 +450,13 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 	}
 
 	for _, r := range results {
-		rel, _ := filepath.Rel(s.workdir, r.Path)
+		rel := ""
+		for _, wd := range s.workdirs {
+			if rp, err := filepath.Rel(wd, r.Path); err == nil && !strings.HasPrefix(rp, "..") {
+				rel = rp
+				break
+			}
+		}
 		if rel == "" {
 			rel = r.Path
 		}
@@ -490,7 +583,7 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	}
 
 	// Resolve working directory.
-	cwd := s.workdir
+	cwd := s.workdirs[0]
 	if args.CWD != "" {
 		resolved, err := s.resolvePath(args.CWD)
 		if err != nil {
@@ -586,7 +679,7 @@ func (s *server) indexFile(path string) error {
 }
 
 func (s *server) migrateFromJSON() error {
-	oldPath := filepath.Join(s.workdir, ".context_mode_db.json")
+	oldPath := filepath.Join(s.workdirs[0], ".context_mode_db.json")
 
 	data, err := os.ReadFile(oldPath)
 	if err != nil {
@@ -689,28 +782,38 @@ func (s *server) storeIndexLocked(path, content string) error {
 	return s.store.Index(path, content)
 }
 
-// resolvePath converts a user-supplied path into an absolute path within the workspace.
-// It guarantees the result is inside s.workdir, preventing path traversal.
-// Note: filepath.Clean does not resolve symlinks; a symlink inside workdir pointing outside is not detected.
+// resolvePath converts a user-supplied path into an absolute path within any workspace.
+// It checks against all configured workdirs and returns the first match.
+// If the path is outside all workspaces, it returns an error.
 func (s *server) resolvePath(p string) (string, error) {
 	if p == "" {
-		return s.workdir, nil
+		return s.workdirs[0], nil
 	}
 	var target string
 	if filepath.IsAbs(p) {
 		target = filepath.Clean(p)
 	} else {
-		target = filepath.Clean(filepath.Join(s.workdir, p))
+		target = filepath.Clean(filepath.Join(s.workdirs[0], p))
 	}
-	if target != s.workdir && !strings.HasPrefix(target, s.workdir+string(filepath.Separator)) {
-		return "", fmt.Errorf("path %q is outside workspace %q", p, s.workdir)
+	for _, wd := range s.workdirs {
+		cleanWd := strings.TrimSuffix(wd, string(filepath.Separator))
+		if target == wd || strings.HasPrefix(target, cleanWd+string(filepath.Separator)) {
+			return target, nil
+		}
 	}
-	return target, nil
+	return "", fmt.Errorf("path %q is outside all workspaces %q", p, s.workdirs)
 }
 
-// excludeFromGit appends the local database files to .git/info/exclude to avoid workspace pollution.
+// excludeFromGit appends the local database files to .git/info/exclude for all workspaces.
 func (s *server) excludeFromGit() {
-	gitDir := filepath.Join(s.workdir, ".git")
+	for _, wd := range s.workdirs {
+		s.excludeFromGitOne(wd)
+	}
+}
+
+// excludeFromGitOne handles a single workspace's git exclusion.
+func (s *server) excludeFromGitOne(wd string) {
+	gitDir := filepath.Join(wd, ".git")
 	info, err := os.Stat(gitDir)
 	if err != nil || !info.IsDir() {
 		return

@@ -180,7 +180,7 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 	}
 
 	// Resolve working directory.
-	cwd := s.workdir
+	cwd := s.workdirs[0]
 	if args.CWD != "" {
 		resolved, err := s.resolvePath(args.CWD)
 		if err != nil {

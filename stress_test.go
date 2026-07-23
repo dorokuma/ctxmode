@@ -36,7 +36,7 @@ func newStressServer(t *testing.T) *server {
 	searchPipeline := NewSearchPipeline(store, floodGuard)
 
 	return &server{
-		workdir:        tmpDir,
+		workdirs:       []string{tmpDir},
 		store:          store,
 		floodGuard:     floodGuard,
 		searchPipeline: searchPipeline,
@@ -47,7 +47,7 @@ func newStressServer(t *testing.T) *server {
 // writeTempFile creates a file under the server's workdir with the given content.
 func writeTempFile(t *testing.T, s *server, name, content string) string {
 	t.Helper()
-	path := filepath.Join(s.workdir, name)
+	path := filepath.Join(s.workdirs[0], name)
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatalf("WriteFile(%s): %v", path, err)
 	}
