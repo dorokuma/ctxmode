@@ -3,6 +3,16 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] - 2026-07-25
+
+### Added
+- A versioned Pi-specific adapter under `integrations/pi/` with installation and configuration documentation.
+- GitHub Actions CI for tests, vetting, and binary builds.
+
+### Changed
+- The Pi adapter relies on tool schemas and prompt guidelines instead of injecting a fixed per-turn system prompt.
+- MCP initialize and `ctx_doctor` now consistently report version 1.1.1.
+
 ## [1.1.0] - 2026-07-23
 
 ### Added

@@ -4,6 +4,12 @@ A 100% NPM/NodeJS-free, Go implementation of Mert Koseoglu's [context-mode](http
 
 Local-first Model Context Protocol (MCP) server that virtualizes tool outputs, allowing AI coding agents to execute heavy tasks and save up to 98% in token usage.
 
+Current version: **1.1.1**.
+
+## Pi integration
+
+A Pi-specific TypeScript adapter is maintained in [`integrations/pi/`](integrations/pi/README.md). The Go binary remains a generic stdio MCP server. The adapter handles Pi lifecycle and tool registration without injecting fixed tool instructions into the system prompt.
+
 ## Quick Start
 
 ```bash

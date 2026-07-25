@@ -16,8 +16,8 @@ type doctorResult struct {
 	DBPath      string            `json:"db_path"`
 	DBSizeBytes int64             `json:"db_size_bytes"`
 	DBError     string            `json:"db_error,omitempty"`
-	FTS5Status  string            `json:"fts5_status"`    // "ok" / "error: ..."
-	Runtimes    map[string]string `json:"runtimes"`       // language -> "available" / "not found: ..."
+	FTS5Status  string            `json:"fts5_status"` // "ok" / "error: ..."
+	Runtimes    map[string]string `json:"runtimes"`    // language -> "available" / "not found: ..."
 	DocCount    int               `json:"doc_count"`
 	CacheCount  int               `json:"cache_count"`
 	Healthy     bool              `json:"healthy"`
@@ -27,7 +27,7 @@ type doctorResult struct {
 // runDoctor collects all diagnostic information.
 func runDoctor(store *Store, dbPath string) (*doctorResult, error) {
 	res := &doctorResult{
-		Version:  "0.2.0",
+		Version:  "1.1.1",
 		DBPath:   dbPath,
 		Runtimes: make(map[string]string),
 		Healthy:  true,

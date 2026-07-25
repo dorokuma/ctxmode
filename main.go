@@ -110,7 +110,7 @@ func main() {
 	}
 	s.excludeFromGit()
 
-	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: "1.0.0"}, nil)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: "1.1.1"}, nil)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_execute",
@@ -293,7 +293,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 	// Auto-indexing logic.
 	const (
 		autoIndexThreshold = 100 * 1024 // 100KB
-		intentThreshold    = 5 * 1024  // 5KB
+		intentThreshold    = 5 * 1024   // 5KB
 	)
 
 	if len(outputText) > autoIndexThreshold {
@@ -625,7 +625,7 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	// Auto-indexing logic (same as toolExecute).
 	const (
 		autoIndexThreshold = 100 * 1024 // 100KB
-		intentThreshold    = 5 * 1024  // 5KB
+		intentThreshold    = 5 * 1024   // 5KB
 	)
 
 	if len(outputText) > autoIndexThreshold {
