@@ -244,6 +244,7 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 	// ---------- handle queries ----------
 
 	var searchResults map[string][]searchHit
+	var searchErrors []string
 	if len(args.Queries) > 0 {
 		searchResults = make(map[string][]searchHit)
 		for _, q := range args.Queries {
@@ -253,27 +254,29 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 			}
 
 			if queryScope == "batch" {
-				// For batch scope: request more results, then filter by batch prefix.
-				hits, _, err := s.searchPipeline.Search(q, 50)
+				// Path-scoped at store layer (no post-filter false negatives).
+				// Bypasses flood guard so batch is a reliable escape hatch.
+				hits, meta, err := s.searchPipeline.SearchBatchScoped(q, 5)
 				if err != nil {
+					msg := err.Error()
+					if meta != nil && meta.FloodStatus == "blocked" {
+						msg = "search blocked by flood guard (unexpected for batch scope): " + msg
+					}
+					searchErrors = append(searchErrors, fmt.Sprintf("%q: %s", q, msg))
 					continue
 				}
-				var filtered []SearchResult
 				for _, h := range hits {
-					if strings.HasPrefix(h.Path, batchIndexPrefix) {
-						filtered = append(filtered, h)
-					}
-				}
-				if len(filtered) > 5 {
-					filtered = filtered[:5]
-				}
-				for _, h := range filtered {
 					searchResults[q] = append(searchResults[q], searchHit{Path: h.Path, Snippet: h.Snippet})
 				}
 			} else {
-				// Global scope: search the entire store.
-				hits, _, err := s.searchPipeline.Search(q, 5)
+				// Global scope: search the entire store (subject to flood guard).
+				hits, meta, err := s.searchPipeline.Search(q, 5)
 				if err != nil {
+					msg := err.Error()
+					if meta != nil && meta.FloodStatus == "blocked" {
+						msg = "search blocked: too many requests; retry later or use query_scope=batch"
+					}
+					searchErrors = append(searchErrors, fmt.Sprintf("%q: %s", q, msg))
 					continue
 				}
 				for _, h := range hits {
@@ -294,8 +297,12 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 	}
 
 	js, _ := json.MarshalIndent(resp, "", "  ")
+	text := string(js)
+	if len(searchErrors) > 0 {
+		text += "\n\nSearch errors:\n- " + strings.Join(searchErrors, "\n- ")
+	}
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: string(js)}},
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
 	}, nil, nil
 }
 

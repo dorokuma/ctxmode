@@ -109,20 +109,11 @@ func (s *server) purgeSession(sessionID string) (*mcp.CallToolResult, any, error
 		return nil, nil, fmt.Errorf("sessionId is required when scope='session'")
 	}
 
-	// session scope only cleans the session: namespace.
-	// execute/batch/execute_file output does not belong to session semantics;
-	// use scope=project for full cleanup.
-	prefixes := []string{
-		"session:" + sessionID,
-	}
-
-	totalDeleted := 0
-	for _, prefix := range prefixes {
-		n, err := s.store.PurgeByPrefix(prefix)
-		if err != nil {
-			return nil, nil, fmt.Errorf("purge session prefix %q: %w", prefix, err)
-		}
-		totalDeleted += n
+	// Exact match on session:{id} plus colon-delimited children session:{id}:...
+	// Avoids prefix false-positives (session:ab must not delete session:abc).
+	totalDeleted, err := s.store.PurgeSessionKeys(sessionID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("purge session %q: %w", sessionID, err)
 	}
 
 	res := purgeResult{
@@ -165,7 +156,7 @@ func (s *server) purgeDryRun(scope, sessionID string) (*mcp.CallToolResult, any,
 		if sessionID == "" {
 			return nil, nil, fmt.Errorf("sessionId is required when scope='session'")
 		}
-		n, err := s.store.CountByPrefix("session:" + sessionID)
+		n, err := s.store.CountSessionKeys(sessionID)
 		if err != nil {
 			return nil, nil, fmt.Errorf("dryRun count: %w", err)
 		}

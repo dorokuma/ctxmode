@@ -27,7 +27,7 @@ type doctorResult struct {
 // runDoctor collects all diagnostic information.
 func runDoctor(store *Store, dbPath string) (*doctorResult, error) {
 	res := &doctorResult{
-		Version:  "1.1.1",
+		Version:  Version,
 		DBPath:   dbPath,
 		Runtimes: make(map[string]string),
 		Healthy:  true,

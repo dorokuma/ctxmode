@@ -4,18 +4,258 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// defaultBackgroundMaxAge is how long a background process may live before
+// the supervisor reaps it. Override is not exposed as a flag yet; constant
+// is documented here for operators.
+const defaultBackgroundMaxAge = 1 * time.Hour
+
+// bgTempPrefix marks temp files owned by background processes so init
+// cleanup can skip them when they are still registered.
+const bgTempPrefix = "ctxmode_bg_"
+
+// ---------- background process registry ----------
+
+// bgEntry tracks a background subprocess for list/kill/reap.
+type bgEntry struct {
+	ID        string    `json:"id"`
+	PID       int       `json:"pid"`
+	StartedAt time.Time `json:"started_at"`
+	Command   string    `json:"command,omitempty"`
+	Language  string    `json:"language,omitempty"`
+	TempFiles []string  `json:"temp_files,omitempty"`
+	Done      bool      `json:"done"`
+	ExitCode  int       `json:"exit_code,omitempty"`
+	// pgid for process-group kill (Setpgid=true).
+	pgid int
+	cmd  *exec.Cmd
+}
+
+var (
+	bgMu      sync.Mutex
+	bgProcs   = map[string]*bgEntry{}
+	bgSeq     atomic.Uint64
+	bgReaper  sync.Once
+)
+
+// registerBackground records a live background process.
+func registerBackground(cmd *exec.Cmd, language, command string, temps []string) *bgEntry {
+	bgReaper.Do(func() { go backgroundReaperLoop() })
+	id := fmt.Sprintf("bg-%d", bgSeq.Add(1))
+	pgid := 0
+	if cmd.Process != nil {
+		pgid = cmd.Process.Pid
+	}
+	// Cap command string for list readability.
+	if len(command) > 200 {
+		command = command[:200] + "..."
+	}
+	e := &bgEntry{
+		ID:        id,
+		PID:       cmd.Process.Pid,
+		StartedAt: time.Now(),
+		Language:  language,
+		Command:   command,
+		TempFiles: append([]string(nil), temps...),
+		pgid:      pgid,
+		cmd:       cmd,
+	}
+	bgMu.Lock()
+	bgProcs[id] = e
+	// Protect temp paths from init-style cleanup while registered.
+	for _, t := range temps {
+		protectTemp(t)
+	}
+	bgMu.Unlock()
+	return e
+}
+
+// finishBackground marks entry done and cleans temps.
+// Idempotent: a second call (e.g. Wait after killBackground) is a no-op.
+func finishBackground(id string, exitCode int) {
+	bgMu.Lock()
+	e, ok := bgProcs[id]
+	if !ok {
+		bgMu.Unlock()
+		return
+	}
+	if e.Done {
+		bgMu.Unlock()
+		return
+	}
+	e.Done = true
+	e.ExitCode = exitCode
+	temps := append([]string(nil), e.TempFiles...)
+	e.TempFiles = nil
+	// Keep entry briefly for list visibility, but unprotect temps for cleanup.
+	for _, t := range temps {
+		unprotectTemp(t)
+	}
+	bgMu.Unlock()
+	for _, t := range temps {
+		os.Remove(t)
+	}
+	// Remove from registry after a short grace so list can still show it.
+	go func() {
+		time.Sleep(30 * time.Second)
+		bgMu.Lock()
+		delete(bgProcs, id)
+		bgMu.Unlock()
+	}()
+}
+
+// listBackground returns a snapshot of registered processes.
+func listBackground() []bgEntry {
+	bgMu.Lock()
+	defer bgMu.Unlock()
+	out := make([]bgEntry, 0, len(bgProcs))
+	for _, e := range bgProcs {
+		cp := *e
+		cp.cmd = nil
+		out = append(out, cp)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].StartedAt.Before(out[j].StartedAt)
+	})
+	return out
+}
+
+// killBackground kills by id or by PID string. Returns a status message.
+// On success the entry is marked Done promptly so list no longer shows it as live.
+// Kill errors (other than ESRCH / already gone) are returned to the caller.
+func killBackground(idOrPID string) (string, error) {
+	bgMu.Lock()
+	var target *bgEntry
+	if e, ok := bgProcs[idOrPID]; ok {
+		target = e
+	} else if pid, err := strconv.Atoi(idOrPID); err == nil {
+		for _, e := range bgProcs {
+			if e.PID == pid {
+				target = e
+				break
+			}
+		}
+	}
+	if target == nil {
+		bgMu.Unlock()
+		return "", fmt.Errorf("no background process matching %q", idOrPID)
+	}
+	if target.Done {
+		id := target.ID
+		bgMu.Unlock()
+		return fmt.Sprintf("process %s already exited", id), nil
+	}
+	pgid := target.pgid
+	id := target.ID
+	pid := target.PID
+	bgMu.Unlock()
+
+	// Two-stage kill of the process group; surface real failures (ignore ESRCH).
+	killErr := func(err error) error {
+		if err == nil || err == syscall.ESRCH {
+			return nil
+		}
+		return err
+	}
+	var lastErr error
+	if pgid != 0 {
+		if err := killErr(syscall.Kill(-pgid, syscall.SIGTERM)); err != nil {
+			lastErr = err
+		}
+		time.Sleep(500 * time.Millisecond)
+		if err := killErr(syscall.Kill(-pgid, syscall.SIGKILL)); err != nil {
+			lastErr = err
+		} else {
+			lastErr = nil // process gone or SIGKILL delivered
+		}
+	} else {
+		if err := killErr(syscall.Kill(pid, syscall.SIGTERM)); err != nil {
+			lastErr = err
+		}
+		time.Sleep(500 * time.Millisecond)
+		if err := killErr(syscall.Kill(pid, syscall.SIGKILL)); err != nil {
+			lastErr = err
+		} else {
+			lastErr = nil
+		}
+	}
+
+	if lastErr != nil {
+		return "", fmt.Errorf("kill background process %s (PID %d): %w", id, pid, lastErr)
+	}
+	// Mark Done ASAP (exit code -1 = killed) so list no longer shows a live task.
+	// Wait goroutine may also call finishBackground; that path is now idempotent.
+	finishBackground(id, -1)
+	return fmt.Sprintf("killed background process %s (PID %d)", id, pid), nil
+}
+
+// backgroundReaperLoop kills processes that exceed defaultBackgroundMaxAge.
+func backgroundReaperLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		bgMu.Lock()
+		var stale []string
+		for id, e := range bgProcs {
+			if !e.Done && now.Sub(e.StartedAt) > defaultBackgroundMaxAge {
+				stale = append(stale, id)
+			}
+		}
+		bgMu.Unlock()
+		for _, id := range stale {
+			_, _ = killBackground(id)
+		}
+	}
+}
+
+// protectedTemps tracks temp files currently owned by live background jobs.
+var (
+	protectedTempsMu sync.Mutex
+	protectedTemps   = map[string]int{}
+)
+
+func protectTemp(path string) {
+	protectedTempsMu.Lock()
+	protectedTemps[path]++
+	protectedTempsMu.Unlock()
+}
+
+func unprotectTemp(path string) {
+	protectedTempsMu.Lock()
+	if protectedTemps[path] > 1 {
+		protectedTemps[path]--
+	} else {
+		delete(protectedTemps, path)
+	}
+	protectedTempsMu.Unlock()
+}
+
+func isTempProtected(path string) bool {
+	protectedTempsMu.Lock()
+	defer protectedTempsMu.Unlock()
+	return protectedTemps[path] > 0
+}
 
 // init cleans up stale temp files from previous runs that may have been
 // killed (e.g., SIGKILL) before their deferred cleanup could execute.
+// Skips temps still referenced by the background registry (same process).
 func init() {
 	entries, err := os.ReadDir(os.TempDir())
 	if err != nil {
@@ -27,14 +267,83 @@ func init() {
 		if !strings.HasPrefix(name, "ctxmode_") {
 			continue
 		}
+		full := filepath.Join(os.TempDir(), name)
+		if isTempProtected(full) {
+			continue
+		}
+		// Background-owned temps use a distinct prefix; if not protected
+		// they belong to a dead prior process and may be reaped after 24h.
 		info, err := e.Info()
 		if err != nil {
 			continue
 		}
 		if now.Sub(info.ModTime()) > 24*time.Hour {
-			os.Remove(filepath.Join(os.TempDir(), name))
+			os.Remove(full)
 		}
 	}
+}
+
+// ---------- MCP tools: background list / kill ----------
+
+type backgroundListArgs struct{}
+
+func (s *server) toolBackgroundList(ctx context.Context, _ *mcp.CallToolRequest, _ backgroundListArgs) (*mcp.CallToolResult, any, error) {
+	entries := listBackground()
+	type row struct {
+		ID        string `json:"id"`
+		PID       int    `json:"pid"`
+		StartedAt string `json:"started_at"`
+		AgeSec    int64  `json:"age_sec"`
+		Language  string `json:"language,omitempty"`
+		Command   string `json:"command,omitempty"`
+		Done      bool   `json:"done"`
+		ExitCode  int    `json:"exit_code,omitempty"`
+	}
+	now := time.Now()
+	out := make([]row, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, row{
+			ID:        e.ID,
+			PID:       e.PID,
+			StartedAt: e.StartedAt.Format(time.RFC3339),
+			AgeSec:    int64(now.Sub(e.StartedAt).Seconds()),
+			Language:  e.Language,
+			Command:   e.Command,
+			Done:      e.Done,
+			ExitCode:  e.ExitCode,
+		})
+	}
+	js, _ := json.MarshalIndent(out, "", "  ")
+	if len(out) == 0 {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "[]\n(no background processes; max age " + defaultBackgroundMaxAge.String() + ")"}},
+		}, nil, nil
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: string(js)}},
+	}, nil, nil
+}
+
+type backgroundKillArgs struct {
+	ID  string `json:"id,omitempty" jsonschema:"Background process id from ctx_background_list"`
+	PID int    `json:"pid,omitempty" jsonschema:"Process PID to kill"`
+}
+
+func (s *server) toolBackgroundKill(ctx context.Context, _ *mcp.CallToolRequest, args backgroundKillArgs) (*mcp.CallToolResult, any, error) {
+	key := args.ID
+	if key == "" && args.PID != 0 {
+		key = strconv.Itoa(args.PID)
+	}
+	if key == "" {
+		return nil, nil, fmt.Errorf("id or pid is required")
+	}
+	msg, err := killBackground(key)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: msg}},
+	}, nil, nil
 }
 
 // ---------- runtime configuration ----------
@@ -94,16 +403,134 @@ func pyWrapper(code string) string {
 	return code
 }
 
-// goWrapper wraps user code into a complete main package.
-func goWrapper(code string) string {
-	return `package main
-
-import "fmt"
-
-func main() {
-` + code + `
+// goStdImportAliases maps common package selectors to their import paths.
+var goStdImportAliases = map[string]string{
+	"fmt":        "fmt",
+	"os":         "os",
+	"strings":    "strings",
+	"strconv":    "strconv",
+	"time":       "time",
+	"bytes":      "bytes",
+	"io":         "io",
+	"bufio":      "bufio",
+	"errors":     "errors",
+	"sort":       "sort",
+	"math":       "math",
+	"sync":       "sync",
+	"context":    "context",
+	"regexp":     "regexp",
+	"log":        "log",
+	"filepath":   "path/filepath",
+	"json":       "encoding/json",
+	"base64":     "encoding/base64",
+	"http":       "net/http",
+	"url":        "net/url",
+	"ioutil":     "io/ioutil",
+	"exec":       "os/exec",
+	"path":       "path",
+	"unicode":    "unicode",
+	"utf8":       "unicode/utf8",
+	"hex":        "encoding/hex",
+	"sha256":     "crypto/sha256",
+	"md5":        "crypto/md5",
+	"rand":       "math/rand",
+	"big":        "math/big",
+	"reflect":    "reflect",
+	"runtime":    "runtime",
+	"flag":       "flag",
+	"net":        "net",
+	"template":   "text/template",
+	"html":       "html",
+	"csv":        "encoding/csv",
+	"gzip":       "compress/gzip",
+	"tar":        "archive/tar",
+	"zip":        "archive/zip",
+	"syscall":    "syscall",
+	"atomic":     "sync/atomic",
+	"binary":     "encoding/binary",
+	"xml":        "encoding/xml",
+	"sql":        "database/sql",
+	"tls":        "crypto/tls",
+	"x509":       "crypto/x509",
+	"hmac":       "crypto/hmac",
+	"sha1":       "crypto/sha1",
+	"sha512":     "crypto/sha512",
+	"aes":        "crypto/aes",
+	"cipher":     "crypto/cipher",
+	"elliptic":   "crypto/elliptic",
+	"ecdsa":      "crypto/ecdsa",
+	"rsa":        "crypto/rsa",
+	"ed25519":    "crypto/ed25519",
+	"pem":        "encoding/pem",
+	"ascii85":    "encoding/ascii85",
+	"gob":        "encoding/gob",
+	"tabwriter":  "text/tabwriter",
+	"scanner":    "text/scanner",
+	"parser":     "go/parser",
+	"ast":        "go/ast",
+	"token":      "go/token",
+	"format":     "go/format",
+	"printer":    "go/printer",
+	"types":      "go/types",
+	"constant":   "go/constant",
+	"build":      "go/build",
+	"doc":        "go/doc",
+	"importer":   "go/importer",
 }
-`
+
+// goSelectorRe matches pkg.Ident uses (simple heuristic for import detection).
+var goSelectorRe = regexp.MustCompile(`\b([a-z][a-zA-Z0-9_]*)\.[A-Z(]`)
+
+// detectGoImports scans user code for common stdlib package selectors and
+// returns the import paths needed. Always includes "fmt" if nothing else is
+// found and the code looks like it might use Print-style helpers, else just
+// the detected set (may be empty → we still default to fmt for ergonomics).
+func detectGoImports(code string) []string {
+	seen := map[string]bool{}
+	for _, m := range goSelectorRe.FindAllStringSubmatch(code, -1) {
+		if len(m) < 2 {
+			continue
+		}
+		if path, ok := goStdImportAliases[m[1]]; ok {
+			seen[path] = true
+		}
+	}
+	// Ergonomic default: snippets often use fmt without other packages.
+	if len(seen) == 0 {
+		seen["fmt"] = true
+	}
+	out := make([]string, 0, len(seen))
+	for p := range seen {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// goWrapper wraps user code into a complete main package, auto-importing
+// standard library packages detected from selector usage (fmt, os, strings, …).
+// If the code already declares `package `, it is returned unchanged.
+func goWrapper(code string) string {
+	trimmed := strings.TrimSpace(code)
+	if strings.HasPrefix(trimmed, "package ") {
+		return code
+	}
+	imports := detectGoImports(code)
+	var b strings.Builder
+	b.WriteString("package main\n\n")
+	if len(imports) == 1 {
+		b.WriteString(fmt.Sprintf("import %q\n\n", imports[0]))
+	} else {
+		b.WriteString("import (\n")
+		for _, imp := range imports {
+			b.WriteString(fmt.Sprintf("\t%q\n", imp))
+		}
+		b.WriteString(")\n\n")
+	}
+	b.WriteString("func main() {\n")
+	b.WriteString(code)
+	b.WriteString("\n}\n")
+	return b.String()
 }
 
 // rustWrapper wraps user code into a complete main function.
@@ -262,10 +689,13 @@ func injectFileContent(language, code, fileContent string) string {
 		return "const FILE_CONTENT = `" + escaped + "`;\n" + code
 
 	case "python":
-		// Triple-quoted raw string. Raw strings cannot escape triple
-		// quotes, and a trailing quote would prematurely close the literal.
-		// Fall back to base64 if content contains """ or ends with a quote.
-		if strings.Contains(fileContent, `"""`) || strings.HasSuffix(fileContent, `"`) {
+		// Triple-quoted raw string. Raw strings cannot contain """, and a
+		// trailing quote would prematurely close the literal. A trailing
+		// backslash is also illegal in a Python raw string (r"foo\").
+		// Fall back to base64 for those cases.
+		if strings.Contains(fileContent, `"""`) ||
+			strings.HasSuffix(fileContent, `"`) ||
+			strings.HasSuffix(fileContent, `\`) {
 			encoded := base64.StdEncoding.EncodeToString([]byte(fileContent))
 			return "import base64\nFILE_CONTENT = base64.b64decode(\"" + encoded + "\").decode()\n" + code
 		}
@@ -368,7 +798,12 @@ func runCode(ctx context.Context, language, code, cwd string, timeout time.Durat
 	}
 
 	// Create a temp file with the appropriate extension.
-	tmpFile, err := os.CreateTemp("", "ctxmode_*"+rt.Ext)
+	// Background temps use a distinct prefix so cleanup can treat them carefully.
+	pattern := "ctxmode_*" + rt.Ext
+	if background {
+		pattern = bgTempPrefix + "*" + rt.Ext
+	}
+	tmpFile, err := os.CreateTemp("", pattern)
 	if err != nil {
 		return nil, fmt.Errorf("create temp file: %w", err)
 	}
@@ -407,7 +842,7 @@ func runShell(ctx context.Context, code, cwd string, timeout time.Duration, back
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	return runCmd(ctx, cmd, timeout, background)
+	return runCmd(ctx, cmd, timeout, background, "shell", code)
 }
 
 // runCompiled executes a language that uses a temp source file.
@@ -517,7 +952,12 @@ func runCompiled(ctx context.Context, language string, rt runtimeConfig, tmpPath
 	if background {
 		cleanups = append(cleanups, tmpPath)
 	}
-	return runCmd(ctx, cmd, timeout, background, cleanups...)
+	// Prefer argv string for observability; falls back to language label.
+	cmdStr := strings.Join(cmd.Args, " ")
+	if cmdStr == "" {
+		cmdStr = language
+	}
+	return runCmd(ctx, cmd, timeout, background, language, cmdStr, cleanups...)
 }
 
 // maxCmdOutput is the maximum number of bytes captured from a subprocess's
@@ -555,7 +995,7 @@ func (lb *limitedBuffer) String() string {
 // runCmd is the shared execution loop for all languages.
 // It starts the process, optionally waits with a timeout, and returns
 // the combined stdout/stderr and exit code.
-func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, background bool, cleanups ...string) (*executeResult, error) {
+func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, background bool, language, command string, cleanups ...string) (*executeResult, error) {
 	var stdoutBuf, stderrBuf limitedBuffer
 	stdoutBuf.limit = maxCmdOutput
 	stderrBuf.limit = maxCmdOutput
@@ -567,17 +1007,23 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 	}
 
 	if background {
-		// Detach: let the process continue running independently.
-		// We reap it in a goroutine to avoid zombie processes, and
-		// clean up temp files after the process exits.
-		go func() {
-			_ = cmd.Wait()
-			for _, p := range cleanups {
-				os.Remove(p)
+		// Register for list/kill supervision; reap on exit; enforce max age.
+		entry := registerBackground(cmd, language, command, cleanups)
+		go func(id string, c *exec.Cmd) {
+			err := c.Wait()
+			exitCode := 0
+			if err != nil {
+				if ee, ok := err.(*exec.ExitError); ok {
+					exitCode = ee.ExitCode()
+				} else {
+					exitCode = -1
+				}
 			}
-		}()
+			finishBackground(id, exitCode)
+		}(entry.ID, cmd)
 		return &executeResult{
-			Stdout:   fmt.Sprintf("Process started in background (PID: %d)", cmd.Process.Pid),
+			Stdout: fmt.Sprintf("Process started in background (id: %s, PID: %d). Use ctx_background_list / ctx_background_kill. Max age %s.",
+				entry.ID, cmd.Process.Pid, defaultBackgroundMaxAge),
 			ExitCode: 0,
 		}, nil
 	}

@@ -202,6 +202,9 @@ func NewStore(dbPath string) (*Store, error) {
 		}
 	}
 
+	// Restrict DB file permissions to owner read/write only (after file exists).
+	secureDBFile(dbPath)
+
 	return s, nil
 }
 
@@ -246,11 +249,18 @@ func (s *Store) Get(path string) (*Document, error) {
 // This is the simple entry point used by batch.go and other internal callers.
 // For the full pipeline (flood guard, fuzzy, proximity), use SearchPipeline.
 func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
+	return s.SearchWithPathPrefix(query, "", limit)
+}
+
+// SearchWithPathPrefix is like Search but restricts hits to paths under pathPrefix
+// (range comparison: path >= prefix AND path < prefix+\U0010ffff). Empty prefix
+// means no path filter.
+func (s *Store) SearchWithPathPrefix(query, pathPrefix string, limit int) ([]SearchResult, error) {
 	if limit < 0 {
 		limit = 0
 	}
-	porterResults, porterErr := s.searchPorter(query, limit*3)
-	trigramResults, trigramErr := s.searchTrigram(query, limit*3)
+	porterResults, porterErr := s.searchPorter(query, pathPrefix, limit*3)
+	trigramResults, trigramErr := s.searchTrigram(query, pathPrefix, limit*3)
 
 	if porterErr != nil && trigramErr != nil {
 		return nil, fmt.Errorf("porter: %v / trigram: %v", porterErr, trigramErr)
@@ -264,22 +274,45 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 }
 
 // searchPorter searches the porter-stemmed FTS5 index.
-func (s *Store) searchPorter(query string, limit int) ([]SearchResult, error) {
+// pathPrefix, when non-empty, constrains results to that path range.
+func (s *Store) searchPorter(query, pathPrefix string, limit int) ([]SearchResult, error) {
 	ftsQuery := fts5Escape(query)
 
-	sqlQuery := `
-		SELECT path, snippet(documents_fts, 1, '<b>', '</b>', '...', 256) AS snippet
-		FROM documents_fts
-		WHERE documents_fts MATCH ?
-		ORDER BY rank
-		LIMIT ?
-	`
+	var (
+		sqlQuery string
+		args     []any
+	)
+	if pathPrefix == "" {
+		sqlQuery = `
+			SELECT path, snippet(documents_fts, 1, '<b>', '</b>', '...', 256) AS snippet
+			FROM documents_fts
+			WHERE documents_fts MATCH ?
+			ORDER BY rank
+			LIMIT ?
+		`
+		args = []any{ftsQuery, limit}
+	} else {
+		sqlQuery = `
+			SELECT path, snippet(documents_fts, 1, '<b>', '</b>', '...', 256) AS snippet
+			FROM documents_fts
+			WHERE documents_fts MATCH ?
+			  AND path >= ? AND path < ?
+			ORDER BY rank
+			LIMIT ?
+		`
+		args = []any{ftsQuery, pathPrefix, pathPrefix + "\U0010ffff", limit}
+	}
 
-	rows, err := s.db.Query(sqlQuery, ftsQuery, limit)
+	rows, err := s.db.Query(sqlQuery, args...)
 	if err != nil {
 		// If phrase-mode fails, try per-term escaping.
 		fallbackQuery := fts5LiteralEscape(query)
-		rows, err = s.db.Query(sqlQuery, fallbackQuery, limit)
+		if pathPrefix == "" {
+			args = []any{fallbackQuery, limit}
+		} else {
+			args = []any{fallbackQuery, pathPrefix, pathPrefix + "\U0010ffff", limit}
+		}
+		rows, err = s.db.Query(sqlQuery, args...)
 		if err != nil {
 			return nil, fmt.Errorf("porter search: %w", err)
 		}
@@ -301,22 +334,44 @@ func (s *Store) searchPorter(query string, limit int) ([]SearchResult, error) {
 }
 
 // searchTrigram searches the trigram FTS5 index (substring matching).
-func (s *Store) searchTrigram(query string, limit int) ([]SearchResult, error) {
+func (s *Store) searchTrigram(query, pathPrefix string, limit int) ([]SearchResult, error) {
 	ftsQuery := fts5Escape(query)
 
-	sqlQuery := `
-		SELECT path, snippet(documents_trigram, 1, '<b>', '</b>', '...', 256) AS snippet
-		FROM documents_trigram
-		WHERE documents_trigram MATCH ?
-		ORDER BY rank
-		LIMIT ?
-	`
+	var (
+		sqlQuery string
+		args     []any
+	)
+	if pathPrefix == "" {
+		sqlQuery = `
+			SELECT path, snippet(documents_trigram, 1, '<b>', '</b>', '...', 256) AS snippet
+			FROM documents_trigram
+			WHERE documents_trigram MATCH ?
+			ORDER BY rank
+			LIMIT ?
+		`
+		args = []any{ftsQuery, limit}
+	} else {
+		sqlQuery = `
+			SELECT path, snippet(documents_trigram, 1, '<b>', '</b>', '...', 256) AS snippet
+			FROM documents_trigram
+			WHERE documents_trigram MATCH ?
+			  AND path >= ? AND path < ?
+			ORDER BY rank
+			LIMIT ?
+		`
+		args = []any{ftsQuery, pathPrefix, pathPrefix + "\U0010ffff", limit}
+	}
 
-	rows, err := s.db.Query(sqlQuery, ftsQuery, limit)
+	rows, err := s.db.Query(sqlQuery, args...)
 	if err != nil {
 		// Trigram is more tolerant; try per-term escaping as fallback.
 		fallbackQuery := fts5LiteralEscape(query)
-		rows, err = s.db.Query(sqlQuery, fallbackQuery, limit)
+		if pathPrefix == "" {
+			args = []any{fallbackQuery, limit}
+		} else {
+			args = []any{fallbackQuery, pathPrefix, pathPrefix + "\U0010ffff", limit}
+		}
+		rows, err = s.db.Query(sqlQuery, args...)
 		if err != nil {
 			return nil, fmt.Errorf("trigram search: %w", err)
 		}
@@ -335,6 +390,79 @@ func (s *Store) searchTrigram(query string, limit int) ([]SearchResult, error) {
 		return nil, err
 	}
 	return results, nil
+}
+
+// secureDBFile chmods the database file (and WAL/SHM sidecars) to 0600.
+func secureDBFile(dbPath string) {
+	if dbPath == "" || dbPath == ":memory:" {
+		return
+	}
+	path := dbPath
+	if strings.HasPrefix(path, "file:") {
+		path = strings.TrimPrefix(path, "file:")
+		if i := strings.IndexAny(path, "?#"); i >= 0 {
+			path = path[:i]
+		}
+	}
+	_ = os.Chmod(path, 0o600)
+	for _, ext := range []string{"-wal", "-shm"} {
+		_ = os.Chmod(path+ext, 0o600)
+	}
+}
+
+// PurgeSessionKeys deletes documents whose path is exactly session:{id}
+// or starts with session:{id}: (colon-delimited sub-keys). This avoids the
+// classic prefix false-positive where purging "session:ab" also removes
+// "session:abc".
+func (s *Store) PurgeSessionKeys(sessionID string) (deleted int, err error) {
+	exact := "session:" + sessionID
+	subPrefix := exact + ":"
+
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Exact key.
+	res, err := tx.Exec(`DELETE FROM documents WHERE path = ?`, exact)
+	if err != nil {
+		return 0, fmt.Errorf("purge session exact: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	deleted = int(rows)
+
+	// Colon-delimited children only (not hyphen/other suffix collisions).
+	res, err = tx.Exec(
+		`DELETE FROM documents WHERE path >= ? AND path < ?`,
+		subPrefix, subPrefix+"\U0010ffff",
+	)
+	if err != nil {
+		return 0, fmt.Errorf("purge session sub-keys: %w", err)
+	}
+	rows, _ = res.RowsAffected()
+	deleted += int(rows)
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit session purge: %w", err)
+	}
+	return deleted, nil
+}
+
+// CountSessionKeys counts documents matching the same keys as PurgeSessionKeys.
+func (s *Store) CountSessionKeys(sessionID string) (int, error) {
+	exact := "session:" + sessionID
+	subPrefix := exact + ":"
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM documents
+		WHERE path = ?
+		   OR (path >= ? AND path < ?)
+	`, exact, subPrefix, subPrefix+"\U0010ffff").Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count session keys: %w", err)
+	}
+	return count, nil
 }
 
 // List returns all documents in the store.

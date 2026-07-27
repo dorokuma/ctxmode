@@ -150,40 +150,56 @@ func NewSearchPipeline(store *Store, floodGuard *FloodGuard) *SearchPipeline {
 	}
 }
 
-// Search runs the complete enhanced search pipeline.
+// Search runs the complete enhanced search pipeline (with flood guard).
 func (sp *SearchPipeline) Search(query string, limit int) ([]SearchResult, *SearchMeta, error) {
+	return sp.search(query, "", limit, true)
+}
+
+// SearchBatchScoped searches only documents under the batch: path prefix and
+// does NOT consume flood-guard quota (batch queries are internal, not agent spam).
+func (sp *SearchPipeline) SearchBatchScoped(query string, limit int) ([]SearchResult, *SearchMeta, error) {
+	return sp.search(query, "batch:", limit, false)
+}
+
+// search is the shared implementation.
+// pathPrefix filters at the store layer; applyFlood enables the flood guard.
+func (sp *SearchPipeline) search(query, pathPrefix string, limit int, applyFlood bool) ([]SearchResult, *SearchMeta, error) {
 	if limit < 0 {
 		limit = 0
 	}
 	start := time.Now()
 	meta := &SearchMeta{}
 
-	// 1. Flood guard check.
-	status := sp.floodGuard.Allow()
-	switch status {
-	case StatusBlocked:
-		meta.FloodStatus = "blocked"
-		meta.TimeMs = time.Since(start).Milliseconds()
-		return nil, meta, fmt.Errorf("search blocked: too many requests in a short time. Use ctx_batch_execute to batch your searches, or wait a moment.")
-	case StatusThrottled:
-		meta.FloodStatus = "throttled"
-		meta.ThrottleMsg = "Search volume is high: showing limited results. Consider using ctx_batch_execute for multiple queries."
-		if limit > 1 {
-			limit = max(1, limit/2)
+	// 1. Flood guard check (optional — skipped for batch-scoped queries).
+	if applyFlood {
+		status := sp.floodGuard.Allow()
+		switch status {
+		case StatusBlocked:
+			meta.FloodStatus = "blocked"
+			meta.TimeMs = time.Since(start).Milliseconds()
+			return nil, meta, fmt.Errorf("search blocked: too many requests in a short time. Wait a moment, or use ctx_batch_execute (its query_scope=batch searches bypass the flood guard).")
+		case StatusThrottled:
+			meta.FloodStatus = "throttled"
+			meta.ThrottleMsg = "Search volume is high: showing limited results. Prefer ctx_batch_execute with query_scope=batch for multiple related queries."
+			if limit > 1 {
+				limit = max(1, limit/2)
+			}
+		default:
+			meta.FloodStatus = "ok"
 		}
-	default:
+	} else {
 		meta.FloodStatus = "ok"
 	}
 
-	// 2. Search both indices.
+	// 2. Search both indices (optionally path-scoped).
 	// Request extra results from each index for better RRF merging.
 	extraLimit := limit * 3
 	if extraLimit < 30 {
 		extraLimit = 30
 	}
 
-	porterResults, porterErr := sp.store.searchPorter(query, extraLimit)
-	trigramResults, trigramErr := sp.store.searchTrigram(query, extraLimit)
+	porterResults, porterErr := sp.store.searchPorter(query, pathPrefix, extraLimit)
+	trigramResults, trigramErr := sp.store.searchTrigram(query, pathPrefix, extraLimit)
 
 	// If both failed, return the error.
 	if porterErr != nil && trigramErr != nil {

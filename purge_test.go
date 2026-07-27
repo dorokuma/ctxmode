@@ -130,12 +130,13 @@ func TestPurgeDryRun_CountMatchesDelete(t *testing.T) {
 	srv := newTestServer(t)
 	s := srv.store
 
-	indexDoc(t, s, "session:x-a", "1")
-	indexDoc(t, s, "session:x-b", "2")
-	indexDoc(t, s, "session:x-c", "3")
+	// Exact session key + colon-delimited child; hyphen suffix must NOT match.
+	indexDoc(t, s, "session:x", "1")
+	indexDoc(t, s, "session:x:child", "2")
+	indexDoc(t, s, "session:x-extra", "3") // must survive (not colon-delimited)
 	indexDoc(t, s, "session:y", "4")
 
-	// DryRun to get preview count.
+	// DryRun preview count for exact session semantics.
 	result, _, err := srv.toolPurge(context.Background(), nil, purgeArgs{
 		DryRun:    true,
 		Scope:     "session",
@@ -147,18 +148,54 @@ func TestPurgeDryRun_CountMatchesDelete(t *testing.T) {
 	text := contentText(result)
 	t.Logf("dryRun result: %s", text)
 
-	// The prefix "session:x" should match 3 docs (session:x-a, session:x-b, session:x-c).
-	n, err := s.PurgeByPrefix("session:x")
+	// PurgeSessionKeys: exact "session:x" + "session:x:..." only.
+	n, err := s.PurgeSessionKeys("x")
 	if err != nil {
-		t.Fatalf("PurgeByPrefix: %v", err)
+		t.Fatalf("PurgeSessionKeys: %v", err)
 	}
-	if n != 3 {
-		t.Fatalf("expected 3 deleted, got %d", n)
+	if n != 2 {
+		t.Fatalf("expected 2 deleted (session:x + session:x:child), got %d", n)
 	}
 
-	// session:y should survive.
+	// session:x-extra and session:y should survive (no prefix false-positive).
+	if doc, _ := s.Get("session:x-extra"); doc == nil {
+		t.Fatal("session:x-extra should survive (hyphen suffix is not a child)")
+	}
 	if doc, _ := s.Get("session:y"); doc == nil {
 		t.Fatal("session:y should survive")
+	}
+}
+
+func TestPurgeSession_NoPrefixFalsePositive(t *testing.T) {
+	srv := newTestServer(t)
+	s := srv.store
+
+	indexDoc(t, s, "session:ab", "1")
+	indexDoc(t, s, "session:abc", "2")
+	indexDoc(t, s, "session:ab:sub", "3")
+
+	result, _, err := srv.toolPurge(context.Background(), nil, purgeArgs{
+		Confirm:   true,
+		Scope:     "session",
+		SessionID: "ab",
+	})
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	text := contentText(result)
+	if !strings.Contains(text, `"deleted_docs": 2`) && !strings.Contains(text, `"deleted_docs":2`) {
+		// Accept either spacing from MarshalIndent.
+		t.Fatalf("expected deleted_docs=2, purge result: %s", text)
+	}
+
+	if doc, _ := s.Get("session:ab"); doc != nil {
+		t.Fatal("session:ab should be deleted")
+	}
+	if doc, _ := s.Get("session:ab:sub"); doc != nil {
+		t.Fatal("session:ab:sub should be deleted")
+	}
+	if doc, _ := s.Get("session:abc"); doc == nil {
+		t.Fatal("session:abc must survive when purging session ab")
 	}
 }
 

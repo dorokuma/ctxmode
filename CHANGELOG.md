@@ -3,6 +3,29 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-07-27
+
+### Added
+- Background process list/kill tools with registry and reaper
+- `SearchWithPathPrefix` and batch-scoped search
+- Secure DB file permissions (0600)
+- Index walk limits and binary content sniffing
+- Go auto-imports for common stdlib packages
+- Default fetch source labeling
+
+### Fixed
+- Symlink path escape outside workdir
+- False "Indexed as" reporting
+- Python trailing backslash handling
+- Non-2xx fetch responses no longer indexed
+- Session purge prefix false positives
+- Flood guard vs batch execute interaction
+- Forced markdown conversion issues
+- Temp cleanup racing long-running background jobs
+- Multi-IP `validateURL` / `Dial` alignment
+- Index-fail preview messaging
+- Kill marks background jobs as Done
+
 ## [1.1.1] - 2026-07-25
 
 ### Added
@@ -12,6 +35,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 ### Changed
 - The Pi adapter relies on tool schemas and prompt guidelines instead of injecting a fixed per-turn system prompt.
 - MCP initialize and `ctx_doctor` now consistently report version 1.1.1.
+
 
 ## [1.1.0] - 2026-07-23
 

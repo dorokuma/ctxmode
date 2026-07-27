@@ -1,5 +1,5 @@
 // ctxmode: a Go MCP server that virtualizes tool output to save context tokens.
-// Registers: ctx_execute, ctx_execute_file, ctx_index, ctx_search, ctx_stats, ctx_fetch_and_index, ctx_batch_execute, ctx_doctor, ctx_purge.
+// Registers: ctx_execute, ctx_execute_file, ctx_index, ctx_search, ctx_stats, ctx_fetch_and_index, ctx_batch_execute, ctx_doctor, ctx_purge, ctx_background_list, ctx_background_kill.
 package main
 
 import (
@@ -18,6 +18,19 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"gopkg.in/yaml.v3"
+)
+
+// Version is the single source of truth for MCP, doctor, and User-Agent.
+// Keep aligned with CHANGELOG.md latest release.
+const Version = "1.2.0"
+
+// toolIndex walk / size limits.
+const (
+	maxIndexFiles      = 5000
+	maxIndexDepth      = 32
+	maxIndexTotalBytes = 100 * 1024 * 1024 // 100 MB total content
+	maxIndexFileBytes  = 1 * 1024 * 1024   // 1 MB per file
+	binarySampleSize   = 8192
 )
 
 type server struct {
@@ -110,7 +123,7 @@ func main() {
 	}
 	s.excludeFromGit()
 
-	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: "1.1.1"}, nil)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: Version}, nil)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_execute",
@@ -156,6 +169,16 @@ func main() {
 		Name:        "ctx_purge",
 		Description: "DESTRUCTIVE: permanently delete indexed content. Cannot be undone. Requires confirm:true.",
 	}, s.toolPurge)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_background_list",
+		Description: "List background processes started via ctx_execute(background:true). Shows PID, age, and status.",
+	}, s.toolBackgroundList)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_background_kill",
+		Description: "Kill a background process by id (from ctx_background_list) or by PID.",
+	}, s.toolBackgroundKill)
 
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		fatal(store, "server exited: %v", err)
@@ -302,10 +325,21 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		if args.Intent != "" {
 			label = "execute:" + args.Intent
 		}
-		if err := s.storeIndexLocked(label, outputText); err == nil {
-			result.Indexed = true
-			result.IndexLabel = label
+		if err := s.storeIndexLocked(label, outputText); err != nil {
+			// Index failed: still return a truncated preview so the agent is not blind.
+			preview := outputText
+			if len(preview) > 2000 {
+				preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
+			}
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{
+					Text: fmt.Sprintf("Output is too large (%d bytes). Indexing failed: %v. Content was NOT indexed.\n\n--- Preview ---\n%s",
+						len(outputText), err, preview),
+				}},
+			}, nil, nil
 		}
+		result.Indexed = true
+		result.IndexLabel = label
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{
 				Text: fmt.Sprintf("Output is too large (%d bytes). Indexed as %q. Use ctx_search(queries: [%q]) to search the indexed content.",
@@ -317,10 +351,19 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 	if len(outputText) > intentThreshold && args.Intent != "" {
 		// Index and return a preview.
 		label := "execute:" + args.Intent
-		if err := s.storeIndexLocked(label, outputText); err == nil {
-			result.Indexed = true
-			result.IndexLabel = label
+		if err := s.storeIndexLocked(label, outputText); err != nil {
+			preview := outputText
+			if len(preview) > 2000 {
+				preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
+			}
+			summary := fmt.Sprintf("Output (%d bytes) was NOT indexed (error: %v).\n\n--- Preview ---\n%s",
+				len(outputText), err, preview)
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: summary}},
+			}, nil, nil
 		}
+		result.Indexed = true
+		result.IndexLabel = label
 
 		preview := outputText
 		if len(preview) > 2000 {
@@ -360,35 +403,90 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 
 	indexedCount := 0
 	skippedCount := 0
+	var skipSamples []string // sample skip reasons (capped)
+	var totalBytes int64
+	hitFileCap := false
+	hitByteCap := false
+
+	addSkip := func(reason string) {
+		skippedCount++
+		if len(skipSamples) < 5 {
+			skipSamples = append(skipSamples, reason)
+		}
+	}
+
 	if info.IsDir() {
-		err = filepath.Walk(target, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() {
+		baseDepth := strings.Count(target, string(filepath.Separator))
+		err = filepath.Walk(target, func(path string, fi os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				addSkip(fmt.Sprintf("%s: walk error: %v", path, walkErr))
 				return nil
+			}
+			// Depth limit (directories and files).
+			depth := strings.Count(path, string(filepath.Separator)) - baseDepth
+			if depth > maxIndexDepth {
+				if fi.IsDir() {
+					return filepath.SkipDir
+				}
+				addSkip(fmt.Sprintf("%s: max depth %d", path, maxIndexDepth))
+				return nil
+			}
+			if fi.IsDir() {
+				base := filepath.Base(path)
+				if base == ".git" || base == "node_modules" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if hitFileCap || hitByteCap {
+				return filepath.SkipDir
+			}
+			if indexedCount >= maxIndexFiles {
+				hitFileCap = true
+				return filepath.SkipDir
 			}
 			if strings.Contains(path, "/.git/") || strings.Contains(path, "/node_modules/") {
-				skippedCount++
+				addSkip(fmt.Sprintf("%s: excluded dir", path))
 				return nil
 			}
-			if isProbablyBinary(info.Name()) || info.Size() > 1*1024*1024 {
-				skippedCount++
+			// Symlink fence: refuse paths that resolve outside workspaces.
+			if real, rerr := s.ensureInsideWorkspaces(path); rerr != nil {
+				addSkip(fmt.Sprintf("%s: outside workspace (%v)", path, rerr))
 				return nil
-			}
-			if err := s.indexFile(path); err == nil {
-				indexedCount++
 			} else {
-				skippedCount++
+				path = real
 			}
+			if fi.Size() > maxIndexFileBytes {
+				addSkip(fmt.Sprintf("%s: too large (%d bytes)", path, fi.Size()))
+				return nil
+			}
+			if isProbablyBinaryName(fi.Name()) {
+				addSkip(fmt.Sprintf("%s: binary extension", path))
+				return nil
+			}
+			if totalBytes+fi.Size() > maxIndexTotalBytes {
+				hitByteCap = true
+				addSkip(fmt.Sprintf("%s: total size cap reached", path))
+				return filepath.SkipDir
+			}
+			if err := s.indexFile(path); err != nil {
+				addSkip(fmt.Sprintf("%s: %v", path, err))
+				return nil
+			}
+			indexedCount++
+			totalBytes += fi.Size()
 			return nil
 		})
 	} else {
-		if isProbablyBinary(info.Name()) || info.Size() > 1*1024*1024 {
+		if isProbablyBinaryName(info.Name()) || info.Size() > maxIndexFileBytes {
 			return nil, nil, fmt.Errorf("file %q is binary or too large (> 1MB)", target)
 		}
+		// Content-based binary check happens in indexFile.
 		err = s.indexFile(target)
 		if err == nil {
 			indexedCount = 1
 		} else {
-			skippedCount = 1
+			return nil, nil, err
 		}
 	}
 
@@ -399,6 +497,18 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 	msg := fmt.Sprintf("Indexed %d file(s)", indexedCount)
 	if skippedCount > 0 {
 		msg += fmt.Sprintf(" (%d skipped)", skippedCount)
+		if len(skipSamples) > 0 {
+			msg += ": " + strings.Join(skipSamples, "; ")
+			if skippedCount > len(skipSamples) {
+				msg += "; ..."
+			}
+		}
+	}
+	if hitFileCap {
+		msg += fmt.Sprintf(" [stopped: max files %d]", maxIndexFiles)
+	}
+	if hitByteCap {
+		msg += fmt.Sprintf(" [stopped: max total bytes %d]", maxIndexTotalBytes)
 	}
 	msg += "."
 	return &mcp.CallToolResult{
@@ -421,7 +531,7 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		// If blocked by flood guard, return a friendly message.
 		if meta != nil && meta.FloodStatus == "blocked" {
 			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: "Search blocked: too many requests in a short time. Use ctx_batch_execute to batch your searches, or wait a moment."}},
+				Content: []mcp.Content{&mcp.TextContent{Text: "Search blocked: too many requests in a short time. Wait a moment, or use ctx_batch_execute (query_scope=batch searches bypass the flood guard)."}},
 			}, nil, nil
 		}
 		return nil, nil, fmt.Errorf("search failed: %w", err)
@@ -557,7 +667,7 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	if info.Size() > 10*1024*1024 {
 		return nil, nil, fmt.Errorf("file %q is too large (%d bytes, max 10MB)", target, info.Size())
 	}
-	if isProbablyBinary(info.Name()) {
+	if isProbablyBinaryName(info.Name()) {
 		return nil, nil, fmt.Errorf("file %q appears to be binary, refusing to read as code input", target)
 	}
 
@@ -565,6 +675,9 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	fileContent, err := os.ReadFile(target)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read file: %w", err)
+	}
+	if isBinaryContent(fileContent) {
+		return nil, nil, fmt.Errorf("file %q appears to be binary (content sample), refusing to read as code input", target)
 	}
 
 	// Default language.
@@ -633,10 +746,21 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		if args.Intent != "" {
 			label = "execute_file:" + args.Intent
 		}
-		if err := s.storeIndexLocked(label, outputText); err == nil {
-			result.Indexed = true
-			result.IndexLabel = label
+		if err := s.storeIndexLocked(label, outputText); err != nil {
+			// Index failed: still return a truncated preview so the agent is not blind.
+			preview := outputText
+			if len(preview) > 2000 {
+				preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
+			}
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{
+					Text: fmt.Sprintf("Output is too large (%d bytes). Indexing failed: %v. Content was NOT indexed.\n\n--- Preview ---\n%s",
+						len(outputText), err, preview),
+				}},
+			}, nil, nil
 		}
+		result.Indexed = true
+		result.IndexLabel = label
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{
 				Text: fmt.Sprintf("Output is too large (%d bytes). Indexed as %q. Use ctx_search to search.",
@@ -647,10 +771,19 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 
 	if len(outputText) > intentThreshold && args.Intent != "" {
 		label := "execute_file:" + args.Intent
-		if err := s.storeIndexLocked(label, outputText); err == nil {
-			result.Indexed = true
-			result.IndexLabel = label
+		if err := s.storeIndexLocked(label, outputText); err != nil {
+			preview := outputText
+			if len(preview) > 2000 {
+				preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
+			}
+			summary := fmt.Sprintf("Output (%d bytes) was NOT indexed (error: %v).\n\n--- Preview ---\n%s",
+				len(outputText), err, preview)
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: summary}},
+			}, nil, nil
 		}
+		result.Indexed = true
+		result.IndexLabel = label
 
 		preview := outputText
 		if len(preview) > 2000 {
@@ -671,11 +804,19 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 // ---------- db helpers ----------
 
 func (s *server) indexFile(path string) error {
-	data, err := os.ReadFile(path)
+	// Re-check symlink fence at read time (Walk may encounter links).
+	real, err := s.ensureInsideWorkspaces(path)
 	if err != nil {
 		return err
 	}
-	return s.storeIndexLocked(path, string(data))
+	data, err := os.ReadFile(real)
+	if err != nil {
+		return err
+	}
+	if isBinaryContent(data) {
+		return fmt.Errorf("binary content detected")
+	}
+	return s.storeIndexLocked(real, string(data))
 }
 
 func (s *server) migrateFromJSON() error {
@@ -752,7 +893,8 @@ func truncateUTF8(s string, maxBytes int) string {
 	return truncated
 }
 
-func isProbablyBinary(name string) bool {
+// isProbablyBinaryName returns true if the filename extension indicates a binary file.
+func isProbablyBinaryName(name string) bool {
 	for _, ext := range []string{
 		".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp",
 		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
@@ -772,6 +914,42 @@ func isProbablyBinary(name string) bool {
 	return false
 }
 
+// isProbablyBinary is kept as an alias for extension-only checks used by older call sites.
+func isProbablyBinary(name string) bool {
+	return isProbablyBinaryName(name)
+}
+
+// isBinaryContent samples the first bytes and detects binary data via null
+// bytes or a high proportion of non-text control characters.
+func isBinaryContent(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	sample := data
+	if len(sample) > binarySampleSize {
+		sample = sample[:binarySampleSize]
+	}
+	// Null byte is a strong binary signal.
+	for _, b := range sample {
+		if b == 0 {
+			return true
+		}
+	}
+	// Count non-text bytes (excluding common whitespace control chars).
+	nonText := 0
+	for _, b := range sample {
+		if b < 0x09 || (b > 0x0d && b < 0x20) {
+			// Allow tab(9), LF(10), VT(11), FF(12), CR(13); treat other controls as non-text.
+			nonText++
+		}
+	}
+	// If more than 30% of the sample is non-text control bytes, treat as binary.
+	if len(sample) > 0 && nonText*100/len(sample) > 30 {
+		return true
+	}
+	return false
+}
+
 // storeIndexLocked wraps store.Index with the server mutex, ensuring that
 // concurrent writes from different goroutines are serialized. Combined with
 // SetMaxOpenConns(1) in the store, this prevents SQLITE_BUSY on concurrent
@@ -783,8 +961,8 @@ func (s *server) storeIndexLocked(path, content string) error {
 }
 
 // resolvePath converts a user-supplied path into an absolute path within any workspace.
-// It checks against all configured workdirs and returns the first match.
-// If the path is outside all workspaces, it returns an error.
+// After Clean, it resolves symlinks (EvalSymlinks) and re-checks that the real
+// path still lies inside a configured workdir. Symlinks that escape are rejected.
 func (s *server) resolvePath(p string) (string, error) {
 	if p == "" {
 		return s.workdirs[0], nil
@@ -795,13 +973,78 @@ func (s *server) resolvePath(p string) (string, error) {
 	} else {
 		target = filepath.Clean(filepath.Join(s.workdirs[0], p))
 	}
+	// First-pass lexical containment (fast reject before syscall).
+	if !s.lexicallyInside(target) {
+		return "", fmt.Errorf("path %q is outside all workspaces %q", p, s.workdirs)
+	}
+	return s.ensureInsideWorkspaces(target)
+}
+
+// lexicallyInside reports whether path is under any workdir before symlink resolution.
+func (s *server) lexicallyInside(target string) bool {
 	for _, wd := range s.workdirs {
 		cleanWd := strings.TrimSuffix(wd, string(filepath.Separator))
-		if target == wd || strings.HasPrefix(target, cleanWd+string(filepath.Separator)) {
-			return target, nil
+		if target == wd || target == cleanWd || strings.HasPrefix(target, cleanWd+string(filepath.Separator)) {
+			return true
 		}
 	}
-	return "", fmt.Errorf("path %q is outside all workspaces %q", p, s.workdirs)
+	return false
+}
+
+// ensureInsideWorkspaces resolves symlinks on path (or its longest existing
+// prefix) and verifies the real path remains inside a configured workdir.
+func (s *server) ensureInsideWorkspaces(path string) (string, error) {
+	resolved, err := evalSymlinksPartial(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve symlinks for %q: %w", path, err)
+	}
+	for _, wd := range s.workdirs {
+		realWd := wd
+		if rw, err := filepath.EvalSymlinks(wd); err == nil {
+			realWd = rw
+		}
+		cleanWd := strings.TrimSuffix(realWd, string(filepath.Separator))
+		if resolved == realWd || resolved == cleanWd || strings.HasPrefix(resolved, cleanWd+string(filepath.Separator)) {
+			return resolved, nil
+		}
+	}
+	return "", fmt.Errorf("path %q resolves to %q which is outside all workspaces", path, resolved)
+}
+
+// evalSymlinksPartial is like filepath.EvalSymlinks but works when the final
+// path component does not yet exist: it resolves the longest existing prefix
+// and re-appends the missing trailing components.
+func evalSymlinksPartial(path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	// Fast path: whole path exists.
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return real, nil
+	}
+	// Walk up until an existing prefix is found.
+	missing := []string{}
+	cur := path
+	for {
+		if cur == "" || cur == string(filepath.Separator) {
+			break
+		}
+		if real, err := filepath.EvalSymlinks(cur); err == nil {
+			// Rejoin missing components.
+			for i := len(missing) - 1; i >= 0; i-- {
+				real = filepath.Join(real, missing[i])
+			}
+			return filepath.Clean(real), nil
+		}
+		dir, base := filepath.Dir(cur), filepath.Base(cur)
+		if dir == cur {
+			break
+		}
+		missing = append(missing, base)
+		cur = dir
+	}
+	// Fall back to Clean if nothing is resolvable (e.g. brand-new absolute path).
+	return filepath.Clean(path), nil
 }
 
 // excludeFromGit appends the local database files to .git/info/exclude for all workspaces.

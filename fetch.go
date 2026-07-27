@@ -71,7 +71,9 @@ type fetchArgs struct {
 
 // validateURL performs SSRF-protection checks on a URL.
 // It verifies the scheme is http/https, resolves DNS, and checks the IP
-// against blocklists.
+// against blocklists. Multi-address hosts are allowed when at least one
+// resolved IP is safe (aligned with DialContext, which also picks the first
+// safe IP rather than requiring every address to pass).
 func validateURL(rawURL string, strict bool) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -94,13 +96,16 @@ func validateURL(rawURL string, strict bool) error {
 		return fmt.Errorf("no IP addresses found for %q", host)
 	}
 
+	var firstErr error
 	for _, ip := range ips {
-		if err := checkIP(ip, strict); err != nil {
-			return fmt.Errorf("blocked IP %v for host %q: %w", ip, host, err)
+		if err := checkIP(ip, strict); err == nil {
+			// At least one safe IP — DialContext will pick a safe address.
+			return nil
+		} else if firstErr == nil {
+			firstErr = fmt.Errorf("blocked IP %v for host %q: %w", ip, host, err)
 		}
 	}
-
-	return nil
+	return fmt.Errorf("all resolved IPs for %q blocked by SSRF rules: %v", host, firstErr)
 }
 
 // checkIP returns an error if the IP is in a blocked range.
@@ -253,14 +258,21 @@ func (s *server) fetchURL(ctx context.Context, rawURL string, timeout time.Durat
 		return nil, "", false, fmt.Errorf("create request: %w", err)
 	}
 
-	// Set a friendly User-Agent.
-	req.Header.Set("User-Agent", "ctxmode/1.0 (MCP context server)")
+	// Set a friendly User-Agent (version aligned with Version constant).
+	req.Header.Set("User-Agent", "ctxmode/"+Version+" (MCP context server)")
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return nil, "", false, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// Non-2xx responses are errors — do not index error pages as content.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Drain a small amount of body for diagnostics then discard.
+		_, _ = io.CopyN(io.Discard, resp.Body, 4096)
+		return nil, "", false, fmt.Errorf("HTTP %d %s", resp.StatusCode, resp.Status)
+	}
 
 	// Read body with size limit + 1 to detect truncation.
 	limited := io.LimitReader(resp.Body, maxBodySize+1)
@@ -293,7 +305,12 @@ func processContent(body []byte, contentType, format string, truncated bool) (st
 	if format != "" {
 		switch format {
 		case "markdown":
-			return htmlToMarkdown(body)
+			// Only run HTML→Markdown when content is actually HTML.
+			// text/markdown, text/plain, etc. are returned as-is.
+			if isHTMLContentType(ct) || looksLikeHTML(body) {
+				return htmlToMarkdown(body)
+			}
+			return string(body), nil
 		case "html":
 			return string(body), nil
 		case "json":
@@ -304,7 +321,7 @@ func processContent(body []byte, contentType, format string, truncated bool) (st
 	}
 	// Fallback: detect from Content-Type.
 	switch {
-	case strings.Contains(ct, "text/html"):
+	case isHTMLContentType(ct):
 		return htmlToMarkdown(body)
 	case strings.Contains(ct, "application/json"):
 		return formatJSON(body, truncated)
@@ -312,6 +329,47 @@ func processContent(body []byte, contentType, format string, truncated bool) (st
 		// text/plain, text/markdown, application/xml, etc.
 		return string(body), nil
 	}
+}
+
+// isHTMLContentType reports whether ct looks like HTML.
+func isHTMLContentType(ct string) bool {
+	return strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml")
+}
+
+// looksLikeHTML does a cheap sniff when Content-Type is missing/misleading.
+func looksLikeHTML(body []byte) bool {
+	// Skip leading whitespace.
+	i := 0
+	for i < len(body) && (body[i] == ' ' || body[i] == '\t' || body[i] == '\n' || body[i] == '\r') {
+		i++
+	}
+	if i >= len(body) {
+		return false
+	}
+	// Strong document-level markers only in the opening bytes.
+	// Do not treat arbitrary "<" or inline markdown HTML fragments as a full page.
+	s := strings.ToLower(string(body[i:min(i+64, len(body))]))
+	if strings.HasPrefix(s, "<!doctype html") || strings.HasPrefix(s, "<html") {
+		return true
+	}
+	// Weaker openers (<head>/<body>) require additional structural HTML tags
+	// in a larger window to avoid misclassifying markdown that happens to
+	// start with those tokens or contains HTML snippets.
+	if strings.HasPrefix(s, "<head") || strings.HasPrefix(s, "<body") {
+		window := strings.ToLower(string(body[i:min(i+512, len(body))]))
+		signals := 0
+		for _, tag := range []string{
+			"<html", "</html", "<head", "</head", "<body", "</body",
+			"<meta", "<link", "<title", "<script", "<div", "<span",
+		} {
+			if strings.Contains(window, tag) {
+				signals++
+			}
+		}
+		// Need at least two distinct structural signals (the opener already counts).
+		return signals >= 2
+	}
+	return false
 }
 
 // htmlToMarkdown converts HTML content to markdown using the html-to-markdown library.
@@ -382,6 +440,10 @@ func chunkContent(content string) []string {
 
 // fetchAndIndex fetches a URL, processes the content, and indexes it into the store.
 func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format string, force bool, ttl int, timeout time.Duration) (*FetchResult, error) {
+	// Default source avoids path becoming ":{url}".
+	if source == "" {
+		source = "fetch"
+	}
 	result := &FetchResult{
 		URL:    rawURL,
 		Source: source,
