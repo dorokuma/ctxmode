@@ -48,10 +48,10 @@ type bgEntry struct {
 }
 
 var (
-	bgMu      sync.Mutex
-	bgProcs   = map[string]*bgEntry{}
-	bgSeq     atomic.Uint64
-	bgReaper  sync.Once
+	bgMu     sync.Mutex
+	bgProcs  = map[string]*bgEntry{}
+	bgSeq    atomic.Uint64
+	bgReaper sync.Once
 )
 
 // registerBackground records a live background process.
@@ -350,8 +350,8 @@ func (s *server) toolBackgroundKill(ctx context.Context, _ *mcp.CallToolRequest,
 
 // runtimeConfig describes how to execute code in a given language.
 type runtimeConfig struct {
-	Exe  string   // executable name (e.g., "node")
-	Ext  string   // temp file extension (e.g., ".js")
+	Exe  string                   // executable name (e.g., "node")
+	Ext  string                   // temp file extension (e.g., ".js")
 	Wrap func(code string) string // wraps user code with language boilerplate
 }
 
@@ -405,77 +405,77 @@ func pyWrapper(code string) string {
 
 // goStdImportAliases maps common package selectors to their import paths.
 var goStdImportAliases = map[string]string{
-	"fmt":        "fmt",
-	"os":         "os",
-	"strings":    "strings",
-	"strconv":    "strconv",
-	"time":       "time",
-	"bytes":      "bytes",
-	"io":         "io",
-	"bufio":      "bufio",
-	"errors":     "errors",
-	"sort":       "sort",
-	"math":       "math",
-	"sync":       "sync",
-	"context":    "context",
-	"regexp":     "regexp",
-	"log":        "log",
-	"filepath":   "path/filepath",
-	"json":       "encoding/json",
-	"base64":     "encoding/base64",
-	"http":       "net/http",
-	"url":        "net/url",
-	"ioutil":     "io/ioutil",
-	"exec":       "os/exec",
-	"path":       "path",
-	"unicode":    "unicode",
-	"utf8":       "unicode/utf8",
-	"hex":        "encoding/hex",
-	"sha256":     "crypto/sha256",
-	"md5":        "crypto/md5",
-	"rand":       "math/rand",
-	"big":        "math/big",
-	"reflect":    "reflect",
-	"runtime":    "runtime",
-	"flag":       "flag",
-	"net":        "net",
-	"template":   "text/template",
-	"html":       "html",
-	"csv":        "encoding/csv",
-	"gzip":       "compress/gzip",
-	"tar":        "archive/tar",
-	"zip":        "archive/zip",
-	"syscall":    "syscall",
-	"atomic":     "sync/atomic",
-	"binary":     "encoding/binary",
-	"xml":        "encoding/xml",
-	"sql":        "database/sql",
-	"tls":        "crypto/tls",
-	"x509":       "crypto/x509",
-	"hmac":       "crypto/hmac",
-	"sha1":       "crypto/sha1",
-	"sha512":     "crypto/sha512",
-	"aes":        "crypto/aes",
-	"cipher":     "crypto/cipher",
-	"elliptic":   "crypto/elliptic",
-	"ecdsa":      "crypto/ecdsa",
-	"rsa":        "crypto/rsa",
-	"ed25519":    "crypto/ed25519",
-	"pem":        "encoding/pem",
-	"ascii85":    "encoding/ascii85",
-	"gob":        "encoding/gob",
-	"tabwriter":  "text/tabwriter",
-	"scanner":    "text/scanner",
-	"parser":     "go/parser",
-	"ast":        "go/ast",
-	"token":      "go/token",
-	"format":     "go/format",
-	"printer":    "go/printer",
-	"types":      "go/types",
-	"constant":   "go/constant",
-	"build":      "go/build",
-	"doc":        "go/doc",
-	"importer":   "go/importer",
+	"fmt":       "fmt",
+	"os":        "os",
+	"strings":   "strings",
+	"strconv":   "strconv",
+	"time":      "time",
+	"bytes":     "bytes",
+	"io":        "io",
+	"bufio":     "bufio",
+	"errors":    "errors",
+	"sort":      "sort",
+	"math":      "math",
+	"sync":      "sync",
+	"context":   "context",
+	"regexp":    "regexp",
+	"log":       "log",
+	"filepath":  "path/filepath",
+	"json":      "encoding/json",
+	"base64":    "encoding/base64",
+	"http":      "net/http",
+	"url":       "net/url",
+	"ioutil":    "io/ioutil",
+	"exec":      "os/exec",
+	"path":      "path",
+	"unicode":   "unicode",
+	"utf8":      "unicode/utf8",
+	"hex":       "encoding/hex",
+	"sha256":    "crypto/sha256",
+	"md5":       "crypto/md5",
+	"rand":      "math/rand",
+	"big":       "math/big",
+	"reflect":   "reflect",
+	"runtime":   "runtime",
+	"flag":      "flag",
+	"net":       "net",
+	"template":  "text/template",
+	"html":      "html",
+	"csv":       "encoding/csv",
+	"gzip":      "compress/gzip",
+	"tar":       "archive/tar",
+	"zip":       "archive/zip",
+	"syscall":   "syscall",
+	"atomic":    "sync/atomic",
+	"binary":    "encoding/binary",
+	"xml":       "encoding/xml",
+	"sql":       "database/sql",
+	"tls":       "crypto/tls",
+	"x509":      "crypto/x509",
+	"hmac":      "crypto/hmac",
+	"sha1":      "crypto/sha1",
+	"sha512":    "crypto/sha512",
+	"aes":       "crypto/aes",
+	"cipher":    "crypto/cipher",
+	"elliptic":  "crypto/elliptic",
+	"ecdsa":     "crypto/ecdsa",
+	"rsa":       "crypto/rsa",
+	"ed25519":   "crypto/ed25519",
+	"pem":       "encoding/pem",
+	"ascii85":   "encoding/ascii85",
+	"gob":       "encoding/gob",
+	"tabwriter": "text/tabwriter",
+	"scanner":   "text/scanner",
+	"parser":    "go/parser",
+	"ast":       "go/ast",
+	"token":     "go/token",
+	"format":    "go/format",
+	"printer":   "go/printer",
+	"types":     "go/types",
+	"constant":  "go/constant",
+	"build":     "go/build",
+	"doc":       "go/doc",
+	"importer":  "go/importer",
 }
 
 // goSelectorRe matches pkg.Ident uses (simple heuristic for import detection).
@@ -575,10 +575,10 @@ func csWrapper(code string) string {
 
 // tsNodeAvailable caches typescript runtime detection result.
 var (
-	tsNodeAvailable  bool
-	tsNodePath       string
-	tsNodeCheckOnce  sync.Once
-	tsNodePathMu     sync.Mutex
+	tsNodeAvailable bool
+	tsNodePath      string
+	tsNodeCheckOnce sync.Once
+	tsNodePathMu    sync.Mutex
 )
 
 // detectTsNode probes for a local ts-node installation without network access.

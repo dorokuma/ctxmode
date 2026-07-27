@@ -75,9 +75,9 @@ func TestStressConcurrentWriteRead(t *testing.T) {
 
 	// Stats.
 	type record struct {
-		success  bool
-		latency  time.Duration
-		errType  string // "" = success, "sqlite_busy", "other_error"
+		success bool
+		latency time.Duration
+		errType string // "" = success, "sqlite_busy", "other_error"
 	}
 	var mu sync.Mutex
 	var records []record

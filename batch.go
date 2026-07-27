@@ -42,11 +42,11 @@ type batchResult struct {
 }
 
 type batchResponse struct {
-	Commands       []batchResult          `json:"commands"`
-	Indexed        int                    `json:"indexed"`
-	IndexFailures  int                    `json:"index_failures,omitempty"`
-	Truncated      bool                   `json:"truncated"`
-	Search         map[string][]searchHit `json:"search,omitempty"`
+	Commands      []batchResult          `json:"commands"`
+	Indexed       int                    `json:"indexed"`
+	IndexFailures int                    `json:"index_failures,omitempty"`
+	Truncated     bool                   `json:"truncated"`
+	Search        map[string][]searchHit `json:"search,omitempty"`
 }
 
 type searchHit struct {

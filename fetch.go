@@ -28,8 +28,8 @@ const (
 	maxRedirects        = 5
 	maxBodySize         = 10 * 1024 * 1024 // 10 MB
 	defaultMaxBytes     = 50 * 1024        // 50 KB return limit
-	defaultTTL         = 24 * time.Hour
-	maxConcurrency     = 8
+	defaultTTL          = 24 * time.Hour
+	maxConcurrency      = 8
 )
 
 // fetchGroup deduplicates concurrent fetches for the same URL+source.
@@ -57,15 +57,15 @@ type FetchResult struct {
 
 // fetchArgs is the JSON schema for the ctx_fetch_and_index tool.
 type fetchArgs struct {
-	URL        string   `json:"url,omitempty" jsonschema:"Single URL to fetch"`
-	URLs       []string `json:"urls,omitempty" jsonschema:"URLs to fetch (up to 10)"`
-	Source     string   `json:"source,omitempty" jsonschema:"Label for indexed content"`
-	Format     string   `json:"format,omitempty" jsonschema:"Output format (markdown/html/json, default markdown)"`
-	Force      bool     `json:"force,omitempty" jsonschema:"Skip cache and re-fetch"`
-	MaxBytes   int      `json:"maxBytes,omitempty" jsonschema:"Max bytes to return (default 50KB)"`
-	TimeoutMs  int      `json:"timeoutMs,omitempty" jsonschema:"Timeout in ms (default 150000)"`
-	TTL        *int     `json:"ttl,omitempty" jsonschema:"Cache TTL in ms (0 = skip cache, omit = 24h default)"`
-} 
+	URL       string   `json:"url,omitempty" jsonschema:"Single URL to fetch"`
+	URLs      []string `json:"urls,omitempty" jsonschema:"URLs to fetch (up to 10)"`
+	Source    string   `json:"source,omitempty" jsonschema:"Label for indexed content"`
+	Format    string   `json:"format,omitempty" jsonschema:"Output format (markdown/html/json, default markdown)"`
+	Force     bool     `json:"force,omitempty" jsonschema:"Skip cache and re-fetch"`
+	MaxBytes  int      `json:"maxBytes,omitempty" jsonschema:"Max bytes to return (default 50KB)"`
+	TimeoutMs int      `json:"timeoutMs,omitempty" jsonschema:"Timeout in ms (default 150000)"`
+	TTL       *int     `json:"ttl,omitempty" jsonschema:"Cache TTL in ms (0 = skip cache, omit = 24h default)"`
+}
 
 // ---------- SSRF validation ----------
 

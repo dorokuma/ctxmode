@@ -493,7 +493,8 @@ func (s *Store) Stats() (docCount int, dbSize int64, err error) {
 
 	// Get the database file path from the connection.
 	var dbPath string
-	var dbSeq int; var dbName string
+	var dbSeq int
+	var dbName string
 	if err := s.db.QueryRow(`PRAGMA database_list`).Scan(&dbSeq, &dbName, &dbPath); err != nil {
 		// Non-fatal; return 0 for size.
 		dbSize = 0
@@ -589,7 +590,8 @@ func (s *Store) Close() error {
 // DBPath returns the filesystem path of the database file.
 func (s *Store) DBPath() string {
 	var dbPath string
-	var dbSeq int; var dbName string
+	var dbSeq int
+	var dbName string
 	// Try to get the database path from SQLite's database_list pragma.
 	if err := s.db.QueryRow(`PRAGMA database_list`).Scan(&dbSeq, &dbName, &dbPath); err != nil {
 		// Fallback: return empty string; caller should handle.

@@ -165,14 +165,34 @@ func TestNewStore_Chmod0600(t *testing.T) {
 		t.Fatalf("NewStore: %v", err)
 	}
 	defer st.Close()
-	fi, err := os.Stat(dbPath)
-	if err != nil {
-		t.Fatal(err)
+
+	// assertPrivate fails only if p exists and has group/other bits set.
+	// -wal/-shm may not exist until a write, so absence is not a failure.
+	assertPrivate := func(label, p string) {
+		fi, err := os.Stat(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return
+			}
+			t.Fatalf("stat %s: %v", label, err)
+		}
+		if mode := fi.Mode().Perm(); mode&0o077 != 0 {
+			t.Fatalf("%s permissions too open: %o (want 0600)", label, mode)
+		}
 	}
-	mode := fi.Mode().Perm()
-	if mode&0o077 != 0 {
-		t.Fatalf("db permissions too open: %o (want 0600)", mode)
+
+	// After NewStore the main DB and any WAL/SHM sidecars must be 0600.
+	assertPrivate("db", dbPath)
+	assertPrivate("-wal", dbPath+"-wal")
+	assertPrivate("-shm", dbPath+"-shm")
+
+	// A real app write creates/extends the WAL; perms must stay 0600.
+	if err := st.Index("test/path", "content to trigger a WAL write"); err != nil {
+		t.Fatalf("Index: %v", err)
 	}
+	assertPrivate("db", dbPath)
+	assertPrivate("-wal", dbPath+"-wal")
+	assertPrivate("-shm", dbPath+"-shm")
 }
 
 // ---------- #8 session exact purge ----------
@@ -485,8 +505,8 @@ func TestAutoIndex_FailureHasPreviewNotIndexedAs(t *testing.T) {
 	}
 
 	// Produce >100KB stdout so the unconditional auto-index branch runs.
-	// python is widely available; fall back to shell printf if needed.
-	code := `python3 -c "print('X'*110000)"`
+	// Pure shell, no external runtime dependency: 110000 null bytes -> 'X'.
+	code := `head -c 110000 /dev/zero | tr '\0' X`
 	res, _, err := s.toolExecute(context.Background(), nil, executeArgs{
 		Command:  code,
 		Language: "shell",
