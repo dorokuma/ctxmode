@@ -1,5 +1,8 @@
 // ctxmode: a Go MCP server that virtualizes tool output to save context tokens.
-// Registers: ctx_execute, ctx_execute_file, ctx_index, ctx_search, ctx_stats, ctx_fetch_and_index, ctx_batch_execute, ctx_doctor, ctx_purge, ctx_background_list, ctx_background_kill.
+// Registers: ctx_execute, ctx_execute_file, ctx_index, ctx_search, ctx_stats, ctx_fetch_and_index,
+// ctx_batch_execute, ctx_doctor, ctx_purge, ctx_background_list, ctx_background_kill,
+// ctx_background_log, ctx_background_wait, ctx_ls, ctx_glob, ctx_stat, ctx_rg,
+// ctx_git_status, ctx_git_diff, ctx_git_log, ctx_run_task.
 package main
 
 import (
@@ -22,7 +25,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "1.2.0"
+const Version = "1.3.0"
 
 // toolIndex walk / size limits.
 const (
@@ -35,6 +38,7 @@ const (
 
 type server struct {
 	workdirs       []string
+	policy         *ShellPolicy
 	mu             sync.Mutex
 	store          *Store
 	floodGuard     *FloodGuard
@@ -59,11 +63,12 @@ func main() {
 	flag.StringVar(&configPath, "config", "", "path to config file")
 	flag.Parse()
 
-	// Load workdirs from config file (or fall back to cwd).
-	workdirs, err := loadConfig(configPath)
+	// Load workdirs + policy from config file (or fall back to cwd / default denylist).
+	cfg, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
+	workdirs := cfg.Workdirs
 
 	// If -workdir flag was given, prepend it (backward compatibility).
 	if workdir != "" {
@@ -102,6 +107,12 @@ func main() {
 		fatal(nil, "no workspace directories configured")
 	}
 
+	// Rebuild policy with final absolute workdirs.
+	policy, err := NewShellPolicy(cfg.ShellPolicy, workdirs)
+	if err != nil {
+		log.Fatalf("failed to build shell policy: %v", err)
+	}
+
 	store, err := NewStore(filepath.Join(workdirs[0], "context_mode.db"))
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
@@ -113,6 +124,7 @@ func main() {
 
 	s := &server{
 		workdirs:       workdirs,
+		policy:         policy,
 		store:          store,
 		floodGuard:     floodGuard,
 		searchPipeline: searchPipeline,
@@ -127,7 +139,7 @@ func main() {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_execute",
-		Description: "Run code in a sandboxed subprocess. Supports 12 languages (javascript, typescript, python, shell, go, rust, php, perl, ruby, r, elixir, csharp). Heavy outputs are auto-indexed to prevent flooding the context window.",
+		Description: "Run code in a subprocess. Supports 12 languages (javascript, typescript, python, shell, go, rust, php, perl, ruby, r, elixir, csharp). Prefer argv over command for shell-free exec. Optional env (allowlist) and stdin. Heavy outputs are auto-indexed. The command policy is not an OS sandbox. Note: ctx_batch_execute does not support argv/env/stdin.",
 	}, s.toolExecute)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -180,6 +192,56 @@ func main() {
 		Description: "Kill a background process by id (from ctx_background_list) or by PID.",
 	}, s.toolBackgroundKill)
 
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_background_log",
+		Description: "Return the captured stdout/stderr tail of a background process by id or PID.",
+	}, s.toolBackgroundLog)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_background_wait",
+		Description: "Wait for a background process to exit (or timeout). Returns done/exit_code and log tail. Does not kill on timeout.",
+	}, s.toolBackgroundWait)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_ls",
+		Description: "List directory entries under a workspace path. Supports limited recursion (depth), hidden files, and result limits. Paths are sandboxed to configured workdirs.",
+	}, s.toolLs)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_glob",
+		Description: "Glob files under a workspace path (supports **). Skips .git/node_modules/vendor and basic .gitignore rules. Truncates at limit.",
+	}, s.toolGlob)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_stat",
+		Description: "Stat a file or directory: size, mode, mtime, is_dir, is_symlink, symlink target, and workdir containment.",
+	}, s.toolStat)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_rg",
+		Description: "Search file contents with regex (or literal). Prefers system rg; pure-Go fallback. Skips binaries and .git. Results are path:line:content.",
+	}, s.toolRg)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_git_status",
+		Description: "Structured git status (--porcelain=v1 -b) for a workdir path. Fails clearly when not a git repository. Read-only; no commit/push/reset.",
+	}, s.toolGitStatus)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_git_diff",
+		Description: "Structured git diff (optional pathspec/stat/staged/unified). Output hard-truncated (200KB / 2000 lines). Paths sandboxed to workdirs. Read-only.",
+	}, s.toolGitDiff)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_git_log",
+		Description: "Structured git log (n default 20, hard max 100; oneline default). Optional pathspec. Read-only; no commit/push/reset.",
+	}, s.toolGitLog)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_run_task",
+		Description: "Structured test/build entrypoint (go_test|go_build|go_vet|npm_test|npm_run_build|cargo_test|cargo_build|make|custom). Fixed argv, no shell. Large output auto-indexed. Prefer over ad-hoc ctx_execute for CI-like tasks.",
+	}, s.toolRunTask)
+
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		fatal(store, "server exited: %v", err)
 	}
@@ -187,10 +249,18 @@ func main() {
 
 // ---------- configuration ----------
 
-// loadConfig reads workdirs from a YAML config file.
+// appConfig is the fully loaded runtime configuration.
+type appConfig struct {
+	Workdirs    []string
+	ShellPolicy ShellPolicyConfig
+}
+
+// loadConfig reads workdirs and optional policy from a YAML config file.
 // Priority: -config flag > $CTXMODE_CONFIG env > ./ctxmode-config.yaml > ~/.config/ctxmode/config.yaml.
 // If no config file is found, falls back to a single workdir from cwd (backward compatible).
-func loadConfig(configFlag string) ([]string, error) {
+// Policy defaults to mode=denylist (built-in high-risk commands/patterns).
+// Explicit mode=off|allowlist and CTXMODE_POLICY_MODE override apply in NewShellPolicy.
+func loadConfig(configFlag string) (*appConfig, error) {
 	var configPath string
 	switch {
 	case configFlag != "":
@@ -208,12 +278,14 @@ func loadConfig(configFlag string) ([]string, error) {
 		}
 	}
 
+	out := &appConfig{}
 	if configPath == "" {
 		wd, err := os.Getwd()
 		if err != nil {
 			return nil, fmt.Errorf("cannot get cwd: %w", err)
 		}
-		return []string{wd}, nil
+		out.Workdirs = []string{wd}
+		return out, nil
 	}
 
 	data, err := os.ReadFile(configPath)
@@ -223,39 +295,50 @@ func loadConfig(configFlag string) ([]string, error) {
 
 	var cfg struct {
 		Workdirs []string `yaml:"workdirs"`
+		Policy   struct {
+			Shell ShellPolicyConfig `yaml:"shell"`
+		} `yaml:"policy"`
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", configPath, err)
 	}
+
+	out.ShellPolicy = cfg.Policy.Shell
 
 	if len(cfg.Workdirs) == 0 {
 		wd, err := os.Getwd()
 		if err != nil {
 			return nil, fmt.Errorf("no workdirs in config and cannot get cwd: %w", err)
 		}
-		return []string{wd}, nil
+		out.Workdirs = []string{wd}
+		return out, nil
 	}
 
-	return cfg.Workdirs, nil
+	out.Workdirs = cfg.Workdirs
+	return out, nil
 }
 
 // ---------- tool implementations ----------
 
 type executeArgs struct {
-	Command    string `json:"command,omitempty" jsonschema:"Command or code to execute"`
-	Language   string `json:"language,omitempty" jsonschema:"Runtime language (javascript/python/shell/go/...)"`
-	Timeout    int    `json:"timeout,omitempty" jsonschema:"Max execution time in ms"`
-	Background bool   `json:"background,omitempty" jsonschema:"Keep running after timeout (for servers/daemons)"`
-	Intent     string `json:"intent,omitempty" jsonschema:"What you're looking for in the output (for auto-indexing)"`
-	CWD        string `json:"cwd,omitempty" jsonschema:"Working directory"`
+	Command    string            `json:"command,omitempty" jsonschema:"Command or code to execute (ignored when argv is non-empty)"`
+	Language   string            `json:"language,omitempty" jsonschema:"Runtime language (javascript/python/shell/go/...). Ignored in argv mode"`
+	Timeout    int               `json:"timeout,omitempty" jsonschema:"Max execution time in ms"`
+	Background bool              `json:"background,omitempty" jsonschema:"Keep running after timeout (for servers/daemons)"`
+	Intent     string            `json:"intent,omitempty" jsonschema:"What you're looking for in the output (for auto-indexing)"`
+	CWD        string            `json:"cwd,omitempty" jsonschema:"Working directory"`
+	Argv       []string          `json:"argv,omitempty" jsonschema:"If non-empty, exec directly without shell (preferred over command). argv[0]=executable"`
+	Env        map[string]string `json:"env,omitempty" jsonschema:"Extra env vars (allowlist only; never PATH/HOME/LD_*). Merged onto process env"`
+	Stdin      string            `json:"stdin,omitempty" jsonschema:"Stdin payload written to the process then closed (max 1MB)"`
 }
 
 func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args executeArgs) (*mcp.CallToolResult, any, error) {
-	if args.Command == "" {
-		return nil, nil, fmt.Errorf("command is required")
+	useArgv := len(args.Argv) > 0
+	if !useArgv && args.Command == "" {
+		return nil, nil, fmt.Errorf("command is required (or provide non-empty argv)")
 	}
 
-	// Default language is shell (backward compatible).
+	// Default language is shell (backward compatible). In argv mode language is ignored.
 	language := args.Language
 	if language == "" {
 		language = "shell"
@@ -280,15 +363,54 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		cwd = resolved
 	}
 
-	// Execute code in the sandbox.
-	result, err := runCode(ctx, language, args.Command, cwd, timeout, args.Background)
+	// Validate env allowlist and stdin size.
+	filteredEnv, err := filterExecEnv(args.Env)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(args.Stdin) > maxStdinBytes {
+		return nil, nil, fmt.Errorf("stdin exceeds maximum size (%d bytes, max %d)", len(args.Stdin), maxStdinBytes)
+	}
+	var opts *runOptions
+	if len(filteredEnv) > 0 || args.Stdin != "" {
+		opts = &runOptions{Env: filteredEnv, Stdin: args.Stdin}
+	}
+
+	// Execute: argv mode (no shell) takes priority over command string.
+	var result *executeResult
+	if useArgv {
+		argv, aerr := s.validateArgv(args.Argv, cwd)
+		if aerr != nil {
+			return nil, nil, aerr
+		}
+		if err := s.checkArgvPolicy(argv, cwd); err != nil {
+			return nil, nil, err
+		}
+		result, err = runArgv(ctx, argv, cwd, timeout, args.Background, opts)
+	} else {
+		// Shell policy applies to language=shell (default) command strings.
+		if language == "shell" {
+			if err := s.checkShellPolicy(args.Command, cwd); err != nil {
+				return nil, nil, err
+			}
+		}
+		result, err = runCodeOpts(ctx, language, args.Command, cwd, timeout, args.Background, opts)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
 
 	// Track stats.
+	inputLen := len(args.Command)
+	if useArgv {
+		inputLen = 0
+		for _, a := range args.Argv {
+			inputLen += len(a) + 1
+		}
+	}
+	inputLen += len(args.Stdin)
 	s.mu.Lock()
-	s.totalInput += int64(len(args.Command))
+	s.totalInput += int64(inputLen)
 	s.totalOutput += int64(len(result.Stdout) + len(result.Stderr))
 	s.mu.Unlock()
 
@@ -343,7 +465,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{
 				Text: fmt.Sprintf("Output is too large (%d bytes). Indexed as %q. Use ctx_search(queries: [%q]) to search the indexed content.",
-					len(outputText), label, args.Intent),
+					len(outputText), label, label),
 			}},
 		}, nil, nil
 	}
@@ -705,6 +827,13 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		cwd = resolved
 	}
 
+	// Shell policy on user code only (not the FILE_CONTENT injection wrapper).
+	if language == "shell" {
+		if err := s.checkShellPolicy(args.Code, cwd); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	// Inject FILE_CONTENT into user code.
 	injectedCode := injectFileContent(language, args.Code, string(fileContent))
 
@@ -960,6 +1089,63 @@ func (s *server) storeIndexLocked(path, content string) error {
 	return s.store.Index(path, content)
 }
 
+// checkShellPolicy applies the configured shell command policy (no-op when mode=off).
+func (s *server) checkShellPolicy(command, cwd string) error {
+	if s == nil || s.policy == nil {
+		return nil
+	}
+	return s.policy.CheckShell(command, cwd)
+}
+
+// checkArgvPolicy applies allowlist/denylist to direct-exec argv (with cwd for rm paths).
+func (s *server) checkArgvPolicy(argv []string, cwd string) error {
+	if s == nil || s.policy == nil {
+		return nil
+	}
+	return s.policy.CheckArgv(argv, cwd)
+}
+
+// validateArgv checks argv for ctx_execute argv mode.
+// argv[0] must be a simple executable name (no path separators) or a path
+// resolved inside a workdir. Empty argv / empty argv[0] are rejected.
+func (s *server) validateArgv(argv []string, cwd string) ([]string, error) {
+	if len(argv) == 0 {
+		return nil, fmt.Errorf("argv must not be empty")
+	}
+	exe := argv[0]
+	if exe == "" {
+		return nil, fmt.Errorf("argv[0] must not be empty")
+	}
+	// Absolute or relative path -> must stay inside workspaces.
+	if strings.Contains(exe, "/") || strings.Contains(exe, string(filepath.Separator)) ||
+		strings.Contains(exe, `\`) || exe == "." || exe == ".." || strings.HasPrefix(exe, ".") {
+		target := exe
+		if !filepath.IsAbs(target) {
+			if cwd == "" {
+				cwd = s.workdirs[0]
+			}
+			target = filepath.Join(cwd, target)
+		}
+		target = filepath.Clean(target)
+		if !s.lexicallyInside(target) {
+			return nil, fmt.Errorf("argv[0] path %q is outside all workspaces", exe)
+		}
+		resolved, err := s.ensureInsideWorkspaces(target)
+		if err != nil {
+			return nil, fmt.Errorf("argv[0] path invalid: %w", err)
+		}
+		out := make([]string, len(argv))
+		copy(out, argv)
+		out[0] = resolved
+		return out, nil
+	}
+	// Simple name: no path traversal.
+	if strings.Contains(exe, "..") {
+		return nil, fmt.Errorf("argv[0] %q is invalid", exe)
+	}
+	return argv, nil
+}
+
 // resolvePath converts a user-supplied path into an absolute path within any workspace.
 // After Clean, it resolves symlinks (EvalSymlinks) and re-checks that the real
 // path still lies inside a configured workdir. Symlinks that escape are rejected.
@@ -1057,18 +1243,31 @@ func (s *server) excludeFromGit() {
 // excludeFromGitOne handles a single workspace's git exclusion.
 func (s *server) excludeFromGitOne(wd string) {
 	gitDir := filepath.Join(wd, ".git")
-	info, err := os.Stat(gitDir)
-	if err != nil || !info.IsDir() {
+	info, err := os.Lstat(gitDir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return
 	}
 	excludePath := filepath.Join(gitDir, "info", "exclude")
+	if _, err := s.ensureInsideWorkspaces(excludePath); err != nil {
+		log.Printf("excludeFromGit: unsafe path %s: %v", excludePath, err)
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(excludePath), 0755); err != nil {
 		log.Printf("excludeFromGit: MkdirAll %s: %v", filepath.Dir(excludePath), err)
 		return
 	}
-	data, err := os.ReadFile(excludePath)
+	if li, err := os.Lstat(excludePath); err == nil && li.Mode()&os.ModeSymlink != 0 {
+		log.Printf("excludeFromGit: refusing symlink %s", excludePath)
+		return
+	}
+	resolvedExclude, err := s.ensureInsideWorkspaces(excludePath)
+	if err != nil {
+		log.Printf("excludeFromGit: unsafe path %s: %v", excludePath, err)
+		return
+	}
+	data, err := os.ReadFile(resolvedExclude)
 	if err != nil && !os.IsNotExist(err) {
-		log.Printf("excludeFromGit: ReadFile %s: %v", excludePath, err)
+		log.Printf("excludeFromGit: ReadFile %s: %v", resolvedExclude, err)
 	}
 	content := ""
 	if err == nil {
@@ -1077,17 +1276,17 @@ func (s *server) excludeFromGitOne(wd string) {
 	if strings.Contains(content, "context_mode.db") {
 		return
 	}
-	f, err := os.OpenFile(excludePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(resolvedExclude, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Printf("excludeFromGit: OpenFile %s: %v", excludePath, err)
+		log.Printf("excludeFromGit: OpenFile %s: %v", resolvedExclude, err)
 		return
 	}
 	defer f.Close()
 	if _, err := f.WriteString("\n# ctxmode local database\ncontext_mode.db\ncontext_mode.db-wal\ncontext_mode.db-shm\n"); err != nil {
-		log.Printf("excludeFromGit: WriteString %s: %v", excludePath, err)
+		log.Printf("excludeFromGit: WriteString %s: %v", resolvedExclude, err)
 		return
 	}
 	if err := f.Sync(); err != nil {
-		log.Printf("excludeFromGit: Sync %s: %v", excludePath, err)
+		log.Printf("excludeFromGit: Sync %s: %v", resolvedExclude, err)
 	}
 }

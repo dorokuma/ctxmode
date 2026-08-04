@@ -65,6 +65,30 @@ func TestResolvePath_SymlinkInsideOK(t *testing.T) {
 	}
 }
 
+func TestExcludeFromGit_RefusesSymlinkGitDir(t *testing.T) {
+	wd := t.TempDir()
+	outside := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(outside, "info"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(outside, "info", "exclude")
+	if err := os.WriteFile(target, []byte("sentinel\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(wd, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{workdirs: []string{wd}}
+	s.excludeFromGitOne(wd)
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "sentinel\n" {
+		t.Fatalf("outside exclude file was modified: %q", data)
+	}
+}
+
 // ---------- #3 python trailing backslash ----------
 
 func TestInjectFileContent_PythonTrailingBackslash(t *testing.T) {
@@ -429,8 +453,9 @@ func TestValidateURL_AllowsIfAnyIPSafe(t *testing.T) {
 // ---------- #13 version constant ----------
 
 func TestVersionAligned(t *testing.T) {
-	if Version != "1.2.0" {
-		t.Fatalf("Version=%q, want 1.2.0 (CHANGELOG)", Version)
+	// Keep in sync with CHANGELOG release label.
+	if Version != "1.3.0" {
+		t.Fatalf("Version=%q, want 1.3.0 (CHANGELOG)", Version)
 	}
 }
 

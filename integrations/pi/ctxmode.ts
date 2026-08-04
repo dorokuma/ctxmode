@@ -184,21 +184,48 @@ class CtxmodeClient {
     this.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params: params || {} }) + "\n")
   }
 
+  /** Per-tool client timeout. Long tasks (run_task/execute/batch) need ≥ server budget. */
+  private timeoutForTool(name: string, args: Record<string, unknown>): number {
+    const fromArgs =
+      typeof args.timeout_ms === "number" && args.timeout_ms > 0
+        ? args.timeout_ms
+        : typeof args.timeout === "number" && args.timeout > 0
+          ? args.timeout
+          : 0
+    // Server defaults: run_task 300s, execute often 30s–hours; keep buffer for MCP overhead.
+    let base = REQUEST_TIMEOUT_MS
+    if (name === "ctx_run_task") {
+      base = Math.max(REQUEST_TIMEOUT_MS, (fromArgs || 300000) + 30000)
+    } else if (name === "ctx_execute" || name === "ctx_execute_file" || name === "ctx_batch_execute") {
+      base = Math.max(REQUEST_TIMEOUT_MS, (fromArgs || 120000) + 30000)
+    } else if (name === "ctx_background_wait") {
+      base = Math.max(REQUEST_TIMEOUT_MS, (fromArgs || 60000) + 15000)
+    }
+    // Cap at 1h + buffer (server max).
+    return Math.min(base, 3600000 + 60000)
+  }
+
   async callTool(name: string, args: Record<string, unknown>): Promise<string> {
     if (!this.initialized) {
       await this.start()
     }
     if (!this.initialized) throw new Error("ctxmode not initialized")
+    const timeoutMs = this.timeoutForTool(name, args)
     try {
-      const result = await this.sendRequest("tools/call", { name, arguments: args })
+      const result = await this.sendRequest("tools/call", { name, arguments: args }, timeoutMs)
       const text = result.content?.map((c) => c.text).join("\n") || ""
       this.restartAttempts = 0
       return compressToolText(text)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      if (/not running|disconnected|timed out/i.test(msg)) {
+      // Do not restart+retry on tool-call timeout: long jobs may still be running
+      // server-side and a retry would duplicate work / orphan processes.
+      if (/timed out/i.test(msg)) {
+        throw err
+      }
+      if (/not running|disconnected/i.test(msg)) {
         await this.start()
-        const result = await this.sendRequest("tools/call", { name, arguments: args })
+        const result = await this.sendRequest("tools/call", { name, arguments: args }, timeoutMs)
         const text = result.content?.map((c) => c.text).join("\n") || ""
         return compressToolText(text)
       }
@@ -208,7 +235,29 @@ class CtxmodeClient {
 
   getTools(): string[] {
     // We know the tools statically; no need to query.
-    return ["ctx_execute", "ctx_execute_file", "ctx_index", "ctx_search", "ctx_stats", "ctx_fetch_and_index", "ctx_batch_execute", "ctx_doctor", "ctx_purge"]
+    return [
+      "ctx_execute",
+      "ctx_execute_file",
+      "ctx_index",
+      "ctx_search",
+      "ctx_stats",
+      "ctx_fetch_and_index",
+      "ctx_batch_execute",
+      "ctx_doctor",
+      "ctx_purge",
+      "ctx_ls",
+      "ctx_glob",
+      "ctx_stat",
+      "ctx_rg",
+      "ctx_git_status",
+      "ctx_git_diff",
+      "ctx_git_log",
+      "ctx_run_task",
+      "ctx_background_list",
+      "ctx_background_kill",
+      "ctx_background_log",
+      "ctx_background_wait",
+    ]
   }
 
   private scheduleRestart() {
@@ -349,20 +398,24 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
   pi.registerTool({
     name: "ctx_execute",
     label: "CTX Execute",
-    description: "跑一段代码或 shell 命令。支持 12 种语言（javascript, typescript, python, shell, go, rust, php, perl, ruby, r, elixir, csharp）。大输出自动索引到 FTS5，不占上下文窗口。",
+    description: "跑一段代码或 shell 命令。支持 12 种语言。优先用 argv 直接 exec（不经 sh -c）；可选 env（白名单）与 stdin（≤1MB）。大输出自动索引。batch_execute 不支持 argv/env/stdin。",
     promptSnippet: "Run code or shell commands with auto-indexing for large output",
     promptGuidelines: [
       "Use ctx_execute for any command where output length is uncertain. When in doubt, use it.",
-      "Use ctx_execute for: git log/diff, build output, test output, docker/kubectl, curl, any command that might produce lots of output.",
+      "Prefer argv over command for simple binaries (no shell injection). Prefer ctx_git_* for git status/diff/log. Prefer ctx_run_task for go/npm/cargo/make test and build.",
+      "env is allowlist-only (GO*, NODE_ENV, CI, CTXMODE_*); PATH/HOME/LD_PRELOAD rejected.",
       "Do NOT use ctx_execute for: pwd, whoami, echo, or commands where you need exact untruncated output.",
     ],
     parameters: Type.Object({
-      command: Type.String({ description: "Command or code to execute" }),
-      language: Type.Optional(Type.String({ description: "Runtime language (javascript/python/shell/go/...). Default: shell" })),
+      command: Type.Optional(Type.String({ description: "Command or code to execute (ignored when argv is set)" })),
+      language: Type.Optional(Type.String({ description: "Runtime language (javascript/python/shell/go/...). Ignored in argv mode. Default: shell" })),
       timeout: Type.Optional(Type.Number({ description: "Max execution time in ms" })),
       background: Type.Optional(Type.Boolean({ description: "Keep running after timeout (for servers/daemons)" })),
       intent: Type.Optional(Type.String({ description: "What you're looking for in the output (for auto-indexing)" })),
       cwd: Type.Optional(Type.String({ description: "Working directory" })),
+      argv: Type.Optional(Type.Array(Type.String(), { description: "If non-empty, exec directly without shell (preferred over command)" })),
+      env: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Extra env (allowlist only; merged onto process env)" })),
+      stdin: Type.Optional(Type.String({ description: "Stdin payload (max 1MB); written then closed" })),
     }),
     async execute(_id, params) {
       return run("ctx_execute", params as Record<string, unknown>)
@@ -528,6 +581,254 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
     }),
     async execute(_id, params) {
       return run("ctx_purge", params as Record<string, unknown>)
+    },
+  })
+
+  // ctx_ls
+  pi.registerTool({
+    name: "ctx_ls",
+    label: "CTX LS",
+    description: "列目录（depth/limit/hidden），路径限制在 workdir 内。",
+    promptSnippet: "List directory entries under workspace",
+    promptGuidelines: [
+      "Use ctx_ls instead of shell ls when you need a bounded, workdir-limited listing.",
+    ],
+    parameters: Type.Object({
+      path: Type.Optional(Type.String({ description: "Directory path (default: .)" })),
+      depth: Type.Optional(Type.Number({ description: "Recursion depth 1-5 (default: 1)" })),
+      include_hidden: Type.Optional(Type.Boolean({ description: "Include dotfiles (default: false)" })),
+      limit: Type.Optional(Type.Number({ description: "Max entries (default: 200)" })),
+    }),
+    async execute(_id, params) {
+      return run("ctx_ls", params as Record<string, unknown>)
+    },
+  })
+
+  // ctx_glob
+  pi.registerTool({
+    name: "ctx_glob",
+    label: "CTX Glob",
+    description: "在 workdir 下按 glob 匹配文件（支持 **），跳过 .git/node_modules/vendor。",
+    promptSnippet: "Glob files under workspace",
+    promptGuidelines: [
+      "Use ctx_glob to find files by pattern without shell find.",
+    ],
+    parameters: Type.Object({
+      pattern: Type.String({ description: "Glob pattern (e.g. **/*.go)" }),
+      path: Type.Optional(Type.String({ description: "Search root (default: .)" })),
+      limit: Type.Optional(Type.Number({ description: "Max matches (default: 200)" })),
+    }),
+    async execute(_id, params) {
+      return run("ctx_glob", params as Record<string, unknown>)
+    },
+  })
+
+  // ctx_stat
+  pi.registerTool({
+    name: "ctx_stat",
+    label: "CTX Stat",
+    description: "查看文件元数据：size/mode/mtime/symlink/是否在 workdir。",
+    promptSnippet: "Stat a file or directory",
+    promptGuidelines: [
+      "Use ctx_stat for file metadata without shell stat.",
+    ],
+    parameters: Type.Object({
+      path: Type.String({ description: "File or directory path" }),
+    }),
+    async execute(_id, params) {
+      return run("ctx_stat", params as Record<string, unknown>)
+    },
+  })
+
+  // ctx_rg
+  pi.registerTool({
+    name: "ctx_rg",
+    label: "CTX RG",
+    description: "磁盘即时内容搜索（优先系统 rg，否则纯 Go）。跳过二进制与 .git。",
+    promptSnippet: "Search file contents with regex",
+    promptGuidelines: [
+      "Use ctx_rg for code/content search instead of shelling out to grep when possible.",
+    ],
+    parameters: Type.Object({
+      pattern: Type.String({ description: "Regex (or literal if literal=true)" }),
+      path: Type.Optional(Type.String({ description: "Search root (default: .)" })),
+      glob: Type.Optional(Type.String({ description: "File glob filter" })),
+      ignore_case: Type.Optional(Type.Boolean({ description: "Case-insensitive" })),
+      context: Type.Optional(Type.Number({ description: "Context lines 0-5" })),
+      limit: Type.Optional(Type.Number({ description: "Max matches (default: 50)" })),
+      literal: Type.Optional(Type.Boolean({ description: "Treat pattern as literal" })),
+    }),
+    async execute(_id, params) {
+      return run("ctx_rg", params as Record<string, unknown>)
+    },
+  })
+
+  // ctx_git_status
+  pi.registerTool({
+    name: "ctx_git_status",
+    label: "CTX Git Status",
+    description: "结构化 git status（--porcelain=v1 -b）。非 git 仓库明确报错。只读。",
+    promptSnippet: "Git status (porcelain) under workspace",
+    promptGuidelines: [
+      "Prefer ctx_git_status over shelling git status via ctx_execute.",
+    ],
+    parameters: Type.Object({
+      cwd: Type.Optional(Type.String({ description: "Repository path (default: workdir root)" })),
+    }),
+    async execute(_id, params) {
+      return run("ctx_git_status", params as Record<string, unknown>)
+    },
+  })
+
+  // ctx_git_diff
+  pi.registerTool({
+    name: "ctx_git_diff",
+    label: "CTX Git Diff",
+    description: "结构化 git diff（path/stat/staged/unified）。输出硬截断 200KB/2000 行。只读。",
+    promptSnippet: "Git diff with workdir limits and truncation",
+    promptGuidelines: [
+      "Prefer ctx_git_diff over ctx_execute for diffs; use stat:true for overview.",
+    ],
+    parameters: Type.Object({
+      cwd: Type.Optional(Type.String({ description: "Repository path (default: workdir root)" })),
+      path: Type.Optional(Type.String({ description: "Optional pathspec (must stay in workdir)" })),
+      stat: Type.Optional(Type.Boolean({ description: "Only --stat summary" })),
+      unified: Type.Optional(Type.Number({ description: "Context lines (-U)" })),
+      staged: Type.Optional(Type.Boolean({ description: "Staged/cached diff" })),
+    }),
+    async execute(_id, params) {
+      return run("ctx_git_diff", params as Record<string, unknown>)
+    },
+  })
+
+  // ctx_git_log
+  pi.registerTool({
+    name: "ctx_git_log",
+    label: "CTX Git Log",
+    description: "结构化 git log（n 默认 20，硬顶 100；默认 oneline）。只读，无 commit/push/reset。",
+    promptSnippet: "Git log with capped commit count",
+    promptGuidelines: [
+      "Prefer ctx_git_log over shelling git log via ctx_execute.",
+    ],
+    parameters: Type.Object({
+      cwd: Type.Optional(Type.String({ description: "Repository path (default: workdir root)" })),
+      n: Type.Optional(Type.Number({ description: "Commit count (default 20, max 100)" })),
+      path: Type.Optional(Type.String({ description: "Optional pathspec" })),
+      oneline: Type.Optional(Type.Boolean({ description: "One-line format (default true)" })),
+    }),
+    async execute(_id, params) {
+      return run("ctx_git_log", params as Record<string, unknown>)
+    },
+  })
+
+  // ctx_run_task
+  pi.registerTool({
+    name: "ctx_run_task",
+    label: "CTX Run Task",
+    description:
+      "结构化测编入口：go_test/go_build/go_vet/npm_test/npm_run_build/cargo_test/cargo_build/make/custom。固定 argv、不经 shell；大输出自动 index。",
+    promptSnippet: "Structured test/build without raw shell",
+    promptGuidelines: [
+      "Prefer ctx_run_task over ctx_execute for go test/build/vet, npm test/build, cargo, make.",
+      "Use kind=custom with args=[exe,...] for other fixed argv (no shell string).",
+      "make target must be a simple identifier [A-Za-z0-9_.-]+.",
+    ],
+    parameters: Type.Object({
+      kind: Type.String({
+        description:
+          "go_test | go_build | go_vet | npm_test | npm_run_build | cargo_test | cargo_build | make | custom",
+      }),
+      target: Type.Optional(
+        Type.String({ description: "go: package path (default ./...); make: target name; custom unused" }),
+      ),
+      args: Type.Optional(
+        Type.Array(Type.String(), { description: "Extra argv (independent args, no shell). custom: full argv" }),
+      ),
+      cwd: Type.Optional(Type.String({ description: "Working directory (limited to configured workdirs)" })),
+      timeout_ms: Type.Optional(
+        Type.Number({ description: "Timeout ms (default 300000, hard max 3600000)" }),
+      ),
+      intent: Type.Optional(Type.String({ description: "Label hint for large-output auto-index" })),
+      env: Type.Optional(
+        Type.Record(Type.String(), Type.String(), {
+          description: "Extra env (allowlist only; never PATH/HOME/LD_*)",
+        }),
+      ),
+    }),
+    async execute(_id, params) {
+      return run("ctx_run_task", params as Record<string, unknown>)
+    },
+  })
+
+  // ctx_background_list
+  pi.registerTool({
+    name: "ctx_background_list",
+    label: "CTX Background List",
+    description: "列出通过 ctx_execute(background:true) 启动的后台进程（id/pid/age/status/log）。",
+    promptSnippet: "List background processes started by ctx_execute",
+    promptGuidelines: [
+      "Use ctx_background_list to discover background job ids before log/wait/kill.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, params) {
+      return run("ctx_background_list", params as Record<string, unknown>)
+    },
+  })
+
+  // ctx_background_kill
+  pi.registerTool({
+    name: "ctx_background_kill",
+    label: "CTX Background Kill",
+    description: "按 id 或 pid 终止后台进程。",
+    promptSnippet: "Kill a background process by id or pid",
+    promptGuidelines: [
+      "Use ctx_background_kill with id from ctx_background_list (or pid).",
+    ],
+    parameters: Type.Object({
+      id: Type.Optional(Type.String({ description: "Background process id from ctx_background_list" })),
+      pid: Type.Optional(Type.Number({ description: "Process PID to kill" })),
+    }),
+    async execute(_id, params) {
+      return run("ctx_background_kill", params as Record<string, unknown>)
+    },
+  })
+
+  // ctx_background_log
+  pi.registerTool({
+    name: "ctx_background_log",
+    label: "CTX Background Log",
+    description: "查看后台进程捕获的 stdout/stderr 尾部。",
+    promptSnippet: "Tail logs of a background process",
+    promptGuidelines: [
+      "Use ctx_background_log after starting a job with ctx_execute(background:true).",
+    ],
+    parameters: Type.Object({
+      id: Type.Optional(Type.String({ description: "Background process id" })),
+      pid: Type.Optional(Type.Number({ description: "Process PID" })),
+      tail_lines: Type.Optional(Type.Number({ description: "Trailing lines (default: 100)" })),
+      tail_bytes: Type.Optional(Type.Number({ description: "Optional trailing byte cap" })),
+    }),
+    async execute(_id, params) {
+      return run("ctx_background_log", params as Record<string, unknown>)
+    },
+  })
+
+  // ctx_background_wait
+  pi.registerTool({
+    name: "ctx_background_wait",
+    label: "CTX Background Wait",
+    description: "等待后台进程结束或超时，返回 exit_code 与日志尾部；超时不杀进程。",
+    promptSnippet: "Wait for a background process without killing it",
+    promptGuidelines: [
+      "Use ctx_background_wait to poll completion of background jobs.",
+    ],
+    parameters: Type.Object({
+      id: Type.Optional(Type.String({ description: "Background process id" })),
+      pid: Type.Optional(Type.Number({ description: "Process PID" })),
+      timeout_ms: Type.Optional(Type.Number({ description: "Max wait ms (default: 60000, max: 1 hour)" })),
+    }),
+    async execute(_id, params) {
+      return run("ctx_background_wait", params as Record<string, unknown>)
     },
   })
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,30 +22,76 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// defaultBackgroundMaxAge is how long a background process may live before
-// the supervisor reaps it. Override is not exposed as a flag yet; constant
-// is documented here for operators.
-const defaultBackgroundMaxAge = 1 * time.Hour
-
-// bgTempPrefix marks temp files owned by background processes so init
-// cleanup can skip them when they are still registered.
-const bgTempPrefix = "ctxmode_bg_"
+const (
+	defaultBackgroundMaxAge = 1 * time.Hour
+	bgLogMaxBytes           = 16 * 1024 * 1024 // 16 MB
+	maxBackgroundWaitMs     = 3600000
+	maxBackgroundTailBytes  = 4 * 1024 * 1024
+	maxBackgroundTailLines  = 10000
+	bgTempPrefix            = "ctxmode_bg_"
+)
 
 // ---------- background process registry ----------
 
 // bgEntry tracks a background subprocess for list/kill/reap.
 type bgEntry struct {
-	ID        string    `json:"id"`
-	PID       int       `json:"pid"`
-	StartedAt time.Time `json:"started_at"`
-	Command   string    `json:"command,omitempty"`
-	Language  string    `json:"language,omitempty"`
-	TempFiles []string  `json:"temp_files,omitempty"`
-	Done      bool      `json:"done"`
-	ExitCode  int       `json:"exit_code,omitempty"`
+	ID           string    `json:"id"`
+	PID          int       `json:"pid"`
+	StartedAt    time.Time `json:"started_at"`
+	Command      string    `json:"command,omitempty"`
+	Language     string    `json:"language,omitempty"`
+	TempFiles    []string  `json:"temp_files,omitempty"`
+	LogPath      string    `json:"log_path,omitempty"` // captured stdout/stderr path
+	LogTruncated bool      `json:"log_truncated,omitempty"`
+	Done         bool      `json:"done"`
+	ExitCode     int       `json:"exit_code,omitempty"`
 	// pgid for process-group kill (Setpgid=true).
 	pgid int
 	cmd  *exec.Cmd
+	// logFile is the open handle used by MultiWriter; closed on process exit
+	// (Wait → finishBackground). kill must not close it early or log tail is lost.
+	logFile       *os.File
+	logWriter     *limitedFileWriter
+	reapScheduled bool // grace-period removal already started
+}
+
+// limitedFileWriter writes to a file until limit is reached, then discards.
+// Safe for concurrent use (stdout+stderr MultiWriter).
+type limitedFileWriter struct {
+	mu        sync.Mutex
+	f         *os.File
+	limit     int64
+	written   int64
+	truncated bool
+}
+
+func (w *limitedFileWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.written >= w.limit {
+		w.truncated = true
+		return len(p), nil
+	}
+	remaining := w.limit - w.written
+	if int64(len(p)) <= remaining {
+		n, err := w.f.Write(p)
+		w.written += int64(n)
+		return n, err
+	}
+	// Partial write up to limit; report full len(p) so MultiWriter continues.
+	n, err := w.f.Write(p[:remaining])
+	w.written += int64(n)
+	w.truncated = true
+	if err != nil {
+		return n, err
+	}
+	return len(p), nil
+}
+
+func (w *limitedFileWriter) isTruncated() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.truncated
 }
 
 var (
@@ -55,7 +102,8 @@ var (
 )
 
 // registerBackground records a live background process.
-func registerBackground(cmd *exec.Cmd, language, command string, temps []string) *bgEntry {
+// logPath/logFile/logWriter may be empty/nil when capture is unavailable.
+func registerBackground(cmd *exec.Cmd, language, command string, temps []string, logPath string, logFile *os.File, logWriter *limitedFileWriter) *bgEntry {
 	bgReaper.Do(func() { go backgroundReaperLoop() })
 	id := fmt.Sprintf("bg-%d", bgSeq.Add(1))
 	pgid := 0
@@ -66,6 +114,15 @@ func registerBackground(cmd *exec.Cmd, language, command string, temps []string)
 	if len(command) > 200 {
 		command = command[:200] + "..."
 	}
+	// Prefer stable log name that includes the id (rename if we used a temp name).
+	if logFile != nil && logPath != "" {
+		finalPath := filepath.Join(os.TempDir(), fmt.Sprintf("%s%s.log", bgTempPrefix, id))
+		if logPath != finalPath {
+			if err := os.Rename(logPath, finalPath); err == nil {
+				logPath = finalPath
+			}
+		}
+	}
 	e := &bgEntry{
 		ID:        id,
 		PID:       cmd.Process.Pid,
@@ -73,6 +130,9 @@ func registerBackground(cmd *exec.Cmd, language, command string, temps []string)
 		Language:  language,
 		Command:   command,
 		TempFiles: append([]string(nil), temps...),
+		LogPath:   logPath,
+		logFile:   logFile,
+		logWriter: logWriter,
 		pgid:      pgid,
 		cmd:       cmd,
 	}
@@ -82,12 +142,18 @@ func registerBackground(cmd *exec.Cmd, language, command string, temps []string)
 	for _, t := range temps {
 		protectTemp(t)
 	}
+	if logPath != "" {
+		protectTemp(logPath)
+	}
 	bgMu.Unlock()
 	return e
 }
 
-// finishBackground marks entry done and cleans temps.
-// Idempotent: a second call (e.g. Wait after killBackground) is a no-op.
+// finishBackground marks entry done, closes the log FD, and cleans temps.
+// Safe to call after markBackgroundKilled: if Done is already set, still
+// closes log and schedules reaping (kill intentionally leaves the log open
+// so the process can flush remaining output before Wait returns).
+// Fully idempotent once log is closed and temps cleared.
 func finishBackground(id string, exitCode int) {
 	bgMu.Lock()
 	e, ok := bgProcs[id]
@@ -95,29 +161,91 @@ func finishBackground(id string, exitCode int) {
 		bgMu.Unlock()
 		return
 	}
-	if e.Done {
+	// Already fully finalized (log closed, temps cleared).
+	if e.Done && e.logFile == nil && len(e.TempFiles) == 0 {
 		bgMu.Unlock()
 		return
 	}
-	e.Done = true
-	e.ExitCode = exitCode
+	if !e.Done {
+		e.Done = true
+		e.ExitCode = exitCode
+	} else if exitCode >= 0 {
+		// Prefer real Wait exit code over kill's placeholder (-1) when available.
+		e.ExitCode = exitCode
+	}
+	if e.logWriter != nil && e.logWriter.isTruncated() {
+		e.LogTruncated = true
+	}
 	temps := append([]string(nil), e.TempFiles...)
 	e.TempFiles = nil
+	logFile := e.logFile
+	e.logFile = nil
+	e.logWriter = nil
+	logPath := e.LogPath
 	// Keep entry briefly for list visibility, but unprotect temps for cleanup.
 	for _, t := range temps {
 		unprotectTemp(t)
 	}
+	scheduleReap := !e.reapScheduled
+	if scheduleReap {
+		e.reapScheduled = true
+	}
 	bgMu.Unlock()
+	if logFile != nil {
+		_ = logFile.Close()
+	}
 	for _, t := range temps {
 		os.Remove(t)
 	}
-	// Remove from registry after a short grace so list can still show it.
+	if !scheduleReap {
+		return
+	}
+	// Remove from registry after a short grace so list/log can still show it.
 	go func() {
 		time.Sleep(30 * time.Second)
 		bgMu.Lock()
-		delete(bgProcs, id)
+		if ent, ok := bgProcs[id]; ok {
+			lp := ent.LogPath
+			delete(bgProcs, id)
+			bgMu.Unlock()
+			if lp != "" {
+				unprotectTemp(lp)
+				os.Remove(lp)
+			}
+			return
+		}
 		bgMu.Unlock()
+		if logPath != "" {
+			unprotectTemp(logPath)
+			os.Remove(logPath)
+		}
 	}()
+}
+
+// markBackgroundKilled marks the entry Done without closing the log FD.
+// The Wait goroutine must still call finishBackground to close the log and
+// reap temps — closing early can drop the final flush of stdout/stderr.
+func markBackgroundKilled(id string) {
+	bgMu.Lock()
+	defer bgMu.Unlock()
+	e, ok := bgProcs[id]
+	if !ok || e.Done {
+		return
+	}
+	e.Done = true
+	e.ExitCode = -1
+}
+
+// snapshotBgEntry copies a registry entry for external use (no live handles).
+func snapshotBgEntry(e *bgEntry) bgEntry {
+	cp := *e
+	if cp.logWriter != nil && cp.logWriter.isTruncated() {
+		cp.LogTruncated = true
+	}
+	cp.cmd = nil
+	cp.logFile = nil
+	cp.logWriter = nil
+	return cp
 }
 
 // listBackground returns a snapshot of registered processes.
@@ -126,14 +254,124 @@ func listBackground() []bgEntry {
 	defer bgMu.Unlock()
 	out := make([]bgEntry, 0, len(bgProcs))
 	for _, e := range bgProcs {
-		cp := *e
-		cp.cmd = nil
-		out = append(out, cp)
+		out = append(out, snapshotBgEntry(e))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].StartedAt.Before(out[j].StartedAt)
 	})
 	return out
+}
+
+// findBackground looks up a live/recent entry by id or PID string.
+func findBackground(idOrPID string) *bgEntry {
+	bgMu.Lock()
+	defer bgMu.Unlock()
+	if e, ok := bgProcs[idOrPID]; ok {
+		cp := snapshotBgEntry(e)
+		return &cp
+	}
+	if pid, err := strconv.Atoi(idOrPID); err == nil {
+		for _, e := range bgProcs {
+			if e.PID == pid {
+				cp := snapshotBgEntry(e)
+				return &cp
+			}
+		}
+	}
+	return nil
+}
+
+// readBackgroundLogTail returns the tail of a background process log.
+// Seeks from the end of the file — never loads the whole file into memory.
+// tailLines defaults to 100; if tailBytes > 0 it is applied as a byte window
+// (and still refined by tailLines when > 0).
+func readBackgroundLogTail(logPath string, tailLines, tailBytes int) (string, error) {
+	if logPath == "" {
+		return "", fmt.Errorf("no log available")
+	}
+	f, err := os.Open(logPath)
+	if err != nil {
+		return "", fmt.Errorf("read log: %w", err)
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("stat log: %w", err)
+	}
+	size := st.Size()
+	if size == 0 {
+		return "", nil
+	}
+
+	if tailLines <= 0 {
+		tailLines = 100
+	}
+	if tailLines > maxBackgroundTailLines {
+		return "", fmt.Errorf("tail_lines %d exceeds maximum allowed (%d)", tailLines, maxBackgroundTailLines)
+	}
+	if tailBytes < 0 || tailBytes > maxBackgroundTailBytes {
+		return "", fmt.Errorf("tail_bytes %d exceeds maximum allowed (%d)", tailBytes, maxBackgroundTailBytes)
+	}
+
+	// How many bytes to pull from the end. Prefer explicit tailBytes; else
+	// estimate from line count with a hard safety cap so huge logs stay cheap.
+	const maxTailRead = 4 * 1024 * 1024 // 4 MB safety for line-based tail
+	var readSize int64
+	if tailBytes > 0 {
+		readSize = int64(tailBytes)
+	} else {
+		// ~512 bytes/line estimate, floor 64KB, cap maxTailRead.
+		readSize = int64(tailLines) * 512
+		if readSize < 64*1024 {
+			readSize = 64 * 1024
+		}
+		if readSize > maxTailRead {
+			readSize = maxTailRead
+		}
+	}
+	if readSize > size {
+		readSize = size
+	}
+
+	offset := size - readSize
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return "", fmt.Errorf("seek log: %w", err)
+	}
+	data := make([]byte, readSize)
+	n, err := io.ReadFull(f, data)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return "", fmt.Errorf("read log: %w", err)
+	}
+	data = data[:n]
+
+	// Drop partial first line when we started mid-file.
+	if offset > 0 {
+		if i := bytes.IndexByte(data, '\n'); i >= 0 && i+1 <= len(data) {
+			data = data[i+1:]
+		}
+	}
+
+	// If tailBytes requested and we still have more (shouldn't after seek), trim.
+	if tailBytes > 0 && len(data) > tailBytes {
+		data = data[len(data)-tailBytes:]
+		if i := bytes.IndexByte(data, '\n'); i >= 0 && i+1 < len(data) {
+			data = data[i+1:]
+		}
+	}
+
+	if tailLines > 0 {
+		lines := bytes.Split(data, []byte{'\n'})
+		// Drop trailing empty from final newline.
+		if len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
+			lines = lines[:len(lines)-1]
+		}
+		if len(lines) > tailLines {
+			lines = lines[len(lines)-tailLines:]
+		}
+		data = bytes.Join(lines, []byte{'\n'})
+	}
+	return string(data), nil
 }
 
 // killBackground kills by id or by PID string. Returns a status message.
@@ -199,9 +437,10 @@ func killBackground(idOrPID string) (string, error) {
 	if lastErr != nil {
 		return "", fmt.Errorf("kill background process %s (PID %d): %w", id, pid, lastErr)
 	}
-	// Mark Done ASAP (exit code -1 = killed) so list no longer shows a live task.
-	// Wait goroutine may also call finishBackground; that path is now idempotent.
-	finishBackground(id, -1)
+	// Mark Done ASAP so list no longer shows a live task, but do NOT close the
+	// log FD here — closing early races the dying process and drops log tail.
+	// Wait goroutine calls finishBackground, which closes the log after exit.
+	markBackgroundKilled(id)
 	return fmt.Sprintf("killed background process %s (PID %d)", id, pid), nil
 }
 
@@ -283,34 +522,46 @@ func init() {
 	}
 }
 
-// ---------- MCP tools: background list / kill ----------
+// ---------- MCP tools: background list / kill / log / wait ----------
 
 type backgroundListArgs struct{}
 
 func (s *server) toolBackgroundList(ctx context.Context, _ *mcp.CallToolRequest, _ backgroundListArgs) (*mcp.CallToolResult, any, error) {
 	entries := listBackground()
 	type row struct {
-		ID        string `json:"id"`
-		PID       int    `json:"pid"`
-		StartedAt string `json:"started_at"`
-		AgeSec    int64  `json:"age_sec"`
-		Language  string `json:"language,omitempty"`
-		Command   string `json:"command,omitempty"`
-		Done      bool   `json:"done"`
-		ExitCode  int    `json:"exit_code,omitempty"`
+		ID           string `json:"id"`
+		PID          int    `json:"pid"`
+		StartedAt    string `json:"started_at"`
+		AgeSec       int64  `json:"age_sec"`
+		Language     string `json:"language,omitempty"`
+		Command      string `json:"command,omitempty"`
+		Done         bool   `json:"done"`
+		ExitCode     int    `json:"exit_code,omitempty"`
+		LogPath      string `json:"log_path,omitempty"`
+		LogAvailable bool   `json:"log_available"`
+		LogTruncated bool   `json:"log_truncated,omitempty"`
 	}
 	now := time.Now()
 	out := make([]row, 0, len(entries))
 	for _, e := range entries {
+		logOK := false
+		if e.LogPath != "" {
+			if st, err := os.Stat(e.LogPath); err == nil && st.Size() >= 0 {
+				logOK = true
+			}
+		}
 		out = append(out, row{
-			ID:        e.ID,
-			PID:       e.PID,
-			StartedAt: e.StartedAt.Format(time.RFC3339),
-			AgeSec:    int64(now.Sub(e.StartedAt).Seconds()),
-			Language:  e.Language,
-			Command:   e.Command,
-			Done:      e.Done,
-			ExitCode:  e.ExitCode,
+			ID:           e.ID,
+			PID:          e.PID,
+			StartedAt:    e.StartedAt.Format(time.RFC3339),
+			AgeSec:       int64(now.Sub(e.StartedAt).Seconds()),
+			Language:     e.Language,
+			Command:      e.Command,
+			Done:         e.Done,
+			ExitCode:     e.ExitCode,
+			LogPath:      e.LogPath,
+			LogAvailable: logOK,
+			LogTruncated: e.LogTruncated,
 		})
 	}
 	js, _ := json.MarshalIndent(out, "", "  ")
@@ -343,6 +594,130 @@ func (s *server) toolBackgroundKill(ctx context.Context, _ *mcp.CallToolRequest,
 	}
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: msg}},
+	}, nil, nil
+}
+
+type backgroundLogArgs struct {
+	ID        string `json:"id,omitempty" jsonschema:"Background process id from ctx_background_list"`
+	PID       int    `json:"pid,omitempty" jsonschema:"Process PID"`
+	TailLines int    `json:"tail_lines,omitempty" jsonschema:"Number of trailing lines (default: 100)"`
+	TailBytes int    `json:"tail_bytes,omitempty" jsonschema:"Optional max trailing bytes (applied before lines)"`
+}
+
+func (s *server) toolBackgroundLog(ctx context.Context, _ *mcp.CallToolRequest, args backgroundLogArgs) (*mcp.CallToolResult, any, error) {
+	key := args.ID
+	if key == "" && args.PID != 0 {
+		key = strconv.Itoa(args.PID)
+	}
+	if key == "" {
+		return nil, nil, fmt.Errorf("id or pid is required")
+	}
+	entry := findBackground(key)
+	if entry == nil {
+		return nil, nil, fmt.Errorf("no background process matching %q", key)
+	}
+	tailLines := args.TailLines
+	if tailLines <= 0 {
+		tailLines = 100
+	}
+	if tailLines > maxBackgroundTailLines {
+		return nil, nil, fmt.Errorf("tail_lines %d exceeds maximum allowed (%d)", tailLines, maxBackgroundTailLines)
+	}
+	if args.TailBytes < 0 || args.TailBytes > maxBackgroundTailBytes {
+		return nil, nil, fmt.Errorf("tail_bytes %d exceeds maximum allowed (%d)", args.TailBytes, maxBackgroundTailBytes)
+	}
+	logText, err := readBackgroundLogTail(entry.LogPath, tailLines, args.TailBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	type logResult struct {
+		ID       string `json:"id"`
+		PID      int    `json:"pid"`
+		Done     bool   `json:"done"`
+		ExitCode int    `json:"exit_code,omitempty"`
+		LogPath  string `json:"log_path,omitempty"`
+		Log      string `json:"log"`
+	}
+	out := logResult{
+		ID:       entry.ID,
+		PID:      entry.PID,
+		Done:     entry.Done,
+		ExitCode: entry.ExitCode,
+		LogPath:  entry.LogPath,
+		Log:      logText,
+	}
+	js, _ := json.MarshalIndent(out, "", "  ")
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: string(js)}},
+	}, nil, nil
+}
+
+type backgroundWaitArgs struct {
+	ID        string `json:"id,omitempty" jsonschema:"Background process id from ctx_background_list"`
+	PID       int    `json:"pid,omitempty" jsonschema:"Process PID"`
+	TimeoutMs int    `json:"timeout_ms,omitempty" jsonschema:"Max wait in ms (default: 60000). Does not kill on timeout."`
+}
+
+func (s *server) toolBackgroundWait(ctx context.Context, _ *mcp.CallToolRequest, args backgroundWaitArgs) (*mcp.CallToolResult, any, error) {
+	key := args.ID
+	if key == "" && args.PID != 0 {
+		key = strconv.Itoa(args.PID)
+	}
+	if key == "" {
+		return nil, nil, fmt.Errorf("id or pid is required")
+	}
+	timeoutMs := args.TimeoutMs
+	if timeoutMs <= 0 {
+		timeoutMs = 60000
+	}
+	if timeoutMs > maxBackgroundWaitMs {
+		return nil, nil, fmt.Errorf("timeout_ms %dms exceeds maximum allowed (1 hour)", timeoutMs)
+	}
+	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	var entry *bgEntry
+	for {
+		entry = findBackground(key)
+		if entry == nil {
+			return nil, nil, fmt.Errorf("no background process matching %q", key)
+		}
+		if entry.Done {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+
+	logText, _ := readBackgroundLogTail(entry.LogPath, 100, 0)
+	type waitResult struct {
+		ID       string `json:"id"`
+		PID      int    `json:"pid"`
+		Done     bool   `json:"done"`
+		ExitCode int    `json:"exit_code,omitempty"`
+		LogPath  string `json:"log_path,omitempty"`
+		Log      string `json:"log"`
+		TimedOut bool   `json:"timed_out,omitempty"`
+	}
+	out := waitResult{
+		ID:       entry.ID,
+		PID:      entry.PID,
+		Done:     entry.Done,
+		ExitCode: entry.ExitCode,
+		LogPath:  entry.LogPath,
+		Log:      logText,
+		TimedOut: !entry.Done,
+	}
+	js, _ := json.MarshalIndent(out, "", "  ")
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: string(js)}},
 	}, nil, nil
 }
 
@@ -669,7 +1044,7 @@ func wrapCode(language, code string) string {
 // ---------- file content injection for ctx_execute_file ----------
 
 // injectFileContent prepends a FILE_CONTENT variable definition to the user's
-// code, so the sandbox script can access the file contents through a variable.
+// code, so the subprocess script can access the file contents through a variable.
 func injectFileContent(language, code, fileContent string) string {
 	switch language {
 	case "shell":
@@ -774,9 +1149,109 @@ func injectFileContent(language, code, fileContent string) string {
 
 // ---------- core execution ----------
 
+// runOptions carries optional env/stdin for execute (shell, argv, and language modes).
+// Env must already be allowlist-filtered. Stdin is written then closed (via Reader EOF).
+type runOptions struct {
+	Env   map[string]string
+	Stdin string
+}
+
+// maxStdinBytes caps ctx_execute stdin payload size (1 MiB).
+const maxStdinBytes = 1 * 1024 * 1024
+
+// envAllowlist is the explicit set of keys callers may inject via ctx_execute env.
+// Unknown keys are rejected. Dangerous keys are always denied even if listed.
+var envAllowlist = map[string]bool{
+	"GOFLAGS":                 true,
+	"CGO_ENABLED":             true,
+	"GOOS":                    true,
+	"GOARCH":                  true,
+	"GOPROXY":                 true,
+	"GOSUMDB":                 true,
+	"GOROOT":                  true,
+	"GOTOOLCHAIN":             true,
+	"GO111MODULE":             true,
+	"GOTMPDIR":                true,
+	"NODE_ENV":                true,
+	"CI":                      true,
+	"RUST_BACKTRACE":          true,
+	"RUSTFLAGS":               true,
+	"CARGO_TERM_COLOR":        true,
+	"PYTHONDONTWRITEBYTECODE": true,
+	"PYTHONUNBUFFERED":        true,
+	"TZ":                      true,
+	"LANG":                    true,
+	"LC_ALL":                  true,
+}
+
+// isDeniedEnvKey reports keys that must never be overridden (PATH, loader, shell, home).
+func isDeniedEnvKey(key string) bool {
+	uk := strings.ToUpper(key)
+	switch uk {
+	case "PATH", "HOME", "SHELL", "USER", "LOGNAME",
+		"LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+		"DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+		"IFS", "CDPATH", "ENV", "BASH_ENV", "SHELLOPTS", "BASHOPTS",
+		"SSLKEYLOGFILE", "TERM":
+		return true
+	}
+	if strings.HasPrefix(uk, "LD_") || strings.HasPrefix(uk, "DYLD_") {
+		return true
+	}
+	return false
+}
+
+// filterExecEnv validates env against the allowlist. Returns a copy or an error.
+// Keys with the CTXMODE_ prefix are also accepted (except denylist collisions).
+func filterExecEnv(env map[string]string) (map[string]string, error) {
+	if len(env) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(env))
+	for k, v := range env {
+		if k == "" {
+			return nil, fmt.Errorf("env: empty key is not allowed")
+		}
+		if strings.ContainsAny(k, "=\x00") {
+			return nil, fmt.Errorf("env: invalid key %q", k)
+		}
+		if isDeniedEnvKey(k) {
+			return nil, fmt.Errorf("env key %q is not allowed (security denylist)", k)
+		}
+		if envAllowlist[k] || strings.HasPrefix(k, "CTXMODE_") {
+			out[k] = v
+			continue
+		}
+		return nil, fmt.Errorf("env key %q is not in the allowlist (allowed: GO*, NODE_ENV, CI, CTXMODE_*, …)", k)
+	}
+	return out, nil
+}
+
+// applyRunOptions sets Env (merged with process env) and Stdin on cmd.
+func applyRunOptions(cmd *exec.Cmd, opts *runOptions) {
+	if opts == nil {
+		return
+	}
+	if len(opts.Env) > 0 {
+		env := append([]string{}, os.Environ()...)
+		for k, v := range opts.Env {
+			env = append(env, k+"="+v)
+		}
+		cmd.Env = env
+	}
+	if opts.Stdin != "" {
+		cmd.Stdin = strings.NewReader(opts.Stdin)
+	}
+}
+
 // runCode executes code in the specified language sandbox.
 // It handles temp file creation, runtime selection, timeout, and background mode.
 func runCode(ctx context.Context, language, code, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
+	return runCodeOpts(ctx, language, code, cwd, timeout, background, nil)
+}
+
+// runCodeOpts is runCode with optional env/stdin.
+func runCodeOpts(ctx context.Context, language, code, cwd string, timeout time.Duration, background bool, opts *runOptions) (*executeResult, error) {
 	rt, ok := runtimes[language]
 	if !ok {
 		return nil, fmt.Errorf("unsupported language: %q (supported: javascript, typescript, python, shell, go, rust, php, perl, ruby, r, elixir, csharp)", language)
@@ -794,7 +1269,7 @@ func runCode(ctx context.Context, language, code, cwd string, timeout time.Durat
 
 	// Shell is handled specially — no temp file needed.
 	if language == "shell" {
-		return runShell(ctx, wrapped, cwd, timeout, background)
+		return runShellOpts(ctx, wrapped, cwd, timeout, background, opts)
 	}
 
 	// Create a temp file with the appropriate extension.
@@ -821,11 +1296,16 @@ func runCode(ctx context.Context, language, code, cwd string, timeout time.Durat
 	tmpFile.Close()
 
 	// Build and run the command based on language.
-	return runCompiled(ctx, language, rt, tmpPath, cwd, timeout, background)
+	return runCompiledOpts(ctx, language, rt, tmpPath, cwd, timeout, background, opts)
 }
 
 // runShell executes code directly via "sh -c".
 func runShell(ctx context.Context, code, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
+	return runShellOpts(ctx, code, cwd, timeout, background, nil)
+}
+
+// runShellOpts is runShell with optional env/stdin.
+func runShellOpts(ctx context.Context, code, cwd string, timeout time.Duration, background bool, opts *runOptions) (*executeResult, error) {
 	var cmd *exec.Cmd
 	shellPath := os.Getenv("SHELL")
 	if shellPath != "" {
@@ -841,12 +1321,38 @@ func runShell(ctx context.Context, code, cwd string, timeout time.Duration, back
 	}
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	applyRunOptions(cmd, opts)
 
 	return runCmd(ctx, cmd, timeout, background, "shell", code)
 }
 
+// runArgv runs exec.Command(argv[0], argv[1:]...) without a shell.
+// argv must already be validated (non-empty; argv[0] simple name or workdir path).
+func runArgv(ctx context.Context, argv []string, cwd string, timeout time.Duration, background bool, opts *runOptions) (*executeResult, error) {
+	if len(argv) == 0 {
+		return nil, fmt.Errorf("argv must not be empty")
+	}
+	if argv[0] == "" {
+		return nil, fmt.Errorf("argv[0] must not be empty")
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = cwd
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	applyRunOptions(cmd, opts)
+	cmdStr := strings.Join(argv, " ")
+	return runCmd(ctx, cmd, timeout, background, "argv", cmdStr)
+}
+
 // runCompiled executes a language that uses a temp source file.
 func runCompiled(ctx context.Context, language string, rt runtimeConfig, tmpPath, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
+	return runCompiledOpts(ctx, language, rt, tmpPath, cwd, timeout, background, nil)
+}
+
+// runCompiledOpts is runCompiled with optional env/stdin.
+func runCompiledOpts(ctx context.Context, language string, rt runtimeConfig, tmpPath, cwd string, timeout time.Duration, background bool, opts *runOptions) (*executeResult, error) {
 	var cmd *exec.Cmd
 	var cleanups []string
 
@@ -870,6 +1376,14 @@ func runCompiled(ctx context.Context, language string, rt runtimeConfig, tmpPath
 		compileCmd := exec.Command("rustc", "-o", outPath, tmpPath)
 		compileCmd.Dir = cwd
 		compileCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		// Env applies to compile + run; stdin only to the run step.
+		if opts != nil && len(opts.Env) > 0 {
+			env := append([]string{}, os.Environ()...)
+			for k, v := range opts.Env {
+				env = append(env, k+"="+v)
+			}
+			compileCmd.Env = env
+		}
 		var compileOutBuf limitedBuffer
 		compileOutBuf.limit = maxCmdOutput
 		compileCmd.Stdout = &compileOutBuf
@@ -949,6 +1463,7 @@ func runCompiled(ctx context.Context, language string, rt runtimeConfig, tmpPath
 	}
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	applyRunOptions(cmd, opts)
 	if background {
 		cleanups = append(cleanups, tmpPath)
 	}
@@ -999,16 +1514,38 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 	var stdoutBuf, stderrBuf limitedBuffer
 	stdoutBuf.limit = maxCmdOutput
 	stderrBuf.limit = maxCmdOutput
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
+
+	// For background jobs, tee stdout/stderr into a log file for later log/wait tools.
+	// Log size is hard-capped at bgLogMaxBytes to prevent unbounded disk growth.
+	var logFile *os.File
+	var logPath string
+	var logWriter *limitedFileWriter
+	if background {
+		f, err := os.CreateTemp(os.TempDir(), bgTempPrefix+"*.log")
+		if err != nil {
+			return nil, fmt.Errorf("create background log: %w", err)
+		}
+		logFile = f
+		logPath = f.Name()
+		logWriter = &limitedFileWriter{f: f, limit: bgLogMaxBytes}
+		cmd.Stdout = io.MultiWriter(&stdoutBuf, logWriter)
+		cmd.Stderr = io.MultiWriter(&stderrBuf, logWriter)
+	} else {
+		cmd.Stdout = &stdoutBuf
+		cmd.Stderr = &stderrBuf
+	}
 
 	if err := cmd.Start(); err != nil {
+		if logFile != nil {
+			logFile.Close()
+			os.Remove(logPath)
+		}
 		return nil, fmt.Errorf("failed to start process: %w", err)
 	}
 
 	if background {
-		// Register for list/kill supervision; reap on exit; enforce max age.
-		entry := registerBackground(cmd, language, command, cleanups)
+		// Register for list/kill/log/wait supervision; reap on exit; enforce max age.
+		entry := registerBackground(cmd, language, command, cleanups, logPath, logFile, logWriter)
 		go func(id string, c *exec.Cmd) {
 			err := c.Wait()
 			exitCode := 0
@@ -1022,7 +1559,7 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 			finishBackground(id, exitCode)
 		}(entry.ID, cmd)
 		return &executeResult{
-			Stdout: fmt.Sprintf("Process started in background (id: %s, PID: %d). Use ctx_background_list / ctx_background_kill. Max age %s.",
+			Stdout: fmt.Sprintf("Process started in background (id: %s, PID: %d). Use ctx_background_list / ctx_background_log / ctx_background_wait / ctx_background_kill. Max age %s.",
 				entry.ID, cmd.Process.Pid, defaultBackgroundMaxAge),
 			ExitCode: 0,
 		}, nil

@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -277,17 +276,12 @@ func TestStressFloodGuard(t *testing.T) {
 // ---------- Test 3: CtxCancel Kill ----------
 
 func TestStressCtxCancelKill(t *testing.T) {
-	// Check if pgrep is available.
-	if _, err := exec.LookPath("pgrep"); err != nil {
-		t.Skip("pgrep not available, skipping process kill verification")
-	}
-
 	s := newStressServer(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start a long-running command in a goroutine.
-	cmd := "sleep 30"
+	pidFile := filepath.Join(s.workdirs[0], "cancel-child.pid")
+	cmd := fmt.Sprintf("echo $$ > %q; sleep 30", pidFile)
 	done := make(chan struct{})
 	var execErr error
 	go func() {
@@ -298,49 +292,44 @@ func TestStressCtxCancelKill(t *testing.T) {
 		})
 	}()
 
-	// Wait for the sleep process to start.
-	time.Sleep(800 * time.Millisecond)
-
-	// Verify the process is running.
-	out, err := exec.Command("pgrep", "-f", "sleep 30").Output()
-	if err == nil && len(out) > 0 {
-		t.Logf("sleep 30 process found (PID(s): %s)", strings.TrimSpace(string(out)))
-	} else {
-		t.Logf("sleep 30 process not found via pgrep (may have already exited)")
+	deadline := time.Now().Add(3 * time.Second)
+	var pid string
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(pidFile); err == nil {
+			pid = strings.TrimSpace(string(data))
+			if pid != "" {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if pid == "" {
+		t.Fatal("child did not publish its PID")
 	}
 
-	// Cancel the context.
 	cancel()
-
-	// Wait for the goroutine to return with a generous timeout.
 	select {
 	case <-done:
-		t.Log("execute returned after context cancellation")
-		took := time.Since(time.Now()) // approximate
-		_ = took
 	case <-time.After(8 * time.Second):
-		t.Error("execute did not return within 8s after context cancellation")
+		t.Fatal("execute did not return within 8s after context cancellation")
 	}
-
 	if execErr != nil {
-		t.Logf("execute error (expected cancellation): %v", execErr)
+		t.Logf("execute error after cancellation: %v", execErr)
 	}
 
-	// Verify the sleep process is gone.
-	time.Sleep(1 * time.Second)
-	out2, err2 := exec.Command("pgrep", "-f", "sleep 30").Output()
-	if err2 == nil && len(out2) > 0 {
-		t.Errorf("sleep 30 process still running after cancellation! PIDs: %s",
-			strings.TrimSpace(string(out2)))
-		// Kill it ourselves.
-		for _, pidStr := range strings.Fields(strings.TrimSpace(string(out2))) {
-			exec.Command("kill", "-9", pidStr).Run()
+	// Check only the exact process started by this test. Never scan or kill
+	// unrelated system processes by command line.
+	procPath := filepath.Join("/proc", pid)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(procPath); os.IsNotExist(err) {
+			return
 		}
-	} else {
-		t.Log("sleep 30 process cleaned up successfully (no residual)")
+		time.Sleep(20 * time.Millisecond)
 	}
-
-	t.Logf("Pass: ctx cancel kills child process")
+	if _, err := os.Stat(procPath); err == nil {
+		t.Fatalf("test child PID %s still exists after cancellation", pid)
+	}
 }
 
 // ---------- Test 4: Singleflight ----------

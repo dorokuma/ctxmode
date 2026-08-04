@@ -18,6 +18,7 @@ type doctorResult struct {
 	DBError     string            `json:"db_error,omitempty"`
 	FTS5Status  string            `json:"fts5_status"` // "ok" / "error: ..."
 	Runtimes    map[string]string `json:"runtimes"`    // language -> "available" / "not found: ..."
+	PolicyMode  string            `json:"policy_mode,omitempty"`
 	DocCount    int               `json:"doc_count"`
 	CacheCount  int               `json:"cache_count"`
 	Healthy     bool              `json:"healthy"`
@@ -26,11 +27,17 @@ type doctorResult struct {
 
 // runDoctor collects all diagnostic information.
 func runDoctor(store *Store, dbPath string) (*doctorResult, error) {
+	return runDoctorWithPolicy(store, dbPath, "")
+}
+
+// runDoctorWithPolicy is runDoctor plus optional policy mode reporting.
+func runDoctorWithPolicy(store *Store, dbPath, policyMode string) (*doctorResult, error) {
 	res := &doctorResult{
-		Version:  Version,
-		DBPath:   dbPath,
-		Runtimes: make(map[string]string),
-		Healthy:  true,
+		Version:    Version,
+		DBPath:     dbPath,
+		Runtimes:   make(map[string]string),
+		PolicyMode: policyMode,
+		Healthy:    true,
 	}
 
 	// Database file size.
@@ -91,7 +98,11 @@ func (s *server) toolDoctor(ctx context.Context, _ *mcp.CallToolRequest, _ docto
 	// Get the database path from the store.
 	dbPath := s.store.DBPath()
 
-	result, err := runDoctor(s.store, dbPath)
+	policyMode := PolicyModeOff
+	if s.policy != nil && s.policy.Mode != "" {
+		policyMode = s.policy.Mode
+	}
+	result, err := runDoctorWithPolicy(s.store, dbPath, policyMode)
 	if err != nil {
 		return nil, nil, fmt.Errorf("doctor check failed: %w", err)
 	}
