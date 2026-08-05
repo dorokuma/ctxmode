@@ -1,8 +1,9 @@
 // ctxmode: a Go MCP server that virtualizes tool output to save context tokens.
-// Registers: ctx_execute, ctx_execute_file, ctx_index, ctx_search, ctx_stats, ctx_fetch_and_index,
-// ctx_batch_execute, ctx_doctor, ctx_purge, ctx_background_list, ctx_background_kill,
-// ctx_background_log, ctx_background_wait, ctx_ls, ctx_glob, ctx_stat, ctx_rg,
-// ctx_git_status, ctx_git_diff, ctx_git_log, ctx_run_task.
+// v2.0 MCP surface (category tools + action=):
+//
+//	ctx_run, ctx_fs, ctx_git, ctx_kb, ctx_bg
+//
+// Internal handlers retain the former ctx_* names; they are not registered as MCP tools.
 package main
 
 import (
@@ -25,7 +26,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "1.3.0"
+const Version = "2.0.0"
 
 // toolIndex walk / size limits.
 const (
@@ -136,111 +137,7 @@ func main() {
 	s.excludeFromGit()
 
 	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: Version}, nil)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_execute",
-		Description: "Run code in a subprocess. Supports 12 languages (javascript, typescript, python, shell, go, rust, php, perl, ruby, r, elixir, csharp). Prefer argv over command for shell-free exec. Optional env (allowlist) and stdin. Heavy outputs are auto-indexed. The command policy is not an OS sandbox. Note: ctx_batch_execute does not support argv/env/stdin.",
-	}, s.toolExecute)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_index",
-		Description: "Index a file or directory into the local knowledge base, avoiding sending the entire file repeatedly.",
-	}, s.toolIndex)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_search",
-		Description: "Search for query terms in the indexed local knowledge base, returning only matching lines or snippets.",
-	}, s.toolSearch)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_stats",
-		Description: "Report token saving statistics of the current context virtualization session.",
-	}, s.toolStats)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_fetch_and_index",
-		Description: "Fetch URL content, convert to markdown, and index into knowledge base. Cache hits are returned immediately.",
-	}, s.toolFetchAndIndex)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_batch_execute",
-		Description: "Run multiple commands in ONE call. Every command's output is auto-indexed into the knowledge base; if you also pass queries, the matching sections come back in the same round trip.",
-	}, s.toolBatchExecute)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_execute_file",
-		Description: "Read a file into a FILE_CONTENT variable and run code over it. Languages: javascript, typescript, python, shell, go, rust, php, perl, ruby, r, elixir, csharp. Supports auto-indexing for large output.",
-	}, s.toolExecuteFile)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_doctor",
-		Description: "Diagnose context-mode installation. Checks runtimes, FTS5, storage, and version.",
-	}, s.toolDoctor)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_purge",
-		Description: "DESTRUCTIVE: permanently delete indexed content. Cannot be undone. Requires confirm:true.",
-	}, s.toolPurge)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_background_list",
-		Description: "List background processes started via ctx_execute(background:true). Shows PID, age, and status.",
-	}, s.toolBackgroundList)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_background_kill",
-		Description: "Kill a background process by id (from ctx_background_list) or by PID.",
-	}, s.toolBackgroundKill)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_background_log",
-		Description: "Return the captured stdout/stderr tail of a background process by id or PID.",
-	}, s.toolBackgroundLog)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_background_wait",
-		Description: "Wait for a background process to exit (or timeout). Returns done/exit_code and log tail. Does not kill on timeout.",
-	}, s.toolBackgroundWait)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_ls",
-		Description: "List directory entries under a workspace path. Supports limited recursion (depth), hidden files, and result limits. Paths are sandboxed to configured workdirs.",
-	}, s.toolLs)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_glob",
-		Description: "Glob files under a workspace path (supports **). Skips .git/node_modules/vendor and basic .gitignore rules. Truncates at limit.",
-	}, s.toolGlob)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_stat",
-		Description: "Stat a file or directory: size, mode, mtime, is_dir, is_symlink, symlink target, and workdir containment.",
-	}, s.toolStat)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_rg",
-		Description: "Search file contents with regex (or literal). Prefers system rg; pure-Go fallback. Skips binaries and .git. Results are path:line:content.",
-	}, s.toolRg)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_git_status",
-		Description: "Structured git status (--porcelain=v1 -b) for a workdir path. Fails clearly when not a git repository. Read-only; no commit/push/reset.",
-	}, s.toolGitStatus)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_git_diff",
-		Description: "Structured git diff (optional pathspec/stat/staged/unified). Output hard-truncated (200KB / 2000 lines). Paths sandboxed to workdirs. Read-only.",
-	}, s.toolGitDiff)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_git_log",
-		Description: "Structured git log (n default 20, hard max 100; oneline default). Optional pathspec. Read-only; no commit/push/reset.",
-	}, s.toolGitLog)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctx_run_task",
-		Description: "Structured test/build entrypoint (go_test|go_build|go_vet|npm_test|npm_run_build|cargo_test|cargo_build|make|custom). Fixed argv, no shell. Large output auto-indexed. Prefer over ad-hoc ctx_execute for CI-like tasks.",
-	}, s.toolRunTask)
+	s.registerCategoryTools(srv)
 
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		fatal(store, "server exited: %v", err)
@@ -653,7 +550,7 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		// If blocked by flood guard, return a friendly message.
 		if meta != nil && meta.FloodStatus == "blocked" {
 			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: "Search blocked: too many requests in a short time. Wait a moment, or use ctx_batch_execute (query_scope=batch searches bypass the flood guard)."}},
+				Content: []mcp.Content{&mcp.TextContent{Text: "Search blocked: too many requests in a short time. Wait a moment, or use ctx_run action=batch (query_scope=batch searches bypass the flood guard)."}},
 			}, nil, nil
 		}
 		return nil, nil, fmt.Errorf("search failed: %w", err)

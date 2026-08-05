@@ -4,11 +4,25 @@ A 100% NPM/NodeJS-free, Go implementation of Mert Koseoglu's [context-mode](http
 
 Local-first Model Context Protocol (MCP) server that virtualizes tool outputs, allowing AI coding agents to execute heavy tasks and save up to 98% in token usage.
 
-Current version: **1.3.0**.
+Current version: **2.0.0**.
+
+## MCP tools (v2)
+
+Five real tools (not skills). Each takes **`action=`** plus capability-specific fields:
+
+| Tool | Actions |
+|------|---------|
+| **ctx_run** | `execute`, `execute_file`, `batch`, `run_task` |
+| **ctx_fs** | `ls`, `glob`, `stat`, `rg` |
+| **ctx_git** | `status`, `diff`, `log` |
+| **ctx_kb** | `index`, `search`, `fetch`, `stats`, `purge`, `doctor` |
+| **ctx_bg** | `list`, `kill`, `log`, `wait` |
+
+Any MCP host (Grok, Pi, …) uses this surface. Grok prefixes the server name (e.g. `ctxmode__ctx_run`).
 
 ## Pi integration
 
-A Pi-specific TypeScript adapter is maintained in [`integrations/pi/`](integrations/pi/README.md). The Go binary remains a generic stdio MCP server. The adapter handles Pi lifecycle and tool registration without injecting fixed tool instructions into the system prompt.
+A Pi-specific TypeScript adapter is maintained in [`integrations/pi/`](integrations/pi/README.md). It registers the **same five tools** and bridges stdio MCP to the Go binary.
 
 ## Quick Start
 

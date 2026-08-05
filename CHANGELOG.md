@@ -3,6 +3,33 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] - 2026-08-05
+
+### Changed
+- **Breaking:** MCP tool surface reduced to **five category tools** with required `action=`:
+  - `ctx_run` — execute | execute_file | batch | run_task
+  - `ctx_fs` — ls | glob | stat | rg
+  - `ctx_git` — status | diff | log
+  - `ctx_kb` — index | search | fetch | stats | purge | doctor
+  - `ctx_bg` — list | kill | log | wait
+- Former top-level tools (`ctx_execute`, `ctx_ls`, …) are **not registered**; same handlers via routers.
+- Pi adapter registers the same five tools and forwards full payloads to MCP.
+- Version **2.0.0**.
+
+### Migration
+| Old tool | New call |
+|----------|----------|
+| `ctx_execute` | `ctx_run` + `action=execute` |
+| `ctx_execute_file` | `ctx_run` + `action=execute_file` |
+| `ctx_batch_execute` | `ctx_run` + `action=batch` |
+| `ctx_run_task` | `ctx_run` + `action=run_task` |
+| `ctx_ls` / `glob` / `stat` / `rg` | `ctx_fs` + matching `action` |
+| `ctx_git_*` | `ctx_git` + `action=status\|diff\|log` |
+| `ctx_index` / `search` / `fetch_and_index` / `stats` / `purge` / `doctor` | `ctx_kb` + `action` |
+| `ctx_background_*` | `ctx_bg` + `action=list\|kill\|log\|wait` |
+
+Grok names: `ctxmode__ctx_run` (etc.). Pi: same short names as MCP tools.
+
 ## [1.3.0] - 2026-08-04
 
 ### Added
