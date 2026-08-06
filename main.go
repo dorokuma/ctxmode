@@ -26,7 +26,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "2.0.0"
+const Version = "2.1.0"
 
 // toolIndex walk / size limits.
 const (
@@ -136,7 +136,7 @@ func main() {
 	}
 	s.excludeFromGit()
 
-	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: Version}, nil)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: Version}, &mcp.ServerOptions{Instructions: serverInstructions})
 	s.registerCategoryTools(srv)
 
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {

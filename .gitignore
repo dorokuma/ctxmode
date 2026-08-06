@@ -5,3 +5,4 @@ REPLICATION_PLAN.md
 context_mode.db
 context_mode.db-shm
 context_mode.db-wal
+.codegraph/

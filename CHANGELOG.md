@@ -3,6 +3,17 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-08-06
+
+### Added
+- Server **instructions** returned on MCP `initialize` (playbook for the five category tools; `mcp.ServerOptions.Instructions`).
+- Pi extension: captures `result.instructions` during the initialize handshake and appends a `## Ctxmode server instructions` section to the agent system prompt (`before_agent_start`). Missing instructions degrade to `null`, no error.
+- Pi extension: `action` parameters for all five tools now carry an `enum` (ctx_run: execute\|execute_file\|batch\|run_task; ctx_fs: ls\|glob\|stat\|rg; ctx_git: status\|diff\|log; ctx_kb: index\|search\|fetch\|stats\|purge\|doctor; ctx_bg: list\|kill\|log\|wait).
+- `.codegraph/` index artifacts ignored.
+
+### Changed
+- Version **2.1.0** (on top of the v2.0.0 five-tool folding baseline).
+
 ## [2.0.0] - 2026-08-05
 
 ### Changed

@@ -58,6 +58,7 @@ interface MCPResponse {
   result?: {
     content?: Array<{ type: string; text: string }>
     tools?: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>
+    instructions?: string
   }
   error?: { code: number; message: string }
 }
@@ -65,6 +66,7 @@ interface MCPResponse {
 interface MCPToolResult {
   content: Array<{ type: string; text: string }>
   tools?: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>
+  instructions?: string
 }
 
 class CtxmodeClient {
@@ -79,6 +81,8 @@ class CtxmodeClient {
     }
   >()
   private initialized = false
+  /** Server-provided instructions from the MCP initialize handshake (may be null). */
+  private serverInstructions: string | null = null
   private starting: Promise<void> | null = null
   private stopped = false
   private restartAttempts = 0
@@ -145,11 +149,12 @@ class CtxmodeClient {
       } catch { /* non-JSON noise */ }
     })
 
-    await this.sendRequest("initialize", {
+    const initResult = await this.sendRequest("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
       clientInfo: { name: "pi-ctxmode", version: "1.0.0" },
     }, START_TIMEOUT_MS)
+    this.serverInstructions = initResult.instructions ?? null
     this.sendNotification("notifications/initialized")
 
     const listResult = await this.sendRequest("tools/list", {}, START_TIMEOUT_MS)
@@ -240,6 +245,11 @@ class CtxmodeClient {
     return ["ctx_run", "ctx_fs", "ctx_git", "ctx_kb", "ctx_bg"]
   }
 
+  /** Instructions announced by the server during initialize (absent → null). */
+  getServerInstructions(): string | null {
+    return this.serverInstructions
+  }
+
   private scheduleRestart() {
     if (this.stopped) return
     if (this.restartAttempts >= 5) {
@@ -304,6 +314,24 @@ export default function (pi: ExtensionAPI) {
       client = null
       const msg = err instanceof Error ? err.message : String(err)
       ctx.ui.notify(`ctxmode 启动失败: ${msg}`, "warning")
+    }
+  })
+
+  pi.on("before_agent_start", async (event, _ctx) => {
+    // 只追加说明，不解析用户口令、不改焦点、不拦截消息。
+    if (client) {
+      const serverInstructions = client.getServerInstructions()
+      if (serverInstructions) {
+        return {
+          systemPrompt:
+            event.systemPrompt +
+            `
+
+## Ctxmode server instructions
+
+${serverInstructions}`,
+        }
+      }
     }
   })
 
@@ -386,7 +414,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       "Use ctx_run action=batch for multiple commands with optional queries.",
     ],
     parameters: Type.Object({
-      action: Type.String({ description: "execute|execute_file|batch|run_task" }),
+      action: Type.String({ description: "execute|execute_file|batch|run_task", enum: ["execute", "execute_file", "batch", "run_task"] }),
       command: Type.Optional(Type.String()),
       language: Type.Optional(Type.String()),
       timeout: Type.Optional(Type.Number()),
@@ -419,7 +447,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
     promptSnippet: "List, glob, stat, or search files under workdirs",
     promptGuidelines: ["Prefer ctx_fs over shell find/ls/rg when listing or searching workspace files."],
     parameters: Type.Object({
-      action: Type.String({ description: "ls|glob|stat|rg" }),
+      action: Type.String({ description: "ls|glob|stat|rg", enum: ["ls", "glob", "stat", "rg"] }),
       path: Type.Optional(Type.String()),
       pattern: Type.Optional(Type.String()),
       glob: Type.Optional(Type.String()),
@@ -442,7 +470,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
     promptSnippet: "Read-only git status/diff/log",
     promptGuidelines: ["Prefer ctx_git for status/diff/log instead of shell git."],
     parameters: Type.Object({
-      action: Type.String({ description: "status|diff|log" }),
+      action: Type.String({ description: "status|diff|log", enum: ["status", "diff", "log"] }),
       cwd: Type.Optional(Type.String()),
       path: Type.Optional(Type.String()),
       stat: Type.Optional(Type.Boolean()),
@@ -466,7 +494,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       "purge requires confirm:true.",
     ],
     parameters: Type.Object({
-      action: Type.String({ description: "index|search|fetch|stats|purge|doctor" }),
+      action: Type.String({ description: "index|search|fetch|stats|purge|doctor", enum: ["index", "search", "fetch", "stats", "purge", "doctor"] }),
       path: Type.Optional(Type.String()),
       query: Type.Optional(Type.String()),
       url: Type.Optional(Type.String()),
@@ -494,7 +522,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
     promptSnippet: "Manage background jobs from ctx_run execute background:true",
     promptGuidelines: ["Use ctx_bg after starting background processes with ctx_run action=execute background:true."],
     parameters: Type.Object({
-      action: Type.String({ description: "list|kill|log|wait" }),
+      action: Type.String({ description: "list|kill|log|wait", enum: ["list", "kill", "log", "wait"] }),
       id: Type.Optional(Type.String()),
       pid: Type.Optional(Type.Number()),
       tail_lines: Type.Optional(Type.Number()),
