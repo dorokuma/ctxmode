@@ -24,8 +24,13 @@ install -m 644 integrations/pi/ctxmode.ts ~/.pi/agent/extensions/ctxmode.ts
 
 ## Tests
 
-零新增依赖（node:test + `--experimental-strip-types`，Node ≥ 22.6）：
+零新增依赖（node:test + `--experimental-strip-types`，Node ≥ 22.15）：
 
 ```bash
 node --experimental-strip-types --test integrations/pi/ctxmode.test.ts
 ```
+
+版本下限由 `node:module` 的 `registerHooks` 卡住：测试用它把 `typebox`
+解析到内置 stub（本机无 node_modules），该 API 自 Node 22.15.0 才可用
+（官方文档 Added in: v22.15.0 / v23.5.0）；`--experimental-strip-types`
+（v22.6.0 起）与 `node:test` 的 mock（v18.13.0 起）要求都低于它，故取 22.15。
