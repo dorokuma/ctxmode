@@ -3,6 +3,25 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [3.0.0] - 2026-08-10
+
+### Breaking changes
+- **Shell command policy removed entirely** (`policy.go` deleted). The `denylist`/`allowlist` modes, `CTXMODE_POLICY_MODE`, and the `policy.shell` config are gone: the checks only inspected the command basename, which interpreters (`python3 -c`, …) trivially bypassed, offering false confidence. ctxmode executes arbitrary commands and code with the server process's privileges — it is **not a sandbox** and provides **no security boundary**; run it only in trusted environments. Upgrade impact: configs carrying a `policy:` section still load (the section is ignored), but deployments that relied on the policy for protection lose it silently — move ctxmode to a trusted environment.
+- **Knowledge base is now per-workdir**: `~/.local/share/ctxmode/<hash>-<basename>/context_mode.db` (hash = first 8 bytes of SHA-256 over the primary workdir's absolute path). The legacy global shared database is no longer used and is **not** migrated automatically; `CTXMODE_DB` still takes priority. Upgrade impact: previously indexed documents are no longer searchable until each workdir re-indexes them (or point `CTXMODE_DB` at the old file to keep using it).
+- **Invalid parameters are hard errors** instead of silent clamps: `ctx_run` batch `concurrency` (1-8) and `query_scope` (`batch`|`global`); `ctx_fs` ls `depth` (1-5) and `limit` (max 2000). Upgrade impact: callers that previously passed out-of-range values and got clamped defaults now receive an error and must pass valid values.
+- **`ctx_kb` purge without `confirm:true` returns an error** instead of a success-style "purge cancelled" message. Upgrade impact: scripts that treated the no-op as success must pass `confirm:true` (or `dryRun:true` to preview without deleting).
+- **`env` injection truly overrides same-named inherited variables** (deduplicated map, not appended duplicates), and subprocess environments strip sensitive inherited variables (names matching `token`/`key`/`secret`/`password`/`credential`/`auth`/`cookie`/`session`) by default; `CTXMODE_ENV_PASSTHROUGH=1` disables the stripping. Upgrade impact: injected values now take effect where the host value previously won, and subprocesses no longer inherit secrets; hosts that must pass the full environment set `CTXMODE_ENV_PASSTHROUGH=1`.
+
+### Changed
+- Indexing skips secret-like files by default: `.env`/`.env.*`, private keys (`*.pem`, `*.key`, `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`), `credentials.json`, `.npmrc`, `.netrc`, and anything under `.aws`/`.ssh`/`.gnupg`/`.kube`.
+- `ctx_run` batch auto-indexes only output >100KB (same threshold as `execute`); small output is no longer persisted to the KB.
+- `ctx_kb` fetch blocks IPv6 loopback (`::1`), link-local (`fe80::/10`), private (`fc00::/7`), unspecified, and multicast addresses symmetrically with IPv4, in both strict and non-strict modes.
+- Background jobs honor the caller-provided `timeout` (default max age 1h) and are capped at **16 concurrent jobs** (exceeding returns an error instead of queueing).
+- Relative paths with multiple configured workdirs no longer silently resolve to the first workdir: zero or multiple matches are errors demanding an absolute path.
+
+### Fixed
+- CI runs `go test -race ./...` (the flood-guard concurrency tests only detect races under `-race`) with a 20-minute job timeout.
+
 ## [2.1.0] - 2026-08-06
 
 ### Added
