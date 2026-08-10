@@ -7,10 +7,45 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { Type } from "typebox"
 import { spawn, type ChildProcess } from "node:child_process"
 import { createInterface } from "node:readline"
+import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 
 const START_TIMEOUT_MS = Number(process.env.CTXMODE_START_TIMEOUT_MS || 15000)
 const REQUEST_TIMEOUT_MS = Number(process.env.CTXMODE_REQUEST_TIMEOUT_MS || 120000)
+const STDERR_KEEP_LINES = 20
+const DIAG_TAG = "ctxmode"
+const DIAG_LOG_FILE = "ctxmode.log"
+/** Cache log path after first ensure (avoids mkdir per line). */
+let diagLogPath: string | null = null
+
+/**
+ * TUI-safe diagnostics. console.* corrupts Pi's input row — only DEBUG may print.
+ * Otherwise append to ~/.pi/agent/logs/ctxmode.log.
+ */
+function diagLog(msg: string): void {
+  const line = `[${DIAG_TAG}] ${msg}`
+  if (process.env.CTXMODE_DEBUG) {
+    console.error(line)
+    return
+  }
+  try {
+    if (!diagLogPath) {
+      const dir = path.join(os.homedir() || "/tmp", ".pi", "agent", "logs")
+      fs.mkdirSync(dir, { recursive: true })
+      diagLogPath = path.join(dir, DIAG_LOG_FILE)
+    }
+    fs.appendFileSync(diagLogPath, `${new Date().toISOString()} ${line}\n`)
+  } catch {
+    diagLogPath = null
+  }
+}
+
+function isInterestingStderrLine(line: string): boolean {
+  if (/\blevel=INFO\b/i.test(line) || /"level"\s*:\s*"INFO"/i.test(line)) return false
+  if (/\blevel=DEBUG\b/i.test(line) || /"level"\s*:\s*"DEBUG"/i.test(line)) return false
+  return true
+}
 
 // ---- Output budget (same spirit as codegraph-go) ----
 const OUTPUT_CHAR_CAP = Number(process.env.CTXMODE_OUTPUT_CHARS || 50000)
@@ -85,8 +120,13 @@ class CtxmodeClient {
   private serverInstructions: string | null = null
   private starting: Promise<void> | null = null
   private stopped = false
+  /** stop()/替换旧进程时置 true，避免 exit 监听把预期关闭当成故障。 */
+  private intentionalClose = false
   private restartAttempts = 0
   private restartTimer: ReturnType<typeof setTimeout> | null = null
+  /** 最近 N 行 stderr，异常退出时写入诊断日志。 */
+  private stderrBuffer: string[] = []
+  private stderrCarry = ""
   readonly workdir: string
 
   constructor(workdir: string) {
@@ -103,35 +143,110 @@ class CtxmodeClient {
     return this.starting
   }
 
+  /** 摘监听后 kill；配合 shutDownProc 先 cleanup，避免 pending 悬挂。 */
+  private disposeProc(proc: ChildProcess): void {
+    this.intentionalClose = true
+    try {
+      proc.removeAllListeners("exit")
+      proc.removeAllListeners("error")
+    } catch { /* ignore */ }
+    try { proc.stdin?.end() } catch { /* ignore */ }
+    try { proc.kill() } catch { /* ignore */ }
+  }
+
+  /** dispose + 清 stderr + reject pending（doStart 换进程 / stop 共用）。 */
+  private shutDownProc(): void {
+    if (!this.proc) return
+    this.disposeProc(this.proc)
+    this.clearStderrBuffer()
+    this.cleanup()
+  }
+
+  private pushStderrLine(line: string): void {
+    if (!line) return
+    this.stderrBuffer.push(line)
+    if (this.stderrBuffer.length > STDERR_KEEP_LINES) this.stderrBuffer.shift()
+  }
+
+  private flushStderrCarry(): void {
+    const tail = this.stderrCarry.trimEnd()
+    if (tail) this.pushStderrLine(tail)
+    this.stderrCarry = ""
+  }
+
+  private clearStderrBuffer(): void {
+    this.flushStderrCarry()
+    this.stderrBuffer = []
+  }
+
+  /** 异常退出写最近 stderr（滤 INFO/DEBUG）；force 时过滤空则回退末 5 行。 */
+  private dumpStderrBuffer(force = false): void {
+    this.flushStderrCarry()
+    if (this.stderrBuffer.length === 0) return
+    const all = this.stderrBuffer.slice(-STDERR_KEEP_LINES)
+    this.stderrBuffer = []
+    let lines = all.filter(isInterestingStderrLine)
+    if (lines.length === 0 && force) lines = all.slice(-5)
+    if (lines.length === 0) return
+    diagLog(`last stderr before exit (${lines.length} lines):`)
+    for (const line of lines) diagLog(`  ${line}`)
+  }
+
   private async doStart(): Promise<void> {
-    if (this.proc) {
-      try { this.proc.kill() } catch { /* ignore */ }
-      this.proc = null
-    }
+    if (this.proc) this.shutDownProc()
 
     const bin = process.env.CTXMODE_BIN || "ctxmode"
+    this.intentionalClose = false
     this.proc = spawn(bin, ["-workdir", this.workdir], {
       stdio: ["pipe", "pipe", "pipe"],
     })
 
+    // 禁止 console.*（污染 Pi TUI 输入行）。
     this.proc.on("error", (err) => {
-      console.error(`[ctxmode] process error: ${err.message}`)
+      const intentional = this.intentionalClose
+      if (!intentional) {
+        diagLog(`process error: ${err.message}`)
+        this.dumpStderrBuffer(true)
+      } else {
+        this.clearStderrBuffer()
+      }
       this.cleanup()
-      this.scheduleRestart()
+      if (!intentional) this.scheduleRestart()
     })
 
-    this.proc.on("exit", (code) => {
-      console.error(`[ctxmode] process exited with code ${code}`)
+    this.proc.on("exit", (code, signal) => {
+      const intentional = this.intentionalClose
+      this.intentionalClose = false
+      if (intentional) {
+        this.clearStderrBuffer()
+        this.cleanup()
+        return
+      }
+      // 意外退出写文件一行（仍不 console）；0/null 也记。
+      const clean = code === 0 || code === null
+      if (clean) {
+        diagLog(
+          `unexpected exit code=${code} signal=${signal ?? ""} (silent to TUI; auto-restart if enabled)`,
+        )
+        this.clearStderrBuffer()
+      } else {
+        diagLog(`process exited abnormally code=${code} signal=${signal ?? ""}`)
+        this.dumpStderrBuffer(true)
+      }
       this.cleanup()
       this.scheduleRestart()
     })
 
     if (this.proc.stderr) {
       this.proc.stderr.on("data", (chunk: Buffer | string) => {
+        const text = typeof chunk === "string" ? chunk : chunk.toString("utf8")
         if (process.env.CTXMODE_DEBUG) {
-          const text = typeof chunk === "string" ? chunk : chunk.toString("utf8")
-          console.error(`[ctxmode] ${text.trimEnd()}`)
+          diagLog(text.trimEnd())
+          return
         }
+        const lines = (this.stderrCarry + text).split("\n")
+        this.stderrCarry = lines.pop() || ""
+        for (const line of lines) this.pushStderrLine(line.trimEnd())
       })
     }
 
@@ -161,8 +276,8 @@ class CtxmodeClient {
     const toolNames = (listResult.tools || []).map(t => t.name).join(", ")
     this.initialized = true
 
-    console.error(
-      `[ctxmode] started workdir=${this.workdir}, tools: ${toolNames}, out≤${OUTPUT_CHAR_CAP}c/${OUTPUT_LINE_CAP}L`,
+    diagLog(
+      `started workdir=${this.workdir}, tools: ${toolNames}, out≤${OUTPUT_CHAR_CAP}c/${OUTPUT_LINE_CAP}L`,
     )
   }
 
@@ -253,18 +368,18 @@ class CtxmodeClient {
   private scheduleRestart() {
     if (this.stopped) return
     if (this.restartAttempts >= 5) {
-      console.error("[ctxmode] gave up auto-restart after 5 attempts")
+      diagLog("gave up auto-restart after 5 attempts")
       return
     }
     if (this.restartTimer) return
     const delay = Math.min(1000 * 2 ** this.restartAttempts, 15000)
     this.restartAttempts++
-    console.error(`[ctxmode] auto-restart in ${delay}ms (attempt ${this.restartAttempts})`)
+    diagLog(`auto-restart in ${delay}ms (attempt ${this.restartAttempts})`)
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null
       if (this.stopped) return
       this.start().catch((err) => {
-        console.error(`[ctxmode] auto-restart failed: ${err}`)
+        diagLog(`auto-restart failed: ${err}`)
         this.scheduleRestart()
       })
     }, delay)
@@ -286,11 +401,7 @@ class CtxmodeClient {
       clearTimeout(this.restartTimer)
       this.restartTimer = null
     }
-    if (this.proc) {
-      this.proc.stdin?.end()
-      this.proc.kill()
-      this.cleanup()
-    }
+    this.shutDownProc()
   }
 }
 
