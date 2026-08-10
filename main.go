@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -39,6 +41,7 @@ const (
 
 type server struct {
 	workdirs       []string
+	dbPath         string
 	mu             sync.Mutex
 	store          *Store
 	floodGuard     *FloodGuard
@@ -107,7 +110,18 @@ func main() {
 		fatal(nil, "no workspace directories configured")
 	}
 
-	store, err := NewStore(filepath.Join(workdirs[0], "context_mode.db"))
+	dbPath, legacyPath, err := databasePath(workdirs[0])
+	if err != nil {
+		fatal(nil, "failed to resolve database path: %v", err)
+	}
+	if err := ensureDBDir(dbPath); err != nil {
+		fatal(nil, "%v", err)
+	}
+	log.Printf("ctxmode: database: %s", dbPath)
+	if dbPath != legacyPath {
+		log.Printf("ctxmode: database location changed (shared %s no longer used); old data is not migrated automatically", legacyPath)
+	}
+	store, err := NewStore(dbPath)
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
 	}
@@ -118,6 +132,7 @@ func main() {
 
 	s := &server{
 		workdirs:       workdirs,
+		dbPath:         dbPath,
 		store:          store,
 		floodGuard:     floodGuard,
 		searchPipeline: searchPipeline,
@@ -198,6 +213,38 @@ func loadConfig(configFlag string) (*appConfig, error) {
 
 	out.Workdirs = cfg.Workdirs
 	return out, nil
+}
+
+// databasePath resolves the per-workdir SQLite database location.
+// Priority: $CTXMODE_DB (full file path) > $HOME/.local/share/ctxmode/<hash>-<basename>/context_mode.db,
+// where <hash> is the first 8 bytes of SHA-256 over the primary workdir's
+// absolute path. Each primary workdir gets its own database, so documents
+// indexed in one project are never searchable from another. The legacy shared
+// path (~/.local/share/ctxmode/context_mode.db) is returned as the second
+// value so main() can log the change; old data is deliberately not migrated.
+func databasePath(workdir string) (string, string, error) {
+	if env := strings.TrimSpace(os.Getenv("CTXMODE_DB")); env != "" {
+		abs, err := filepath.Abs(env)
+		return abs, abs, err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	legacy := filepath.Join(home, ".local", "share", "ctxmode", "context_mode.db")
+	cleanWd := filepath.Clean(workdir)
+	sum := sha256.Sum256([]byte(cleanWd))
+	dir := filepath.Join(home, ".local", "share", "ctxmode", fmt.Sprintf("%x-%s", sum[:8], filepath.Base(cleanWd)))
+	return filepath.Join(dir, "context_mode.db"), legacy, nil
+}
+
+// ensureDBDir creates the parent directory of the database file (0755).
+func ensureDBDir(dbPath string) error {
+	dir := filepath.Dir(dbPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create database directory %q: %w", dir, err)
+	}
+	return nil
 }
 
 // ---------- tool implementations ----------
@@ -316,10 +363,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 
 	if len(outputText) > autoIndexThreshold {
 		// Unconditionally index large outputs.
-		label := fmt.Sprintf("execute:%d", time.Now().UnixNano())
-		if args.Intent != "" {
-			label = "execute:" + args.Intent
-		}
+		label := uniqueIndexLabel("execute", args.Intent)
 		if err := s.storeIndexLocked(label, outputText); err != nil {
 			// Index failed: still return a truncated preview so the agent is not blind.
 			preview := outputText
@@ -345,7 +389,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 
 	if len(outputText) > intentThreshold && args.Intent != "" {
 		// Index and return a preview.
-		label := "execute:" + args.Intent
+		label := uniqueIndexLabel("execute", args.Intent)
 		if err := s.storeIndexLocked(label, outputText); err != nil {
 			preview := outputText
 			if len(preview) > 2000 {
@@ -398,6 +442,7 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 
 	indexedCount := 0
 	skippedCount := 0
+	sensitiveCount := 0
 	var skipSamples []string // sample skip reasons (capped)
 	var totalBytes int64
 	hitFileCap := false
@@ -440,8 +485,13 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 				hitFileCap = true
 				return filepath.SkipDir
 			}
-			if strings.Contains(path, "/.git/") || strings.Contains(path, "/node_modules/") {
+			if pathHasExcludedSegment(path, ".git", "node_modules") {
 				addSkip(fmt.Sprintf("%s: excluded dir", path))
+				return nil
+			}
+			if isSensitiveFilePath(path) {
+				sensitiveCount++
+				addSkip(fmt.Sprintf("%s: sensitive file (secrets)", path))
 				return nil
 			}
 			// Symlink fence: refuse paths that resolve outside workspaces.
@@ -473,6 +523,9 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 			return nil
 		})
 	} else {
+		if isSensitiveFilePath(target) {
+			return nil, nil, fmt.Errorf("refusing to index sensitive file %q (credentials/secrets)", target)
+		}
 		if isProbablyBinaryName(info.Name()) || info.Size() > maxIndexFileBytes {
 			return nil, nil, fmt.Errorf("file %q is binary or too large (> 1MB)", target)
 		}
@@ -491,7 +544,12 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 
 	msg := fmt.Sprintf("Indexed %d file(s)", indexedCount)
 	if skippedCount > 0 {
-		msg += fmt.Sprintf(" (%d skipped)", skippedCount)
+		msg += fmt.Sprintf(" (%d skipped", skippedCount)
+		if sensitiveCount > 0 {
+			msg += fmt.Sprintf(", %d sensitive)", sensitiveCount)
+		} else {
+			msg += ")"
+		}
 		if len(skipSamples) > 0 {
 			msg += ": " + strings.Join(skipSamples, "; ")
 			if skippedCount > len(skipSamples) {
@@ -600,12 +658,12 @@ func (s *server) toolStats(ctx context.Context, _ *mcp.CallToolRequest, _ statsA
 
 	docCount, dbSize, err := s.store.Stats()
 	if err != nil {
-		docCount = 0
+		return nil, nil, fmt.Errorf("store stats: %w", err)
 	}
 
 	cacheCount, err := s.store.CacheCount()
 	if err != nil {
-		cacheCount = 0
+		return nil, nil, fmt.Errorf("store cache count: %w", err)
 	}
 
 	savedBytes := s.totalOutput - s.totalInput
@@ -737,10 +795,11 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	)
 
 	if len(outputText) > autoIndexThreshold {
-		label := "execute_file:" + filepath.Base(target)
-		if args.Intent != "" {
-			label = "execute_file:" + args.Intent
+		intent := args.Intent
+		if intent == "" {
+			intent = filepath.Base(target)
 		}
+		label := uniqueIndexLabel("execute_file", intent)
 		if err := s.storeIndexLocked(label, outputText); err != nil {
 			// Index failed: still return a truncated preview so the agent is not blind.
 			preview := outputText
@@ -765,7 +824,7 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	}
 
 	if len(outputText) > intentThreshold && args.Intent != "" {
-		label := "execute_file:" + args.Intent
+		label := uniqueIndexLabel("execute_file", args.Intent)
 		if err := s.storeIndexLocked(label, outputText); err != nil {
 			preview := outputText
 			if len(preview) > 2000 {
@@ -914,6 +973,54 @@ func isProbablyBinary(name string) bool {
 	return isProbablyBinaryName(name)
 }
 
+// pathHasExcludedSegment reports whether any path segment equals one of the
+// excluded directory names. It splits on the OS separator (filepath semantics)
+// instead of matching a hardcoded "/.git/" substring, which breaks on Windows
+// and also treats a file like ".gitignore" as a directory.
+func pathHasExcludedSegment(path string, excluded ...string) bool {
+	for _, seg := range strings.Split(path, string(filepath.Separator)) {
+		for _, ex := range excluded {
+			if seg == ex {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isSensitiveFilePath reports whether the file should be excluded from
+// indexing because it likely holds credentials or other secrets: .env and its
+// variants (.env.local, .env.production, ...), private keys (*.pem, *.key,
+// id_rsa/id_ed25519/...), cloud/registry auth files (credentials.json,
+// .npmrc, .netrc), and anything under a dot-secret directory (.aws, .ssh,
+// .gnupg, .kube). Matches are case-insensitive.
+func isSensitiveFilePath(path string) bool {
+	lower := strings.ToLower(path)
+	base := filepath.Base(lower)
+	if base == ".env" || strings.HasPrefix(base, ".env.") {
+		return true
+	}
+	if strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key") {
+		return true
+	}
+	for _, key := range []string{"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"} {
+		if strings.HasSuffix(base, key) {
+			return true
+		}
+	}
+	switch base {
+	case "credentials.json", "credentials", ".npmrc", ".netrc":
+		return true
+	}
+	for _, seg := range strings.Split(lower, string(filepath.Separator)) {
+		switch seg {
+		case ".aws", ".ssh", ".gnupg", ".kube":
+			return true
+		}
+	}
+	return false
+}
+
 // isBinaryContent samples the first bytes and detects binary data via null
 // bytes or a high proportion of non-text control characters.
 func isBinaryContent(data []byte) bool {
@@ -943,6 +1050,23 @@ func isBinaryContent(data []byte) bool {
 		return true
 	}
 	return false
+}
+
+// indexLabelSeq guarantees unique index labels even for two indexes created
+// within the same nanosecond (concurrent executes sharing an intent).
+var indexLabelSeq atomic.Uint64
+
+// uniqueIndexLabel builds a store label that never collides: a static prefix,
+// the optional intent, a nanosecond timestamp, and a monotonically increasing
+// sequence. Without the unique suffix, INSERT OR REPLACE would silently drop
+// the earlier document when two executes share an intent, leaving the agent
+// with a search label whose content is gone.
+func uniqueIndexLabel(prefix, intent string) string {
+	base := prefix
+	if intent != "" {
+		base += ":" + intent
+	}
+	return fmt.Sprintf("%s:%d:%d", base, time.Now().UnixNano(), indexLabelSeq.Add(1))
 }
 
 // storeIndexLocked wraps store.Index with the server mutex, ensuring that
@@ -997,23 +1121,39 @@ func (s *server) validateArgv(argv []string, cwd string) ([]string, error) {
 }
 
 // resolvePath converts a user-supplied path into an absolute path within any workspace.
-// After Clean, it resolves symlinks (EvalSymlinks) and re-checks that the real
-// path still lies inside a configured workdir. Symlinks that escape are rejected.
+// Absolute paths must be lexically inside a workspace, then resolve symlinks
+// (EvalSymlinks) and re-check containment. Relative paths are tried against
+// every workdir and must match exactly one existing path: silently joining to
+// workdirs[0] made secondary roots unreachable and could drop files into the
+// wrong directory. Zero or multiple matches are errors that demand an
+// absolute path.
 func (s *server) resolvePath(p string) (string, error) {
 	if p == "" {
 		return s.workdirs[0], nil
 	}
-	var target string
 	if filepath.IsAbs(p) {
-		target = filepath.Clean(p)
-	} else {
-		target = filepath.Clean(filepath.Join(s.workdirs[0], p))
+		target := filepath.Clean(p)
+		// First-pass lexical containment (fast reject before syscall).
+		if !s.lexicallyInside(target) {
+			return "", fmt.Errorf("path %q is outside all workspaces %q", p, s.workdirs)
+		}
+		return s.ensureInsideWorkspaces(target)
 	}
-	// First-pass lexical containment (fast reject before syscall).
-	if !s.lexicallyInside(target) {
-		return "", fmt.Errorf("path %q is outside all workspaces %q", p, s.workdirs)
+	var matches []string
+	for _, wd := range s.workdirs {
+		cand := filepath.Clean(filepath.Join(wd, p))
+		if _, err := os.Stat(cand); err == nil {
+			matches = append(matches, cand)
+		}
 	}
-	return s.ensureInsideWorkspaces(target)
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("relative path %q does not exist under any workspace %q; use an absolute path", p, s.workdirs)
+	case 1:
+		return s.ensureInsideWorkspaces(matches[0])
+	default:
+		return "", fmt.Errorf("relative path %q exists under multiple workspaces %q; use an absolute path to disambiguate", p, s.workdirs)
+	}
 }
 
 // lexicallyInside reports whether path is under any workdir before symlink resolution.
@@ -1083,15 +1223,33 @@ func evalSymlinksPartial(path string) (string, error) {
 	return filepath.Clean(path), nil
 }
 
-// excludeFromGit appends the local database files to .git/info/exclude for all workspaces.
+// excludeFromGit excludes the local database files from git tracking in any
+// workspace that contains them. The per-workdir database normally lives under
+// ~/.local/share/ctxmode/<hash>-<basename>/ (outside every workspace), so in
+// the default setup there is nothing to exclude; only when CTXMODE_DB points
+// inside a workspace does a .git/info/exclude entry make sense. The entry uses
+// the database file's real repo-relative path (the previous hardcoded
+// "context_mode.db" matched nothing once the database moved out of the repo).
 func (s *server) excludeFromGit() {
 	for _, wd := range s.workdirs {
 		s.excludeFromGitOne(wd)
 	}
 }
 
-// excludeFromGitOne handles a single workspace's git exclusion.
+// excludeFromGitOne handles a single workspace's git exclusion: it appends the
+// database file's repo-relative path (plus -wal/-shm siblings) to
+// .git/info/exclude, but only when the database actually lives inside that
+// workspace. When it lives outside the repository — the default — this is a
+// no-op.
 func (s *server) excludeFromGitOne(wd string) {
+	if s.dbPath == "" {
+		return
+	}
+	rel, err := filepath.Rel(wd, s.dbPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		// Database is outside this workspace; git exclusion is meaningless.
+		return
+	}
 	gitDir := filepath.Join(wd, ".git")
 	info, err := os.Lstat(gitDir)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
@@ -1123,7 +1281,7 @@ func (s *server) excludeFromGitOne(wd string) {
 	if err == nil {
 		content = string(data)
 	}
-	if strings.Contains(content, "context_mode.db") {
+	if strings.Contains(content, rel) {
 		return
 	}
 	f, err := os.OpenFile(resolvedExclude, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -1132,7 +1290,7 @@ func (s *server) excludeFromGitOne(wd string) {
 		return
 	}
 	defer f.Close()
-	if _, err := f.WriteString("\n# ctxmode local database\ncontext_mode.db\ncontext_mode.db-wal\ncontext_mode.db-shm\n"); err != nil {
+	if _, err := f.WriteString(fmt.Sprintf("\n# ctxmode local database\n%s\n%s-wal\n%s-shm\n", rel, rel, rel)); err != nil {
 		log.Printf("excludeFromGit: WriteString %s: %v", resolvedExclude, err)
 		return
 	}
