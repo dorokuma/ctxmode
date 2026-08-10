@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -245,5 +246,152 @@ func TestExecuteCommand_CancellationSIGKILL_ForceKill(t *testing.T) {
 	// 必须等了至少 3 秒 (SIGTERM → 3s wait → SIGKILL)
 	if elapsed < 3*time.Second {
 		t.Fatalf("expected at least 3s elapsed for SIGKILL fallback, got %v", elapsed)
+	}
+}
+
+// ============================================================================
+// batch auto-index threshold（与 execute 路径一致的 100KB 门槛）
+// ============================================================================
+
+// TestBatchExecute_LargeOutputIndexedSmallNot verifies that batch output is
+// auto-indexed ONLY when it exceeds the 100KB threshold (same as the execute
+// path); small output must NOT be persisted, and the response must flag which
+// entries were indexed.
+func TestBatchExecute_LargeOutputIndexedSmallNot(t *testing.T) {
+	srv := newTestServer(t)
+	srv.workdirs = []string{t.TempDir()}
+
+	res, _, err := srv.toolBatchExecute(context.Background(), nil, batchArgs{
+		Commands: []batchCommand{
+			{Label: "big", Command: "head -c 102500 /dev/zero | tr '\\0' 'a'"},
+			{Label: "small", Command: "echo tiny_batch_output"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("toolBatchExecute: %v", err)
+	}
+	text := contentText(res)
+	var resp batchResponse
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v\n%s", err, text)
+	}
+	if resp.Indexed != 1 {
+		t.Fatalf("expected indexed=1 (only big), got %d\n%s", resp.Indexed, text)
+	}
+
+	byLabel := map[string]batchResult{}
+	for _, r := range resp.Commands {
+		byLabel[r.Label] = r
+	}
+	big, ok := byLabel["big"]
+	if !ok {
+		t.Fatalf("missing big entry: %s", text)
+	}
+	if !big.Indexed {
+		t.Fatalf("big output should be indexed: %+v", big)
+	}
+	if !big.Truncated {
+		t.Fatalf("big output should be truncated in response: %+v", big)
+	}
+	small, ok := byLabel["small"]
+	if !ok {
+		t.Fatalf("missing small entry: %s", text)
+	}
+	if small.Indexed {
+		t.Fatalf("small output must NOT be indexed: %+v", small)
+	}
+
+	// Store must contain batch:big but not batch:small.
+	if doc, _ := srv.store.Get(batchIndexPrefix + "big"); doc == nil {
+		t.Fatal("batch:big should be present in store")
+	}
+	if doc, _ := srv.store.Get(batchIndexPrefix + "small"); doc != nil {
+		t.Fatal("batch:small must NOT be persisted (no-size-threshold indexing removed)")
+	}
+}
+
+// TestBatchExecute_ConcurrentIndexesLargeOutput verifies the concurrent path
+// applies the same threshold and flags indexed entries.
+func TestBatchExecute_ConcurrentIndexesLargeOutput(t *testing.T) {
+	srv := newTestServer(t)
+	srv.workdirs = []string{t.TempDir()}
+
+	res, _, err := srv.toolBatchExecute(context.Background(), nil, batchArgs{
+		Commands: []batchCommand{
+			{Label: "c1", Command: "head -c 102500 /dev/zero | tr '\\0' 'a'"},
+			{Label: "c2", Command: "head -c 102500 /dev/zero | tr '\\0' 'b'"},
+		},
+		Concurrency: 2,
+	})
+	if err != nil {
+		t.Fatalf("toolBatchExecute: %v", err)
+	}
+	text := contentText(res)
+	var resp batchResponse
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v\n%s", err, text)
+	}
+	if resp.Indexed != 2 {
+		t.Fatalf("expected indexed=2, got %d\n%s", resp.Indexed, text)
+	}
+	for _, r := range resp.Commands {
+		if !r.Indexed {
+			t.Fatalf("expected all entries indexed in concurrent path: %+v", r)
+		}
+	}
+	if doc, _ := srv.store.Get(batchIndexPrefix + "c1"); doc == nil {
+		t.Fatal("batch:c1 should be in store")
+	}
+	if doc, _ := srv.store.Get(batchIndexPrefix + "c2"); doc == nil {
+		t.Fatal("batch:c2 should be in store")
+	}
+}
+
+// ============================================================================
+// batch 参数校验（不再静默夹紧/默认化）
+// ============================================================================
+
+func TestBatchExecute_ConcurrencyTooHigh(t *testing.T) {
+	srv := newTestServer(t)
+	srv.workdirs = []string{t.TempDir()}
+	_, _, err := srv.toolBatchExecute(context.Background(), nil, batchArgs{
+		Commands:    []batchCommand{{Label: "a", Command: "echo hi"}},
+		Concurrency: 9,
+	})
+	if err == nil {
+		t.Fatal("expected error for concurrency > 8")
+	}
+	if !strings.Contains(err.Error(), "concurrency") || !strings.Contains(err.Error(), "1-8") {
+		t.Fatalf("expected valid range in error, got: %v", err)
+	}
+}
+
+func TestBatchExecute_NegativeConcurrency(t *testing.T) {
+	srv := newTestServer(t)
+	srv.workdirs = []string{t.TempDir()}
+	_, _, err := srv.toolBatchExecute(context.Background(), nil, batchArgs{
+		Commands:    []batchCommand{{Label: "a", Command: "echo hi"}},
+		Concurrency: -3,
+	})
+	if err == nil {
+		t.Fatal("expected error for negative concurrency")
+	}
+	if !strings.Contains(err.Error(), "1-8") {
+		t.Fatalf("expected valid range in error, got: %v", err)
+	}
+}
+
+func TestBatchExecute_InvalidQueryScope(t *testing.T) {
+	srv := newTestServer(t)
+	srv.workdirs = []string{t.TempDir()}
+	_, _, err := srv.toolBatchExecute(context.Background(), nil, batchArgs{
+		Commands:   []batchCommand{{Label: "a", Command: "echo hi"}},
+		QueryScope: "everything",
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid query_scope")
+	}
+	if !strings.Contains(err.Error(), "batch") || !strings.Contains(err.Error(), "global") {
+		t.Fatalf("expected valid values in error, got: %v", err)
 	}
 }

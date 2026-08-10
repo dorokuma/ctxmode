@@ -9,9 +9,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// purgeArgs is the JSON schema for the ctx_purge tool.
+// purgeArgs is the JSON schema for ctx_kb action=purge.
 type purgeArgs struct {
-	Confirm   bool   `json:"confirm" jsonschema:"MUST be true. Destructive operation; false returns 'purge cancelled'."`
+	Confirm   bool   `json:"confirm" jsonschema:"MUST be true. Destructive operation; requires confirm:true. dryRun:true previews without confirm."`
 	Scope     string `json:"scope,omitempty" jsonschema:"'session' or 'project'"`
 	SessionID string `json:"sessionId,omitempty" jsonschema:"UUID of session to purge (for scope='session')"`
 	DryRun    bool   `json:"dryRun,omitempty" jsonschema:"If true, preview what would be deleted without actually deleting"`
@@ -32,11 +32,10 @@ func (s *server) toolPurge(ctx context.Context, _ *mcp.CallToolRequest, args pur
 		return s.purgeDryRun(args.Scope, args.SessionID)
 	}
 
-	// Must confirm.
+	// Must confirm. Missing or false confirm is an explicit error (not a silent
+	// "cancelled" success) so callers cannot mistake a no-op for a completed purge.
 	if !args.Confirm {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "purge cancelled"}},
-		}, nil, nil
+		return nil, nil, fmt.Errorf("confirm:true is required: purge permanently deletes indexed documents; pass confirm:true to proceed, or dryRun:true to preview without deleting")
 	}
 
 	// Scope is required.

@@ -36,6 +36,7 @@ type batchResult struct {
 	Success    bool   `json:"success"`
 	ExitCode   int    `json:"exit_code"`
 	Truncated  bool   `json:"truncated,omitempty"`
+	Indexed    bool   `json:"indexed,omitempty"`
 	Size       int    `json:"size"`
 	Error      string `json:"error,omitempty"`
 	IndexError string `json:"index_error,omitempty"`
@@ -170,13 +171,16 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 		seen[cmd.Label] = true
 	}
 
-	// Validate concurrency.
+	// Validate concurrency (1-8, default 1). Invalid values are errors, not silent clamps.
 	concurrency := args.Concurrency
-	if concurrency < 1 {
-		concurrency = 1
+	if concurrency < 0 {
+		return nil, nil, fmt.Errorf("invalid concurrency %d (valid range: 1-8, default 1)", concurrency)
+	}
+	if concurrency == 0 {
+		concurrency = 1 // default (unset)
 	}
 	if concurrency > 8 {
-		concurrency = 8
+		return nil, nil, fmt.Errorf("concurrency %d exceeds maximum 8 (valid range: 1-8, default 1)", concurrency)
 	}
 
 	// Resolve working directory.
@@ -189,10 +193,12 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 		cwd = resolved
 	}
 
-	// Validate query_scope.
+	// Validate query_scope (batch or global, default batch). Invalid values are errors.
 	queryScope := strings.ToLower(args.QueryScope)
-	if queryScope != "batch" && queryScope != "global" {
-		queryScope = "batch" // default
+	if queryScope == "" {
+		queryScope = "batch" // default (unset)
+	} else if queryScope != "batch" && queryScope != "global" {
+		return nil, nil, fmt.Errorf("invalid query_scope %q (valid values: batch, global; default batch)", args.QueryScope)
 	}
 
 	// Validate queries max (fast-fail before executing commands).
@@ -230,7 +236,7 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 	indexFailures := 0
 	anyTruncated := false
 	for _, r := range results {
-		if r.Size > 0 && r.IndexError == "" {
+		if r.Indexed {
 			totalIndexed++
 		}
 		if r.IndexError != "" {
@@ -354,11 +360,14 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 			r.Truncated = true
 		}
 
-		// Index the full output (even if truncated in the response).
-		if out != "" {
+		// Auto-index only large output (same 100KB threshold as the execute path);
+		// small output is not persisted. Indexed entries are flagged in the response.
+		if len(out) > maxOutputSize {
 			s.mu.Lock()
 			if err := s.store.Index(batchIndexPrefix+cmd.Label, out); err != nil {
 				r.IndexError = err.Error()
+			} else {
+				r.Indexed = true
 			}
 			s.mu.Unlock()
 		}
@@ -411,11 +420,14 @@ func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCom
 				r.Truncated = true
 			}
 
-			// Index with mutex protection (SQLite only allows one writer at a time).
-			if out != "" {
+			// Auto-index only large output (same 100KB threshold as the execute path);
+			// small output is not persisted. Mutex serializes SQLite single-writer.
+			if len(out) > maxOutputSize {
 				s.mu.Lock()
 				if err := s.store.Index(batchIndexPrefix+c.Label, out); err != nil {
 					r.IndexError = err.Error()
+				} else {
+					r.Indexed = true
 				}
 				s.mu.Unlock()
 			}

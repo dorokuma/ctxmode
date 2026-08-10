@@ -52,7 +52,7 @@ var skipWalkDirs = map[string]bool{
 	"target":        true, // Rust/Java common
 }
 
-// ---------- ctx_ls ----------
+// ---------- ctx_fs: ls ----------
 
 type lsArgs struct {
 	Path          string `json:"path,omitempty" jsonschema:"Directory path to list (default: .)"`
@@ -81,14 +81,14 @@ func (s *server) toolLs(ctx context.Context, _ *mcp.CallToolRequest, args lsArgs
 		depth = fsDefaultDepth
 	}
 	if depth > fsMaxDepth {
-		depth = fsMaxDepth
+		return nil, nil, fmt.Errorf("invalid depth %d: exceeds maximum %d (valid range: 1-%d, default %d)", depth, fsMaxDepth, fsMaxDepth, fsDefaultDepth)
 	}
 	limit := args.Limit
 	if limit <= 0 {
 		limit = fsDefaultLimit
 	}
 	if limit > fsHardLimit {
-		limit = fsHardLimit
+		return nil, nil, fmt.Errorf("invalid limit %d: exceeds maximum %d (valid range: 1-%d, default %d)", limit, fsHardLimit, fsHardLimit, fsDefaultLimit)
 	}
 
 	root, err := s.resolvePath(pathArg)
@@ -249,7 +249,7 @@ func (s *server) displayPath(abs string) string {
 	return abs
 }
 
-// ---------- ctx_glob ----------
+// ---------- ctx_fs: glob ----------
 
 type globArgs struct {
 	Pattern string `json:"pattern" jsonschema:"Glob pattern (e.g. **/*.go)"`
@@ -270,7 +270,7 @@ func (s *server) toolGlob(ctx context.Context, _ *mcp.CallToolRequest, args glob
 		limit = fsDefaultLimit
 	}
 	if limit > fsHardLimit {
-		limit = fsHardLimit
+		return nil, nil, fmt.Errorf("invalid limit %d: exceeds maximum %d (valid range: 1-%d, default %d)", limit, fsHardLimit, fsHardLimit, fsDefaultLimit)
 	}
 
 	root, err := s.resolvePath(pathArg)
@@ -498,7 +498,7 @@ func (g basicGitignore) ignores(rel string, isDir bool) bool {
 	return false
 }
 
-// ---------- ctx_stat ----------
+// ---------- ctx_fs: stat ----------
 
 type statArgs struct {
 	Path string `json:"path" jsonschema:"File or directory path to stat"`
@@ -613,7 +613,7 @@ func (s *server) resolvePathKeepFinal(p string) (string, error) {
 	return full, nil
 }
 
-// ---------- ctx_rg ----------
+// ---------- ctx_fs: rg ----------
 
 type rgArgs struct {
 	Pattern    string `json:"pattern" jsonschema:"Regex pattern to search (or literal if literal=true)"`
@@ -638,7 +638,7 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		limit = fsRgDefaultLimit
 	}
 	if limit > fsRgHardLimit {
-		limit = fsRgHardLimit
+		return nil, nil, fmt.Errorf("invalid limit %d: exceeds maximum %d (valid range: 1-%d, default %d)", limit, fsRgHardLimit, fsRgHardLimit, fsRgDefaultLimit)
 	}
 	contextLines := args.Context
 	if contextLines < 0 {

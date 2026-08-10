@@ -57,7 +57,7 @@ func mustWrite(t *testing.T, path, content string) {
 	}
 }
 
-// ---- ctx_ls ----
+// ---- ctx_fs: ls ----
 
 func TestCtxLs_DefaultAndDepth(t *testing.T) {
 	_, s := setupFSFixture(t)
@@ -164,7 +164,7 @@ func itoa(i int) string {
 	return string(b[pos:])
 }
 
-// ---- ctx_glob ----
+// ---- ctx_fs: glob ----
 
 func TestCtxGlob_GoFilesAndSkip(t *testing.T) {
 	_, s := setupFSFixture(t)
@@ -239,7 +239,7 @@ func TestCtxGlob_Outside(t *testing.T) {
 	}
 }
 
-// ---- ctx_stat ----
+// ---- ctx_fs: stat ----
 
 func TestCtxStat_FileAndSymlink(t *testing.T) {
 	wd, s := setupFSFixture(t)
@@ -290,7 +290,7 @@ func TestCtxStat_FileAndSymlink(t *testing.T) {
 	}
 }
 
-// ---- ctx_rg ----
+// ---- ctx_fs: rg ----
 
 func TestCtxRg_HitAndLiteral(t *testing.T) {
 	_, s := setupFSFixture(t)
@@ -425,7 +425,7 @@ func TestFSTools_SymlinkEscapeNoSecretLeak(t *testing.T) {
 
 	s := testServerWithWorkdir(t, wd)
 
-	// ctx_ls
+	// ctx_fs ls
 	res, _, err := s.toolLs(context.Background(), nil, lsArgs{Depth: 3, Limit: 100})
 	if err != nil {
 		t.Fatalf("ls: %v", err)
@@ -438,7 +438,7 @@ func TestFSTools_SymlinkEscapeNoSecretLeak(t *testing.T) {
 		t.Fatalf("ls should not list files under escaped dir symlink: %s", lsText)
 	}
 
-	// ctx_glob
+	// ctx_fs glob
 	resG, _, err := s.toolGlob(context.Background(), nil, globArgs{Pattern: "**/*", Limit: 500})
 	if err != nil {
 		t.Fatalf("glob: %v", err)
@@ -451,7 +451,7 @@ func TestFSTools_SymlinkEscapeNoSecretLeak(t *testing.T) {
 		t.Fatalf("glob should not include escaped paths: %s", gText)
 	}
 
-	// ctx_rg — must not match secret content via symlink
+	// ctx_fs rg — must not match secret content via symlink
 	resR, _, err := s.toolRg(context.Background(), nil, rgArgs{
 		Pattern: "OUTSIDE_SECRET_CONTENT",
 		Limit:   50,
@@ -475,102 +475,72 @@ func TestFSTools_SymlinkEscapeNoSecretLeak(t *testing.T) {
 	}
 }
 
-// ---- M4: limit/depth hard caps ----
+// ---- M4: limit/depth over-limit validation (was silent clamp, now explicit error) ----
 
-func TestCtxLs_HardLimitAndDepthCap(t *testing.T) {
-	wd := t.TempDir()
-	// Create more than fsHardLimit entries so limit=99999 must cap.
-	// Creating 2000+ files is slow; instead spy via a modest tree and assert
-	// the effective cap constants by requesting absurd limit/depth and checking
-	// observed depth ≤5 and count ≤ fsHardLimit.
-	for i := 0; i < 30; i++ {
-		mustWrite(t, filepath.Join(wd, "f"+itoa(i)+".txt"), "x")
-	}
-	// Deep nest of dirs (depth 8).
-	p := wd
-	for d := 0; d < 8; d++ {
-		p = filepath.Join(p, "d"+itoa(d))
-		if err := os.MkdirAll(p, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		mustWrite(t, filepath.Join(p, "leaf.txt"), "deep")
-	}
-	s := testServerWithWorkdir(t, wd)
+func TestCtxLs_OverLimitErrors(t *testing.T) {
+	_, s := setupFSFixture(t)
 
-	res, _, err := s.toolLs(context.Background(), nil, lsArgs{
-		Depth: 99,
-		Limit: 99999,
-	})
+	// Depth beyond fsMaxDepth must error with the legal range.
+	_, _, err := s.toolLs(context.Background(), nil, lsArgs{Depth: 99})
+	if err == nil {
+		t.Fatal("expected error for depth > fsMaxDepth")
+	}
+	if !strings.Contains(err.Error(), "depth") || !strings.Contains(err.Error(), "5") {
+		t.Fatalf("expected depth valid range (1-5) in error, got: %v", err)
+	}
+
+	// Limit beyond fsHardLimit must error with the legal range.
+	_, _, err = s.toolLs(context.Background(), nil, lsArgs{Limit: 99999})
+	if err == nil {
+		t.Fatal("expected error for limit > fsHardLimit")
+	}
+	if !strings.Contains(err.Error(), "limit") || !strings.Contains(err.Error(), "2000") {
+		t.Fatalf("expected limit valid range (1-2000) in error, got: %v", err)
+	}
+
+	// Boundary values remain accepted.
+	res, _, err := s.toolLs(context.Background(), nil, lsArgs{Depth: fsMaxDepth, Limit: fsHardLimit})
 	if err != nil {
-		t.Fatalf("ls: %v", err)
+		t.Fatalf("boundary depth/limit should be accepted: %v", err)
 	}
-	text := mcpResultText(t, res)
-	var out struct {
-		Count   int `json:"count"`
-		Entries []struct {
-			Path  string `json:"path"`
-			Depth int    `json:"depth"`
-		} `json:"entries"`
-	}
-	if err := json.Unmarshal([]byte(text), &out); err != nil {
-		t.Fatalf("json: %v\n%s", err, text)
-	}
-	if out.Count > fsHardLimit {
-		t.Fatalf("limit=99999 should cap at fsHardLimit=%d, got count=%d", fsHardLimit, out.Count)
-	}
-	for _, e := range out.Entries {
-		if e.Depth > fsMaxDepth {
-			t.Fatalf("depth=99 should cap at fsMaxDepth=%d, entry depth=%d path=%s", fsMaxDepth, e.Depth, e.Path)
-		}
-	}
-	// Depth 6+ leaves should not appear (max depth 5).
-	if strings.Contains(text, "d5/leaf") || strings.Contains(text, "d6/") || strings.Contains(text, "d7/") {
-		// d0 is depth1, d4 is depth5 — d5 would be depth6 and must be excluded.
-		// Path display is relative; check depth markers carefully.
-	}
-	for _, e := range out.Entries {
-		if strings.Contains(e.Path, "d5") && e.Depth > fsMaxDepth {
-			t.Fatalf("should not list beyond max depth: %+v", e)
-		}
-	}
-	// Positive: depth-5 entry may exist (d0..d4).
-	foundDeep := false
-	for _, e := range out.Entries {
-		if e.Depth == fsMaxDepth {
-			foundDeep = true
-			break
-		}
-	}
-	if !foundDeep {
-		t.Fatalf("expected some entry at depth=%d with depth=99 request, got: %s", fsMaxDepth, text)
+	if mcpResultText(t, res) == "" {
+		t.Fatal("expected result text")
 	}
 }
 
-func TestCtxGlob_HardLimitCap(t *testing.T) {
+func TestCtxGlob_OverLimitErrors(t *testing.T) {
 	wd := t.TempDir()
 	for i := 0; i < 50; i++ {
 		mustWrite(t, filepath.Join(wd, "g"+itoa(i)+".txt"), "y")
 	}
 	s := testServerWithWorkdir(t, wd)
-	res, _, err := s.toolGlob(context.Background(), nil, globArgs{
+
+	// Limit beyond fsHardLimit must error with the legal range (no silent clamp).
+	_, _, err := s.toolGlob(context.Background(), nil, globArgs{
 		Pattern: "**/*",
 		Limit:   99999,
 	})
+	if err == nil {
+		t.Fatal("expected error for limit > fsHardLimit")
+	}
+	if !strings.Contains(err.Error(), "limit") || !strings.Contains(err.Error(), "2000") {
+		t.Fatalf("expected limit valid range (1-2000) in error, got: %v", err)
+	}
+
+	// Boundary value remains accepted.
+	res, _, err := s.toolGlob(context.Background(), nil, globArgs{
+		Pattern: "**/*",
+		Limit:   fsHardLimit,
+	})
 	if err != nil {
-		t.Fatalf("glob: %v", err)
+		t.Fatalf("boundary limit should be accepted: %v", err)
 	}
-	var out struct {
-		Count int `json:"count"`
-	}
-	if err := json.Unmarshal([]byte(mcpResultText(t, res)), &out); err != nil {
-		t.Fatal(err)
-	}
-	if out.Count > fsHardLimit {
-		t.Fatalf("glob limit=99999 should cap at %d, got %d", fsHardLimit, out.Count)
+	if mcpResultText(t, res) == "" {
+		t.Fatal("expected result text")
 	}
 }
 
-func TestCtxRg_HardLimitCap(t *testing.T) {
+func TestCtxRg_OverLimitErrors(t *testing.T) {
 	wd := t.TempDir()
 	var b strings.Builder
 	for i := 0; i < 600; i++ {
@@ -578,27 +548,30 @@ func TestCtxRg_HardLimitCap(t *testing.T) {
 	}
 	mustWrite(t, filepath.Join(wd, "many.txt"), b.String())
 	s := testServerWithWorkdir(t, wd)
-	res, _, err := s.toolRg(context.Background(), nil, rgArgs{
+
+	// Limit beyond fsRgHardLimit must error with the legal range (no silent clamp).
+	_, _, err := s.toolRg(context.Background(), nil, rgArgs{
 		Pattern: "RG_HARD_CAP_TOKEN",
 		Limit:   99999,
 		Path:    "many.txt",
 	})
+	if err == nil {
+		t.Fatal("expected error for limit > fsRgHardLimit")
+	}
+	if !strings.Contains(err.Error(), "limit") || !strings.Contains(err.Error(), "500") {
+		t.Fatalf("expected limit valid range (1-500) in error, got: %v", err)
+	}
+
+	// Boundary value remains accepted.
+	res, _, err := s.toolRg(context.Background(), nil, rgArgs{
+		Pattern: "RG_HARD_CAP_TOKEN",
+		Limit:   fsRgHardLimit,
+		Path:    "many.txt",
+	})
 	if err != nil {
-		t.Fatalf("rg: %v", err)
+		t.Fatalf("boundary limit should be accepted: %v", err)
 	}
-	text := mcpResultText(t, res)
-	// Header: engine=... matches=N
-	// matches must be ≤ fsRgHardLimit
-	hits := 0
-	for _, line := range strings.Split(text, "\n") {
-		if strings.Contains(line, "RG_HARD_CAP_TOKEN") && (strings.Contains(line, "many.txt") || strings.Contains(line, "line")) {
-			if strings.HasPrefix(line, "engine=") {
-				continue
-			}
-			hits++
-		}
-	}
-	if hits > fsRgHardLimit {
-		t.Fatalf("rg limit=99999 should cap at %d hits, got %d\n%s", fsRgHardLimit, hits, text)
+	if mcpResultText(t, res) == "" {
+		t.Fatal("expected result text")
 	}
 }

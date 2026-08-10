@@ -166,6 +166,52 @@ func TestPurgeDryRun_CountMatchesDelete(t *testing.T) {
 	}
 }
 
+// ============================================================================
+// confirm 必填校验（缺失/false 时必须返回明确错误，而非成功的 cancelled 文案）
+// ============================================================================
+
+func TestPurge_RequiresConfirmError(t *testing.T) {
+	srv := newTestServer(t)
+	s := srv.store
+	indexDoc(t, s, "session:keepme", "1")
+
+	// Missing confirm (zero value) → explicit error, nothing deleted.
+	_, _, err := srv.toolPurge(context.Background(), nil, purgeArgs{Scope: "project"})
+	if err == nil {
+		t.Fatal("expected error when confirm is missing")
+	}
+	if !strings.Contains(err.Error(), "confirm:true") {
+		t.Fatalf("expected confirm:true in error message, got: %v", err)
+	}
+	if doc, _ := s.Get("session:keepme"); doc == nil {
+		t.Fatal("document must survive when purge is not confirmed")
+	}
+
+	// Explicit confirm=false → same error.
+	_, _, err = srv.toolPurge(context.Background(), nil, purgeArgs{Scope: "project", Confirm: false})
+	if err == nil {
+		t.Fatal("expected error when confirm=false")
+	}
+	if !strings.Contains(err.Error(), "confirm:true") {
+		t.Fatalf("expected confirm:true in error message, got: %v", err)
+	}
+	if doc, _ := s.Get("session:keepme"); doc == nil {
+		t.Fatal("document must survive when confirm=false")
+	}
+}
+
+func TestPurge_DryRunWithoutConfirmSucceeds(t *testing.T) {
+	srv := newTestServer(t)
+	// DryRun keeps the pre-confirm preview behavior: no confirm required.
+	res, _, err := srv.toolPurge(context.Background(), nil, purgeArgs{DryRun: true, Scope: "project"})
+	if err != nil {
+		t.Fatalf("dryRun without confirm should succeed: %v", err)
+	}
+	if !strings.Contains(contentText(res), "DRY RUN") {
+		t.Fatalf("expected DRY RUN preview, got: %s", contentText(res))
+	}
+}
+
 func TestPurgeSession_NoPrefixFalsePositive(t *testing.T) {
 	srv := newTestServer(t)
 	s := srv.store
