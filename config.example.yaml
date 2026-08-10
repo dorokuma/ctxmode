@@ -5,5 +5,7 @@
 #   -config flag > $CTXMODE_CONFIG > ./ctxmode-config.yaml > ~/.config/ctxmode/config.yaml
 
 workdirs:
-  - /root
+  # Workspace roots: every cwd/path argument is resolved against them.
+  # Replace with your own directories; /tmp exists on any machine.
+  - /path/to/your/project
   - /tmp

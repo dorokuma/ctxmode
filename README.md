@@ -50,7 +50,7 @@ Optional YAML (`-config` / `$CTXMODE_CONFIG` / `./ctxmode-config.yaml` / `~/.con
 
 ```yaml
 workdirs:
-  - /root
+  - /path/to/your/project
   - /tmp
 ```
 
