@@ -28,6 +28,8 @@ action argument.
 - Big outputs are auto-indexed: search ctx_kb instead of re-running.
 - Mutating: ctx_run (executes code/commands), ctx_kb index/fetch/purge (writes
   the local KB), ctx_bg kill. Everything else is read-only.
+- NOT a sandbox: commands and code run with the server process's privileges;
+  no security boundary. Use only in trusted environments.
 
 ## Host notes
 

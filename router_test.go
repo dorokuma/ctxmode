@@ -101,3 +101,32 @@ func TestRegisterCategoryToolsDoesNotPanic(t *testing.T) {
 	}
 	_ = s
 }
+
+func TestCtxKbFetchAndIndexAliasRejected(t *testing.T) {
+	s := &server{workdirs: []string{t.TempDir()}}
+	_, _, err := s.toolCtxKb(context.Background(), nil, ctxKbArgs{Action: "fetch_and_index"})
+	if err == nil {
+		t.Fatal("expected fetch_and_index alias to be rejected")
+	}
+	if !strings.Contains(err.Error(), "fetch") {
+		t.Fatalf("expected error to hint the correct action name, got: %v", err)
+	}
+	// Case-insensitive variant also rejected.
+	_, _, err = s.toolCtxKb(context.Background(), nil, ctxKbArgs{Action: "FETCH_AND_INDEX"})
+	if err == nil {
+		t.Fatal("expected FETCH_AND_INDEX rejected")
+	}
+}
+
+func TestCtxRunDescriptionListsAllRunTaskKinds(t *testing.T) {
+	// The ctx_run description must advertise every kind accepted by run_task.
+	for _, k := range []string{"go_test", "go_build", "go_vet", "npm_test", "npm_run_build", "cargo_test", "cargo_build", "make", "custom"} {
+		if !strings.Contains(ctxRunDescription, k) {
+			t.Fatalf("ctx_run description missing kind %q: %s", k, ctxRunDescription)
+		}
+	}
+	// Removed v1 tool names must not be advertised.
+	if strings.Contains(ctxRunDescription, "ctx_search") || strings.Contains(ctxRunDescription, "ctx_batch_execute") {
+		t.Fatalf("ctx_run description references removed tool names: %s", ctxRunDescription)
+	}
+}

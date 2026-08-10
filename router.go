@@ -173,7 +173,7 @@ func (s *server) toolCtxKb(ctx context.Context, req *mcp.CallToolRequest, args c
 		return s.toolIndex(ctx, req, indexArgs{Path: args.Path})
 	case "search":
 		return s.toolSearch(ctx, req, searchArgs{Query: args.Query})
-	case "fetch", "fetch_and_index":
+	case "fetch":
 		return s.toolFetchAndIndex(ctx, req, fetchArgs{
 			URL: args.URL, URLs: args.URLs, Source: args.Source, Format: args.Format,
 			Force: args.Force, MaxBytes: args.MaxBytes, TimeoutMs: args.TimeoutMs, TTL: args.TTL,
@@ -189,6 +189,9 @@ func (s *server) toolCtxKb(ctx context.Context, req *mcp.CallToolRequest, args c
 	case "":
 		return nil, nil, fmt.Errorf("action is required (index|search|fetch|stats|purge|doctor)")
 	default:
+		if strings.EqualFold(strings.TrimSpace(args.Action), "fetch_and_index") {
+			return nil, nil, fmt.Errorf("unknown ctx_kb action %q: fetch_and_index is not a valid action, use \"fetch\"", args.Action)
+		}
 		return nil, nil, fmt.Errorf("unknown ctx_kb action %q (index|search|fetch|stats|purge|doctor)", args.Action)
 	}
 }
@@ -225,13 +228,17 @@ func (s *server) toolCtxBg(ctx context.Context, req *mcp.CallToolRequest, args c
 	}
 }
 
+// ctxRunDescription is the registered description of the ctx_run tool.
+// The kind list must match validRunTaskKinds (run_task.go).
+const ctxRunDescription = "PRIMARY for commands/tests/builds. action=execute (shell/code; prefer argv), " +
+	"execute_file (code over FILE_CONTENT), batch (many commands + optional queries), " +
+	"run_task (go_test|go_build|go_vet|npm_test|npm_run_build|cargo_test|cargo_build|make|custom; fixed argv). Large output auto-indexed."
+
 // registerCategoryTools wires the v2.0 multi-category MCP surface (end state).
 func (s *server) registerCategoryTools(srv *mcp.Server) {
 	mcp.AddTool(srv, &mcp.Tool{
-		Name: "ctx_run",
-		Description: "PRIMARY for commands/tests/builds. action=execute (shell/code; prefer argv), " +
-			"execute_file (code over FILE_CONTENT), batch (many commands + optional queries), " +
-			"run_task (go_test|go_build|npm_test|cargo_test|make|custom; fixed argv). Large output auto-indexed.",
+		Name:        "ctx_run",
+		Description: ctxRunDescription,
 	}, s.toolCtxRun)
 
 	mcp.AddTool(srv, &mcp.Tool{

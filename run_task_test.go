@@ -239,3 +239,43 @@ func TestTailUTF8(t *testing.T) {
 		t.Fatal("short should pass through")
 	}
 }
+
+// TestFinishRunTaskOutput_HintUsesCtxKb verifies indexed-output messages point
+// to the live tool (ctx_kb action=search) and never to the removed ctx_search.
+func TestFinishRunTaskOutput_HintUsesCtxKb(t *testing.T) {
+	srv := newTestServer(t)
+
+	// Auto-index branch (> 100KB output).
+	big := strings.Repeat("x", runTaskAutoIndexBytes+1)
+	res, _, err := srv.finishRunTaskOutput(big, 0, "go_test", "")
+	if err != nil {
+		t.Fatalf("finishRunTaskOutput: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "ctx_kb action=search") {
+		t.Fatalf("expected ctx_kb action=search hint, got:\n%s", text)
+	}
+	if strings.Contains(text, "ctx_search") {
+		t.Fatalf("must not reference removed ctx_search tool:\n%s", text)
+	}
+	if !strings.Contains(text, "Indexed as") {
+		t.Fatalf("expected indexed notice:\n%s", text)
+	}
+
+	// Intent branch (5KB-100KB with intent).
+	med := strings.Repeat("y", runTaskIntentIndexBytes+50)
+	res2, _, err := srv.finishRunTaskOutput(med, 0, "go_test", "myintent")
+	if err != nil {
+		t.Fatalf("finishRunTaskOutput intent: %v", err)
+	}
+	text2 := mcpResultText(t, res2)
+	if !strings.Contains(text2, "ctx_kb action=search") {
+		t.Fatalf("expected ctx_kb action=search hint in intent branch:\n%s", text2)
+	}
+	if strings.Contains(text2, "ctx_search") {
+		t.Fatalf("intent branch must not reference ctx_search:\n%s", text2)
+	}
+	if !strings.Contains(text2, "run_task:myintent") {
+		t.Fatalf("expected intent label in message:\n%s", text2)
+	}
+}

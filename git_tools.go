@@ -25,7 +25,7 @@ const (
 	gitStatusMaxBytes = 100 * 1024
 )
 
-// ---------- ctx_git_status ----------
+// ---------- ctx_git: status ----------
 
 type gitStatusArgs struct {
 	CWD string `json:"cwd,omitempty" jsonschema:"Repository working directory (default: workdir root)"`

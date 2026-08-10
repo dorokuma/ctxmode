@@ -10,7 +10,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// ---------- ctx_run_task ----------
+// ---------- ctx_run: run_task ----------
 
 const (
 	runTaskDefaultTimeoutMs = 300000  // 5 minutes
@@ -44,7 +44,7 @@ type runTaskArgs struct {
 	CWD       string            `json:"cwd,omitempty" jsonschema:"Working directory (sandboxed via resolvePath)"`
 	TimeoutMs int               `json:"timeout_ms,omitempty" jsonschema:"Timeout in ms (default 300000, hard max 3600000)"`
 	Intent    string            `json:"intent,omitempty" jsonschema:"Label hint for large-output auto-index"`
-	Env       map[string]string `json:"env,omitempty" jsonschema:"Extra env (same allowlist as ctx_execute; never PATH/HOME/LD_*)"`
+	Env       map[string]string `json:"env,omitempty" jsonschema:"Extra env (same allowlist as ctx_run action=execute; never PATH/HOME/LD_*)"`
 }
 
 func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args runTaskArgs) (*mcp.CallToolResult, any, error) {
@@ -79,7 +79,7 @@ func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args r
 		cwd = resolved
 	}
 
-	// Env allowlist (same as ctx_execute / P1).
+	// Env allowlist (same as ctx_run action=execute / P1).
 	filteredEnv, err := filterExecEnv(args.Env)
 	if err != nil {
 		return nil, nil, err
@@ -250,7 +250,7 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 		}
 		preview := tailUTF8(outputText, runTaskTailBytes)
 		// Search hint must use the index label (not empty intent).
-		msg := fmt.Sprintf("exit_code: %d\nOutput is too large (%d bytes). Indexed as %q. Use ctx_search(queries: [%q]) to search the indexed content.\n\n--- Tail preview ---\n%s",
+		msg := fmt.Sprintf("exit_code: %d\nOutput is too large (%d bytes). Indexed as %q. Use ctx_kb action=search query=%q to search the indexed content.\n\n--- Tail preview ---\n%s",
 			exitCode, len(outputText), label, label, preview)
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: msg}},
@@ -271,7 +271,7 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 		preview := tailUTF8(outputText, runTaskPreviewBytes)
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{
-				Text: fmt.Sprintf("exit_code: %d\nOutput (%d bytes) indexed as %q. Use ctx_search(queries: [%q]) to search.\n\n--- Tail preview ---\n%s",
+				Text: fmt.Sprintf("exit_code: %d\nOutput (%d bytes) indexed as %q. Use ctx_kb action=search query=%q to search.\n\n--- Tail preview ---\n%s",
 					exitCode, len(outputText), label, label, preview),
 			}},
 		}, nil, nil

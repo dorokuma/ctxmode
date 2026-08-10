@@ -177,10 +177,10 @@ func (sp *SearchPipeline) search(query, pathPrefix string, limit int, applyFlood
 		case StatusBlocked:
 			meta.FloodStatus = "blocked"
 			meta.TimeMs = time.Since(start).Milliseconds()
-			return nil, meta, fmt.Errorf("search blocked: too many requests in a short time. Wait a moment, or use ctx_batch_execute (its query_scope=batch searches bypass the flood guard).")
+			return nil, meta, fmt.Errorf("search blocked: too many requests in a short time. Wait a moment, or use ctx_run action=batch (its query_scope=batch searches bypass the flood guard).")
 		case StatusThrottled:
 			meta.FloodStatus = "throttled"
-			meta.ThrottleMsg = "Search volume is high: showing limited results. Prefer ctx_batch_execute with query_scope=batch for multiple related queries."
+			meta.ThrottleMsg = "Search volume is high: showing limited results. Prefer ctx_run action=batch with query_scope=batch for multiple related queries."
 			if limit > 1 {
 				limit = max(1, limit/2)
 			}

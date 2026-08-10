@@ -82,7 +82,7 @@ func runDoctor(store *Store, dbPath string) (*doctorResult, error) {
 	return res, nil
 }
 
-// ---------- MCP tool handler for ctx_doctor ----------
+// ---------- MCP tool handler for ctx_kb: doctor ----------
 
 type doctorArgs struct {
 }

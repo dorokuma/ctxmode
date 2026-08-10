@@ -57,7 +57,7 @@ func NewFloodGuard(windowDur time.Duration, capacity int) *FloodGuard {
 // WindowCount returns the number of OK calls recorded in the current sliding
 // window, without recording a new call.  This counts only calls that received
 // StatusOK — it does not include throttled or blocked attempts.
-// It is used for stats reporting (SearchCallsWindow field in ctx_stats).
+// It is used for stats reporting (SearchCallsWindow field in ctx_kb stats).
 func (fg *FloodGuard) WindowCount() int {
 	fg.mu.Lock()
 	defer fg.mu.Unlock()

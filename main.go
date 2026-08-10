@@ -381,7 +381,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		result.IndexLabel = label
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{
-				Text: fmt.Sprintf("Output is too large (%d bytes). Indexed as %q. Use ctx_search(queries: [%q]) to search the indexed content.",
+				Text: fmt.Sprintf("Output is too large (%d bytes). Indexed as %q. Use ctx_kb action=search query=%q to search the indexed content.",
 					len(outputText), label, label),
 			}},
 		}, nil, nil
@@ -408,8 +408,8 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		if len(preview) > 2000 {
 			preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
 		}
-		summary := fmt.Sprintf("Output (%d bytes) indexed as %q. Use ctx_search(queries: [%q]) to search.\n\n--- Preview ---\n%s",
-			len(outputText), label, args.Intent, preview)
+		summary := fmt.Sprintf("Output (%d bytes) indexed as %q. Use ctx_kb action=search query=%q to search.\n\n--- Preview ---\n%s",
+			len(outputText), label, label, preview)
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: summary}},
 		}, nil, nil
@@ -636,7 +636,7 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 	}, nil, nil
 }
 
-// statsResult is the detailed response for ctx_stats.
+// statsResult is the detailed response for ctx_kb action=stats.
 type statsResult struct {
 	DocsIndexed        int   `json:"docs_indexed"`
 	CacheEntries       int   `json:"cache_entries"`
@@ -687,7 +687,7 @@ func (s *server) toolStats(ctx context.Context, _ *mcp.CallToolRequest, _ statsA
 	}, nil, nil
 }
 
-// ---------- ctx_execute_file ----------
+// ---------- ctx_run action=execute_file ----------
 
 type executeFileArgs struct {
 	Path     string `json:"path" jsonschema:"File path to read into FILE_CONTENT variable"`
@@ -817,8 +817,8 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		result.IndexLabel = label
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{
-				Text: fmt.Sprintf("Output is too large (%d bytes). Indexed as %q. Use ctx_search to search.",
-					len(outputText), label),
+				Text: fmt.Sprintf("Output is too large (%d bytes). Indexed as %q. Use ctx_kb action=search query=%q to search.",
+					len(outputText), label, label),
 			}},
 		}, nil, nil
 	}
@@ -843,8 +843,8 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		if len(preview) > 2000 {
 			preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
 		}
-		summary := fmt.Sprintf("Output (%d bytes) indexed as %q. Use ctx_search to search.\n\n--- Preview ---\n%s",
-			len(outputText), label, preview)
+		summary := fmt.Sprintf("Output (%d bytes) indexed as %q. Use ctx_kb action=search query=%q to search.\n\n--- Preview ---\n%s",
+			len(outputText), label, label, preview)
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: summary}},
 		}, nil, nil
@@ -1079,7 +1079,7 @@ func (s *server) storeIndexLocked(path, content string) error {
 	return s.store.Index(path, content)
 }
 
-// validateArgv checks argv for ctx_execute argv mode.
+// validateArgv checks argv for ctx_run action=execute argv mode.
 // argv[0] must be a simple executable name (no path separators) or a path
 // resolved inside a workdir. Empty argv / empty argv[0] are rejected.
 func (s *server) validateArgv(argv []string, cwd string) ([]string, error) {
