@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -361,30 +360,19 @@ func TestProcessContent_MarkdownWithHTMLFragments(t *testing.T) {
 // ---------- #16 default source ----------
 
 func TestFetchAndIndex_DefaultSource(t *testing.T) {
-	// IPv6 loopback is allowed in non-strict SSRF mode (see checkIP / stress tests).
-	// This exercises the real fetchAndIndex production path, not a local if-copy.
-	listener, err := net.Listen("tcp", "[::1]:0")
-	if err != nil {
-		t.Skipf("IPv6 loopback not available: %v", err)
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	// The fake transport serves HTTP locally, bypassing both the network and
+	// the SSRF DialContext gate: ::1 loopback is now blocked in non-strict
+	// SSRF mode too, so a real [::1] listener can no longer be used. The
+	// public-looking host passes validateURL without any DNS lookup. This
+	// still exercises the real fetchAndIndex production path, not a local
+	// if-copy.
+	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("hello default source"))
-	})
-	hs := &http.Server{Handler: mux}
-	go hs.Serve(listener)
-	defer hs.Close()
-
-	port := listener.Addr().(*net.TCPAddr).Port
-	rawURL := "http://[::1]:" + strconv.Itoa(port) + "/"
-
-	st := newTestStore(t)
-	s := &server{
-		store:      st,
-		httpClient: newHTTPClient(),
-		workdirs:   []string{t.TempDir()},
 	}
+	s := newFetchTestServer(t, handler)
+
+	rawURL := "http://1.1.1.1/default-source"
 
 	result, err := s.fetchAndIndex(context.Background(), rawURL, "", "markdown", true, 0, 5*time.Second)
 	if err != nil {
@@ -397,13 +385,13 @@ func TestFetchAndIndex_DefaultSource(t *testing.T) {
 		t.Fatalf("default source: got %q, want %q", result.Source, "fetch")
 	}
 	// Indexed path must use fetch: prefix, never bare :{url}.
-	doc, getErr := st.Get("fetch:" + rawURL)
+	doc, getErr := s.store.Get("fetch:" + rawURL)
 	if getErr != nil {
 		t.Fatalf("Get indexed doc: %v", getErr)
 	}
 	if doc == nil {
 		// May be chunked as fetch:{url}#chunk-0 for multi-chunk; try prefix search.
-		hits, sErr := st.SearchWithPathPrefix("hello", "fetch:", 5)
+		hits, sErr := s.store.SearchWithPathPrefix("hello", "fetch:", 5)
 		if sErr != nil {
 			t.Fatalf("SearchWithPathPrefix: %v", sErr)
 		}
