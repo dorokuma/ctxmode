@@ -40,6 +40,7 @@ type fetchResultData struct {
 	content    string
 	chunkCount int
 	truncated  bool
+	indexError string
 }
 
 // ---------- data types ----------
@@ -53,9 +54,10 @@ type FetchResult struct {
 	ChunkCount int    `json:"chunkCount,omitempty"`
 	Truncated  bool   `json:"truncated,omitempty"`
 	Error      string `json:"error,omitempty"`
+	IndexError string `json:"indexError,omitempty"`
 }
 
-// fetchArgs is the JSON schema for the ctx_fetch_and_index tool.
+// fetchArgs is the JSON schema for the ctx_kb fetch tool.
 type fetchArgs struct {
 	URL       string   `json:"url,omitempty" jsonschema:"Single URL to fetch"`
 	URLs      []string `json:"urls,omitempty" jsonschema:"URLs to fetch (up to 10)"`
@@ -113,9 +115,9 @@ func validateURL(rawURL string, strict bool) error {
 // 169.254.0.0/16 (link-local/IMDS), 224.0.0.0/4 (multicast),
 // 240.0.0.0/4 (reserved), 10.0.0.0/8 / 172.16.0.0/12 / 192.168.0.0/16 (private),
 // 100.64.0.0/10 (CGNAT), 198.18.0.0/15 (benchmark),
-// IPv6 link-local, unspecified, and multicast.
-// Strict mode (CTX_FETCH_STRICT=1): additionally blocks IPv6 loopback (::1)
-// and IPv6 private addresses.
+// IPv6 loopback (::1), IPv6 private (fc00::/7, RFC 4193), IPv6 link-local,
+// unspecified, and multicast. IPv6 rules are symmetric with IPv4: loopback
+// and private addresses are blocked in both strict and non-strict mode.
 func checkIP(ip net.IP, strict bool) error {
 	if ip == nil {
 		return fmt.Errorf("nil IP")
@@ -166,12 +168,10 @@ func checkIP(ip net.IP, strict bool) error {
 			return fmt.Errorf("198.18.0.0/15 (benchmark)")
 		}
 	} else {
-		// IPv6
+		// IPv6 — symmetric with IPv4: loopback and private (ULA) addresses are
+		// always blocked, in both strict and non-strict mode.
 		if ip.IsLoopback() {
-			if strict {
-				return fmt.Errorf("::1 (IPv6 loopback) blocked in strict mode")
-			}
-			// In non-strict mode, allow loopback for testing convenience.
+			return fmt.Errorf("::1 (IPv6 loopback) blocked")
 		}
 		if ip.IsLinkLocalUnicast() {
 			return fmt.Errorf("IPv6 link-local unicast (fe80::/10) blocked")
@@ -182,8 +182,8 @@ func checkIP(ip net.IP, strict bool) error {
 		if ip.IsMulticast() {
 			return fmt.Errorf("IPv6 multicast blocked")
 		}
-		if ip.IsPrivate() && strict {
-			return fmt.Errorf("IPv6 private address blocked in strict mode")
+		if ip.IsPrivate() {
+			return fmt.Errorf("IPv6 private address (fc00::/7) blocked")
 		}
 	}
 
@@ -282,7 +282,10 @@ func (s *server) fetchURL(ctx context.Context, rawURL string, timeout time.Durat
 	}
 	truncated = len(body) > maxBodySize
 	if truncated {
-		body = body[:maxBodySize]
+		// Cut at a valid UTF-8 boundary so the tail of the last rune is not
+		// split into invalid bytes (truncateUTF8 backs off to the previous
+		// rune boundary).
+		body = []byte(truncateUTF8(string(body), maxBodySize))
 	}
 
 	contentType = resp.Header.Get("Content-Type")
@@ -397,7 +400,9 @@ func formatJSON(body []byte, truncated bool) (string, error) {
 // ---------- chunking ----------
 
 // chunkContent splits content into chunks for indexing.
-// Simple strategy: split by double newlines (paragraphs).
+// Simple strategy: split by double newlines (paragraphs). A single paragraph
+// longer than maxChunkSize is force-split at UTF-8 boundaries so no chunk
+// exceeds the size limit.
 func chunkContent(content string) []string {
 	const maxChunkSize = 4000
 
@@ -410,6 +415,17 @@ func chunkContent(content string) []string {
 	for _, p := range paragraphs {
 		p = strings.TrimSpace(p)
 		if p == "" {
+			continue
+		}
+
+		// Oversized paragraph (e.g. a wall of text with no blank lines) must
+		// be force-split instead of producing a single huge chunk.
+		if len(p) > maxChunkSize {
+			if current.Len() > 0 {
+				chunks = append(chunks, current.String())
+				current.Reset()
+			}
+			chunks = append(chunks, splitLongText(p, maxChunkSize)...)
 			continue
 		}
 
@@ -436,7 +452,56 @@ func chunkContent(content string) []string {
 	return chunks
 }
 
+// splitLongText splits s into pieces of at most max bytes, breaking only at
+// valid UTF-8 rune boundaries (lossless: joining the pieces reproduces s).
+func splitLongText(s string, max int) []string {
+	var parts []string
+	for len(s) > max {
+		cut := truncateUTF8(s, max)
+		if cut == "" {
+			// Invalid UTF-8 leading byte; advance one byte to guarantee progress.
+			cut = s[:1]
+		}
+		parts = append(parts, cut)
+		s = s[len(cut):]
+	}
+	if len(s) > 0 {
+		parts = append(parts, s)
+	}
+	return parts
+}
+
 // ---------- fetch and index (single URL) ----------
+
+// indexContentLocked replaces the documents under docPath (source:url) with
+// freshly chunked content: stale chunks from an earlier fetch are removed
+// first, then each new chunk is indexed. Returns the number of chunks written
+// and the first indexing error, if any.
+func (s *server) indexContentLocked(docPath, content string) (int, error) {
+	if err := s.storePurgePrefixLocked(docPath); err != nil {
+		return 0, fmt.Errorf("clear stale documents under %q: %w", docPath, err)
+	}
+	chunks := chunkContent(content)
+	for i, chunk := range chunks {
+		chunkPath := docPath
+		if len(chunks) > 1 {
+			chunkPath = fmt.Sprintf("%s#chunk-%d", docPath, i)
+		}
+		if err := s.storeIndexLocked(chunkPath, chunk); err != nil {
+			return len(chunks), fmt.Errorf("index chunk %d: %w", i, err)
+		}
+	}
+	return len(chunks), nil
+}
+
+// storePurgePrefixLocked deletes all documents under a path prefix with the
+// server mutex held (same serialization as storeIndexLocked).
+func (s *server) storePurgePrefixLocked(prefix string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.store.PurgeByPrefix(prefix)
+	return err
+}
 
 // fetchAndIndex fetches a URL, processes the content, and indexes it into the store.
 func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format string, force bool, ttl int, timeout time.Duration) (*FetchResult, error) {
@@ -479,6 +544,19 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 				result.Content = cached.Content
 				result.Cached = true
 				result.ChunkCount = countChunks(cached.Content)
+
+				// The cache can outlive the indexed documents (e.g. after a
+				// purge). Verify the document still exists in the KB and
+				// re-index it when missing, otherwise we'd report a cache hit
+				// for content that search cannot find.
+				docPath := source + ":" + rawURL
+				count, err := s.store.CountByPrefix(docPath)
+				if err != nil || count == 0 {
+					if _, err := s.indexContentLocked(docPath, cached.Content); err != nil {
+						result.IndexError = fmt.Sprintf("cache hit re-index failed: %v", err)
+						fmt.Fprintf(os.Stderr, "cache hit re-index failed for %q: %v\n", docPath, err)
+					}
+				}
 				return result, nil
 			}
 		}
@@ -515,18 +593,14 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 		}
 		result.Content = content
 
-		// Index into store.
+		// Index into store: clear stale chunks for this source:url first so a
+		// re-fetch with fewer chunks does not leave old chunks searchable.
 		docPath := source + ":" + rawURL
-		chunks := chunkContent(content)
-		result.ChunkCount = len(chunks)
-		for i, chunk := range chunks {
-			chunkPath := docPath
-			if len(chunks) > 1 {
-				chunkPath = fmt.Sprintf("%s#chunk-%d", docPath, i)
-			}
-			if err := s.storeIndexLocked(chunkPath, chunk); err != nil {
-				fmt.Fprintf(os.Stderr, "index chunk %d failed: %v\n", i, err)
-			}
+		chunkCount, indexErr := s.indexContentLocked(docPath, content)
+		result.ChunkCount = chunkCount
+		if indexErr != nil {
+			result.IndexError = indexErr.Error()
+			fmt.Fprintf(os.Stderr, "index %q failed: %v\n", docPath, indexErr)
 		}
 		// skipCacheWrite=true: no cache write.
 		return result, nil
@@ -536,7 +610,13 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 	sfKey := rawURL + "|" + cacheSource
 	var sfTruncated bool
 	sfResult, err, _ := fetchGroup.Do(sfKey, func() (interface{}, error) {
-		body, contentType, truncated, err := s.fetchURL(ctx, rawURL, timeout)
+		// Use a context that does not inherit the caller's cancel: when the
+		// first caller of a shared singleflight key times out or is cancelled,
+		// later callers waiting on the same key must not be cancelled with it.
+		// An independent timeout is still applied by fetchURL below.
+		sfCtx := context.WithoutCancel(ctx)
+
+		body, contentType, truncated, err := s.fetchURL(sfCtx, rawURL, timeout)
 		if err != nil {
 			return nil, fmt.Errorf("fetch failed: %w", err)
 		}
@@ -547,17 +627,14 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 			return nil, fmt.Errorf("content processing failed: %w", err)
 		}
 
-		// Index into store.
+		// Index into store: clear stale chunks for this source:url first so a
+		// re-fetch with fewer chunks does not leave old chunks searchable.
 		docPath := source + ":" + rawURL
-		chunks := chunkContent(content)
-		for i, chunk := range chunks {
-			chunkPath := docPath
-			if len(chunks) > 1 {
-				chunkPath = fmt.Sprintf("%s#chunk-%d", docPath, i)
-			}
-			if err := s.storeIndexLocked(chunkPath, chunk); err != nil {
-				fmt.Fprintf(os.Stderr, "index chunk %d failed: %v\n", i, err)
-			}
+		chunkCount, indexErr := s.indexContentLocked(docPath, content)
+		var indexErrString string
+		if indexErr != nil {
+			indexErrString = indexErr.Error()
+			fmt.Fprintf(os.Stderr, "index %q failed: %v\n", docPath, indexErr)
 		}
 
 		// Write to cache (with mutex protection).
@@ -568,7 +645,7 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 		_ = s.store.PruneCache(7 * 24 * time.Hour)
 		s.mu.Unlock()
 
-		return &fetchResultData{content: content, chunkCount: len(chunks), truncated: truncated}, nil
+		return &fetchResultData{content: content, chunkCount: chunkCount, truncated: truncated, indexError: indexErrString}, nil
 	})
 	if err != nil {
 		result.Error = err.Error()
@@ -579,6 +656,7 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 	result.Content = data.content
 	result.ChunkCount = data.chunkCount
 	result.Truncated = data.truncated
+	result.IndexError = data.indexError
 
 	return result, nil
 }
@@ -713,6 +791,9 @@ func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, 
 		}
 		if r.Error != "" {
 			status = "❌ " + r.Error
+		} else if r.IndexError != "" {
+			// Content was fetched but indexing failed: it is not searchable.
+			status = "❌ " + r.IndexError
 		} else {
 			successCount++
 		}
@@ -729,7 +810,7 @@ func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, 
 	// Build the search hint.
 	searchHint := ""
 	if successCount > 0 {
-		searchHint = fmt.Sprintf("\n\nIndexed content is searchable via ctx_search. Use queries like %q to find specific sections.", args.Source+":*")
+		searchHint = fmt.Sprintf("\n\nIndexed content is searchable via ctx_kb action=search. Use queries like %q to find specific sections.", args.Source+":*")
 	}
 
 	// Truncate individual contents and build the full response.
@@ -740,7 +821,7 @@ func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, 
 	builder.WriteString(searchHint)
 
 	// If it was a single URL and successful, include the content preview.
-	if len(results) == 1 && results[0] != nil && results[0].Error == "" && results[0].Content != "" {
+	if len(results) == 1 && results[0] != nil && results[0].Error == "" && results[0].IndexError == "" && results[0].Content != "" {
 		content := results[0].Content
 		if len(content) > maxBytes {
 			content = truncateUTF8(content, maxBytes) + "\n... (truncated)"

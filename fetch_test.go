@@ -1,8 +1,16 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
+	"time"
+	"unicode/utf8"
 )
 
 // ---------- checkIP tests ----------
@@ -147,57 +155,40 @@ func TestCheckIP_IPv6_Blocked(t *testing.T) {
 	}
 }
 
-func TestCheckIP_IPv6_StrictOnly(t *testing.T) {
-	t.Run("::1 allowed in non-strict", func(t *testing.T) {
-		ip := net.ParseIP("::1")
-		if ip == nil {
-			t.Fatal("bad test IP")
-		}
-		err := checkIP(ip, false)
-		if err != nil {
-			t.Fatalf("non-strict: expected allowed, got: %v", err)
-		}
-		err = checkIP(ip, true)
-		if err == nil {
-			t.Fatal("strict: expected blocked for ::1")
-		}
-		if err.Error() != "::1 (IPv6 loopback) blocked in strict mode" {
-			t.Fatalf("strict: unexpected error: %v", err)
-		}
-	})
+func TestCheckIP_IPv6_LoopbackAndPrivateBlocked(t *testing.T) {
+	// IPv6 rules are symmetric with IPv4: loopback (::1) and private/ULA
+	// (fc00::/7) addresses are always blocked — in non-strict mode too.
+	tests := []struct {
+		name   string
+		ip     string
+		reason string
+	}{
+		{"IPv6 loopback ::1", "::1", "::1 (IPv6 loopback) blocked"},
+		{"IPv6 ULA fc00::1", "fc00::1", "IPv6 private address (fc00::/7) blocked"},
+		{"IPv6 ULA fd00::1", "fd00::1", "IPv6 private address (fc00::/7) blocked"},
+	}
 
-	t.Run("IPv6 private fc00::1 allowed in non-strict", func(t *testing.T) {
-		ip := net.ParseIP("fc00::1")
-		if ip == nil {
-			t.Fatal("bad test IP")
-		}
-		err := checkIP(ip, false)
-		if err != nil {
-			t.Fatalf("non-strict: expected allowed, got: %v", err)
-		}
-		err = checkIP(ip, true)
-		if err == nil {
-			t.Fatal("strict: expected blocked for v6 private")
-		}
-		if err.Error() != "IPv6 private address blocked in strict mode" {
-			t.Fatalf("strict: unexpected error: %v", err)
-		}
-	})
-
-	t.Run("IPv6 private fd00::1 allowed in non-strict", func(t *testing.T) {
-		ip := net.ParseIP("fd00::1")
-		if ip == nil {
-			t.Fatal("bad test IP")
-		}
-		err := checkIP(ip, false)
-		if err != nil {
-			t.Fatalf("non-strict: expected allowed, got: %v", err)
-		}
-		err = checkIP(ip, true)
-		if err == nil {
-			t.Fatal("strict: expected blocked for v6 private")
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ip := net.ParseIP(tt.ip)
+			if ip == nil {
+				t.Fatalf("bad test IP: %s", tt.ip)
+			}
+			// Blocked in non-strict mode (symmetric with IPv4 loopback/private).
+			err := checkIP(ip, false)
+			if err == nil {
+				t.Fatalf("non-strict: expected blocked, got nil")
+			}
+			if err.Error() != tt.reason {
+				t.Fatalf("non-strict: expected %q, got %q", tt.reason, err.Error())
+			}
+			// Blocked in strict mode too.
+			err = checkIP(ip, true)
+			if err == nil {
+				t.Fatalf("strict: expected blocked, got nil")
+			}
+		})
+	}
 }
 
 func TestCheckIP_Public_IPv6(t *testing.T) {
@@ -307,5 +298,399 @@ func TestSingleflightKey_UniquePerFormat(t *testing.T) {
 	}
 	if keyHTML == keyJSON {
 		t.Fatalf("html and json keys should differ: %q", keyHTML)
+	}
+}
+
+// ---------- fetch test harness ----------
+
+// fakeRoundTripper serves HTTP requests locally, bypassing both the network
+// and the SSRF DialContext gate. Tests use public-looking IP hosts (e.g.
+// http://1.1.1.1/...) so validateURL passes without real DNS lookups.
+type fakeRoundTripper struct {
+	handler http.Handler
+}
+
+func (f *fakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	rr := httptest.NewRecorder()
+	f.handler.ServeHTTP(rr, req)
+	return rr.Result(), nil
+}
+
+// newFetchTestServer builds a server whose HTTP client is backed by a local
+// handler instead of real network dialing.
+func newFetchTestServer(t *testing.T, handler http.HandlerFunc) *server {
+	t.Helper()
+	s := newTestServer(t)
+	s.httpClient = &http.Client{Transport: &fakeRoundTripper{handler: handler}}
+	return s
+}
+
+// ---------- #1 stale chunk cleanup ----------
+
+func TestIndexContentLocked_ClearsStaleChunks(t *testing.T) {
+	srv := newTestServer(t)
+	const docPath = "src:http://example.com/doc"
+
+	// Simulate an earlier fetch that indexed 3 chunks.
+	indexDoc(t, srv.store, docPath+"#chunk-0", "old alpha")
+	indexDoc(t, srv.store, docPath+"#chunk-1", "old beta")
+	indexDoc(t, srv.store, docPath+"#chunk-2", "old gamma")
+
+	// Re-index with a single chunk (fewer than before).
+	count, err := srv.indexContentLocked(docPath, "new content only")
+	if err != nil {
+		t.Fatalf("indexContentLocked: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 chunk, got %d", count)
+	}
+
+	// Old chunks must be gone; only the new single chunk remains.
+	got, _ := srv.store.CountByPrefix(docPath)
+	if got != 1 {
+		t.Fatalf("expected 1 document under prefix, got %d", got)
+	}
+	doc, err := srv.store.Get(docPath)
+	if err != nil || doc == nil {
+		t.Fatalf("expected doc at %q (err=%v)", docPath, err)
+	}
+	if doc.Content != "new content only" {
+		t.Fatalf("unexpected content: %q", doc.Content)
+	}
+	if stale, _ := srv.store.Get(docPath + "#chunk-1"); stale != nil {
+		t.Fatalf("stale chunk %q survived re-index", docPath+"#chunk-1")
+	}
+}
+
+func TestFetchAndIndex_RefetchClearsStaleChunks(t *testing.T) {
+	var mu sync.Mutex
+	var body string
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, body)
+	}
+	srv := newFetchTestServer(t, handler)
+	const url = "http://1.1.1.1/doc"
+
+	mu.Lock()
+	// 5 paragraphs of ~1500 bytes each: chunkContent merges paragraphs up to
+	// 4000 bytes, so chunks are p1+p2, p3+p4, p5 → 3 chunks.
+	para := strings.Repeat("zebra ", 250)
+	body = "alpha " + para + "\n\n" + para + "\n\n" + para + "\n\n" + para + "\n\n" + para
+	mu.Unlock()
+	res, err := srv.fetchAndIndex(context.Background(), url, "src", "markdown", false, 3600000, 30*time.Second)
+	if err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	if res.Error != "" {
+		t.Fatalf("first fetch error: %s", res.Error)
+	}
+	if res.ChunkCount != 3 {
+		t.Fatalf("expected 3 chunks, got %d", res.ChunkCount)
+	}
+
+	// Re-fetch with fewer chunks (force skips cache read).
+	mu.Lock()
+	body = "delta zebra only"
+	mu.Unlock()
+	res2, err := srv.fetchAndIndex(context.Background(), url, "src", "markdown", true, 3600000, 30*time.Second)
+	if err != nil {
+		t.Fatalf("second fetch: %v", err)
+	}
+	if res2.Error != "" {
+		t.Fatalf("second fetch error: %s", res2.Error)
+	}
+	if res2.ChunkCount != 1 {
+		t.Fatalf("expected 1 chunk after re-fetch, got %d", res2.ChunkCount)
+	}
+
+	// Old chunks must be removed from documents and FTS.
+	count, _ := srv.store.CountByPrefix("src:" + url)
+	if count != 1 {
+		t.Fatalf("expected 1 document under prefix, got %d", count)
+	}
+	if stale, _ := srv.store.Get("src:" + url + "#chunk-1"); stale != nil {
+		t.Fatal("stale chunk #chunk-1 survived re-fetch")
+	}
+	hits, err := srv.store.Search("alpha", 10)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("old content 'alpha' should no longer be searchable, got %d hits", len(hits))
+	}
+}
+
+// ---------- #2 index failures surface in results ----------
+
+func TestFetchAndIndex_IndexErrorReported(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "content that cannot be indexed")
+	}
+	srv := newFetchTestServer(t, handler)
+
+	// Close the store: every index write (purge + insert) must fail.
+	if err := srv.store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	// singleflight branch (ttl > 0): IndexError must be propagated to result.
+	res, err := srv.fetchAndIndex(context.Background(), "http://1.1.1.1/doc", "src", "markdown", false, 3600000, 30*time.Second)
+	if err != nil {
+		t.Fatalf("fetchAndIndex: %v", err)
+	}
+	if res.Error != "" {
+		t.Fatalf("fetch itself should succeed, got error: %s", res.Error)
+	}
+	if res.IndexError == "" {
+		t.Fatal("expected IndexError when store is closed (singleflight branch)")
+	}
+
+	// Direct branch (ttl=0, skipCacheWrite=true): same requirement.
+	res2, err := srv.fetchAndIndex(context.Background(), "http://1.1.1.1/doc2", "src", "markdown", false, 0, 30*time.Second)
+	if err != nil {
+		t.Fatalf("fetchAndIndex ttl=0: %v", err)
+	}
+	if res2.Error != "" {
+		t.Fatalf("fetch ttl=0 should succeed, got error: %s", res2.Error)
+	}
+	if res2.IndexError == "" {
+		t.Fatal("expected IndexError when store is closed (direct branch)")
+	}
+
+	// Tool summary must not advertise searchability when indexing failed.
+	toolRes, _, err := srv.toolFetchAndIndex(context.Background(), nil, fetchArgs{
+		URL:    "http://1.1.1.1/doc",
+		Source: "src",
+		Format: "markdown",
+	})
+	if err != nil {
+		t.Fatalf("toolFetchAndIndex: %v", err)
+	}
+	text := contentText(toolRes)
+	if strings.Contains(text, "searchable") {
+		t.Fatalf("must not advertise searchability when indexing failed, got: %s", text)
+	}
+	if strings.Contains(text, "--- Content ---") {
+		t.Fatalf("must not include content preview when indexing failed, got: %s", text)
+	}
+}
+
+// ---------- #3 cache hit refills missing documents ----------
+
+func TestFetchAndIndex_CacheHitRefillsMissingDocs(t *testing.T) {
+	srv := newTestServer(t)
+	const url = "http://x.test/doc"
+	const content = "cached content with unique token"
+
+	// Seed the fetch cache but no indexed documents (simulates a purge).
+	if err := srv.store.SetCache(url, "src|markdown", content); err != nil {
+		t.Fatalf("SetCache: %v", err)
+	}
+
+	// A cache hit must detect the missing document and re-index it.
+	res, err := srv.fetchAndIndex(context.Background(), url, "src", "markdown", false, 3600000, time.Second)
+	if err != nil {
+		t.Fatalf("fetchAndIndex: %v", err)
+	}
+	if !res.Cached {
+		t.Fatal("expected cache hit")
+	}
+	if res.IndexError != "" {
+		t.Fatalf("unexpected index error: %s", res.IndexError)
+	}
+
+	doc, err := srv.store.Get("src:" + url)
+	if err != nil || doc == nil {
+		t.Fatalf("cache hit should have re-indexed missing doc (err=%v)", err)
+	}
+	if doc.Content != content {
+		t.Fatalf("re-indexed content mismatch: %q", doc.Content)
+	}
+	count, _ := srv.store.CountByPrefix("src:" + url)
+	if count != 1 {
+		t.Fatalf("expected 1 document, got %d", count)
+	}
+
+	// A second hit with the document present must not error or duplicate.
+	res2, err := srv.fetchAndIndex(context.Background(), url, "src", "markdown", false, 3600000, time.Second)
+	if err != nil {
+		t.Fatalf("second fetchAndIndex: %v", err)
+	}
+	if !res2.Cached || res2.IndexError != "" {
+		t.Fatalf("second hit: cached=%v indexError=%q", res2.Cached, res2.IndexError)
+	}
+	count, _ = srv.store.CountByPrefix("src:" + url)
+	if count != 1 {
+		t.Fatalf("expected 1 document after second hit, got %d", count)
+	}
+}
+
+// ---------- #4 singleflight uses a caller-independent context ----------
+
+func TestFetchAndIndex_SingleflightSurvivesCallerCancel(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "independent context content")
+	}
+	srv := newFetchTestServer(t, handler)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type outcome struct {
+		res *FetchResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := srv.fetchAndIndex(ctx, "http://1.1.1.1/doc", "src", "markdown", false, 3600000, 30*time.Second)
+		done <- outcome{res: res, err: err}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("request never reached handler")
+	}
+
+	// Cancel the caller while the shared singleflight fetch is in flight.
+	cancel()
+	close(release)
+
+	select {
+	case o := <-done:
+		if o.err != nil {
+			t.Fatalf("fetchAndIndex: %v", o.err)
+		}
+		if o.res.Error != "" {
+			t.Fatalf("singleflight fetch must survive caller cancel, got error: %s", o.res.Error)
+		}
+		if o.res.Content != "independent context content" {
+			t.Fatalf("unexpected content: %q", o.res.Content)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("fetchAndIndex did not return")
+	}
+}
+
+// ---------- #5 body truncation at UTF-8 boundary ----------
+
+func TestFetchURL_TruncatesAtUTF8Boundary(t *testing.T) {
+	// 3-byte runes: maxBodySize falls in the middle of a rune (maxBodySize%3==1).
+	big := strings.Repeat("界", maxBodySize/3+5000)
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprint(w, big)
+	}
+	srv := newFetchTestServer(t, handler)
+
+	body, _, truncated, err := srv.fetchURL(context.Background(), "http://1.1.1.1/big", 30*time.Second)
+	if err != nil {
+		t.Fatalf("fetchURL: %v", err)
+	}
+	if !truncated {
+		t.Fatal("expected truncated=true for oversized body")
+	}
+	if len(body) > maxBodySize {
+		t.Fatalf("body length %d exceeds maxBodySize %d", len(body), maxBodySize)
+	}
+	if !utf8.Valid(body) {
+		t.Fatal("truncated body must end on a valid UTF-8 boundary")
+	}
+	if !strings.HasPrefix(big, string(body)) {
+		t.Fatal("truncated body must be a prefix of the original content")
+	}
+}
+
+// ---------- #7 oversized paragraphs are force-split ----------
+
+func TestChunkContent_ForceSplitsOversizedParagraph(t *testing.T) {
+	const maxChunkSize = 4000
+
+	t.Run("ascii wall of text", func(t *testing.T) {
+		long := strings.Repeat("a", 10000) // no blank lines at all
+		chunks := chunkContent(long)
+		if len(chunks) != 3 {
+			t.Fatalf("expected 3 chunks, got %d", len(chunks))
+		}
+		for i, c := range chunks {
+			if len(c) > maxChunkSize {
+				t.Fatalf("chunk %d is %d bytes (max %d)", i, len(c), maxChunkSize)
+			}
+		}
+		if strings.Join(chunks, "") != long {
+			t.Fatal("force-split must be lossless")
+		}
+	})
+
+	t.Run("multibyte wall of text", func(t *testing.T) {
+		wide := strings.Repeat("界", 2000) // 6000 bytes, no blank lines
+		chunks := chunkContent(wide)
+		if len(chunks) != 2 {
+			t.Fatalf("expected 2 chunks, got %d", len(chunks))
+		}
+		for i, c := range chunks {
+			if len(c) > maxChunkSize {
+				t.Fatalf("chunk %d is %d bytes (max %d)", i, len(c), maxChunkSize)
+			}
+			if !utf8.ValidString(c) {
+				t.Fatalf("chunk %d split mid-rune", i)
+			}
+		}
+		if strings.Join(chunks, "") != wide {
+			t.Fatal("force-split must be lossless")
+		}
+	})
+
+	t.Run("mixed short and oversized paragraphs", func(t *testing.T) {
+		long := strings.Repeat("b", 9000)
+		mixed := "short intro\n\n" + long + "\n\nshort outro"
+		chunks := chunkContent(mixed)
+		if len(chunks) != 5 {
+			t.Fatalf("expected 5 chunks (1 + 3 + 1), got %d", len(chunks))
+		}
+		for i, c := range chunks {
+			if len(c) > maxChunkSize {
+				t.Fatalf("chunk %d is %d bytes (max %d)", i, len(c), maxChunkSize)
+			}
+		}
+		if chunks[0] != "short intro" {
+			t.Fatalf("unexpected first chunk: %q", chunks[0])
+		}
+		if chunks[len(chunks)-1] != "short outro" {
+			t.Fatalf("unexpected last chunk: %q", chunks[len(chunks)-1])
+		}
+	})
+}
+
+// ---------- #8 search hint uses ctx_kb action=search ----------
+
+func TestToolFetchAndIndex_SearchHintUsesCtxKB(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "hint test content")
+	}
+	srv := newFetchTestServer(t, handler)
+
+	toolRes, _, err := srv.toolFetchAndIndex(context.Background(), nil, fetchArgs{
+		URL:    "http://1.1.1.1/doc",
+		Source: "src",
+		Format: "markdown",
+	})
+	if err != nil {
+		t.Fatalf("toolFetchAndIndex: %v", err)
+	}
+	text := contentText(toolRes)
+	if strings.Contains(text, "ctx_search") {
+		t.Fatalf("runtime text must not mention the removed ctx_search tool: %s", text)
+	}
+	if !strings.Contains(text, "ctx_kb action=search") {
+		t.Fatalf("expected ctx_kb action=search hint, got: %s", text)
 	}
 }
