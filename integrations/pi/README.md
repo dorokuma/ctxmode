@@ -5,9 +5,11 @@ Thin bridge: spawn `ctxmode`, register the **same five MCP tools** on Pi
 
 ```bash
 go build -o ctxmode .
-install -m 755 ctxmode /usr/local/bin/ctxmode
+install -m 755 ctxmode /root/.local/bin/ctxmode
 install -m 644 integrations/pi/ctxmode.ts ~/.pi/agent/extensions/ctxmode.ts
 ```
+
+建议直接用仓库自带的 `deploy.sh` 一键部署（编译 → 原子替换到 `/root/.local/bin`），不要手动 install，避免装到别处造成版本分叉。
 
 `/reload` or restart Pi.
 
