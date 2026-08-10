@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -29,6 +30,10 @@ const (
 	maxBackgroundTailBytes  = 4 * 1024 * 1024
 	maxBackgroundTailLines  = 10000
 	bgTempPrefix            = "ctxmode_bg_"
+	// maxBackgroundProcs caps concurrently running background jobs. Reaching
+	// the cap rejects new background launches with an error instead of
+	// silently queueing or spawning unbounded processes.
+	maxBackgroundProcs = 16
 )
 
 // ---------- background process registry ----------
@@ -47,7 +52,11 @@ type bgEntry struct {
 	ExitCode     int       `json:"exit_code,omitempty"`
 	// pgid for process-group kill (Setpgid=true).
 	pgid int
-	cmd  *exec.Cmd
+	// starttime (field 22 of /proc/<pid>/stat, clock ticks since boot)
+	// captured at registration; killBackground verifies it before signaling
+	// so a recycled PID can never cause an unrelated process to be killed.
+	starttime uint64
+	cmd       *exec.Cmd
 	// logFile is the open handle used by MultiWriter; closed on process exit
 	// (Wait → finishBackground). kill must not close it early or log tail is lost.
 	logFile       *os.File
@@ -79,7 +88,10 @@ func (w *limitedFileWriter) Write(p []byte) (int, error) {
 		return n, err
 	}
 	// Partial write up to limit; report full len(p) so MultiWriter continues.
-	n, err := w.f.Write(p[:remaining])
+	// Trim the chunk on a UTF-8 rune boundary: a hard byte cut would leave a
+	// half character at the end of the log (rendered as U+FFFD).
+	cut := []byte(truncateUTF8(string(p), int(remaining)))
+	n, err := w.f.Write(cut)
 	w.written += int64(n)
 	w.truncated = true
 	if err != nil {
@@ -103,25 +115,19 @@ var (
 
 // registerBackground records a live background process.
 // logPath/logFile/logWriter may be empty/nil when capture is unavailable.
-func registerBackground(cmd *exec.Cmd, language, command string, temps []string, logPath string, logFile *os.File, logWriter *limitedFileWriter) *bgEntry {
+// Returns an error when the concurrent-background cap is reached; the caller
+// must then stop the already-started process and clean up the log file.
+func registerBackground(cmd *exec.Cmd, language, command string, temps []string, logPath string, logFile *os.File, logWriter *limitedFileWriter) (*bgEntry, error) {
 	bgReaper.Do(func() { go backgroundReaperLoop() })
 	id := fmt.Sprintf("bg-%d", bgSeq.Add(1))
 	pgid := 0
 	if cmd.Process != nil {
 		pgid = cmd.Process.Pid
 	}
-	// Cap command string for list readability.
+	// Cap command string for list readability, on a UTF-8 rune boundary
+	// (a hard byte cut could leave a half character in the listing).
 	if len(command) > 200 {
-		command = command[:200] + "..."
-	}
-	// Prefer stable log name that includes the id (rename if we used a temp name).
-	if logFile != nil && logPath != "" {
-		finalPath := filepath.Join(os.TempDir(), fmt.Sprintf("%s%s.log", bgTempPrefix, id))
-		if logPath != finalPath {
-			if err := os.Rename(logPath, finalPath); err == nil {
-				logPath = finalPath
-			}
-		}
+		command = truncateUTF8(command, 200) + "..."
 	}
 	e := &bgEntry{
 		ID:        id,
@@ -135,18 +141,57 @@ func registerBackground(cmd *exec.Cmd, language, command string, temps []string,
 		logWriter: logWriter,
 		pgid:      pgid,
 		cmd:       cmd,
+		// Identity snapshot for the PID-reuse guard in killBackground.
+		starttime: procStartTime(cmd.Process.Pid),
 	}
 	bgMu.Lock()
+	// Enforce the concurrent-background cap under the lock (authoritative;
+	// runCmd's pre-check only avoids starting a doomed process).
+	live := 0
+	for _, ent := range bgProcs {
+		if !ent.Done {
+			live++
+		}
+	}
+	if live >= maxBackgroundProcs {
+		bgMu.Unlock()
+		return nil, fmt.Errorf("too many concurrent background processes (%d max): wait for some to finish or kill them first", maxBackgroundProcs)
+	}
 	bgProcs[id] = e
 	// Protect temp paths from init-style cleanup while registered.
 	for _, t := range temps {
 		protectTemp(t)
 	}
-	if logPath != "" {
-		protectTemp(logPath)
-	}
 	bgMu.Unlock()
-	return e
+
+	// Prefer stable log name that includes the id (rename if we used a temp
+	// name). Done after registration so a cap rejection never renames; e is
+	// the live registry entry, so updating e.LogPath keeps the registry in
+	// sync. The final path is protected once it exists.
+	if logFile != nil && logPath != "" {
+		finalPath := filepath.Join(os.TempDir(), fmt.Sprintf("%s%s.log", bgTempPrefix, id))
+		if logPath != finalPath {
+			if err := os.Rename(logPath, finalPath); err == nil {
+				e.LogPath = finalPath
+				protectTemp(finalPath)
+			}
+		}
+	}
+	return e, nil
+}
+
+// liveBackgroundCount returns the number of background jobs still running
+// (not yet Done). Used by runCmd to enforce the concurrent-background cap.
+func liveBackgroundCount() int {
+	bgMu.Lock()
+	defer bgMu.Unlock()
+	n := 0
+	for _, e := range bgProcs {
+		if !e.Done {
+			n++
+		}
+	}
+	return n
 }
 
 // finishBackground marks entry done, closes the log FD, and cleans temps.
@@ -371,7 +416,70 @@ func readBackgroundLogTail(logPath string, tailLines, tailBytes int) (string, er
 		}
 		data = bytes.Join(lines, []byte{'\n'})
 	}
+	// Keep the result on UTF-8 rune boundaries at BOTH ends: the byte window
+	// can start mid-rune (seek offset) and the file can end mid-rune (process
+	// killed mid-write). A raw string(data) would render a mojibake
+	// replacement character at the head.
+	data = dropLeadingPartialRune(data)
+	data = trimTrailingPartialRune(data)
 	return string(data), nil
+}
+
+// procStartTime reads field 22 (starttime, in clock ticks since boot) from
+// /proc/<pid>/stat — a stable per-process identity that survives PID reuse.
+// Returns 0 when the process no longer exists or the file is unreadable.
+// The comm field (2) is parenthesized and may contain spaces/parens, so the
+// remainder is parsed after the LAST ')'.
+func procStartTime(pid int) uint64 {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	i := bytes.LastIndexByte(data, ')')
+	if i < 0 || i+2 >= len(data) {
+		return 0
+	}
+	fields := strings.Fields(string(data[i+2:]))
+	// Fields after comm: state(1) ppid(2) pgrp(3) session(4) tty_nr(5)
+	// tpgid(6) flags(7) minflt(8) cminflt(9) majflt(10) cmajflt(11)
+	// utime(12) stime(13) cutime(14) cstime(15) priority(16) nice(17)
+	// num_threads(18) itrealvalue(19) starttime(20) → index 19.
+	if len(fields) < 20 {
+		return 0
+	}
+	v, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// dropLeadingPartialRune drops leading bytes until b starts on a UTF-8 rune
+// boundary. Used when a byte-window read (seek from the end of a log) lands
+// mid-rune: the half character would otherwise render as U+FFFD.
+func dropLeadingPartialRune(b []byte) []byte {
+	for len(b) > 0 {
+		r, size := utf8.DecodeRune(b)
+		if r != utf8.RuneError || size > 1 {
+			return b
+		}
+		b = b[1:]
+	}
+	return b
+}
+
+// trimTrailingPartialRune drops trailing bytes that form an incomplete rune
+// (e.g. a process killed mid-write). Unlike a full validity scan, mid-stream
+// invalid bytes are preserved untouched.
+func trimTrailingPartialRune(b []byte) []byte {
+	for len(b) > 0 {
+		r, size := utf8.DecodeLastRune(b)
+		if r != utf8.RuneError || size > 1 {
+			return b
+		}
+		b = b[:len(b)-1]
+	}
+	return b
 }
 
 // killBackground kills by id or by PID string. Returns a status message.
@@ -402,7 +510,16 @@ func killBackground(idOrPID string) (string, error) {
 	pgid := target.pgid
 	id := target.ID
 	pid := target.PID
+	starttime := target.starttime
 	bgMu.Unlock()
+
+	// PID-reuse guard: verify the process identity before signaling. The PID
+	// (and its process group) may have been recycled by an unrelated process
+	// since registration; signaling blindly could kill an innocent process.
+	current := procStartTime(pid)
+	if current == 0 || current != starttime {
+		return "", fmt.Errorf("refusing to kill %s (PID %d): process identity mismatch (starttime recorded %d, current %d); PID likely reused or process already gone", id, pid, starttime, current)
+	}
 
 	// Two-stage kill of the process group; surface real failures (ignore ESRCH).
 	killErr := func(err error) error {
@@ -576,7 +693,7 @@ func (s *server) toolBackgroundList(ctx context.Context, _ *mcp.CallToolRequest,
 }
 
 type backgroundKillArgs struct {
-	ID  string `json:"id,omitempty" jsonschema:"Background process id from ctx_background_list"`
+	ID  string `json:"id,omitempty" jsonschema:"Background process id from ctx_bg action=list"`
 	PID int    `json:"pid,omitempty" jsonschema:"Process PID to kill"`
 }
 
@@ -598,7 +715,7 @@ func (s *server) toolBackgroundKill(ctx context.Context, _ *mcp.CallToolRequest,
 }
 
 type backgroundLogArgs struct {
-	ID        string `json:"id,omitempty" jsonschema:"Background process id from ctx_background_list"`
+	ID        string `json:"id,omitempty" jsonschema:"Background process id from ctx_bg action=list"`
 	PID       int    `json:"pid,omitempty" jsonschema:"Process PID"`
 	TailLines int    `json:"tail_lines,omitempty" jsonschema:"Number of trailing lines (default: 100)"`
 	TailBytes int    `json:"tail_bytes,omitempty" jsonschema:"Optional max trailing bytes (applied before lines)"`
@@ -653,7 +770,7 @@ func (s *server) toolBackgroundLog(ctx context.Context, _ *mcp.CallToolRequest, 
 }
 
 type backgroundWaitArgs struct {
-	ID        string `json:"id,omitempty" jsonschema:"Background process id from ctx_background_list"`
+	ID        string `json:"id,omitempty" jsonschema:"Background process id from ctx_bg action=list"`
 	PID       int    `json:"pid,omitempty" jsonschema:"Process PID"`
 	TimeoutMs int    `json:"timeout_ms,omitempty" jsonschema:"Max wait in ms (default: 60000). Does not kill on timeout."`
 }
@@ -1041,7 +1158,7 @@ func wrapCode(language, code string) string {
 	return rt.Wrap(code)
 }
 
-// ---------- file content injection for ctx_execute_file ----------
+// ---------- file content injection for ctx_run: execute_file ----------
 
 // injectFileContent prepends a FILE_CONTENT variable definition to the user's
 // code, so the subprocess script can access the file contents through a variable.
@@ -1156,10 +1273,10 @@ type runOptions struct {
 	Stdin string
 }
 
-// maxStdinBytes caps ctx_execute stdin payload size (1 MiB).
+// maxStdinBytes caps ctx_run execute stdin payload size (1 MiB).
 const maxStdinBytes = 1 * 1024 * 1024
 
-// envAllowlist is the explicit set of keys callers may inject via ctx_execute env.
+// envAllowlist is the explicit set of keys callers may inject via ctx_run execute env.
 // Unknown keys are rejected. Dangerous keys are always denied even if listed.
 var envAllowlist = map[string]bool{
 	"GOFLAGS":                 true,
@@ -1227,18 +1344,70 @@ func filterExecEnv(env map[string]string) (map[string]string, error) {
 	return out, nil
 }
 
+// sensitiveEnvKeyRe matches environment variable names that commonly carry
+// secrets (API keys, tokens, passwords, credentials, auth material, cookies,
+// session data). Matching is case-insensitive on the KEY NAME; values are not
+// inspected.
+var sensitiveEnvKeyRe = regexp.MustCompile(`(?i)token|key|secret|password|passwd|credential|auth|cookie|session`)
+
+// childEnv builds the environment map for a subprocess.
+//
+// Security default: variables inherited from the parent whose key name
+// matches sensitiveEnvKeyRe are REMOVED. A subprocess would otherwise inherit
+// API keys / tokens / passwords, and because its output is captured and
+// auto-indexed, those secrets could be persisted to disk.
+//
+// Exceptions, in priority order:
+//   - CTXMODE_ENV_PASSTHROUGH=1 in the parent environment disables stripping
+//     entirely (opt-out for hosts that must pass the full environment).
+//   - Keys explicitly allowlisted (envAllowlist) are always kept.
+//   - Keys explicitly passed by the caller (overrides, already validated by
+//     filterExecEnv) always win and are never stripped.
+//
+// The merge also fixes duplicate-key injection: overrides are applied to a
+// map and the result is flattened, so a caller-provided value truly replaces
+// a same-named inherited one. Previously the new entry was appended after
+// os.Environ(), and with a duplicate key glibc getenv returns the FIRST
+// occurrence — the stale host value — making the injection ineffective.
+func childEnv(overrides map[string]string) map[string]string {
+	env := make(map[string]string)
+	strip := os.Getenv("CTXMODE_ENV_PASSTHROUGH") != "1"
+	for _, kv := range os.Environ() {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || k == "" {
+			continue
+		}
+		if strip && !envAllowlist[k] && sensitiveEnvKeyRe.MatchString(k) {
+			continue
+		}
+		env[k] = v
+	}
+	for k, v := range overrides {
+		env[k] = v
+	}
+	return env
+}
+
+// flattenEnv renders a merged env map as the sorted "K=V" slice exec.Cmd
+// expects (sorted for deterministic ordering).
+func flattenEnv(env map[string]string) []string {
+	out := make([]string, 0, len(env))
+	for k, v := range env {
+		out = append(out, k+"="+v)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // applyRunOptions sets Env (merged with process env) and Stdin on cmd.
+// cmd.Env is ALWAYS set (even with no caller options) so that sensitive
+// inherited variables are stripped by default — see childEnv.
 func applyRunOptions(cmd *exec.Cmd, opts *runOptions) {
 	if opts == nil {
+		cmd.Env = flattenEnv(childEnv(nil))
 		return
 	}
-	if len(opts.Env) > 0 {
-		env := append([]string{}, os.Environ()...)
-		for k, v := range opts.Env {
-			env = append(env, k+"="+v)
-		}
-		cmd.Env = env
-	}
+	cmd.Env = flattenEnv(childEnv(opts.Env))
 	if opts.Stdin != "" {
 		cmd.Stdin = strings.NewReader(opts.Stdin)
 	}
@@ -1261,7 +1430,10 @@ func runCodeOpts(ctx context.Context, language, code, cwd string, timeout time.D
 		return nil, fmt.Errorf("runtime %q is not available for language %q — install it first or use a different language", rt.Exe, language)
 	}
 
-	if timeout <= 0 {
+	if timeout <= 0 && !background {
+		// Foreground default is 30s. Background jobs without an explicit
+		// caller timeout are bounded by defaultBackgroundMaxAge instead
+		// (enforced by the per-job timer in runCmd and by the reaper).
 		timeout = 30 * time.Second
 	}
 
@@ -1335,7 +1507,10 @@ func runArgv(ctx context.Context, argv []string, cwd string, timeout time.Durati
 	if argv[0] == "" {
 		return nil, fmt.Errorf("argv[0] must not be empty")
 	}
-	if timeout <= 0 {
+	if timeout <= 0 && !background {
+		// Foreground default is 30s. Background jobs without an explicit
+		// caller timeout are bounded by defaultBackgroundMaxAge instead
+		// (enforced by the per-job timer in runCmd and by the reaper).
 		timeout = 30 * time.Second
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
@@ -1368,22 +1543,26 @@ func runCompiledOpts(ctx context.Context, language string, rt runtimeConfig, tmp
 
 		compileStart := time.Now()
 		compileCtx := ctx
-		if timeout > 0 {
-			var cancel context.CancelFunc
-			compileCtx, cancel = context.WithTimeout(ctx, timeout)
-			defer cancel()
+		// Background jobs without an explicit caller timeout still cap the
+		// synchronous compile step at the background default so a hung rustc
+		// cannot block the tool call forever.
+		compileBudget := timeout
+		if compileBudget <= 0 {
+			compileBudget = defaultBackgroundMaxAge
 		}
+		var cancel context.CancelFunc
+		compileCtx, cancel = context.WithTimeout(ctx, compileBudget)
+		defer cancel()
 		compileCmd := exec.Command("rustc", "-o", outPath, tmpPath)
 		compileCmd.Dir = cwd
 		compileCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		// Env applies to compile + run; stdin only to the run step.
-		if opts != nil && len(opts.Env) > 0 {
-			env := append([]string{}, os.Environ()...)
-			for k, v := range opts.Env {
-				env = append(env, k+"="+v)
-			}
-			compileCmd.Env = env
+		// Same dedup + secret-strip rules as the run step (see childEnv).
+		var optsEnv map[string]string
+		if opts != nil {
+			optsEnv = opts.Env
 		}
+		compileCmd.Env = flattenEnv(childEnv(optsEnv))
 		var compileOutBuf limitedBuffer
 		compileOutBuf.limit = maxCmdOutput
 		compileCmd.Stdout = &compileOutBuf
@@ -1402,7 +1581,7 @@ func runCompiledOpts(ctx context.Context, language string, rt runtimeConfig, tmp
 		compileDone := make(chan error, 1)
 		go func() { compileDone <- compileCmd.Wait() }()
 		var compileErr error
-		if timeout > 0 {
+		if compileBudget > 0 {
 			select {
 			case compileErr = <-compileDone:
 			case <-compileCtx.Done():
@@ -1499,7 +1678,11 @@ func (lb *limitedBuffer) Write(p []byte) (int, error) {
 		return lb.buf.Write(p)
 	}
 	lb.truncated = true
-	_, _ = lb.buf.Write(p[:remaining])
+	// Cut on a UTF-8 rune boundary: a hard byte cut would leave a half
+	// character at the tail of the captured output. The FULL input chunk is
+	// passed with the remaining budget so truncateUTF8's boundary back-off
+	// actually runs (passing p[:remaining] would short-circuit on len==max).
+	_, _ = lb.buf.WriteString(truncateUTF8(string(p), remaining))
 	return len(p), nil
 }
 
@@ -1521,6 +1704,13 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 	var logPath string
 	var logWriter *limitedFileWriter
 	if background {
+		// Cap concurrently running background jobs: reject with an error
+		// instead of silently queueing. registerBackground re-checks under
+		// the lock (authoritative); this pre-check avoids starting a doomed
+		// process in the common case.
+		if liveBackgroundCount() >= maxBackgroundProcs {
+			return nil, fmt.Errorf("too many concurrent background processes (%d max): wait for some to finish or kill them first", maxBackgroundProcs)
+		}
 		f, err := os.CreateTemp(os.TempDir(), bgTempPrefix+"*.log")
 		if err != nil {
 			return nil, fmt.Errorf("create background log: %w", err)
@@ -1545,7 +1735,20 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 
 	if background {
 		// Register for list/kill/log/wait supervision; reap on exit; enforce max age.
-		entry := registerBackground(cmd, language, command, cleanups, logPath, logFile, logWriter)
+		entry, err := registerBackground(cmd, language, command, cleanups, logPath, logFile, logWriter)
+		if err != nil {
+			// Cap reached (e.g. a concurrent launch won the race): stop the
+			// just-started process, reap it, and clean up the log.
+			if cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				_ = cmd.Wait()
+			}
+			if logFile != nil {
+				logFile.Close()
+				os.Remove(logPath)
+			}
+			return nil, err
+		}
 		go func(id string, c *exec.Cmd) {
 			err := c.Wait()
 			exitCode := 0
@@ -1558,9 +1761,20 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 			}
 			finishBackground(id, exitCode)
 		}(entry.ID, cmd)
+		// Honor the caller-provided timeout on the background job; without an
+		// explicit timeout the defaultBackgroundMaxAge (1h) applies. The
+		// reaper loop remains as a safety net.
+		maxAge := timeout
+		if maxAge <= 0 {
+			maxAge = defaultBackgroundMaxAge
+		}
+		time.AfterFunc(maxAge, func() {
+			// Entry may already be Done or reaped — nothing to do then.
+			_, _ = killBackground(entry.ID)
+		})
 		return &executeResult{
-			Stdout: fmt.Sprintf("Process started in background (id: %s, PID: %d). Use ctx_background_list / ctx_background_log / ctx_background_wait / ctx_background_kill. Max age %s.",
-				entry.ID, cmd.Process.Pid, defaultBackgroundMaxAge),
+			Stdout: fmt.Sprintf("Process started in background (id: %s, PID: %d). Use ctx_bg action=list|kill|log|wait. Max age %s.",
+				entry.ID, cmd.Process.Pid, maxAge),
 			ExitCode: 0,
 		}, nil
 	}
@@ -1571,16 +1785,21 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 		done <- cmd.Wait()
 	}()
 
-	var timer *time.Timer
+	// timeout <= 0 means no deadline: timerC stays nil and its select case is
+	// disabled (a nil channel never fires). The select then waits on context
+	// cancellation or process exit. (Dereferencing a nil *time.Timer for .C
+	// would panic with a nil-pointer dereference, hence the channel variable.)
+	var timerC <-chan time.Time
 	if timeout > 0 {
-		timer = time.NewTimer(timeout)
+		timer := time.NewTimer(timeout)
 		defer timer.Stop()
+		timerC = timer.C
 	}
 
 	truncated := false
 
 	select {
-	case <-timer.C:
+	case <-timerC:
 		// Timeout: send SIGTERM first for graceful shutdown, then SIGKILL.
 		if cmd.Process != nil {
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
@@ -1666,7 +1885,7 @@ func availableLanguages() []string {
 	return langs
 }
 
-// ---------- FILE_CONTENT injection for ctx_execute_file (base64 fallback) ----------
+// ---------- FILE_CONTENT injection for ctx_run: execute_file (base64 fallback) ----------
 
 // injectFileContentBase64 uses base64 encoding to safely inject arbitrary file
 // content into any language. The user code must decode the variable.

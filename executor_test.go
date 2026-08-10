@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -867,4 +869,456 @@ func TestToolExecute_BackgroundArgvLog(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("background_log did not show BG_ARGV_MARKER within timeout; last log=%q", logText)
+}
+
+// ============================================================================
+// env merge: true override, no duplicate keys (fix #1)
+// ============================================================================
+
+func TestChildEnv_OverrideReplacesHostValue(t *testing.T) {
+	old := os.Getenv("TZ")
+	defer os.Setenv("TZ", old)
+	os.Setenv("TZ", "Host/Zone")
+
+	flat := flattenEnv(childEnv(map[string]string{"TZ": "Injected/Zone"}))
+	tzCount := 0
+	for _, kv := range flat {
+		if strings.HasPrefix(kv, "TZ=") {
+			tzCount++
+			if kv != "TZ=Injected/Zone" {
+				t.Fatalf("TZ must be the injected value, got %q", kv)
+			}
+		}
+	}
+	if tzCount != 1 {
+		t.Fatalf("expected exactly one TZ entry (no duplicate), got %d in %v", tzCount, flat)
+	}
+}
+
+func TestApplyRunOptions_EnvOverrideWins(t *testing.T) {
+	old := os.Getenv("TZ")
+	defer os.Setenv("TZ", old)
+	os.Setenv("TZ", "Host/Zone")
+
+	opts := &runOptions{Env: map[string]string{"TZ": "Injected/Zone"}}
+	result, err := runShellOpts(context.Background(), `echo "TZ=$TZ"`, "/tmp", 5*time.Second, false, opts)
+	if err != nil {
+		t.Fatalf("runShellOpts: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "TZ=Injected/Zone") {
+		t.Fatalf("child must see the injected TZ even though the host has the same key: stdout=%q stderr=%q", result.Stdout, result.Stderr)
+	}
+	if strings.Contains(result.Stdout, "Host/Zone") {
+		t.Fatalf("host TZ leaked into the child: %q", result.Stdout)
+	}
+}
+
+// ============================================================================
+// secret env stripping (fix #2)
+// ============================================================================
+
+func TestChildEnv_StripsSensitiveKeys(t *testing.T) {
+	for _, kv := range []string{
+		"API_KEY=sk-123", "GITHUB_TOKEN=tok", "DB_PASSWORD=pw", "PASSWD=x",
+		"AUTH_TOKEN=at", "COOKIE=c1", "SESSION_ID=s1", "CREDENTIAL_FILE=cf",
+	} {
+		k, v, _ := strings.Cut(kv, "=")
+		os.Setenv(k, v)
+		defer os.Unsetenv(k)
+	}
+	os.Setenv("CTXMODE_TEST_PLAIN_VAR", "visible")
+	defer os.Unsetenv("CTXMODE_TEST_PLAIN_VAR")
+
+	env := childEnv(nil)
+	for _, k := range []string{"API_KEY", "GITHUB_TOKEN", "DB_PASSWORD", "PASSWD", "AUTH_TOKEN", "COOKIE", "SESSION_ID", "CREDENTIAL_FILE"} {
+		if _, ok := env[k]; ok {
+			t.Fatalf("sensitive key %s must be stripped from child env", k)
+		}
+	}
+	if env["CTXMODE_TEST_PLAIN_VAR"] != "visible" {
+		t.Fatal("non-sensitive keys must still be inherited")
+	}
+	if env["PATH"] == "" {
+		t.Fatal("PATH must still be inherited")
+	}
+}
+
+func TestChildEnv_KeepsExplicitAndAllowlistedKeys(t *testing.T) {
+	// Caller-passed keys always survive, even when the key name is sensitive.
+	env := childEnv(map[string]string{"API_KEY": "explicit"})
+	if env["API_KEY"] != "explicit" {
+		t.Fatalf("caller-passed sensitive key must be kept, got %q", env["API_KEY"])
+	}
+
+	// Allowlisted keys survive stripping even when the name matches a pattern.
+	envAllowlist["TEST_KEY_ALLOWED_SENSITIVE"] = true
+	defer delete(envAllowlist, "TEST_KEY_ALLOWED_SENSITIVE")
+	os.Setenv("TEST_KEY_ALLOWED_SENSITIVE", "keepme")
+	defer os.Unsetenv("TEST_KEY_ALLOWED_SENSITIVE")
+	env = childEnv(nil)
+	if env["TEST_KEY_ALLOWED_SENSITIVE"] != "keepme" {
+		t.Fatal("allowlisted key must survive secret stripping")
+	}
+}
+
+func TestChildEnv_PassthroughDisablesStripping(t *testing.T) {
+	os.Setenv("API_KEY", "sk-passthrough")
+	defer os.Unsetenv("API_KEY")
+	old := os.Getenv("CTXMODE_ENV_PASSTHROUGH")
+	defer os.Setenv("CTXMODE_ENV_PASSTHROUGH", old)
+	os.Setenv("CTXMODE_ENV_PASSTHROUGH", "1")
+
+	env := childEnv(nil)
+	if env["API_KEY"] != "sk-passthrough" {
+		t.Fatal("CTXMODE_ENV_PASSTHROUGH=1 must disable secret stripping")
+	}
+}
+
+func TestRunShell_ChildEnvStripsSecrets(t *testing.T) {
+	os.Setenv("API_KEY", "hunter2topsecret")
+	defer os.Unsetenv("API_KEY")
+
+	result, err := runShell(context.Background(),
+		`if env | grep -q '^API_KEY='; then echo HAS_API_KEY; else echo NO_API_KEY; fi; echo "key=[$API_KEY]"`,
+		"/tmp", 5*time.Second, false)
+	if err != nil {
+		t.Fatalf("runShell: %v", err)
+	}
+	if strings.Contains(result.Stdout, "HAS_API_KEY") || strings.Contains(result.Stdout, "hunter2topsecret") {
+		t.Fatalf("secret leaked into the child environment: %q", result.Stdout)
+	}
+	if !strings.Contains(result.Stdout, "NO_API_KEY") || !strings.Contains(result.Stdout, "key=[]") {
+		t.Fatalf("expected stripped child env, got %q", result.Stdout)
+	}
+}
+
+// ============================================================================
+// UTF-8 boundary handling (fixes #3/#4/#5)
+// ============================================================================
+
+func TestLimitedBuffer_DoesNotSplitUTF8(t *testing.T) {
+	lb := &limitedBuffer{limit: 3}
+	if _, err := lb.Write([]byte("ab")); err != nil {
+		t.Fatal(err)
+	}
+	// "é" is 2 bytes; only 1 of the 4 input bytes fits, landing inside the rune.
+	n, err := lb.Write([]byte("écd"))
+	if err != nil || n != 4 {
+		t.Fatalf("Write: n=%d err=%v", n, err)
+	}
+	if !lb.truncated {
+		t.Fatal("expected truncated")
+	}
+	if got := lb.String(); got != "ab" {
+		t.Fatalf("buffer must not contain a split rune, got %q", got)
+	}
+}
+
+func TestLimitedBuffer_MultiByteRuneFitsExactly(t *testing.T) {
+	lb := &limitedBuffer{limit: 3}
+	if _, err := lb.Write([]byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	// é (2 bytes) fits exactly in the remaining 2 bytes: no split, no truncate.
+	if _, err := lb.Write([]byte("é")); err != nil {
+		t.Fatal(err)
+	}
+	if got := lb.String(); got != "aé" {
+		t.Fatalf("expected 'aé', got %q", got)
+	}
+	if lb.truncated {
+		t.Fatal("exact fit must not be flagged truncated")
+	}
+}
+
+func TestLimitedFileWriter_DoesNotSplitUTF8(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "w.log")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	w := &limitedFileWriter{f: f, limit: 3}
+	if _, err := w.Write([]byte("ab")); err != nil {
+		t.Fatal(err)
+	}
+	n, err := w.Write([]byte("écd")) // only 1 byte fits — inside the 2-byte é
+	if err != nil || n != 4 {
+		t.Fatalf("Write: n=%d err=%v", n, err)
+	}
+	if !w.isTruncated() {
+		t.Fatal("expected truncated")
+	}
+	st, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size() != 2 {
+		t.Fatalf("file must not contain a split rune: size=%d (want 2)", st.Size())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "ab" {
+		t.Fatalf("file content must be exactly 'ab', got %q", string(data))
+	}
+}
+
+func TestReadBackgroundLogTail_HeadUTF8Boundary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "utf8.log")
+	// A single 200-byte line of é (no newline): any byte offset can land
+	// mid-rune and there is no '\n' to realign the head.
+	if err := os.WriteFile(path, []byte(strings.Repeat("é", 100)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readBackgroundLogTail(path, 0, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == "" {
+		t.Fatal("expected non-empty tail")
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("tail must be valid UTF-8, got %q", got)
+	}
+	if !strings.HasPrefix(got, "é") {
+		t.Fatalf("head must start on a rune boundary, got %q", got)
+	}
+	if len(got) > 9 {
+		t.Fatalf("tail longer than the requested window: %d", len(got))
+	}
+}
+
+func TestReadBackgroundLogTail_TrailingPartialRune(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "partial.log")
+	// File ends mid-rune (process killed mid-write): 中 = E4 B8 AD, only the
+	// first two bytes were flushed.
+	if err := os.WriteFile(path, []byte("hello\xE4\xB8"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readBackgroundLogTail(path, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "hello" {
+		t.Fatalf("expected trailing partial rune dropped, got %q", got)
+	}
+}
+
+func TestRegisterBackground_CommandTruncatedAtUTF8Boundary(t *testing.T) {
+	// 99 é (198 bytes) + "é x" (4 bytes) = 202 bytes; a 200-byte cut lands
+	// inside the last é.
+	cmdStr := strings.Repeat("é", 99) + "é x"
+	if len(cmdStr) <= 200 {
+		t.Fatalf("test setup: command must exceed 200 bytes, got %d", len(cmdStr))
+	}
+	result, err := runShell(context.Background(), cmdStr, "/tmp", 0, true)
+	if err != nil {
+		t.Fatalf("start background: %v", err)
+	}
+	id := parseBgID(t, result.Stdout)
+	defer killBackground(id)
+
+	entry := findBackground(id)
+	if entry == nil {
+		t.Fatal("entry not found")
+	}
+	if !utf8.ValidString(entry.Command) {
+		t.Fatalf("truncated command must be valid UTF-8, got %q", entry.Command)
+	}
+	if len(entry.Command) > 203 {
+		t.Fatalf("command too long after truncation: %d", len(entry.Command))
+	}
+}
+
+// ============================================================================
+// background timeout + concurrency cap (fix #6)
+// ============================================================================
+
+func TestBackground_CallerTimeoutStopsJob(t *testing.T) {
+	result, err := runShell(context.Background(), "sleep 30", "/tmp", 300*time.Millisecond, true)
+	if err != nil {
+		t.Fatalf("start background: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "Max age 300ms.") {
+		t.Fatalf("start message should reflect the caller timeout, got: %q", result.Stdout)
+	}
+	id := parseBgID(t, result.Stdout)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		entry := findBackground(id)
+		if entry != nil && entry.Done {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	entry := findBackground(id)
+	if entry == nil {
+		t.Fatalf("entry %s disappeared", id)
+	}
+	if !entry.Done {
+		t.Fatal("background job must be stopped by the caller-provided timeout")
+	}
+	// The underlying process must actually be gone.
+	if entry.PID > 0 {
+		deadline = time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if procStartTime(entry.PID) == 0 {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if procStartTime(entry.PID) != 0 {
+			t.Fatalf("background process %d still alive after timeout stop", entry.PID)
+		}
+	}
+}
+
+func TestBackground_CapRejectsOverflow(t *testing.T) {
+	// Clean slate: kill any leftover live jobs from earlier tests.
+	bgMu.Lock()
+	var live []string
+	for id, e := range bgProcs {
+		if !e.Done {
+			live = append(live, id)
+		}
+	}
+	bgMu.Unlock()
+	for _, id := range live {
+		_, _ = killBackground(id)
+	}
+
+	started := make([]string, 0, maxBackgroundProcs)
+	defer func() {
+		for _, id := range started {
+			_, _ = killBackground(id)
+		}
+	}()
+	for i := 0; i < maxBackgroundProcs; i++ {
+		res, err := runShell(context.Background(), "sleep 60", "/tmp", 0, true)
+		if err != nil {
+			t.Fatalf("start %d: %v", i, err)
+		}
+		started = append(started, parseBgID(t, res.Stdout))
+	}
+	// The (cap+1)-th launch must be rejected, not queued.
+	_, err := runShell(context.Background(), "sleep 60", "/tmp", 0, true)
+	if err == nil {
+		t.Fatal("expected cap rejection error")
+	}
+	if !strings.Contains(err.Error(), "too many") {
+		t.Fatalf("expected cap error mentioning the limit, got: %v", err)
+	}
+}
+
+// ============================================================================
+// killBackground PID-reuse guard (fix #7)
+// ============================================================================
+
+func TestProcStartTime_ReadsOwnPID(t *testing.T) {
+	st := procStartTime(os.Getpid())
+	if st == 0 {
+		t.Fatal("expected non-zero starttime for the test process")
+	}
+}
+
+func TestKillBackground_RefusesIdentityMismatch(t *testing.T) {
+	result, err := runShell(context.Background(), "sleep 30", "/tmp", 0, true)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := parseBgID(t, result.Stdout)
+
+	bgMu.Lock()
+	e := bgProcs[id]
+	real := e.starttime
+	if real == 0 {
+		bgMu.Unlock()
+		t.Fatal("expected a recorded starttime")
+	}
+	e.starttime = real + 1 // simulate PID reuse: stale recorded identity
+	bgMu.Unlock()
+	defer func() {
+		bgMu.Lock()
+		if e2 := bgProcs[id]; e2 != nil {
+			e2.starttime = real
+		}
+		bgMu.Unlock()
+		_, _ = killBackground(id)
+	}()
+
+	msg, err := killBackground(id)
+	if err == nil {
+		t.Fatalf("expected refusal on identity mismatch, got msg %q", msg)
+	}
+	if !strings.Contains(err.Error(), "identity") {
+		t.Fatalf("expected identity-mismatch error, got: %v", err)
+	}
+	// The process must be untouched.
+	e2 := findBackground(id)
+	if e2 == nil || e2.Done {
+		t.Fatal("process must not be killed when identity does not match")
+	}
+	// Restore the real identity: the kill now succeeds.
+	bgMu.Lock()
+	if e3 := bgProcs[id]; e3 != nil {
+		e3.starttime = real
+	}
+	bgMu.Unlock()
+	msg, err = killBackground(id)
+	if err != nil {
+		t.Fatalf("kill after identity restore: %v", err)
+	}
+	if !strings.Contains(msg, "killed") {
+		t.Fatalf("expected killed message, got %q", msg)
+	}
+}
+
+// ============================================================================
+// runCmd without timeout (fix #8)
+// ============================================================================
+
+func TestRunCmd_ZeroTimeoutNoPanic(t *testing.T) {
+	cmd := exec.Command("echo", "no-timeout-ok")
+	cmd.Dir = "/tmp"
+	res, err := runCmd(context.Background(), cmd, 0, false, "argv", "echo no-timeout-ok")
+	if err != nil {
+		t.Fatalf("runCmd: %v", err)
+	}
+	if res.ExitCode != 0 || !strings.Contains(res.Stdout, "no-timeout-ok") {
+		t.Fatalf("unexpected result: exit=%d stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
+	}
+}
+
+func TestRunCmd_NegativeTimeoutNoPanic(t *testing.T) {
+	cmd := exec.Command("echo", "neg-timeout-ok")
+	cmd.Dir = "/tmp"
+	res, err := runCmd(context.Background(), cmd, -5*time.Second, false, "argv", "echo neg-timeout-ok")
+	if err != nil {
+		t.Fatalf("runCmd: %v", err)
+	}
+	if res.ExitCode != 0 || !strings.Contains(res.Stdout, "neg-timeout-ok") {
+		t.Fatalf("unexpected result: exit=%d stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
+	}
+}
+
+// ============================================================================
+// tool-name messaging (fix #9)
+// ============================================================================
+
+func TestBackground_StartMessageMentionsCtxBg(t *testing.T) {
+	result, err := runShell(context.Background(), "sleep 30", "/tmp", 0, true)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := parseBgID(t, result.Stdout)
+	defer killBackground(id)
+	if !strings.Contains(result.Stdout, "ctx_bg action=list|kill|log|wait") {
+		t.Fatalf("start message must reference ctx_bg action=list|kill|log|wait, got: %q", result.Stdout)
+	}
 }
