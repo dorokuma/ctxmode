@@ -39,7 +39,6 @@ const (
 
 type server struct {
 	workdirs       []string
-	policy         *ShellPolicy
 	mu             sync.Mutex
 	store          *Store
 	floodGuard     *FloodGuard
@@ -64,7 +63,7 @@ func main() {
 	flag.StringVar(&configPath, "config", "", "path to config file")
 	flag.Parse()
 
-	// Load workdirs + policy from config file (or fall back to cwd / default denylist).
+	// Load workdirs from config file (or fall back to cwd).
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
@@ -108,12 +107,6 @@ func main() {
 		fatal(nil, "no workspace directories configured")
 	}
 
-	// Rebuild policy with final absolute workdirs.
-	policy, err := NewShellPolicy(cfg.ShellPolicy, workdirs)
-	if err != nil {
-		log.Fatalf("failed to build shell policy: %v", err)
-	}
-
 	store, err := NewStore(filepath.Join(workdirs[0], "context_mode.db"))
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
@@ -125,7 +118,6 @@ func main() {
 
 	s := &server{
 		workdirs:       workdirs,
-		policy:         policy,
 		store:          store,
 		floodGuard:     floodGuard,
 		searchPipeline: searchPipeline,
@@ -148,15 +140,13 @@ func main() {
 
 // appConfig is the fully loaded runtime configuration.
 type appConfig struct {
-	Workdirs    []string
-	ShellPolicy ShellPolicyConfig
+	Workdirs []string
 }
 
-// loadConfig reads workdirs and optional policy from a YAML config file.
+// loadConfig reads workdirs from a YAML config file.
 // Priority: -config flag > $CTXMODE_CONFIG env > ./ctxmode-config.yaml > ~/.config/ctxmode/config.yaml.
 // If no config file is found, falls back to a single workdir from cwd (backward compatible).
-// Policy defaults to mode=denylist (built-in high-risk commands/patterns).
-// Explicit mode=off|allowlist and CTXMODE_POLICY_MODE override apply in NewShellPolicy.
+// A legacy "policy:" section in the YAML (if present) is ignored.
 func loadConfig(configFlag string) (*appConfig, error) {
 	var configPath string
 	switch {
@@ -192,15 +182,10 @@ func loadConfig(configFlag string) (*appConfig, error) {
 
 	var cfg struct {
 		Workdirs []string `yaml:"workdirs"`
-		Policy   struct {
-			Shell ShellPolicyConfig `yaml:"shell"`
-		} `yaml:"policy"`
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", configPath, err)
 	}
-
-	out.ShellPolicy = cfg.Policy.Shell
 
 	if len(cfg.Workdirs) == 0 {
 		wd, err := os.Getwd()
@@ -280,17 +265,8 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		if aerr != nil {
 			return nil, nil, aerr
 		}
-		if err := s.checkArgvPolicy(argv, cwd); err != nil {
-			return nil, nil, err
-		}
 		result, err = runArgv(ctx, argv, cwd, timeout, args.Background, opts)
 	} else {
-		// Shell policy applies to language=shell (default) command strings.
-		if language == "shell" {
-			if err := s.checkShellPolicy(args.Command, cwd); err != nil {
-				return nil, nil, err
-			}
-		}
 		result, err = runCodeOpts(ctx, language, args.Command, cwd, timeout, args.Background, opts)
 	}
 	if err != nil {
@@ -724,13 +700,6 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		cwd = resolved
 	}
 
-	// Shell policy on user code only (not the FILE_CONTENT injection wrapper).
-	if language == "shell" {
-		if err := s.checkShellPolicy(args.Code, cwd); err != nil {
-			return nil, nil, err
-		}
-	}
-
 	// Inject FILE_CONTENT into user code.
 	injectedCode := injectFileContent(language, args.Code, string(fileContent))
 
@@ -984,22 +953,6 @@ func (s *server) storeIndexLocked(path, content string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.store.Index(path, content)
-}
-
-// checkShellPolicy applies the configured shell command policy (no-op when mode=off).
-func (s *server) checkShellPolicy(command, cwd string) error {
-	if s == nil || s.policy == nil {
-		return nil
-	}
-	return s.policy.CheckShell(command, cwd)
-}
-
-// checkArgvPolicy applies allowlist/denylist to direct-exec argv (with cwd for rm paths).
-func (s *server) checkArgvPolicy(argv []string, cwd string) error {
-	if s == nil || s.policy == nil {
-		return nil
-	}
-	return s.policy.CheckArgv(argv, cwd)
 }
 
 // validateArgv checks argv for ctx_execute argv mode.

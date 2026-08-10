@@ -101,9 +101,6 @@ func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args r
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := s.checkArgvPolicy(argv, cwd); err != nil {
-		return nil, nil, err
-	}
 
 	result, err := runArgv(ctx, argv, cwd, timeout, false, opts)
 	if err != nil {

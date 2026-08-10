@@ -65,11 +65,6 @@ const (
 // It captures stdout and stderr separately, then merges them.
 // Returns merged output, exit code, and any execution error.
 func (s *server) executeCommand(ctx context.Context, command, cwd string) (output string, exitCode int, execErr error) {
-	// Apply shell command policy before starting the process.
-	if err := s.checkShellPolicy(command, cwd); err != nil {
-		return "", -1, err
-	}
-
 	var cmd *exec.Cmd
 	shellPath := os.Getenv("SHELL")
 	if shellPath != "" {
