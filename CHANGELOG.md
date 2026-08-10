@@ -21,6 +21,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ### Fixed
 - CI runs `go test -race ./...` (the flood-guard concurrency tests only detect races under `-race`) with a 20-minute job timeout.
+- **Pi extension** (`integrations/pi/ctxmode.ts`): child process lifecycle diagnostics no longer use `console.error`/`console.warn` on the host process (those writes corrupt Pi's TUI input row). Logs go to `~/.pi/agent/logs/ctxmode.log` unless `CTXMODE_DEBUG` is set; clean exits stay quiet, unexpected exits still file-log and auto-restart.
 
 ## [2.1.0] - 2026-08-06
 
