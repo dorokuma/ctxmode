@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-BINARY="/root/.local/bin/ctxmode"
+BINARY="${BINARY:-$HOME/.local/bin/ctxmode}"
 BUILD_OUT="$ROOT/bin/ctxmode"
 
 echo "=== 编译 ==="
@@ -13,6 +13,7 @@ go build -o "$BUILD_OUT" . 2>&1
 echo "编译完成 ($(du -h "$BUILD_OUT" | cut -f1))"
 
 echo "=== 原子部署 ==="
+mkdir -p "$(dirname "$BINARY")"
 install -m 755 "$BUILD_OUT" "$BINARY"
 echo "部署完成 → $BINARY"
 rm -rf "$ROOT/bin"
