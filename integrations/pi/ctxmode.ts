@@ -2,11 +2,21 @@
 // Wraps the ctxmode Go binary (MCP over stdio) as pi custom tools.
 //
 // Requires: ctxmode on PATH (or set CTXMODE_BIN env var)
+//
+// Env knobs（详见 integrations/pi/README.md）:
+//   CTXMODE_BIN              二进制路径（默认 "ctxmode"）
+//   CTXMODE_WORKDIR          默认工作目录（默认会话 cwd）
+//   CTXMODE_START_TIMEOUT_MS / CTXMODE_REQUEST_TIMEOUT_MS  超时
+//   CTXMODE_DEBUG            诊断同时打 stderr（会污染 TUI 输入行，仅调试用）
+//   CTXMODE_DIAG_STDERR=1    opt-in：诊断同时写 stderr（默认只写日志文件，保 TUI 干净）
+//   CTXMODE_DIAG_DIR         诊断日志目录（默认 ~/.pi/agent/logs）
+//   CTXMODE_DIAG_MAX_BYTES   日志轮转体积上限（默认 5MB，保留 .1/.2 最多两个历史）
+//   CTXMODE_DISPOSE_WAIT_MS  换进程时 SIGTERM→SIGKILL 等待窗口（默认 3000ms）
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { Type } from "typebox"
 import { spawn, type ChildProcess } from "node:child_process"
-import { createInterface } from "node:readline"
+import { createInterface, type Interface } from "node:readline"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -16,28 +26,87 @@ const REQUEST_TIMEOUT_MS = Number(process.env.CTXMODE_REQUEST_TIMEOUT_MS || 1200
 const STDERR_KEEP_LINES = 20
 const DIAG_TAG = "ctxmode"
 const DIAG_LOG_FILE = "ctxmode.log"
+/** 日志轮转体积上限默认 5MB（超限时轮转为 .1/.2，最多保留两个历史文件）。 */
+const DIAG_MAX_BYTES_DEFAULT = 5 * 1024 * 1024
+/** disposeProc 换进程时 SIGTERM → SIGKILL 等待窗口默认 3s（异步等待，不阻塞事件循环）。 */
+const DISPOSE_WAIT_MS_DEFAULT = 3000
+
+/** Opt-in：CTXMODE_DIAG_STDERR=1 时诊断同时写 stderr（默认不写，保持 TUI 干净）。 */
+function diagStderrEnabled(): boolean {
+  return process.env.CTXMODE_DIAG_STDERR === "1"
+}
+/** 日志轮转体积上限（运行时读取，便于测试与调优）。 */
+function diagMaxBytes(): number {
+  return Number(process.env.CTXMODE_DIAG_MAX_BYTES || DIAG_MAX_BYTES_DEFAULT)
+}
+/** disposeProc 等待窗口（运行时读取，便于测试与调优）。 */
+function disposeWaitMs(): number {
+  return Number(process.env.CTXMODE_DISPOSE_WAIT_MS || DISPOSE_WAIT_MS_DEFAULT)
+}
+
 /** Cache log path after first ensure (avoids mkdir per line). */
 let diagLogPath: string | null = null
+/** 降级提示只报一次（首次失败 console.error 一条，之后不再重复刷）。 */
+let diagDegradedReported = false
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function reportDiagDegraded(reason: string): void {
+  if (diagDegradedReported) return
+  diagDegradedReported = true
+  console.error(`[${DIAG_TAG}] 诊断日志降级: ${reason}; 本次会话不再重复提示`)
+}
+
+/** 超限轮转：log → log.1 → log.2，旧 .2 删除（最多保留两个历史文件）。 */
+function rotateDiagLog(p: string): void {
+  try { fs.unlinkSync(`${p}.2`) } catch { /* 不存在 */ }
+  try { fs.renameSync(`${p}.1`, `${p}.2`) } catch { /* 不存在 */ }
+  try { fs.renameSync(p, `${p}.1`) } catch { /* 不存在 */ }
+}
+
+function ensureDiagLogPath(): string | null {
+  if (diagLogPath) return diagLogPath
+  const dir = process.env.CTXMODE_DIAG_DIR || path.join(os.homedir() || "/tmp", ".pi", "agent", "logs")
+  try {
+    fs.mkdirSync(dir, { recursive: true })
+    diagLogPath = path.join(dir, DIAG_LOG_FILE)
+  } catch (err) {
+    reportDiagDegraded(`日志目录不可用: ${errMessage(err)}`)
+    return null
+  }
+  return diagLogPath
+}
 
 /**
- * TUI-safe diagnostics. console.* corrupts Pi's input row — only DEBUG may print.
- * Otherwise append to ~/.pi/agent/logs/ctxmode.log.
+ * TUI-safe diagnostics. console.* corrupts Pi's input row — only DEBUG or
+ * CTXMODE_DIAG_STDERR=1 may print. Otherwise append to
+ * ~/.pi/agent/logs/ctxmode.log（CTXMODE_DIAG_DIR 可覆盖目录）；超体积上限
+ * （CTXMODE_DIAG_MAX_BYTES，默认 5MB）轮转为 .1/.2，最多保留两个历史文件；
+ * 写失败首次降级提示一次并记录原因，之后静默重试。
  */
-function diagLog(msg: string): void {
+export function diagLog(msg: string): void {
   const line = `[${DIAG_TAG}] ${msg}`
   if (process.env.CTXMODE_DEBUG) {
     console.error(line)
     return
   }
+  if (diagStderrEnabled()) console.error(line)
+  const p = ensureDiagLogPath()
+  if (!p) return
   try {
-    if (!diagLogPath) {
-      const dir = path.join(os.homedir() || "/tmp", ".pi", "agent", "logs")
-      fs.mkdirSync(dir, { recursive: true })
-      diagLogPath = path.join(dir, DIAG_LOG_FILE)
-    }
-    fs.appendFileSync(diagLogPath, `${new Date().toISOString()} ${line}\n`)
-  } catch {
-    diagLogPath = null
+    let size = 0
+    try { size = fs.statSync(p).size } catch { /* 新文件 */ }
+    if (size > diagMaxBytes()) rotateDiagLog(p)
+    fs.appendFileSync(p, `${new Date().toISOString()} ${line}\n`)
+  } catch (err) {
+    diagLogPath = null // 路径失效则下次重建
+    reportDiagDegraded(`写入失败: ${errMessage(err)}`)
   }
 }
 
@@ -104,7 +173,7 @@ interface MCPToolResult {
   instructions?: string
 }
 
-class CtxmodeClient {
+export class CtxmodeClient {
   private proc: ChildProcess | null = null
   private requestId = 0
   private pending = new Map<
@@ -124,6 +193,8 @@ class CtxmodeClient {
   private intentionalClose = false
   private restartAttempts = 0
   private restartTimer: ReturnType<typeof setTimeout> | null = null
+  /** readline 实例（doStart 创建，disposeProc 关闭）；持引用才能关闭。 */
+  private rl: Interface | null = null
   /** 最近 N 行 stderr，异常退出时写入诊断日志。 */
   private stderrBuffer: string[] = []
   private stderrCarry = ""
@@ -143,21 +214,49 @@ class CtxmodeClient {
     return this.starting
   }
 
-  /** 摘监听后 kill；配合 shutDownProc 先 cleanup，避免 pending 悬挂。 */
-  private disposeProc(proc: ChildProcess): void {
+  /**
+   * 摘除 exit/error/stderr-data 监听、关闭 readline、销毁 stdio，确保旧进程再也
+   * 碰不到新进程的缓冲与状态；随后 SIGTERM，等待窗口内未退出则升级 SIGKILL
+   * （异步等待，不阻塞事件循环）；kill 失败走 diagLog 记录，不静默吞。
+   */
+  private async disposeProc(proc: ChildProcess): Promise<void> {
     this.intentionalClose = true
     try {
       proc.removeAllListeners("exit")
       proc.removeAllListeners("error")
     } catch { /* ignore */ }
+    try { this.rl?.close() } catch { /* ignore */ }
+    this.rl = null
     try { proc.stdin?.end() } catch { /* ignore */ }
-    try { proc.kill() } catch { /* ignore */ }
+    try {
+      proc.stderr?.removeAllListeners("data")
+      proc.stderr?.destroy()
+      proc.stdout?.destroy()
+    } catch { /* ignore */ }
+    const exitPromise = new Promise<void>((resolve) => proc.once("exit", () => resolve()))
+    let sent = false
+    try {
+      sent = proc.kill("SIGTERM")
+    } catch (err) {
+      diagLog(`dispose: kill(SIGTERM) 失败: ${errMessage(err)}`)
+    }
+    if (sent && proc.exitCode === null && proc.signalCode === null) {
+      await Promise.race([exitPromise, sleep(disposeWaitMs())])
+      if (proc.exitCode === null && proc.signalCode === null) {
+        try {
+          proc.kill("SIGKILL")
+        } catch (err) {
+          diagLog(`dispose: kill(SIGKILL) 失败: ${errMessage(err)}`)
+        }
+      }
+    }
   }
 
   /** dispose + 清 stderr + reject pending（doStart 换进程 / stop 共用）。 */
-  private shutDownProc(): void {
+  private async shutDownProc(): Promise<void> {
     if (!this.proc) return
-    this.disposeProc(this.proc)
+    const proc = this.proc
+    await this.disposeProc(proc)
     this.clearStderrBuffer()
     this.cleanup()
   }
@@ -192,17 +291,50 @@ class CtxmodeClient {
     for (const line of lines) diagLog(`  ${line}`)
   }
 
+  /** 统一处理退出：code===0 才算干净；null（被信号杀等）按异常 dump 并带 signal。 */
+  private handleProcExit(code: number | null, signal: NodeJS.Signals | null): void {
+    const intentional = this.intentionalClose
+    this.intentionalClose = false
+    if (intentional) {
+      this.clearStderrBuffer()
+      this.cleanup()
+      return
+    }
+    if (code === 0) {
+      // 意外退出写文件一行（仍不 console）。
+      diagLog(`unexpected exit code=0 signal=${signal ?? ""} (silent to TUI; auto-restart if enabled)`)
+      this.clearStderrBuffer()
+    } else {
+      diagLog(`process exited abnormally code=${code} signal=${signal ?? ""}`)
+      this.dumpStderrBuffer(true)
+    }
+    this.cleanup()
+    this.scheduleRestart()
+  }
+
+  /** stderr 数据：DEBUG 模式逐段输出之外，同样填充环形缓冲（两件事不互斥）。 */
+  private handleStderrChunk(chunk: Buffer | string): void {
+    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8")
+    if (process.env.CTXMODE_DEBUG) {
+      diagLog(text.trimEnd())
+    }
+    const lines = (this.stderrCarry + text).split("\n")
+    this.stderrCarry = lines.pop() || ""
+    for (const line of lines) this.pushStderrLine(line.trimEnd())
+  }
+
   private async doStart(): Promise<void> {
-    if (this.proc) this.shutDownProc()
+    if (this.proc) await this.shutDownProc()
 
     const bin = process.env.CTXMODE_BIN || "ctxmode"
     this.intentionalClose = false
     this.proc = spawn(bin, ["-workdir", this.workdir], {
       stdio: ["pipe", "pipe", "pipe"],
     })
+    const proc = this.proc
 
     // 禁止 console.*（污染 Pi TUI 输入行）。
-    this.proc.on("error", (err) => {
+    proc.on("error", (err) => {
       const intentional = this.intentionalClose
       if (!intentional) {
         diagLog(`process error: ${err.message}`)
@@ -214,44 +346,18 @@ class CtxmodeClient {
       if (!intentional) this.scheduleRestart()
     })
 
-    this.proc.on("exit", (code, signal) => {
-      const intentional = this.intentionalClose
-      this.intentionalClose = false
-      if (intentional) {
-        this.clearStderrBuffer()
-        this.cleanup()
-        return
-      }
-      // 意外退出写文件一行（仍不 console）；0/null 也记。
-      const clean = code === 0 || code === null
-      if (clean) {
-        diagLog(
-          `unexpected exit code=${code} signal=${signal ?? ""} (silent to TUI; auto-restart if enabled)`,
-        )
-        this.clearStderrBuffer()
-      } else {
-        diagLog(`process exited abnormally code=${code} signal=${signal ?? ""}`)
-        this.dumpStderrBuffer(true)
-      }
-      this.cleanup()
-      this.scheduleRestart()
-    })
+    proc.on("exit", (code, signal) => this.handleProcExit(code, signal))
 
-    if (this.proc.stderr) {
-      this.proc.stderr.on("data", (chunk: Buffer | string) => {
-        const text = typeof chunk === "string" ? chunk : chunk.toString("utf8")
-        if (process.env.CTXMODE_DEBUG) {
-          diagLog(text.trimEnd())
-          return
-        }
-        const lines = (this.stderrCarry + text).split("\n")
-        this.stderrCarry = lines.pop() || ""
-        for (const line of lines) this.pushStderrLine(line.trimEnd())
+    if (proc.stderr) {
+      proc.stderr.on("data", (chunk: Buffer | string) => {
+        // 兜底：dispose 已摘监听，但旧进程残留事件也不得污染新进程状态。
+        if (this.proc !== proc) return
+        this.handleStderrChunk(chunk)
       })
     }
 
-    const rl = createInterface({ input: this.proc.stdout! })
-    rl.on("line", (line) => {
+    this.rl = createInterface({ input: proc.stdout! })
+    this.rl.on("line", (line) => {
       try {
         const msg: MCPResponse = JSON.parse(line)
         if (msg.id !== undefined && this.pending.has(msg.id)) {
@@ -395,13 +501,13 @@ class CtxmodeClient {
     this.initialized = false
   }
 
-  stop() {
+  async stop() {
     this.stopped = true
     if (this.restartTimer) {
       clearTimeout(this.restartTimer)
       this.restartTimer = null
     }
-    this.shutDownProc()
+    await this.shutDownProc()
   }
 }
 
@@ -448,7 +554,7 @@ ${serverInstructions}`,
 
   pi.on("session_shutdown", async () => {
     if (client) {
-      client.stop()
+      await client.stop()
       client = null
     }
   })
@@ -483,7 +589,7 @@ ${serverInstructions}`,
         ctx.ui.notify("ctxmode 未运行", "info")
         return
       }
-      client.stop()
+      await client.stop()
       client = null
       ctx.ui.notify("ctxmode 已停止", "info")
     },
