@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-BINARY="/usr/local/bin/ctxmode"
+BINARY="/root/.local/bin/ctxmode"
 BUILD_OUT="$ROOT/bin/ctxmode"
 
 echo "=== 编译 ==="
