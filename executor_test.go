@@ -993,6 +993,57 @@ func TestRunShell_ChildEnvStripsSecrets(t *testing.T) {
 }
 
 // ============================================================================
+// runtime probe 子进程环境隔离（detectTsNode npm ls / checkRuntime <exe> version）
+// ============================================================================
+
+// writeExitCodeProbe installs a fake executable on PATH whose exit code
+// encodes the child environment: 0 when the sentinel is ABSENT (stripped),
+// 1 when present. The two probes under test (detectTsNode's `npm ls` and
+// checkRuntime's `<exe> version`) discard child output and only inspect the
+// exit code, so the shim must fail the probe when the sentinel leaked.
+// Shell builtins only ([, -n, exit): no dependency on PATH internals.
+func writeExitCodeProbe(t *testing.T, name, sentinel string) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\nif [ -n \"$" + sentinel + "\" ]; then exit 1; else exit 0; fi\n"
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// TestDetectTsNode_NpmProbeStripsSensitiveEnv guards the `npm ls` fallback in
+// detectTsNode (executor.go): the child must run with a sanitized env
+// (npmCmd.Env = flattenEnv(childEnv(nil))). PATH points only at a fake `npm`
+// shim so the ts-node LookPath shortcut is skipped and the npm path is
+// exercised; the shim exits 0 only when FAKE_NPM_TOKEN was stripped.
+func TestDetectTsNode_NpmProbeStripsSensitiveEnv(t *testing.T) {
+	t.Setenv("FAKE_NPM_TOKEN", "super-secret-value")
+	shimDir := writeExitCodeProbe(t, "npm", "FAKE_NPM_TOKEN")
+	t.Setenv("PATH", shimDir)
+	t.Chdir(t.TempDir())
+
+	avail, _ := detectTsNode()
+	if !avail {
+		t.Fatal("npm ls probe must succeed: fake npm exited 0 only when FAKE_NPM_TOKEN was stripped")
+	}
+}
+
+// TestCheckRuntime_GoVersionProbeStripsSensitiveEnv guards the `go version`
+// probe in checkRuntime (executor.go): the child must not see sensitive
+// inherited variables (cmd.Env = flattenEnv(childEnv(nil))). The fake `go`
+// exits 0 only when FAKE_GO_AUTH was stripped from its environment.
+func TestCheckRuntime_GoVersionProbeStripsSensitiveEnv(t *testing.T) {
+	t.Setenv("FAKE_GO_AUTH", "super-secret-value")
+	shimDir := writeExitCodeProbe(t, "go", "FAKE_GO_AUTH")
+	t.Setenv("PATH", shimDir)
+
+	if !checkRuntime("go", false) {
+		t.Fatal("go version probe must succeed: fake go exited 0 only when FAKE_GO_AUTH was stripped")
+	}
+}
+
+// ============================================================================
 // UTF-8 boundary handling (fixes #3/#4/#5)
 // ============================================================================
 

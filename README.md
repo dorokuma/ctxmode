@@ -60,7 +60,7 @@ Environment variables:
 
 - `CTXMODE_DB` — absolute path to the SQLite database file; takes priority over the per-workdir default (see Database).
 - `CTXMODE_CONFIG` — path to the YAML config file.
-- `CTXMODE_ENV_PASSTHROUGH=1` — disable the default stripping of sensitive variables from subprocess environments (see Security model).
+- `CTXMODE_ENV_PASSTHROUGH=1` — disable the default stripping of sensitive variables from subprocess environments (see [Subprocess environment isolation](#subprocess-environment-isolation)).
 
 ## Security model — NOT a sandbox
 
@@ -71,6 +71,27 @@ The following are defense-in-depth measures, never a security guarantee:
 - Subprocess environments strip inherited variables whose names look sensitive (`token`, `key`, `secret`, `password`, `passwd`, `credential`, `auth`, `cookie`, `session`, case-insensitive) by default; `CTXMODE_ENV_PASSTHROUGH=1` disables this. Caller-provided `env` overrides truly replace same-named inherited variables (deduplicated map, not appended duplicates), and the allowlist still rejects `PATH`/`HOME`/`SHELL`/`LD_*`/`DYLD_*` etc.
 - Indexing skips secret-like files by default: `.env`/`.env.*`, private keys (`*.pem`, `*.key`, `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`), `credentials.json`, `.npmrc`, `.netrc`, and anything under `.aws`/`.ssh`/`.gnupg`/`.kube`.
 - `ctx_kb action=fetch` refuses SSRF targets: IPv4 and IPv6 loopback, link-local (169.254.0.0/16, fe80::/10), multicast, reserved, private (RFC 1918, fc00::/7), CGNAT and benchmark ranges — IPv6 is symmetric with IPv4 in both strict and non-strict modes.
+
+### Subprocess environment isolation
+
+Every subprocess ctxmode spawns — `execute`/`execute_file`, `run_task` (including its compile step), `batch`, and the `rg` and `git` helpers — starts from a sanitized environment built by `childEnv` (`executor.go`). By default, inherited variables whose **key name** matches `(?i)token|key|secret|password|passwd|credential|auth|cookie|session` (case-insensitive substring match; values are never inspected) are removed, so API keys, tokens or passwords present in the server's environment never reach a child — whose output is captured and auto-indexed.
+
+Exceptions, in priority order:
+
+- Keys on the `envAllowlist` (`executor.go`) are always kept, even when the name matches the pattern.
+- Caller-provided `env` overrides (already validated by `filterExecEnv`, which still rejects `PATH`/`HOME`/`SHELL`/`LD_*`/`DYLD_*` etc.) are applied last and always win.
+- Everything else that does not match the pattern — `PATH`, `HOME`, `SHELL`, `LANG`, `TZ`, … — is inherited unchanged.
+
+Side effects to be aware of:
+
+- `SSH_AUTH_SOCK` (contains `auth`) and `XDG_SESSION_*` / `DESKTOP_SESSION` (contain `session`) are stripped too — git remotes over SSH that authenticate via ssh-agent will fail, and session-aware desktop tooling may misbehave. The `git` tool additionally drops all inherited `GIT_*` overrides (see `sanitizedGitEnv` in `git_tools.go`).
+- Stripping is name-based only: a variable like `MYVAR` whose *value* contains a secret still passes through.
+
+`CTXMODE_ENV_PASSTHROUGH=1` disables stripping:
+
+- It is a **global switch**: it affects every execution path at once, not a single command.
+- It is read from the ctxmode server process's own environment — `childEnv` calls `os.Getenv("CTXMODE_ENV_PASSTHROUGH")` (`executor.go`). Passing it through `ctx_run`'s `env` parameter has no effect (that env is filtered and applied to the child, not to the server); set it in the parent environment that starts ctxmode, e.g. the shell or MCP host launching the binary.
+- Risk: with passthrough enabled, every subprocess can read **all** sensitive variables of the host. On top of that, ctxmode stores captured output into the local knowledge base as plaintext without redaction once it exceeds the indexing threshold (>100KB, or >5KB with `intent`) — secrets that reach stdout would be persisted to disk. Prefer enabling it only temporarily, and only in trusted environments.
 
 ## Tools
 

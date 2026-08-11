@@ -281,13 +281,15 @@ func TestCtxGitDiff_PathspecNotTreatedAsFlag(t *testing.T) {
 
 // writeFakeGit installs a fake git shim on PATH: it answers
 // `rev-parse --show-toplevel` with wd (so ensureGitToplevelInside passes) and
-// for any other invocation prints the FAKE_* env vars the subprocess actually
-// inherited — a direct probe of the child environment.
+// for any other invocation prints the CTXMODE_ENV_PROBE marker (a positive
+// probe that proves the shim actually ran and inherited the non-sensitive
+// marker) plus the FAKE_* env vars the subprocess actually inherited — a
+// direct probe of the child environment.
 func writeFakeGit(t *testing.T, wd string) string {
 	t.Helper()
 	fakeDir := t.TempDir()
 	script := "#!/bin/sh\ncase \" $* \" in\n  *\" rev-parse \"*) echo " + wd + " ;;\n"
-	script += "  *) env | grep '^FAKE_' || true ;;\n"
+	script += "  *) env | grep '^CTXMODE_ENV_PROBE=' || true; env | grep '^FAKE_' || true ;;\n"
 	script += "esac\n"
 	if err := os.WriteFile(filepath.Join(fakeDir, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -298,12 +300,16 @@ func writeFakeGit(t *testing.T, wd string) string {
 func TestRunGit_StripsSensitiveEnv(t *testing.T) {
 	t.Setenv("FAKE_TOKEN_SENTINEL", "super-secret-value")
 	t.Setenv("FAKE_AUTH_SENTINEL", "super-secret-value")
+	t.Setenv("CTXMODE_ENV_PROBE", "1")
 	wd := t.TempDir()
 	t.Setenv("PATH", writeFakeGit(t, wd)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	s := testServerWithWorkdir(t, wd)
 	out, err := s.runGit(context.Background(), wd, "status")
 	if err != nil {
 		t.Fatalf("runGit: %v", err)
+	}
+	if !strings.Contains(out, "CTXMODE_ENV_PROBE=1") {
+		t.Fatalf("fake git shim must have run and inherited the marker (probe absent): %q", out)
 	}
 	if strings.Contains(out, "FAKE_TOKEN_SENTINEL") || strings.Contains(out, "FAKE_AUTH_SENTINEL") || strings.Contains(out, "super-secret-value") {
 		t.Fatalf("sensitive env leaked into git child env: %q", out)
