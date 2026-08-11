@@ -395,3 +395,45 @@ func TestBatchExecute_InvalidQueryScope(t *testing.T) {
 		t.Fatalf("expected valid values in error, got: %v", err)
 	}
 }
+
+// ============================================================================
+// executeCommand 测试 — 子进程环境隔离（batch 路径复用 childEnv/flattenEnv）
+// ============================================================================
+
+func TestExecuteCommand_StripsSensitiveEnv(t *testing.T) {
+	t.Setenv("FAKE_TOKEN_SENTINEL", "super-secret-value")
+	t.Setenv("FAKE_AUTH_SENTINEL", "super-secret-value")
+	s := &server{}
+	ctx := context.Background()
+	out, _, err := s.executeCommand(ctx,
+		`if env | grep -q '^FAKE_TOKEN_SENTINEL=' || env | grep -q '^FAKE_AUTH_SENTINEL='; then echo LEAKED; else echo CLEAN; fi; if env | grep -q '^PATH='; then echo HAS_PATH; else echo NO_PATH; fi`,
+		"/tmp")
+	if err != nil {
+		t.Fatalf("executeCommand: %v", err)
+	}
+	if strings.Contains(out, "LEAKED") || strings.Contains(out, "super-secret-value") {
+		t.Fatalf("sensitive env leaked into batch child env: %q", out)
+	}
+	if !strings.Contains(out, "CLEAN") {
+		t.Fatalf("expected stripped child env, got %q", out)
+	}
+	if !strings.Contains(out, "HAS_PATH") || strings.Contains(out, "NO_PATH") {
+		t.Fatalf("PATH must survive stripping (no minimal env), got %q", out)
+	}
+}
+
+func TestExecuteCommand_PassthroughKeepsEnv(t *testing.T) {
+	t.Setenv("FAKE_TOKEN_SENTINEL", "super-secret-value")
+	t.Setenv("CTXMODE_ENV_PASSTHROUGH", "1")
+	s := &server{}
+	ctx := context.Background()
+	out, _, err := s.executeCommand(ctx,
+		`if env | grep -q '^FAKE_TOKEN_SENTINEL='; then echo HAS_FAKE_TOKEN; else echo NO_FAKE_TOKEN; fi`,
+		"/tmp")
+	if err != nil {
+		t.Fatalf("executeCommand: %v", err)
+	}
+	if !strings.Contains(out, "HAS_FAKE_TOKEN") {
+		t.Fatalf("CTXMODE_ENV_PASSTHROUGH=1 must keep sensitive vars, got %q", out)
+	}
+}

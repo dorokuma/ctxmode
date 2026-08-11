@@ -87,6 +87,10 @@ func (s *server) executeCommand(ctx context.Context, command, cwd string) (outpu
 	stderrBuf.limit = maxCmdOutput
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
+	// Strip sensitive inherited variables (same default as the execute path;
+	// see childEnv). batch runs caller-controlled shell commands and stores
+	// their output in the KB, so the child env must not leak secrets.
+	cmd.Env = flattenEnv(childEnv(nil))
 
 	// Start the command.
 	if err := cmd.Start(); err != nil {

@@ -233,19 +233,20 @@ func (s *server) gitCeilingDirectories() string {
 // nominally read-only command to another repository, config, object store, or
 // executable. Repository-local config still loads, but command-specific
 // hardening below disables fsmonitor hooks and external diff programs.
+//
+// The env starts from childEnv(nil) so sensitive inherited variables are
+// stripped with the same default (and CTXMODE_ENV_PASSTHROUGH semantics) as
+// the execute path; then GIT_* keys are dropped; then hardening is applied
+// LAST so it cannot be overwritten by anything inherited.
 func sanitizedGitEnv() []string {
-	env := make([]string, 0, len(os.Environ())+6)
-	for _, item := range os.Environ() {
-		key := item
-		if i := strings.IndexByte(item, '='); i >= 0 {
-			key = item[:i]
+	env := childEnv(nil)
+	for k := range env {
+		if strings.HasPrefix(strings.ToUpper(k), "GIT_") {
+			delete(env, k)
 		}
-		if strings.HasPrefix(strings.ToUpper(key), "GIT_") {
-			continue
-		}
-		env = append(env, item)
 	}
-	return append(env,
+	flat := flattenEnv(env)
+	return append(flat,
 		"GIT_PAGER=cat",
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_CONFIG_NOSYSTEM=1",

@@ -722,6 +722,8 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 	cmdArgs = append(cmdArgs, "--", args.Pattern, root)
 
 	cmd := exec.CommandContext(ctx, rgPath, cmdArgs...)
+	// Strip sensitive inherited variables (same default as the execute path).
+	cmd.Env = flattenEnv(childEnv(nil))
 	var stdout limitedBuffer
 	stdout.limit = fsRgProcessCaptureBytes
 	var stderr limitedBuffer

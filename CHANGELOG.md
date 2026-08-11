@@ -3,6 +3,12 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [3.1.0] - 2026-08-11
+
+### Fixed
+- **Subprocess environment isolation gaps closed in five paths** (security hardening). `batch.go` `executeCommand`, `git_tools.go` `sanitizedGitEnv`, `fs_tools.go` `rgSystem`, and the two runtime probes in `executor.go` (`npm ls` and `go version`) now all build the child environment from `childEnv`/`flattenEnv`, same as the execute path. Children no longer inherit parent environment variables whose names match `token`/`key`/`secret`/`password`/`credential`/`auth`/`cookie`/`session`; hosts that must pass the full inherited set can set `CTXMODE_ENV_PASSTHROUGH=1`.
+- Six regression tests added (strip vs. passthrough pairs for the batch, git, and rg paths), verified by mutation testing — reverting any fix line makes its test fail.
+
 ## [3.0.0] - 2026-08-10
 
 ### Breaking changes

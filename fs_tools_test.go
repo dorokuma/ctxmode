@@ -575,3 +575,48 @@ func TestCtxRg_OverLimitErrors(t *testing.T) {
 		t.Fatal("expected result text")
 	}
 }
+
+// ============================================================================
+// rg 子进程环境隔离（rgSystem 复用 childEnv/flattenEnv）
+// ============================================================================
+
+// writeFakeRg installs a fake rg shim that prints the FAKE_* env vars the
+// subprocess actually inherited — a direct probe of the child environment.
+func writeFakeRg(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\nenv | grep '^FAKE_' || true\n"
+	fake := filepath.Join(dir, "fakerg")
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return fake
+}
+
+func TestRgSystem_StripsSensitiveEnv(t *testing.T) {
+	t.Setenv("FAKE_TOKEN_SENTINEL", "super-secret-value")
+	t.Setenv("FAKE_AUTH_SENTINEL", "super-secret-value")
+	dir := t.TempDir()
+	s := &server{}
+	out, _, _, err := s.rgSystem(context.Background(), writeFakeRg(t), dir, rgArgs{Pattern: "x", Limit: 50}, 50, 0)
+	if err != nil {
+		t.Fatalf("rgSystem: %v", err)
+	}
+	if out != "" {
+		t.Fatalf("expected empty child env dump, got %q", out)
+	}
+}
+
+func TestRgSystem_PassthroughKeepsEnv(t *testing.T) {
+	t.Setenv("FAKE_TOKEN_SENTINEL", "super-secret-value")
+	t.Setenv("CTXMODE_ENV_PASSTHROUGH", "1")
+	dir := t.TempDir()
+	s := &server{}
+	out, _, _, err := s.rgSystem(context.Background(), writeFakeRg(t), dir, rgArgs{Pattern: "x", Limit: 50}, 50, 0)
+	if err != nil {
+		t.Fatalf("rgSystem: %v", err)
+	}
+	if !strings.Contains(out, "FAKE_TOKEN_SENTINEL=") {
+		t.Fatalf("CTXMODE_ENV_PASSTHROUGH=1 must keep sensitive vars in rg child env, got %q", out)
+	}
+}

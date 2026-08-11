@@ -1091,7 +1091,9 @@ func detectTsNode() (bool, string) {
 	// 3. Fall back to npm ls (local only, reads package.json)
 	npmCtx, npmCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer npmCancel()
-	if exec.CommandContext(npmCtx, "npm", "ls", "ts-node", "--depth=0").Run() == nil {
+	npmCmd := exec.CommandContext(npmCtx, "npm", "ls", "ts-node", "--depth=0")
+	npmCmd.Env = flattenEnv(childEnv(nil))
+	if npmCmd.Run() == nil {
 		// ts-node is installed locally; use the local path
 		cwd, _ := os.Getwd()
 		p := filepath.Join(cwd, "node_modules", ".bin", "ts-node")
@@ -1120,7 +1122,9 @@ func checkRuntime(language string, useCache bool) bool {
 	switch language {
 	case "go":
 		// go version exits 0
-		return exec.Command(rt.Exe, "version").Run() == nil
+		cmd := exec.Command(rt.Exe, "version")
+		cmd.Env = flattenEnv(childEnv(nil))
+		return cmd.Run() == nil
 	case "typescript":
 		if useCache {
 			tsNodeCheckOnce.Do(func() {
