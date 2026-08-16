@@ -577,20 +577,42 @@ func (s *server) toolStat(ctx context.Context, _ *mcp.CallToolRequest, args stat
 
 // resolvePathKeepFinal is like resolvePath but does not EvalSymlinks the final
 // path component. This allows Lstat to observe a symlink at the leaf while still
-// fencing parent directories against workspace escape.
+// fencing parent directories against workspace escape. Relative paths are tried
+// against every workdir and must match exactly one existing path (existence is
+// checked with Lstat so a leaf symlink counts even when broken); zero or
+// multiple matches are errors that demand an absolute path.
 func (s *server) resolvePathKeepFinal(p string) (string, error) {
 	if p == "" {
 		return s.workdirs[0], nil
 	}
-	var target string
 	if filepath.IsAbs(p) {
-		target = filepath.Clean(p)
-	} else {
-		target = filepath.Clean(filepath.Join(s.workdirs[0], p))
+		target := filepath.Clean(p)
+		if !s.lexicallyInside(target) {
+			return "", fmt.Errorf("path %q is outside all workspaces %q", p, s.workdirs)
+		}
+		return s.resolveKeepFinalFenced(target)
 	}
-	if !s.lexicallyInside(target) {
-		return "", fmt.Errorf("path %q is outside all workspaces %q", p, s.workdirs)
+	var matches []string
+	for _, wd := range s.workdirs {
+		cand := filepath.Clean(filepath.Join(wd, p))
+		if _, err := os.Lstat(cand); err == nil {
+			matches = append(matches, cand)
+		}
 	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("relative path %q does not exist under any workspace %q; use an absolute path", p, s.workdirs)
+	case 1:
+		return s.resolveKeepFinalFenced(matches[0])
+	default:
+		return "", fmt.Errorf("relative path %q exists under multiple workspaces %q; use an absolute path to disambiguate", p, s.workdirs)
+	}
+}
+
+// resolveKeepFinalFenced resolves the parent of target (symlink-aware) and
+// re-appends the final component so a leaf symlink is preserved for Lstat; the
+// resolved parent must stay inside a workspace.
+func (s *server) resolveKeepFinalFenced(target string) (string, error) {
 	parent := filepath.Dir(target)
 	base := filepath.Base(target)
 	// Root edge: Dir("/") == "/".

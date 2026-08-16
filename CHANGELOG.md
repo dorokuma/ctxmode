@@ -3,6 +3,19 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Git hooks hardened** (`githooks/pre-push`, `githooks/commit-msg`): pre-push now parses the four-field push line, handles branch deletions and new branches (zero SHA) correctly, scans only outgoing commits, and fails loudly on malformed input or git errors instead of silently passing; grep patterns are `--`-separated so patterns can never be parsed as options, and the noisy `bug.*fix`/`fix.*bug` words were dropped from commit-msg (normal bugfix messages pass again). Regression coverage in `githooks_test.go`.
+- **`scripts/install-hooks.sh` honors `core.hooksPath`**: relative hooksPath values resolve against the repo root, and a missing hooks directory fails fast instead of claiming installation into a directory git would never use.
+- **`ctx_kb` fetch**: the strict/non-strict split is gone — `CTX_FETCH_STRICT` was removed and the SSRF blocklist is a single fixed set; indexed documents are isolated per format (`source:format:url`), legacy `source:url` documents are purged on fetch, and the cache-hit re-index check backfills only the requested format.
+- **Atomic deployment** (`deploy.sh`): the binary is staged inside the target directory and `mv`-renamed into place (same filesystem, atomic), with an ERR trap that cleans the temp file and leaves the old binary untouched on failure.
+- **`ctx_fs` stat with multiple workdirs**: relative paths must match exactly one existing path under the configured workspaces; zero or multiple matches are errors demanding an absolute path instead of silently resolving to the first workdir.
+- **Index walk early-stop**: `toolIndex` uses `filepath.SkipAll` once the file/size caps are hit, so the whole remaining tree is skipped instead of walking it.
+- **Go `execute_file` imports**: selector-like text inside string literals and comments (including the injected `FILE_CONTENT` data) no longer triggers imports, and the default `fmt` import was removed — the wrapped program compiles without unused imports.
+- **Background job memory**: background stdout/stderr stream straight to the capped disk log with no in-memory capture, removing up to 10MB per stream per job for concurrent jobs.
+- **Linux platform contract documented**: `ctx_bg kill` verifies the PID identity via `/proc/<pid>/stat` starttime; on non-Linux platforms the check fails closed (never signal an unknown identity), so `ctx_bg` termination is only guaranteed on Linux.
+
 ## [3.1.0] - 2026-08-11
 
 ### Fixed

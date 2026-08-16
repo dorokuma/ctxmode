@@ -290,6 +290,98 @@ func TestCtxStat_FileAndSymlink(t *testing.T) {
 	}
 }
 
+// resolvePathKeepFinal must resolve relative paths against every workdir (not
+// just workdirs[0]) and preserve leaf symlink semantics via Lstat.
+func TestCtxStat_MultiWorkdirResolution(t *testing.T) {
+	wd1 := t.TempDir()
+	wd2 := t.TempDir()
+	s := &server{workdirs: []string{wd1, wd2}}
+
+	// wd2-only file: relative path must resolve into wd2 (previously silently
+	// joined to workdirs[0] and failed with "no such file").
+	mustWrite(t, filepath.Join(wd2, "only-wd2.txt"), "hello")
+	res, _, err := s.toolStat(context.Background(), nil, statArgs{Path: "only-wd2.txt"})
+	if err != nil {
+		t.Fatalf("stat wd2-only file: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, filepath.Join(wd2, "only-wd2.txt")) {
+		t.Fatalf("expected wd2 path in result, got: %s", text)
+	}
+
+	// Duplicate relative path in both workdirs: must demand an absolute path.
+	mustWrite(t, filepath.Join(wd1, "dup.txt"), "one")
+	mustWrite(t, filepath.Join(wd2, "dup.txt"), "two")
+	_, _, err = s.toolStat(context.Background(), nil, statArgs{Path: "dup.txt"})
+	if err == nil {
+		t.Fatal("expected ambiguity error for duplicate relative path")
+	}
+	if !strings.Contains(err.Error(), "absolute path") {
+		t.Fatalf("expected absolute-path hint, got: %v", err)
+	}
+
+	// Missing under every workdir: explicit not-exists error.
+	_, _, err = s.toolStat(context.Background(), nil, statArgs{Path: "nope.txt"})
+	if err == nil {
+		t.Fatal("expected error for missing relative path")
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("expected does-not-exist error, got: %v", err)
+	}
+
+	// Absolute path still resolves and disambiguates (no regression).
+	res2, _, err := s.toolStat(context.Background(), nil, statArgs{Path: filepath.Join(wd1, "dup.txt")})
+	if err != nil {
+		t.Fatalf("stat absolute dup: %v", err)
+	}
+	if !strings.Contains(mcpResultText(t, res2), filepath.Join(wd1, "dup.txt")) {
+		t.Fatalf("expected wd1 dup path in result, got: %s", mcpResultText(t, res2))
+	}
+
+	// Absolute path outside workspaces still rejected (no regression).
+	if _, _, err = s.toolStat(context.Background(), nil, statArgs{Path: "/etc/hostname"}); err == nil {
+		t.Fatal("expected outside rejection for absolute path")
+	}
+}
+
+// A leaf symlink inside wd2 must be found by relative path (Lstat counts the
+// link itself, even when broken) and reported as a symlink, not dereferenced.
+func TestCtxStat_Wd2LeafSymlink(t *testing.T) {
+	wd1 := t.TempDir()
+	wd2 := t.TempDir()
+	s := &server{workdirs: []string{wd1, wd2}}
+
+	mustWrite(t, filepath.Join(wd2, "target.txt"), "data")
+	link := filepath.Join(wd2, "leaf-link")
+	if err := os.Symlink(filepath.Join(wd2, "target.txt"), link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	res, _, err := s.toolStat(context.Background(), nil, statArgs{Path: "leaf-link"})
+	if err != nil {
+		t.Fatalf("stat wd2 leaf symlink: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, `"is_symlink": true`) {
+		t.Fatalf("expected is_symlink, got: %s", text)
+	}
+	if !strings.Contains(text, filepath.Join(wd2, "leaf-link")) {
+		t.Fatalf("expected wd2 link path in result, got: %s", text)
+	}
+
+	// Broken leaf symlink in wd2 must still match and be reported as a link.
+	broken := filepath.Join(wd2, "broken-link")
+	if err := os.Symlink(filepath.Join(wd2, "no-such-target"), broken); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	res2, _, err := s.toolStat(context.Background(), nil, statArgs{Path: "broken-link"})
+	if err != nil {
+		t.Fatalf("stat wd2 broken symlink: %v", err)
+	}
+	if !strings.Contains(mcpResultText(t, res2), `"is_symlink": true`) {
+		t.Fatalf("expected broken link still reported as symlink, got: %s", mcpResultText(t, res2))
+	}
+}
+
 // ---- ctx_fs: rg ----
 
 func TestCtxRg_HitAndLiteral(t *testing.T) {

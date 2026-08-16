@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -576,6 +577,7 @@ func TestBackgroundWait_TimeoutMsCap(t *testing.T) {
 
 // M5: kill marks Done but Wait closes log — log still readable after kill
 func TestBackgroundKill_LogReadableAfterKill(t *testing.T) {
+	requireLinux(t) // killBackground succeeds only with /proc identity
 	// Long-running process that prints then sleeps; kill should preserve log tail.
 	result, err := runShell(context.Background(),
 		`echo KILL_LOG_MARKER; while true; do sleep 1; done`,
@@ -621,6 +623,109 @@ func TestBackgroundKill_LogReadableAfterKill(t *testing.T) {
 	}
 	if !strings.Contains(logText, "KILL_LOG_MARKER") {
 		t.Fatalf("expected marker in log after kill: %q", logText)
+	}
+}
+
+// requireLinux skips tests whose behavior depends on Linux /proc semantics
+// (procStartTime reads /proc/<pid>/stat). On other platforms the runtime
+// fails closed by design — these tests would fail or leak instead of
+// exercising the contract, so they are skipped rather than faked.
+func requireLinux(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux /proc (procStartTime fails closed on other platforms)")
+	}
+}
+
+// ============================================================================
+// background writer: disk-only log, no in-memory buffers
+// ============================================================================
+
+func TestBackground_NoInMemoryBuffer(t *testing.T) {
+	requireLinux(t) // cleanup via killBackground needs /proc identity
+	result, err := runShell(context.Background(), "echo BG_NOBUF_MARKER; sleep 30", "/tmp", 0, true)
+	if err != nil {
+		t.Fatalf("start background: %v", err)
+	}
+	id := parseBgID(t, result.Stdout)
+	defer killBackground(id)
+
+	entry := findBackground(id)
+	if entry == nil {
+		t.Fatalf("entry %s not registered", id)
+	}
+	// findBackground returns a snapshot with live handles nilled; read the
+	// registry entry directly to inspect the writer wiring.
+	bgMu.Lock()
+	live := bgProcs[id]
+	bgMu.Unlock()
+	if live == nil {
+		t.Fatalf("live entry %s not registered", id)
+	}
+	if live.cmd == nil {
+		t.Fatal("entry.cmd must be set while the process runs")
+	}
+	if live.logWriter == nil {
+		t.Fatal("expected a disk log writer on the entry")
+	}
+	// The background process's stdout/stderr must be wired DIRECTLY to the
+	// disk log writer — no in-memory limitedBuffer (and no MultiWriter
+	// wrapping one) in between. Pointer equality is the proof.
+	if live.cmd.Stdout != live.logWriter {
+		t.Fatalf("background stdout must be the log writer only, got %T", live.cmd.Stdout)
+	}
+	if live.cmd.Stderr != live.logWriter {
+		t.Fatalf("background stderr must be the log writer only, got %T", live.cmd.Stderr)
+	}
+}
+
+func TestBackground_BigOutputLogAndWait(t *testing.T) {
+	requireLinux(t)
+	// stdout alone exceeds the old 10MB per-stream limitedBuffer cap; the
+	// full stream must land on the disk log, and ctx_bg log/wait must keep
+	// working with no in-memory capture.
+	script := "head -c 11000000 /dev/zero | tr '\\0' O; echo; head -c 3000000 /dev/zero | tr '\\0' E 1>&2; echo; echo BG_BIG_TAIL_MARKER"
+	result, err := runShell(context.Background(), script, "/tmp", 0, true)
+	if err != nil {
+		t.Fatalf("start background: %v", err)
+	}
+	id := parseBgID(t, result.Stdout)
+	defer killBackground(id)
+
+	s := &server{workdirs: []string{"/tmp"}}
+	wres, _, err := s.toolBackgroundWait(context.Background(), nil, backgroundWaitArgs{ID: id, TimeoutMs: 60000})
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	wtext := mcpResultText(t, wres)
+	if !strings.Contains(wtext, `"done": true`) {
+		t.Fatalf("expected done=true: %s", wtext)
+	}
+	if !strings.Contains(wtext, "BG_BIG_TAIL_MARKER") {
+		t.Fatalf("wait log tail should contain the marker: %s", wtext)
+	}
+
+	// The whole >10MB stdout stream must be on disk (log capped at 16MB,
+	// not at the old 10MB in-memory buffer limit).
+	entry := findBackground(id)
+	if entry == nil || entry.LogPath == "" {
+		t.Fatalf("entry %s missing log path", id)
+	}
+	st, err := os.Stat(entry.LogPath)
+	if err != nil {
+		t.Fatalf("stat log: %v", err)
+	}
+	if st.Size() < 13_000_000 {
+		t.Fatalf("expected log to hold the full >10MB stream, got %d bytes", st.Size())
+	}
+
+	lres, _, err := s.toolBackgroundLog(context.Background(), nil, backgroundLogArgs{ID: id, TailLines: 10})
+	if err != nil {
+		t.Fatalf("log: %v", err)
+	}
+	ltext := mcpResultText(t, lres)
+	if !strings.Contains(ltext, "BG_BIG_TAIL_MARKER") {
+		t.Fatalf("ctx_bg log should contain the tail marker: %s", ltext)
 	}
 }
 
@@ -1191,6 +1296,7 @@ func TestRegisterBackground_CommandTruncatedAtUTF8Boundary(t *testing.T) {
 // ============================================================================
 
 func TestBackground_CallerTimeoutStopsJob(t *testing.T) {
+	requireLinux(t) // verifies process death via procStartTime (/proc)
 	result, err := runShell(context.Background(), "sleep 30", "/tmp", 300*time.Millisecond, true)
 	if err != nil {
 		t.Fatalf("start background: %v", err)
@@ -1231,6 +1337,7 @@ func TestBackground_CallerTimeoutStopsJob(t *testing.T) {
 }
 
 func TestBackground_CapRejectsOverflow(t *testing.T) {
+	requireLinux(t) // cleanup relies on killBackground's /proc identity guard
 	// Clean slate: kill any leftover live jobs from earlier tests.
 	bgMu.Lock()
 	var live []string
@@ -1272,6 +1379,7 @@ func TestBackground_CapRejectsOverflow(t *testing.T) {
 // ============================================================================
 
 func TestProcStartTime_ReadsOwnPID(t *testing.T) {
+	requireLinux(t)
 	st := procStartTime(os.Getpid())
 	if st == 0 {
 		t.Fatal("expected non-zero starttime for the test process")
@@ -1279,6 +1387,7 @@ func TestProcStartTime_ReadsOwnPID(t *testing.T) {
 }
 
 func TestKillBackground_RefusesIdentityMismatch(t *testing.T) {
+	requireLinux(t) // recorded starttime comes from /proc
 	result, err := runShell(context.Background(), "sleep 30", "/tmp", 0, true)
 	if err != nil {
 		t.Fatalf("start: %v", err)

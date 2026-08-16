@@ -32,11 +32,15 @@ const Version = "3.1.0"
 
 // toolIndex walk / size limits.
 const (
-	maxIndexFiles      = 5000
-	maxIndexDepth      = 32
-	maxIndexTotalBytes = 100 * 1024 * 1024 // 100 MB total content
-	maxIndexFileBytes  = 1 * 1024 * 1024   // 1 MB per file
-	binarySampleSize   = 8192
+	maxIndexDepth     = 32
+	maxIndexFileBytes = 1 * 1024 * 1024 // 1 MB per file
+	binarySampleSize  = 8192
+)
+
+// Tool index walk caps. Package vars so tests can shrink them; restore after use.
+var (
+	maxIndexFiles            = 5000
+	maxIndexTotalBytes int64 = 100 * 1024 * 1024 // 100 MB total content
 )
 
 type server struct {
@@ -479,11 +483,11 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 				return nil
 			}
 			if hitFileCap || hitByteCap {
-				return filepath.SkipDir
+				return filepath.SkipAll
 			}
 			if indexedCount >= maxIndexFiles {
 				hitFileCap = true
-				return filepath.SkipDir
+				return filepath.SkipAll
 			}
 			if pathHasExcludedSegment(path, ".git", "node_modules") {
 				addSkip(fmt.Sprintf("%s: excluded dir", path))
@@ -512,7 +516,7 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 			if totalBytes+fi.Size() > maxIndexTotalBytes {
 				hitByteCap = true
 				addSkip(fmt.Sprintf("%s: total size cap reached", path))
-				return filepath.SkipDir
+				return filepath.SkipAll
 			}
 			if err := s.indexFile(path); err != nil {
 				addSkip(fmt.Sprintf("%s: %v", path, err))

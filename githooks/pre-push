@@ -4,6 +4,8 @@ set -euo pipefail
 RED='\033[0;31m'; NC='\033[0m'
 die() { echo -e "${RED}❌ PUSH REJECTED:${NC} $*"; exit 1; }
 
+ZERO_SHA="0000000000000000000000000000000000000000"
+
 SECRET_PATTERNS=(
   'ghp_[a-zA-Z0-9]{36}' 'gho_[a-zA-Z0-9]{36}'
   'ghu_[a-zA-Z0-9]{36}' 'ghs_[a-zA-Z0-9]{36}'
@@ -12,20 +14,49 @@ SECRET_PATTERNS=(
   'password\s*[:=]\s*\S+' 'api_key\s*[:=]\s*\S+' 'secret\s*[:=]\s*\S+'
 )
 
-while read -r _local _remote; do
-  for sha in $(git rev-list "$_local" "^$_remote" 2>/dev/null || true); do
-    diff=$(git show "$sha" 2>/dev/null || true)
-    msg=$(git log -1 --format=%B "$sha" 2>/dev/null || true)
-    combined="$diff $msg"
-    for pat in "${SECRET_PATTERNS[@]}"; do
-      if echo "$combined" | grep -qiE "$pat"; then
-        die "commit $sha contains a secret matching: \"$pat\""
-      fi
-    done
-    if echo "$msg" | grep -Pn '[^\x00-\x7F]' > /dev/null 2>&1; then
-      die "commit $sha has non-ASCII characters in message. English only."
+scan_commit() {
+  local sha=$1
+  local diff msg combined
+  if ! diff=$(git show "$sha" 2>&1); then
+    die "git show failed for commit $sha: $diff"
+  fi
+  if ! msg=$(git log -1 --format=%B "$sha" 2>&1); then
+    die "git log failed for commit $sha: $msg"
+  fi
+  combined="$diff $msg"
+  for pat in "${SECRET_PATTERNS[@]}"; do
+    if echo "$combined" | grep -qiE -- "$pat"; then
+      die "commit $sha contains a secret matching: \"$pat\""
     fi
   done
+  if echo "$msg" | grep -Pn -- '[^\x00-\x7F]' > /dev/null 2>&1; then
+    die "commit $sha has non-ASCII characters in message. English only."
+  fi
+}
+
+# Pre-push hook input is one line per ref being pushed, four space-separated
+# fields: <local ref> <local sha> <remote ref> <remote sha>.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "$local_ref" ] && continue
+  if [ -z "$local_sha" ] || [ -z "$remote_ref" ] || [ -z "$remote_sha" ]; then
+    die "malformed pre-push input line: '$local_ref $local_sha $remote_ref $remote_sha'"
+  fi
+  if [ "$local_sha" = "$ZERO_SHA" ]; then
+    continue # branch deletion — nothing is pushed, nothing to scan
+  fi
+  if [ "$remote_sha" = "$ZERO_SHA" ]; then
+    rev_args=("$local_sha") # new branch — every local commit is outgoing
+  else
+    rev_args=("$local_sha" "^$remote_sha")
+  fi
+  if ! rev_list=$(git rev-list "${rev_args[@]}" 2>&1); then
+    die "git rev-list failed for $local_ref -> $remote_ref: $rev_list"
+  fi
+  if [ -n "$rev_list" ]; then
+    while read -r sha; do
+      scan_commit "$sha"
+    done <<< "$rev_list"
+  fi
 done
 
 exit 0

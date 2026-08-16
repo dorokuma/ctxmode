@@ -57,15 +57,16 @@ type bgEntry struct {
 	// so a recycled PID can never cause an unrelated process to be killed.
 	starttime uint64
 	cmd       *exec.Cmd
-	// logFile is the open handle used by MultiWriter; closed on process exit
-	// (Wait → finishBackground). kill must not close it early or log tail is lost.
+	// logFile is the open handle that background stdout/stderr write to;
+	// closed on process exit (Wait → finishBackground). kill must not close it
+	// early or log tail is lost.
 	logFile       *os.File
 	logWriter     *limitedFileWriter
 	reapScheduled bool // grace-period removal already started
 }
 
 // limitedFileWriter writes to a file until limit is reached, then discards.
-// Safe for concurrent use (stdout+stderr MultiWriter).
+// Safe for concurrent use (background stdout+stderr share one instance).
 type limitedFileWriter struct {
 	mu        sync.Mutex
 	f         *os.File
@@ -87,7 +88,7 @@ func (w *limitedFileWriter) Write(p []byte) (int, error) {
 		w.written += int64(n)
 		return n, err
 	}
-	// Partial write up to limit; report full len(p) so MultiWriter continues.
+	// Partial write up to limit; report full len(p) so the child keeps writing.
 	// Trim the chunk on a UTF-8 rune boundary: a hard byte cut would leave a
 	// half character at the end of the log (rendered as U+FFFD).
 	cut := []byte(truncateUTF8(string(p), int(remaining)))
@@ -427,6 +428,16 @@ func readBackgroundLogTail(logPath string, tailLines, tailBytes int) (string, er
 
 // procStartTime reads field 22 (starttime, in clock ticks since boot) from
 // /proc/<pid>/stat — a stable per-process identity that survives PID reuse.
+//
+// Linux-specific: this depends on procfs (/proc/<pid>/stat), which is present
+// on Linux (and a few BSDs with procfs mounted); there is no portable
+// equivalent that is also race-free against PID reuse. On platforms where the
+// file cannot be read, 0 is returned and callers fail closed: killBackground
+// refuses to signal on an unknown identity, so a recycled PID can never be
+// killed. That fail-closed behavior is the contract — no fake cross-platform
+// implementation is attempted, and the pid-reuse guard degrades to "never
+// kill" rather than "kill blind".
+//
 // Returns 0 when the process no longer exists or the file is unreadable.
 // The comm field (2) is parenthesized and may contain spaces/parens, so the
 // remainder is parsed after the LAST ')'.
@@ -973,23 +984,95 @@ var goStdImportAliases = map[string]string{
 // goSelectorRe matches pkg.Ident uses (simple heuristic for import detection).
 var goSelectorRe = regexp.MustCompile(`\b([a-z][a-zA-Z0-9_]*)\.[A-Z(]`)
 
-// detectGoImports scans user code for common stdlib package selectors and
-// returns the import paths needed. Always includes "fmt" if nothing else is
-// found and the code looks like it might use Print-style helpers, else just
-// the detected set (may be empty → we still default to fmt for ergonomics).
-func detectGoImports(code string) []string {
-	seen := map[string]bool{}
-	for _, m := range goSelectorRe.FindAllStringSubmatch(code, -1) {
-		if len(m) < 2 {
-			continue
-		}
-		if path, ok := goStdImportAliases[m[1]]; ok {
-			seen[path] = true
+// goStringSpans returns half-open byte ranges of Go string literal, rune
+// literal, and comment regions in code. Selector-looking text inside these
+// regions is data, not code, and must not drive import detection:
+//   - raw strings (backtick-delimited), e.g. the FILE_CONTENT literal that
+//     injectFileContent prepends — including its backtick-concatenation form,
+//     where backticks inside "`" strings are literal data;
+//   - interpreted "..." strings and '...' rune literals (backslash escapes the
+//     next byte inside them; raw strings have no escapes and end at the next
+//     backtick);
+//   - // line comments and /* */ block comments (a stray quote in a comment
+//     must not swallow the rest of the code).
+func goStringSpans(code string) [][2]int {
+	var spans [][2]int
+	for i := 0; i < len(code); {
+		switch {
+		case code[i] == '/' && i+1 < len(code) && code[i+1] == '/':
+			if end := strings.IndexByte(code[i:], '\n'); end < 0 {
+				spans = append(spans, [2]int{i, len(code)})
+				return spans
+			} else {
+				spans = append(spans, [2]int{i, i + end})
+				i += end
+			}
+		case code[i] == '/' && i+1 < len(code) && code[i+1] == '*':
+			if end := strings.Index(code[i+2:], "*/"); end < 0 {
+				spans = append(spans, [2]int{i, len(code)})
+				return spans
+			} else {
+				spans = append(spans, [2]int{i, i + end + 4})
+				i += end + 4
+			}
+		case code[i] == '`':
+			if end := strings.IndexByte(code[i+1:], '`'); end < 0 {
+				spans = append(spans, [2]int{i, len(code)})
+				return spans
+			} else {
+				spans = append(spans, [2]int{i, i + end + 2})
+				i += end + 2
+			}
+		case code[i] == '"' || code[i] == '\'':
+			quote := code[i]
+			j := i + 1
+			for j < len(code) {
+				if code[j] == '\\' {
+					j += 2
+					continue
+				}
+				if code[j] == quote {
+					break
+				}
+				j++
+			}
+			if j >= len(code) {
+				spans = append(spans, [2]int{i, len(code)})
+				return spans
+			}
+			spans = append(spans, [2]int{i, j + 1})
+			i = j + 1
+		default:
+			i++
 		}
 	}
-	// Ergonomic default: snippets often use fmt without other packages.
-	if len(seen) == 0 {
-		seen["fmt"] = true
+	return spans
+}
+
+// detectGoImports scans user code for common stdlib package selectors and
+// returns the import paths needed. Matches inside string literals and
+// comments (see goStringSpans) are data, not code, and are skipped — this
+// keeps FILE_CONTENT raw-string data injected by injectFileContent from
+// triggering unused imports. No default import is added: only packages with a
+// real selector usage are imported, so the wrapped program compiles.
+func detectGoImports(code string) []string {
+	spans := goStringSpans(code)
+	inData := func(pos int) bool {
+		for _, s := range spans {
+			if pos >= s[0] && pos < s[1] {
+				return true
+			}
+		}
+		return false
+	}
+	seen := map[string]bool{}
+	for _, m := range goSelectorRe.FindAllStringSubmatchIndex(code, -1) {
+		if len(m) < 4 || inData(m[0]) {
+			continue
+		}
+		if path, ok := goStdImportAliases[code[m[2]:m[3]]]; ok {
+			seen[path] = true
+		}
 	}
 	out := make([]string, 0, len(seen))
 	for p := range seen {
@@ -1012,7 +1095,7 @@ func goWrapper(code string) string {
 	b.WriteString("package main\n\n")
 	if len(imports) == 1 {
 		b.WriteString(fmt.Sprintf("import %q\n\n", imports[0]))
-	} else {
+	} else if len(imports) > 1 {
 		b.WriteString("import (\n")
 		for _, imp := range imports {
 			b.WriteString(fmt.Sprintf("\t%q\n", imp))
@@ -1702,8 +1785,12 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 	stdoutBuf.limit = maxCmdOutput
 	stderrBuf.limit = maxCmdOutput
 
-	// For background jobs, tee stdout/stderr into a log file for later log/wait tools.
-	// Log size is hard-capped at bgLogMaxBytes to prevent unbounded disk growth.
+	// For background jobs, route stdout/stderr straight to a disk log for the
+	// log/wait tools — no in-memory capture at all. The log size is
+	// hard-capped at bgLogMaxBytes to prevent unbounded disk growth. The
+	// background result is never returned to the caller, so the foreground
+	// limitedBuffer capture is unnecessary; a 10MB buffer per stream per job
+	// would multiply with maxBackgroundProcs concurrent jobs.
 	var logFile *os.File
 	var logPath string
 	var logWriter *limitedFileWriter
@@ -1722,8 +1809,8 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 		logFile = f
 		logPath = f.Name()
 		logWriter = &limitedFileWriter{f: f, limit: bgLogMaxBytes}
-		cmd.Stdout = io.MultiWriter(&stdoutBuf, logWriter)
-		cmd.Stderr = io.MultiWriter(&stderrBuf, logWriter)
+		cmd.Stdout = logWriter
+		cmd.Stderr = logWriter
 	} else {
 		cmd.Stdout = &stdoutBuf
 		cmd.Stderr = &stderrBuf

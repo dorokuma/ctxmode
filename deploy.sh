@@ -13,8 +13,25 @@ go build -o "$BUILD_OUT" . 2>&1
 echo "编译完成 ($(du -h "$BUILD_OUT" | cut -f1))"
 
 echo "=== 原子部署 ==="
-mkdir -p "$(dirname "$BINARY")"
-install -m 755 "$BUILD_OUT" "$BINARY"
+# ===== atomic deploy fragment: start =====
+# 临时文件建在目标目录内（同文件系统，mv 才是原子替换）；
+# 失败时 ERR trap 清理临时文件，旧目标保持不动；成功后解除 trap。
+TARGET_DIR="$(dirname "$BINARY")"
+mkdir -p -- "$TARGET_DIR"
+
+TMP_FILE=""
+cleanup_tmp() {
+  if [ -n "$TMP_FILE" ]; then
+    rm -f -- "$TMP_FILE"
+  fi
+}
+trap cleanup_tmp ERR
+
+TMP_FILE="$(mktemp "$TARGET_DIR/.ctxmode.XXXXXX")"
+install -m 755 "$BUILD_OUT" "$TMP_FILE"
+mv -f -- "$TMP_FILE" "$BINARY"
+trap - ERR
+# ===== atomic deploy fragment: end =====
 echo "部署完成 → $BINARY"
 rm -rf "$ROOT/bin"
 echo "已清理编译产物 $ROOT/bin"

@@ -284,6 +284,133 @@ func TestGoWrapper_AlreadyFullProgram(t *testing.T) {
 	}
 }
 
+func TestGoWrapper_NoDefaultFmtWithoutSelector(t *testing.T) {
+	// No real selector: the old code defaulted to importing fmt, which made
+	// any snippet that does NOT use fmt fail to compile (unused import).
+	code := `println("hello")`
+	imports := detectGoImports(code)
+	if len(imports) != 0 {
+		t.Fatalf("expected no imports for selector-free code, got %v", imports)
+	}
+	out := goWrapper(code)
+	if strings.Contains(out, `"fmt"`) {
+		t.Fatalf("selector-free code must not import fmt:\n%s", out)
+	}
+	if !strings.Contains(out, `println("hello")`) {
+		t.Fatalf("code body must be preserved:\n%s", out)
+	}
+}
+
+func TestGoWrapper_SkipsRawStringData(t *testing.T) {
+	// Selector-looking text inside a raw backtick string is DATA (e.g. the
+	// FILE_CONTENT literal injected by injectFileContent), not code: it must
+	// not trigger imports. Real selectors outside the literal still do.
+	code := "s := `fmt.Println(os.Getenv(\"HOME\"))`\nfmt.Println(len(s))"
+	imports := detectGoImports(code)
+	if len(imports) != 1 || imports[0] != "fmt" {
+		t.Fatalf("expected only fmt, got %v", imports)
+	}
+	out := goWrapper(code)
+	if strings.Contains(out, `"os"`) {
+		t.Fatalf("raw-string data must not import os:\n%s", out)
+	}
+	if !strings.Contains(out, `"fmt"`) {
+		t.Fatalf("real fmt selector must still be imported:\n%s", out)
+	}
+}
+
+func TestGoWrapper_SkipsInterpretedStringData(t *testing.T) {
+	// Selector-looking text inside interpreted strings is data too, even
+	// with escaped quotes (backslash must not end the string early).
+	code := "s := \"os.Getenv(\\\"X\\\") strings.Split\"\nfmt.Println(s)"
+	imports := detectGoImports(code)
+	if len(imports) != 1 || imports[0] != "fmt" {
+		t.Fatalf("expected only fmt, got %v", imports)
+	}
+	out := goWrapper(code)
+	if strings.Contains(out, `"os"`) || strings.Contains(out, `"strings"`) {
+		t.Fatalf("string-literal data must not import os/strings:\n%s", out)
+	}
+}
+
+func TestGoWrapper_CommentSelectorsIgnored(t *testing.T) {
+	// Selector text in comments must not trigger imports; a stray quote in a
+	// comment must not swallow the real code either.
+	code := "// fmt.Println(os.Getenv(\"X\")) note\nfmt.Println(\"real\")"
+	imports := detectGoImports(code)
+	if len(imports) != 1 || imports[0] != "fmt" {
+		t.Fatalf("expected only fmt, got %v", imports)
+	}
+}
+
+func TestGoWrapper_SkipsInjectedFileContentSimpleRaw(t *testing.T) {
+	// Simple injection form (no backticks in the file): selector text inside
+	// the FILE_CONTENT raw literal must not be imported.
+	content := "plain data fmt.Println(os.Getenv(\"X\")) strings.Split(\"a,b\", \",\")"
+	code := "fmt.Println(len(FILE_CONTENT))"
+	injected := injectFileContent("go", code, content)
+	if !strings.HasPrefix(injected, "FILE_CONTENT := `") {
+		t.Fatalf("expected simple raw form, got:\n%s", injected)
+	}
+	imports := detectGoImports(injected)
+	if len(imports) != 1 || imports[0] != "fmt" {
+		t.Fatalf("expected only fmt, got %v", imports)
+	}
+}
+
+func TestGoWrapper_SkipsInjectedFileContentBacktickConcat(t *testing.T) {
+	// Backtick-concatenation injection form (file contains backticks):
+	// FILE_CONTENT := `a` + "`" + `b...` — the backticks inside the "`"
+	// strings are literal data, not raw-string delimiters, and the data must
+	// not trigger imports. Real selectors in the user code still do.
+	content := "a`b`c fmt.Println(os.Getenv(\"X\")) strings.Split(\"a,b\", \",\")"
+	code := "fmt.Println(strings.Count(FILE_CONTENT, \"`\"))"
+	injected := injectFileContent("go", code, content)
+	const concatForm = `+ "` + "`" + `" +`
+	if !strings.Contains(injected, concatForm) {
+		t.Fatalf("expected backtick concatenation form, got:\n%s", injected)
+	}
+	imports := detectGoImports(injected)
+	got := map[string]bool{}
+	for _, p := range imports {
+		got[p] = true
+	}
+	if !got["fmt"] || !got["strings"] {
+		t.Fatalf("real selectors fmt/strings must be imported, got %v", imports)
+	}
+	if got["os"] {
+		t.Fatalf("FILE_CONTENT data must not import os, got %v", imports)
+	}
+}
+
+func TestExecuteFile_GoCompilesWithoutSpuriousImports(t *testing.T) {
+	// Real end-to-end regression through toolExecuteFile: FILE_CONTENT data
+	// that LOOKS like Go selectors (fmt/os/strings...) must not be scanned
+	// for imports. The old detector saw the raw-string data, imported os
+	// (unused), and the wrapped program failed to compile.
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: newTestStore(t)}
+	ctx := context.Background()
+
+	// Backticks in the content force the concatenation injection form.
+	content := "package fake\nfmt.Println(os.Getenv(\"HOME\"))\nstrings.Split(`a,b`, \",\")\n"
+	mustWrite(t, filepath.Join(wd, "data.txt"), content)
+
+	res, _, err := s.toolExecuteFile(ctx, nil, executeFileArgs{
+		Path:     "data.txt",
+		Code:     "fmt.Println(strings.Count(FILE_CONTENT, \"\\n\"))",
+		Language: "go",
+		Timeout:  60000,
+	})
+	if err != nil {
+		t.Fatalf("toolExecuteFile (go): %v", err)
+	}
+	text := strings.TrimSpace(mcpResultText(t, res))
+	if text != "3" {
+		t.Fatalf("expected line count 3, got %q (a compile failure surfaces as stderr here)", text)
+	}
+}
+
 // ---------- #14 format=markdown only for HTML ----------
 
 func TestProcessContent_MarkdownNotForcedOnPlain(t *testing.T) {
@@ -385,7 +512,7 @@ func TestFetchAndIndex_DefaultSource(t *testing.T) {
 		t.Fatalf("default source: got %q, want %q", result.Source, "fetch")
 	}
 	// Indexed path must use fetch: prefix, never bare :{url}.
-	doc, getErr := s.store.Get("fetch:" + rawURL)
+	doc, getErr := s.store.Get("fetch:markdown:" + rawURL)
 	if getErr != nil {
 		t.Fatalf("Get indexed doc: %v", getErr)
 	}
@@ -415,7 +542,7 @@ func TestFetchAndIndex_DefaultSource(t *testing.T) {
 
 func TestValidateURL_AllowsIfAnyIPSafe(t *testing.T) {
 	// Hosts that resolve only to blocked IPs should fail.
-	err := validateURL("http://127.0.0.1/", false)
+	err := validateURL("http://127.0.0.1/")
 	if err == nil {
 		t.Fatal("expected 127.0.0.1 blocked")
 	}
@@ -425,13 +552,13 @@ func TestValidateURL_AllowsIfAnyIPSafe(t *testing.T) {
 	if ips, err := net.LookupIP("example.com"); err == nil && len(ips) > 0 {
 		var anySafe bool
 		for _, ip := range ips {
-			if checkIP(ip, false) == nil {
+			if checkIP(ip) == nil {
 				anySafe = true
 				break
 			}
 		}
 		if anySafe {
-			if err := validateURL("https://example.com/", false); err != nil {
+			if err := validateURL("https://example.com/"); err != nil {
 				t.Fatalf("expected example.com allowed when a public IP exists: %v", err)
 			}
 		}
@@ -450,6 +577,7 @@ func TestVersionAligned(t *testing.T) {
 // ---------- #7 background registry ----------
 
 func TestBackgroundRegistry_ListAndKill(t *testing.T) {
+	requireLinux(t) // killBackground succeeds only with /proc identity
 	result, err := runShell(context.Background(), "sleep 60", "/tmp", 0, true)
 	if err != nil {
 		t.Fatalf("start background: %v", err)

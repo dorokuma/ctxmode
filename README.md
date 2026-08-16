@@ -6,6 +6,8 @@ Local-first Model Context Protocol (MCP) server that virtualizes tool outputs, a
 
 Current version: **3.1.0**.
 
+Supported platform: **Linux**. Background process identity verification reads `/proc/<pid>/stat`; on other platforms ctxmode still runs, but `ctx_bg` termination is not promised (see [ctx_bg](#ctx_bg--background-process-supervision-from-ctx_run-actionexecute-backgroundtrue)).
+
 ## MCP tools (v2)
 
 Five real tools (not skills). Each takes **`action=`** plus capability-specific fields:
@@ -70,7 +72,7 @@ The following are defense-in-depth measures, never a security guarantee:
 
 - Subprocess environments strip inherited variables whose names look sensitive (`token`, `key`, `secret`, `password`, `passwd`, `credential`, `auth`, `cookie`, `session`, case-insensitive) by default; `CTXMODE_ENV_PASSTHROUGH=1` disables this. Caller-provided `env` overrides truly replace same-named inherited variables (deduplicated map, not appended duplicates), and the allowlist still rejects `PATH`/`HOME`/`SHELL`/`LD_*`/`DYLD_*` etc.
 - Indexing skips secret-like files by default: `.env`/`.env.*`, private keys (`*.pem`, `*.key`, `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`), `credentials.json`, `.npmrc`, `.netrc`, and anything under `.aws`/`.ssh`/`.gnupg`/`.kube`.
-- `ctx_kb action=fetch` refuses SSRF targets: IPv4 and IPv6 loopback, link-local (169.254.0.0/16, fe80::/10), multicast, reserved, private (RFC 1918, fc00::/7), CGNAT and benchmark ranges — IPv6 is symmetric with IPv4 in both strict and non-strict modes.
+- `ctx_kb action=fetch` refuses SSRF targets: IPv4 and IPv6 loopback, link-local (169.254.0.0/16, fe80::/10), multicast, reserved, private (RFC 1918, fc00::/7), CGNAT and benchmark ranges — IPv6 is symmetric with IPv4. The blocklist is a single fixed set: the former strict/non-strict split was removed (`CTX_FETCH_STRICT` no longer exists) and the intercepted set cannot be changed via the environment.
 
 ### Subprocess environment isolation
 
@@ -119,7 +121,7 @@ Side effects to be aware of:
 
 - `index` — `path` (file or directory) into SQLite FTS5; skips `.git`/`node_modules`, sensitive/secret files, binaries and >1MB files; capped at 5000 files / 100MB total.
 - `search` — `query`: BM25 + Porter + Trigram + RRF + proximity rerank; flood-guarded (`ctx_run` batch `query_scope=batch` bypasses the guard).
-- `fetch` — `url`/`urls` (≤10) → markdown → index; `source`, `format` (markdown/html/json), `force`, `maxBytes` (default 50KB), `timeoutMs` (default 150000), `ttl` (default 24h, 0 = skip cache); SSRF protection as above.
+- `fetch` — `url`/`urls` (≤10) → markdown → index; `source`, `format` (markdown/html/json), `force`, `maxBytes` (default 50KB), `timeoutMs` (default 150000), `ttl` (default 24h, 0 = skip cache); SSRF protection as above. Indexed documents are isolated per `format`: the KB path embeds the format (`source:format:url`), so the same URL can coexist as markdown/html/json without overwriting, and re-fetching in one format never touches the others.
 - `stats` — document/cache/DB statistics, token-savings estimate.
 - `purge` — `confirm:true` is mandatory: missing or `false` returns an error (not a silent no-op). `scope` (`session`|`project`), `sessionId` (session scope), `dryRun` preview without deleting.
 - `doctor` — runtime availability, FTS5 self-test, storage info.
@@ -127,10 +129,11 @@ Side effects to be aware of:
 ### ctx_bg — background process supervision (from `ctx_run action=execute background:true`)
 
 - `list` — registered jobs (id/pid/age/exit_code/log availability).
-- `kill` — by `id` or `pid`; PID-reuse guarded via /proc starttime.
+- `kill` — by `id` or `pid`; PID-reuse guarded via the process starttime read from `/proc/<pid>/stat`.
 - `log` — `id`/`pid`, `tail_lines` (≤10000), `tail_bytes` (≤4MB); seeks from file end.
 - `wait` — `id`/`pid`, `timeout_ms` (default 60000, max 1h); never kills on timeout.
 - Max 16 concurrent background jobs (exceeding is an error); a caller-provided `timeout` on the launch is honored (default max age 1h); log files capped at 16MB.
+- Platform contract: the `kill` identity check reads `/proc/<pid>/stat` (Linux). On platforms where that file is unavailable the check fails closed — a job with unknown identity is never signaled — so `ctx_bg` termination is only guaranteed on Linux; `list`/`log`/`wait` keep working everywhere.
 
 ## Database
 

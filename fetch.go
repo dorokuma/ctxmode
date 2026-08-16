@@ -76,7 +76,7 @@ type fetchArgs struct {
 // against blocklists. Multi-address hosts are allowed when at least one
 // resolved IP is safe (aligned with DialContext, which also picks the first
 // safe IP rather than requiring every address to pass).
-func validateURL(rawURL string, strict bool) error {
+func validateURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
@@ -100,7 +100,7 @@ func validateURL(rawURL string, strict bool) error {
 
 	var firstErr error
 	for _, ip := range ips {
-		if err := checkIP(ip, strict); err == nil {
+		if err := checkIP(ip); err == nil {
 			// At least one safe IP — DialContext will pick a safe address.
 			return nil
 		} else if firstErr == nil {
@@ -111,14 +111,14 @@ func validateURL(rawURL string, strict bool) error {
 }
 
 // checkIP returns an error if the IP is in a blocked range.
-// Always blocked: 0.0.0.0/8 (unspecified), 127.0.0.0/8 (loopback),
-// 169.254.0.0/16 (link-local/IMDS), 224.0.0.0/4 (multicast),
+// The blocklist is a single fixed set: 0.0.0.0/8 (unspecified), 127.0.0.0/8
+// (loopback), 169.254.0.0/16 (link-local/IMDS), 224.0.0.0/4 (multicast),
 // 240.0.0.0/4 (reserved), 10.0.0.0/8 / 172.16.0.0/12 / 192.168.0.0/16 (private),
 // 100.64.0.0/10 (CGNAT), 198.18.0.0/15 (benchmark),
 // IPv6 loopback (::1), IPv6 private (fc00::/7, RFC 4193), IPv6 link-local,
 // unspecified, and multicast. IPv6 rules are symmetric with IPv4: loopback
-// and private addresses are blocked in both strict and non-strict mode.
-func checkIP(ip net.IP, strict bool) error {
+// and private addresses are always blocked.
+func checkIP(ip net.IP) error {
 	if ip == nil {
 		return fmt.Errorf("nil IP")
 	}
@@ -169,7 +169,7 @@ func checkIP(ip net.IP, strict bool) error {
 		}
 	} else {
 		// IPv6 — symmetric with IPv4: loopback and private (ULA) addresses are
-		// always blocked, in both strict and non-strict mode.
+		// always blocked.
 		if ip.IsLoopback() {
 			return fmt.Errorf("::1 (IPv6 loopback) blocked")
 		}
@@ -214,10 +214,9 @@ func newHTTPClient() *http.Client {
 					return nil, fmt.Errorf("DNS resolution in DialContext: %w", err)
 				}
 
-				strict := os.Getenv("CTX_FETCH_STRICT") == "1"
 				var safeIP net.IP
 				for _, ip := range ips {
-					if err := checkIP(ip.IP, strict); err == nil {
+					if err := checkIP(ip.IP); err == nil {
 						safeIP = ip.IP
 						break
 					}
@@ -473,8 +472,8 @@ func splitLongText(s string, max int) []string {
 
 // ---------- fetch and index (single URL) ----------
 
-// indexContentLocked replaces the documents under docPath (source:url) with
-// freshly chunked content: stale chunks from an earlier fetch are removed
+// indexContentLocked replaces the documents under docPath (source:format:url)
+// with freshly chunked content: stale chunks from an earlier fetch are removed
 // first, then each new chunk is indexed. Returns the number of chunks written
 // and the first indexing error, if any.
 func (s *server) indexContentLocked(docPath, content string) (int, error) {
@@ -503,12 +502,50 @@ func (s *server) storePurgePrefixLocked(prefix string) error {
 	return err
 }
 
+// fetchDocPath builds the KB document path for a fetched URL. The format is
+// embedded between source and URL so the same URL can coexist in the KB in
+// several formats (markdown/html/json) without overwriting each other.
+func fetchDocPath(source, format, rawURL string) string {
+	return source + ":" + format + ":" + rawURL
+}
+
+// purgeLegacyFetchDocs removes documents that older versions indexed under
+// the pre-format path scheme source:url. SSRF validation guarantees the URL
+// part always starts with http:// or https://, so new-format paths
+// (source:format:url) can never match: they carry the format segment right
+// after the source. The LIKE prefix is bounded to one source and cannot
+// spill into other sources. Returns the number of documents removed.
+func (s *server) purgeLegacyFetchDocs(source string) (int, error) {
+	// Escape LIKE wildcards so a source containing % or _ matches literally.
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(source)
+	total := 0
+	for _, scheme := range []string{"http://", "https://"} {
+		s.mu.Lock()
+		res, err := s.store.db.Exec(`DELETE FROM documents WHERE path LIKE ? ESCAPE '\'`, escaped+":"+scheme+"%")
+		s.mu.Unlock()
+		if err != nil {
+			return total, fmt.Errorf("purge legacy fetch docs for %q: %w", source, err)
+		}
+		n, _ := res.RowsAffected()
+		total += int(n)
+	}
+	return total, nil
+}
+
 // fetchAndIndex fetches a URL, processes the content, and indexes it into the store.
 func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format string, force bool, ttl int, timeout time.Duration) (*FetchResult, error) {
 	// Default source avoids path becoming ":{url}".
 	if source == "" {
 		source = "fetch"
 	}
+
+	// Upgrade cleanup: older versions indexed documents as source:url without
+	// a format segment. Remove them for this source so search does not surface
+	// stale duplicates; new source:format:url paths are never matched.
+	if _, err := s.purgeLegacyFetchDocs(source); err != nil {
+		fmt.Fprintf(os.Stderr, "legacy fetch doc cleanup failed: %v\n", err)
+	}
+
 	result := &FetchResult{
 		URL:    rawURL,
 		Source: source,
@@ -546,10 +583,11 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 				result.ChunkCount = countChunks(cached.Content)
 
 				// The cache can outlive the indexed documents (e.g. after a
-				// purge). Verify the document still exists in the KB and
-				// re-index it when missing, otherwise we'd report a cache hit
-				// for content that search cannot find.
-				docPath := source + ":" + rawURL
+				// purge). Verify the document for this exact format still exists
+				// in the KB and re-index it when missing, otherwise we'd report
+				// a cache hit for content that search cannot find. Only this
+				// format's document is checked/backfilled.
+				docPath := fetchDocPath(source, format, rawURL)
 				count, err := s.store.CountByPrefix(docPath)
 				if err != nil || count == 0 {
 					if _, err := s.indexContentLocked(docPath, cached.Content); err != nil {
@@ -563,8 +601,7 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 	}
 
 	// SSRF validation.
-	strict := os.Getenv("CTX_FETCH_STRICT") == "1"
-	if err := validateURL(rawURL, strict); err != nil {
+	if err := validateURL(rawURL); err != nil {
 		result.Error = fmt.Sprintf("SSRF check failed: %v", err)
 		return result, nil
 	}
@@ -593,9 +630,9 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 		}
 		result.Content = content
 
-		// Index into store: clear stale chunks for this source:url first so a
-		// re-fetch with fewer chunks does not leave old chunks searchable.
-		docPath := source + ":" + rawURL
+		// Index into store: clear stale chunks for this source:format:url first
+		// so a re-fetch with fewer chunks does not leave old chunks searchable.
+		docPath := fetchDocPath(source, format, rawURL)
 		chunkCount, indexErr := s.indexContentLocked(docPath, content)
 		result.ChunkCount = chunkCount
 		if indexErr != nil {
@@ -627,9 +664,9 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 			return nil, fmt.Errorf("content processing failed: %w", err)
 		}
 
-		// Index into store: clear stale chunks for this source:url first so a
-		// re-fetch with fewer chunks does not leave old chunks searchable.
-		docPath := source + ":" + rawURL
+		// Index into store: clear stale chunks for this source:format:url first
+		// so a re-fetch with fewer chunks does not leave old chunks searchable.
+		docPath := fetchDocPath(source, format, rawURL)
 		chunkCount, indexErr := s.indexContentLocked(docPath, content)
 		var indexErrString string
 		if indexErr != nil {

@@ -66,17 +66,12 @@ func TestCheckIP_IPv4_Blocked(t *testing.T) {
 			if ip == nil {
 				t.Fatalf("bad test IP: %s", tt.ip)
 			}
-			err := checkIP(ip, false)
+			err := checkIP(ip)
 			if err == nil {
 				t.Fatalf("expected blocked, got nil error")
 			}
 			if err.Error() != tt.reason {
 				t.Fatalf("expected %q, got %q", tt.reason, err.Error())
-			}
-			// strict=true should also block (same as non-strict for v4).
-			err = checkIP(ip, true)
-			if err == nil {
-				t.Fatalf("strict: expected blocked, got nil error")
 			}
 		})
 	}
@@ -109,13 +104,8 @@ func TestCheckIP_IPv4_Allowed(t *testing.T) {
 			if ip == nil {
 				t.Fatalf("bad test IP: %s", tt.ip)
 			}
-			err := checkIP(ip, false)
-			if err != nil {
+			if err := checkIP(ip); err != nil {
 				t.Fatalf("expected allowed, got: %v", err)
-			}
-			err = checkIP(ip, true)
-			if err != nil {
-				t.Fatalf("strict: expected allowed, got: %v", err)
 			}
 		})
 	}
@@ -140,16 +130,12 @@ func TestCheckIP_IPv6_Blocked(t *testing.T) {
 			if ip == nil {
 				t.Fatalf("bad test IP: %s", tt.ip)
 			}
-			err := checkIP(ip, false)
+			err := checkIP(ip)
 			if err == nil {
-				t.Fatalf("non-strict: expected blocked, got nil")
+				t.Fatalf("expected blocked, got nil")
 			}
 			if err.Error() != tt.reason {
-				t.Fatalf("non-strict: expected %q, got %q", tt.reason, err.Error())
-			}
-			err = checkIP(ip, true)
-			if err == nil {
-				t.Fatalf("strict: expected blocked, got nil")
+				t.Fatalf("expected %q, got %q", tt.reason, err.Error())
 			}
 		})
 	}
@@ -157,7 +143,7 @@ func TestCheckIP_IPv6_Blocked(t *testing.T) {
 
 func TestCheckIP_IPv6_LoopbackAndPrivateBlocked(t *testing.T) {
 	// IPv6 rules are symmetric with IPv4: loopback (::1) and private/ULA
-	// (fc00::/7) addresses are always blocked — in non-strict mode too.
+	// (fc00::/7) addresses are always blocked.
 	tests := []struct {
 		name   string
 		ip     string
@@ -174,18 +160,12 @@ func TestCheckIP_IPv6_LoopbackAndPrivateBlocked(t *testing.T) {
 			if ip == nil {
 				t.Fatalf("bad test IP: %s", tt.ip)
 			}
-			// Blocked in non-strict mode (symmetric with IPv4 loopback/private).
-			err := checkIP(ip, false)
+			err := checkIP(ip)
 			if err == nil {
-				t.Fatalf("non-strict: expected blocked, got nil")
+				t.Fatalf("expected blocked, got nil")
 			}
 			if err.Error() != tt.reason {
-				t.Fatalf("non-strict: expected %q, got %q", tt.reason, err.Error())
-			}
-			// Blocked in strict mode too.
-			err = checkIP(ip, true)
-			if err == nil {
-				t.Fatalf("strict: expected blocked, got nil")
+				t.Fatalf("expected %q, got %q", tt.reason, err.Error())
 			}
 		})
 	}
@@ -196,23 +176,34 @@ func TestCheckIP_Public_IPv6(t *testing.T) {
 	if ip == nil {
 		t.Fatal("bad test IP")
 	}
-	err := checkIP(ip, false)
-	if err != nil {
-		t.Fatalf("non-strict: expected allowed, got: %v", err)
-	}
-	err = checkIP(ip, true)
-	if err != nil {
-		t.Fatalf("strict: expected allowed, got: %v", err)
+	if err := checkIP(ip); err != nil {
+		t.Fatalf("expected allowed, got: %v", err)
 	}
 }
 
 func TestCheckIP_Nil(t *testing.T) {
-	err := checkIP(nil, false)
+	err := checkIP(nil)
 	if err == nil {
 		t.Fatal("expected error for nil IP")
 	}
 	if err.Error() != "nil IP" {
 		t.Fatalf("expected 'nil IP', got %q", err.Error())
+	}
+}
+
+func TestCheckIP_IgnoresStrictEnv(t *testing.T) {
+	// CTX_FETCH_STRICT no longer exists (the strict parameter was removed):
+	// setting it must not change the SSRF blocklist, which is a single fixed
+	// set. This guards against reintroducing an env-var switch.
+	t.Setenv("CTX_FETCH_STRICT", "1")
+	if err := checkIP(net.ParseIP("10.0.0.1")); err == nil {
+		t.Fatal("private IP must be blocked even with CTX_FETCH_STRICT=1")
+	}
+	if err := checkIP(net.ParseIP("8.8.8.8")); err != nil {
+		t.Fatalf("public IP must stay allowed with CTX_FETCH_STRICT=1: %v", err)
+	}
+	if err := checkIP(net.ParseIP("::1")); err == nil {
+		t.Fatal("IPv6 loopback must be blocked even with CTX_FETCH_STRICT=1")
 	}
 }
 
@@ -227,7 +218,7 @@ func TestCheckIP_IPv4Mapped_IPv6(t *testing.T) {
 	if v4 == nil {
 		t.Fatal("expected non-nil v4 for IPv4-mapped")
 	}
-	err := checkIP(ip, false)
+	err := checkIP(ip)
 	if err == nil {
 		t.Fatal("expected blocked for ::ffff:10.0.0.1")
 	}
@@ -329,7 +320,7 @@ func newFetchTestServer(t *testing.T, handler http.HandlerFunc) *server {
 
 func TestIndexContentLocked_ClearsStaleChunks(t *testing.T) {
 	srv := newTestServer(t)
-	const docPath = "src:http://example.com/doc"
+	const docPath = "src:markdown:http://example.com/doc"
 
 	// Simulate an earlier fetch that indexed 3 chunks.
 	indexDoc(t, srv.store, docPath+"#chunk-0", "old alpha")
@@ -407,11 +398,11 @@ func TestFetchAndIndex_RefetchClearsStaleChunks(t *testing.T) {
 	}
 
 	// Old chunks must be removed from documents and FTS.
-	count, _ := srv.store.CountByPrefix("src:" + url)
+	count, _ := srv.store.CountByPrefix("src:markdown:" + url)
 	if count != 1 {
 		t.Fatalf("expected 1 document under prefix, got %d", count)
 	}
-	if stale, _ := srv.store.Get("src:" + url + "#chunk-1"); stale != nil {
+	if stale, _ := srv.store.Get("src:markdown:" + url + "#chunk-1"); stale != nil {
 		t.Fatal("stale chunk #chunk-1 survived re-fetch")
 	}
 	hits, err := srv.store.Search("alpha", 10)
@@ -503,14 +494,14 @@ func TestFetchAndIndex_CacheHitRefillsMissingDocs(t *testing.T) {
 		t.Fatalf("unexpected index error: %s", res.IndexError)
 	}
 
-	doc, err := srv.store.Get("src:" + url)
+	doc, err := srv.store.Get("src:markdown:" + url)
 	if err != nil || doc == nil {
 		t.Fatalf("cache hit should have re-indexed missing doc (err=%v)", err)
 	}
 	if doc.Content != content {
 		t.Fatalf("re-indexed content mismatch: %q", doc.Content)
 	}
-	count, _ := srv.store.CountByPrefix("src:" + url)
+	count, _ := srv.store.CountByPrefix("src:markdown:" + url)
 	if count != 1 {
 		t.Fatalf("expected 1 document, got %d", count)
 	}
@@ -523,9 +514,196 @@ func TestFetchAndIndex_CacheHitRefillsMissingDocs(t *testing.T) {
 	if !res2.Cached || res2.IndexError != "" {
 		t.Fatalf("second hit: cached=%v indexError=%q", res2.Cached, res2.IndexError)
 	}
-	count, _ = srv.store.CountByPrefix("src:" + url)
+	count, _ = srv.store.CountByPrefix("src:markdown:" + url)
 	if count != 1 {
 		t.Fatalf("expected 1 document after second hit, got %d", count)
+	}
+}
+
+// ---------- #3b format isolation in KB documents ----------
+
+func TestFetchAndIndex_FormatIsolation(t *testing.T) {
+	const url = "http://1.1.1.1/format-isolation"
+	const page = "<html><body><h1>FormatIsolationHeader</h1><p>format isolation body</p></body></html>"
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, page)
+	}
+	srv := newFetchTestServer(t, handler)
+
+	// Index the same URL+source in two formats: they must coexist.
+	mdRes, err := srv.fetchAndIndex(context.Background(), url, "src", "markdown", false, 3600000, 30*time.Second)
+	if err != nil {
+		t.Fatalf("markdown fetch: %v", err)
+	}
+	if mdRes.Error != "" {
+		t.Fatalf("markdown fetch error: %s", mdRes.Error)
+	}
+	htmlRes, err := srv.fetchAndIndex(context.Background(), url, "src", "html", false, 3600000, 30*time.Second)
+	if err != nil {
+		t.Fatalf("html fetch: %v", err)
+	}
+	if htmlRes.Error != "" {
+		t.Fatalf("html fetch error: %s", htmlRes.Error)
+	}
+	if htmlRes.Cached {
+		t.Fatal("html fetch must not hit the markdown cache entry")
+	}
+
+	mdPath := fetchDocPath("src", "markdown", url)
+	htmlPath := fetchDocPath("src", "html", url)
+	mdDoc, err := srv.store.Get(mdPath)
+	if err != nil || mdDoc == nil {
+		t.Fatalf("markdown doc missing at %q (err=%v)", mdPath, err)
+	}
+	htmlDoc, err := srv.store.Get(htmlPath)
+	if err != nil || htmlDoc == nil {
+		t.Fatalf("html doc missing at %q (err=%v)", htmlPath, err)
+	}
+	if strings.Contains(mdDoc.Content, "<html") {
+		t.Fatalf("markdown doc must not contain raw HTML: %q", mdDoc.Content)
+	}
+	if !strings.Contains(htmlDoc.Content, "<html") {
+		t.Fatalf("html doc must contain raw HTML: %q", htmlDoc.Content)
+	}
+	count, _ := srv.store.CountByPrefix("src:")
+	if count != 2 {
+		t.Fatalf("expected both format docs to coexist, got %d", count)
+	}
+
+	// Markdown cache hit must keep the markdown doc markdown and must not
+	// touch the html doc.
+	mdAgain, err := srv.fetchAndIndex(context.Background(), url, "src", "markdown", false, 3600000, 30*time.Second)
+	if err != nil {
+		t.Fatalf("markdown re-fetch: %v", err)
+	}
+	if !mdAgain.Cached {
+		t.Fatal("expected markdown cache hit")
+	}
+	if mdDoc2, _ := srv.store.Get(mdPath); mdDoc2 == nil || mdDoc2.Content != mdDoc.Content {
+		t.Fatalf("markdown doc must survive cache hit unchanged, got %+v", mdDoc2)
+	}
+	if htmlDoc2, _ := srv.store.Get(htmlPath); htmlDoc2 == nil || htmlDoc2.Content != htmlDoc.Content {
+		t.Fatalf("html doc must be untouched by markdown cache hit, got %+v", htmlDoc2)
+	}
+
+	// Search scoped to the markdown format must return the markdown doc.
+	hits, err := srv.store.SearchWithPathPrefix("FormatIsolationHeader", "src:markdown:", 5)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Path != mdPath {
+		t.Fatalf("expected single markdown-scoped hit on %q, got %+v", mdPath, hits)
+	}
+	hits, err = srv.store.SearchWithPathPrefix("FormatIsolationHeader", "src:html:", 5)
+	if err != nil {
+		t.Fatalf("search html scope: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Path != htmlPath {
+		t.Fatalf("expected single html-scoped hit on %q, got %+v", htmlPath, hits)
+	}
+}
+
+func TestFetchAndIndex_CacheHitBackfillsOnlyItsFormat(t *testing.T) {
+	srv := newTestServer(t)
+	const url = "http://x.test/partial-purge"
+	const mdContent = "markdown backfill token"
+	const htmlContent = "<html><body>html backfill token</body></html>"
+
+	// Seed both format caches; simulate a partial purge where only the html
+	// doc survived and the markdown doc is missing.
+	if err := srv.store.SetCache(url, "src|markdown", mdContent); err != nil {
+		t.Fatalf("SetCache markdown: %v", err)
+	}
+	if err := srv.store.SetCache(url, "src|html", htmlContent); err != nil {
+		t.Fatalf("SetCache html: %v", err)
+	}
+	indexDoc(t, srv.store, "src:html:"+url, htmlContent)
+
+	res, err := srv.fetchAndIndex(context.Background(), url, "src", "markdown", false, 3600000, time.Second)
+	if err != nil {
+		t.Fatalf("fetchAndIndex: %v", err)
+	}
+	if !res.Cached {
+		t.Fatal("expected markdown cache hit")
+	}
+	if res.IndexError != "" {
+		t.Fatalf("unexpected index error: %s", res.IndexError)
+	}
+
+	// Only the markdown doc may be backfilled; the html doc stays untouched.
+	mdDoc, err := srv.store.Get("src:markdown:" + url)
+	if err != nil || mdDoc == nil {
+		t.Fatalf("markdown doc must be backfilled on its format's cache hit (err=%v)", err)
+	}
+	if mdDoc.Content != mdContent {
+		t.Fatalf("backfilled markdown content mismatch: %q", mdDoc.Content)
+	}
+	htmlDoc, err := srv.store.Get("src:html:" + url)
+	if err != nil || htmlDoc == nil {
+		t.Fatalf("html doc must survive (err=%v)", err)
+	}
+	if htmlDoc.Content != htmlContent {
+		t.Fatalf("html doc must be untouched by markdown backfill: %q", htmlDoc.Content)
+	}
+	count, _ := srv.store.CountByPrefix("src:html:" + url)
+	if count != 1 {
+		t.Fatalf("html doc must stay a single document, got %d", count)
+	}
+}
+
+// ---------- legacy source:url upgrade cleanup ----------
+
+func TestPurgeLegacyFetchDocs(t *testing.T) {
+	srv := newTestServer(t)
+
+	// Old-format docs (source:url), including a chunked one.
+	indexDoc(t, srv.store, "src:http://old.example.com/a", "legacy a")
+	indexDoc(t, srv.store, "src:http://old.example.com/b#chunk-1", "legacy b")
+	indexDoc(t, srv.store, "src:https://old.example.com/c", "legacy c")
+
+	// New-format docs (source:format:url) must survive the cleanup.
+	indexDoc(t, srv.store, "src:markdown:http://new.example.com/a", "new md")
+	indexDoc(t, srv.store, "src:html:http://new.example.com/a", "new html")
+	indexDoc(t, srv.store, "src:json:http://new.example.com/a", "new json")
+
+	// Other sources must not be touched.
+	indexDoc(t, srv.store, "other:http://other.example.com/a", "other legacy")
+
+	n, err := srv.purgeLegacyFetchDocs("src")
+	if err != nil {
+		t.Fatalf("purgeLegacyFetchDocs: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("expected 3 legacy docs deleted, got %d", n)
+	}
+	for _, p := range []string{
+		"src:http://old.example.com/a",
+		"src:http://old.example.com/b#chunk-1",
+		"src:https://old.example.com/c",
+	} {
+		if doc, _ := srv.store.Get(p); doc != nil {
+			t.Fatalf("legacy doc %q survived cleanup", p)
+		}
+	}
+	for _, p := range []string{
+		"src:markdown:http://new.example.com/a",
+		"src:html:http://new.example.com/a",
+		"src:json:http://new.example.com/a",
+		"other:http://other.example.com/a",
+	} {
+		if doc, _ := srv.store.Get(p); doc == nil {
+			t.Fatalf("doc %q must survive cleanup", p)
+		}
+	}
+
+	// Idempotent: a second run removes nothing.
+	n2, err := srv.purgeLegacyFetchDocs("src")
+	if err != nil {
+		t.Fatalf("second purgeLegacyFetchDocs: %v", err)
+	}
+	if n2 != 0 {
+		t.Fatalf("expected 0 on second run, got %d", n2)
 	}
 }
 

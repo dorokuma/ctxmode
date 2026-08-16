@@ -10,8 +10,8 @@ die() { echo -e "${RED}❌ REJECTED:${NC} $*"; exit 1; }
 
 # ── 1. Non-ASCII block ──────────────────────────────────────────────
 # Chinese / Japanese / Korean / Cyrillic → reject.
-if echo "$MSG" | grep -Pn '[^\x00-\x7F]' > /dev/null 2>&1; then
-  nonascii=$(echo "$MSG" | grep -Pn '[^\x00-\x7F]' | head -5)
+if echo "$MSG" | grep -Pn -- '[^\x00-\x7F]' > /dev/null 2>&1; then
+  nonascii=$(echo "$MSG" | grep -Pn -- '[^\x00-\x7F]' | head -5)
   die "commit message contains non-ASCII characters. English only.
 Offending lines:
 $nonascii"
@@ -21,11 +21,11 @@ fi
 # Lines that scream "process diary" instead of "what changed".
 NOISE_WORDS=(
   "审计" "审查" "review.*round" "round.*review" "轮审"
-  "fix.*audit" "audit.*fix" "bug.*fix" "fix.*bug"
+  "fix.*audit" "audit.*fix"
   "修了" "改了" "搞了" "弄了"
 )
 for word in "${NOISE_WORDS[@]}"; do
-  if echo "$MSG" | grep -qiE "$word"; then
+  if echo "$MSG" | grep -qiE -- "$word"; then
     die "commit message contains noise word: \"$word\"
 Write what the change IS, not what process produced it."
   fi
@@ -47,7 +47,7 @@ SECRET_PATTERNS=(
   'secret\s*[:=]\s*\S+'            # secret=
 )
 for pat in "${SECRET_PATTERNS[@]}"; do
-  if echo "$MSG" | grep -qiE "$pat"; then
+  if echo "$MSG" | grep -qiE -- "$pat"; then
     die "commit message appears to contain a secret matching: \"$pat\"
 Secrets must never be committed. Use environment variables."
   fi
@@ -61,7 +61,7 @@ else
   DIFF=$(git diff --cached 2>/dev/null || true)
 fi
 for pat in "${SECRET_PATTERNS[@]}"; do
-  if echo "$DIFF" | grep -qiE "$pat"; then
+  if echo "$DIFF" | grep -qiE -- "$pat"; then
     die "staged changes contain a secret matching: \"$pat\"
 Secrets must never be committed. Use environment variables."
   fi

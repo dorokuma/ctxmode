@@ -555,3 +555,84 @@ func TestExecuteFile_IndexedHintUsesCtxKb(t *testing.T) {
 		t.Fatalf("execute_file auto-index hint must not reference ctx_search:\n%s", text)
 	}
 }
+
+// ============================================================================
+// 项：toolIndex 文件数 / 总字节 cap 后整棵 Walk 早停（SkipAll）
+// ============================================================================
+
+// withIndexCaps shrinks the package-level walk caps for one test and restores
+// them on cleanup. These tests must NOT run in parallel: the caps are shared
+// package state.
+func withIndexCaps(t *testing.T, files int, totalBytes int64) {
+	t.Helper()
+	oldFiles, oldBytes := maxIndexFiles, maxIndexTotalBytes
+	maxIndexFiles, maxIndexTotalBytes = files, totalBytes
+	t.Cleanup(func() { maxIndexFiles, maxIndexTotalBytes = oldFiles, oldBytes })
+}
+
+// buildIndexTree writes cap+1 indexable files under dirA and, in a sibling dir
+// (alphabetically after dirA) beyond maxIndexDepth, a marker file. If the walk
+// does not truly stop at the cap, the walk would reach the marker and record a
+// "max depth 32" skip; if it stops early (SkipAll), the sibling is never
+// visited and no such skip appears.
+func buildIndexTree(t *testing.T, wd string, n int) {
+	t.Helper()
+	dirA := filepath.Join(wd, "aaa")
+	sib := filepath.Join(wd, "zzz-marker")
+	for i := 0; i < n; i++ {
+		mustWrite(t, filepath.Join(dirA, fmt.Sprintf("f%d.txt", i)), "hello world")
+	}
+	deep := sib
+	for i := 0; i < 31; i++ {
+		deep = filepath.Join(deep, fmt.Sprintf("d%d", i))
+	}
+	mustWrite(t, filepath.Join(deep, "marker.txt"), "marker")
+}
+
+func TestToolIndex_StopsWalkAtFileCap(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+	withIndexCaps(t, 3, 100*1024*1024)
+
+	buildIndexTree(t, wd, 4) // 4 files in dirA, cap 3
+
+	res, _, err := s.toolIndex(context.Background(), nil, indexArgs{Path: wd})
+	if err != nil {
+		t.Fatalf("toolIndex: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "Indexed 3 file(s)") {
+		t.Fatalf("expected 3 indexed files, got: %s", text)
+	}
+	if !strings.Contains(text, "[stopped: max files 3]") {
+		t.Fatalf("expected file cap stop notice, got: %s", text)
+	}
+	if strings.Contains(text, "max depth") {
+		t.Fatalf("walk entered sibling dir after file cap (SkipAll missing), got: %s", text)
+	}
+}
+
+func TestToolIndex_StopsWalkAtByteCap(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+	withIndexCaps(t, 5000, 20) // each file is 11 bytes; cap 20 → hit on second file
+
+	buildIndexTree(t, wd, 4)
+
+	res, _, err := s.toolIndex(context.Background(), nil, indexArgs{Path: wd})
+	if err != nil {
+		t.Fatalf("toolIndex: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "Indexed 1 file(s)") {
+		t.Fatalf("expected 1 indexed file, got: %s", text)
+	}
+	if !strings.Contains(text, "[stopped: max total bytes 20]") {
+		t.Fatalf("expected byte cap stop notice, got: %s", text)
+	}
+	if strings.Contains(text, "max depth") {
+		t.Fatalf("walk entered sibling dir after byte cap (SkipAll missing), got: %s", text)
+	}
+}
