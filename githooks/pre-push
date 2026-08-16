@@ -45,7 +45,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     continue # branch deletion — nothing is pushed, nothing to scan
   fi
   if [ "$remote_sha" = "$ZERO_SHA" ]; then
-    rev_args=("$local_sha") # new branch — every local commit is outgoing
+    # New ref (new branch or tag): the remote has no counterpart, so only
+    # commits it does not already own are outgoing. Exclude everything
+    # reachable from any remote-tracking ref; otherwise a tag push would
+    # rescan the entire local history, including old commits the remote
+    # already has (e.g. pre-ASCII-message history).
+    rev_args=("$local_sha" "--not" "--remotes")
   else
     rev_args=("$local_sha" "^$remote_sha")
   fi

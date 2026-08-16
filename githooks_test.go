@@ -180,6 +180,38 @@ func TestPrePushHook(t *testing.T) {
 		}
 	})
 
+	t.Run("new ref on fully remote-owned history passes", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		commitFile(t, repo, "a.txt", "hello\n", "feat: add a")
+		head := commitFile(t, repo, "b.txt", "world\n", "修复加载器")
+		// Simulate the remote already owning all of head's history.
+		runGit(t, repo, "update-ref", "refs/remotes/origin/main", head)
+		// New tag (zero remote sha) pointing at fully owned history: the
+		// pre-existing non-ASCII message must not be rescanned.
+		out, code := runHook(t, repo, script,
+			"refs/tags/v1.0.0 "+head+" refs/tags/v1.0.0 "+zeroSHA+"\n")
+		if code != 0 {
+			t.Fatalf("expected pass (remote already owns history), got exit %d:\n%s", code, out)
+		}
+	})
+
+	t.Run("new ref with commit unseen by remote is rejected", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		base := commitFile(t, repo, "a.txt", "hello\n", "feat: add a")
+		runGit(t, repo, "update-ref", "refs/remotes/origin/main", base)
+		head := commitFile(t, repo, "secret.txt",
+			"token = "+fakeToken+"\n", "feat: add config")
+		// New branch (zero remote sha) with a commit the remote lacks:
+		// the outgoing secret must still be caught.
+		out, code := runHook(t, repo, script,
+			"refs/heads/main "+head+" refs/heads/main "+zeroSHA+"\n")
+		if code == 0 {
+			t.Fatalf("expected rejection for unseen secret commit, got pass:\n%s", out)
+		}
+	})
+
 	t.Run("existing remote only scans outgoing commits", func(t *testing.T) {
 		repo := t.TempDir()
 		initTestRepo(t, repo)
