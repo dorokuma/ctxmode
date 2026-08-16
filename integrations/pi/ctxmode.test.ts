@@ -8,7 +8,7 @@
 //   data: URL stub（测试只触及 CtxmodeClient/diagLog，不触发 registerTools，
 //   stub 无需真实实现）。
 // - 日志全部指向 os.tmpdir() 下临时目录，after() 统一删除，不碰真实家目录。
-// - 假 child process / 假流（EventEmitter），不真 spawn 任何二进制。
+// - 假 child process / 假流（EventEmitter）。启动失败回收测一次本地 stub 脚本。
 import { after, before, test } from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
@@ -24,9 +24,14 @@ interface ClientTestSurface {
   dumpStderrBuffer(force?: boolean): void
   handleProcExit(code: number | null, signal: NodeJS.Signals | null): void
   disposeProc(proc: unknown): Promise<void>
+  sendRequest(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<{ content?: Array<{ text: string }> }>
+  start(): Promise<void>
+  callTool(name: string, args: Record<string, unknown>): Promise<string>
   stderrBuffer: string[]
   stderrCarry: string
   stopped: boolean
+  initialized: boolean
+  proc: { pid?: number } | null
   rl: { close(): void } | null
 }
 
@@ -267,5 +272,90 @@ test("diagLog 超体积上限真的轮转，历史最多保留两个", () => {
     assert.ok(h2.includes("ROT#2") && !h2.includes("ROT#1"), ".2 是上上代，更老的被删")
   } finally {
     delete process.env.CTXMODE_DIAG_MAX_BYTES
+  }
+})
+
+function writeStubBin(name: string, body: string): string {
+  const p = path.join(tmpDir, name)
+  fs.writeFileSync(p, `#!${process.execPath}\n${body}`)
+  fs.chmodSync(p, 0o755)
+  return p
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH"
+  }
+}
+
+// ---- start/initialize 失败回收进程 ----
+test("start/initialize 失败后进程被回收", async () => {
+  const pidfile = path.join(tmpDir, "fail-init.pid")
+  const bin = writeStubBin("fail-init-ctxmode", `
+const fs = require("fs");
+fs.writeFileSync(process.env.CTXMODE_TEST_PIDFILE, String(process.pid));
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  let idx;
+  while ((idx = buf.indexOf("\\n")) >= 0) {
+    const line = buf.slice(0, idx);
+    buf = buf.slice(idx + 1);
+    let msg;
+    try { msg = JSON.parse(line); } catch { continue; }
+    if (msg.method === "initialize") {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { code: -32000, message: "initialize refused" },
+      }) + "\\n");
+    }
+  }
+});
+process.stdin.resume();
+`)
+  process.env.CTXMODE_BIN = bin
+  process.env.CTXMODE_TEST_PIDFILE = pidfile
+  process.env.CTXMODE_DISPOSE_WAIT_MS = "50"
+  const c = newClient()
+  try {
+    await assert.rejects(() => c.start(), /initialize refused/)
+    assert.equal(c.proc, null, "start 失败后不再持有子进程")
+    assert.equal(c.initialized, false, "未标记 initialized")
+    const pid = Number(fs.readFileSync(pidfile, "utf8"))
+    assert.ok(pid > 0, "stub 写出了 pid")
+    assert.equal(pidAlive(pid), false, "子进程已退出")
+  } finally {
+    delete process.env.CTXMODE_BIN
+    delete process.env.CTXMODE_TEST_PIDFILE
+    delete process.env.CTXMODE_DISPOSE_WAIT_MS
+  }
+})
+
+// ---- callTool disconnect 不重放 ----
+test("callTool 在 disconnected 时不二次 tools/call", async () => {
+  for (const boom of ["ctxmode disconnected", "ctxmode not running"]) {
+    const c = newClient()
+    c.initialized = true
+    let toolCalls = 0
+    c.start = async () => {
+      c.initialized = true
+    }
+    c.sendRequest = async (method: string) => {
+      if (method === "tools/call") {
+        toolCalls++
+        throw new Error(boom)
+      }
+      return { content: [] }
+    }
+    await assert.rejects(
+      () => c.callTool("ctx_run", { action: "execute", command: "echo hi" }),
+      new RegExp(boom.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+    )
+    assert.equal(toolCalls, 1, `${boom}: 不重放 tools/call`)
   }
 })

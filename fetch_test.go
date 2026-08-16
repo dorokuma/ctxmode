@@ -872,3 +872,43 @@ func TestToolFetchAndIndex_SearchHintUsesCtxKB(t *testing.T) {
 		t.Fatalf("expected ctx_kb action=search hint, got: %s", text)
 	}
 }
+
+func TestCheckIP_EmbeddedIPv4Blocked(t *testing.T) {
+	cases := []string{
+		"64:ff9b::a9fe:a9fe",
+		"64:ff9b::a00:1",
+		"2002:a9fe:a9fe::",
+		"::169.254.169.254",
+		"::10.0.0.1",
+	}
+	for _, raw := range cases {
+		ip := net.ParseIP(raw)
+		if ip == nil {
+			t.Fatalf("ParseIP(%q) nil", raw)
+		}
+		if err := checkIP(ip); err == nil {
+			t.Errorf("checkIP(%s) allowed embedded private/IMDS", raw)
+		}
+	}
+}
+
+func TestIndexContentLocked_DoesNotDeleteLongerURL(t *testing.T) {
+	srv := newTestServer(t)
+	shortPath := fetchDocPath("web", "markdown", "http://ex.com/foo")
+	longPath := fetchDocPath("web", "markdown", "http://ex.com/foobar")
+	if _, err := srv.indexContentLocked(shortPath, "SHORT"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.indexContentLocked(longPath, "LONG"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.indexContentLocked(shortPath, "SHORT_V2"); err != nil {
+		t.Fatal(err)
+	}
+	if doc, _ := srv.store.Get(longPath); doc == nil {
+		t.Fatal("longer URL document must survive re-index of the shorter prefix")
+	}
+	if doc, _ := srv.store.Get(shortPath); doc == nil || doc.Content != "SHORT_V2" {
+		t.Fatalf("short URL not updated: %+v", doc)
+	}
+}

@@ -245,6 +245,30 @@ func TestPurgeSession_NoPrefixFalsePositive(t *testing.T) {
 	}
 }
 
+func TestPurgeSession_DeletesServerTaggedDocs(t *testing.T) {
+	srv := newTestServer(t)
+	srv.sessionID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	label := srv.indexLabel("execute", "job")
+	if err := srv.storeIndexLocked(label, "tagged execute output"); err != nil {
+		t.Fatal(err)
+	}
+	res, _, err := srv.toolPurge(context.Background(), nil, purgeArgs{
+		Confirm:   true,
+		Scope:     "session",
+		SessionID: srv.sessionID,
+	})
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	text := contentText(res)
+	if !strings.Contains(text, `"deleted_docs": 1`) && !strings.Contains(text, `"deleted_docs":1`) {
+		t.Fatalf("expected deleted_docs=1, got %s", text)
+	}
+	if doc, _ := srv.store.Get(label); doc != nil {
+		t.Fatal("session-tagged execute doc should be gone")
+	}
+}
+
 // helpers
 
 func contentText(result *mcp.CallToolResult) string {

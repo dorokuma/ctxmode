@@ -308,7 +308,7 @@ func TestBatchExecute_LargeOutputIndexedSmallNot(t *testing.T) {
 	}
 
 	// Store must contain the unique label of the big command but nothing for small.
-	if !strings.HasPrefix(big.IndexLabel, batchIndexPrefix+"big:") {
+	if !strings.HasPrefix(big.IndexLabel, batchIndexPrefix) || !strings.Contains(big.IndexLabel, ":big:") {
 		t.Fatalf("index label must stay identifiable by command: %q", big.IndexLabel)
 	}
 	if doc, _ := srv.store.Get(big.IndexLabel); doc == nil {
@@ -350,7 +350,7 @@ func TestBatchExecute_ConcurrentIndexesLargeOutput(t *testing.T) {
 		if r.IndexLabel == "" {
 			t.Fatalf("expected unique index label for %s: %+v", r.Label, r)
 		}
-		if !strings.HasPrefix(r.IndexLabel, batchIndexPrefix+r.Label+":") {
+		if !strings.HasPrefix(r.IndexLabel, batchIndexPrefix) || !strings.Contains(r.IndexLabel, ":"+r.Label+":") {
 			t.Fatalf("index label must stay identifiable by command: %q", r.IndexLabel)
 		}
 		if doc, _ := srv.store.Get(r.IndexLabel); doc == nil {

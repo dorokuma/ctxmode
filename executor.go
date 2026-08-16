@@ -65,46 +65,111 @@ type bgEntry struct {
 	reapScheduled bool // grace-period removal already started
 }
 
-// limitedFileWriter writes to a file until limit is reached, then discards.
-// Safe for concurrent use (background stdout+stderr share one instance).
+// limitedFileWriter keeps the newest `limit` bytes of a background log.
+// Writes wrap in a ring so a long job's FAIL/summary at the end stays
+// readable. compact() linearizes the file so readBackgroundLogTail can
+// seek from EOF. Safe for concurrent stdout+stderr.
 type limitedFileWriter struct {
 	mu        sync.Mutex
 	f         *os.File
 	limit     int64
-	written   int64
+	pos       int64 // next write offset in [0, limit)
+	filled    int64 // valid bytes, ≤ limit
 	truncated bool
 }
 
 func (w *limitedFileWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.written >= w.limit {
-		w.truncated = true
+	if w.limit <= 0 || w.f == nil {
 		return len(p), nil
 	}
-	remaining := w.limit - w.written
-	if int64(len(p)) <= remaining {
-		n, err := w.f.Write(p)
-		w.written += int64(n)
-		return n, err
+	want := len(p)
+	for len(p) > 0 {
+		if w.pos >= w.limit {
+			w.pos = 0
+			w.truncated = true
+		}
+		room := w.limit - w.pos
+		chunk := p
+		if int64(len(chunk)) > room {
+			chunk = chunk[:room]
+			w.truncated = true
+		}
+		if _, err := w.f.WriteAt(chunk, w.pos); err != nil {
+			return 0, err
+		}
+		w.pos += int64(len(chunk))
+		if w.filled < w.limit {
+			w.filled += int64(len(chunk))
+			if w.filled > w.limit {
+				w.filled = w.limit
+			}
+		} else {
+			w.truncated = true
+		}
+		p = p[len(chunk):]
 	}
-	// Partial write up to limit; report full len(p) so the child keeps writing.
-	// Trim the chunk on a UTF-8 rune boundary: a hard byte cut would leave a
-	// half character at the end of the log (rendered as U+FFFD).
-	cut := []byte(truncateUTF8(string(p), int(remaining)))
-	n, err := w.f.Write(cut)
-	w.written += int64(n)
-	w.truncated = true
-	if err != nil {
-		return n, err
-	}
-	return len(p), nil
+	return want, nil
 }
 
 func (w *limitedFileWriter) isTruncated() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.truncated
+}
+
+func (w *limitedFileWriter) logicalBytes() ([]byte, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.logicalBytesLocked()
+}
+
+func (w *limitedFileWriter) logicalBytesLocked() ([]byte, error) {
+	if w.f == nil || w.filled == 0 {
+		return nil, nil
+	}
+	buf := make([]byte, w.filled)
+	if !w.truncated || w.filled < w.limit {
+		_, err := w.f.ReadAt(buf, 0)
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			return nil, err
+		}
+		return dropLeadingPartialRune(buf), nil
+	}
+	// Ring: [pos, limit) oldest, [0, pos) newest.
+	head := w.limit - w.pos
+	n1, err := w.f.ReadAt(buf[:head], w.pos)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return nil, err
+	}
+	n2, err := w.f.ReadAt(buf[n1:n1+int(w.pos)], 0)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return nil, err
+	}
+	return dropLeadingPartialRune(buf[:n1+n2]), nil
+}
+
+// compact rewrites the file as a linear tail so later readers can seek from EOF.
+func (w *limitedFileWriter) compact() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	data, err := w.logicalBytesLocked()
+	if err != nil {
+		return err
+	}
+	if err := w.f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := w.f.Write(data); err != nil {
+		return err
+	}
+	w.pos = int64(len(data))
+	w.filled = int64(len(data))
+	return nil
 }
 
 var (
@@ -225,6 +290,7 @@ func finishBackground(id string, exitCode int) {
 	temps := append([]string(nil), e.TempFiles...)
 	e.TempFiles = nil
 	logFile := e.logFile
+	logWriter := e.logWriter
 	e.logFile = nil
 	e.logWriter = nil
 	logPath := e.LogPath
@@ -237,6 +303,9 @@ func finishBackground(id string, exitCode int) {
 		e.reapScheduled = true
 	}
 	bgMu.Unlock()
+	if logWriter != nil && logFile != nil {
+		_ = logWriter.compact()
+	}
 	if logFile != nil {
 		_ = logFile.Close()
 	}
@@ -335,6 +404,18 @@ func readBackgroundLogTail(logPath string, tailLines, tailBytes int) (string, er
 	if logPath == "" {
 		return "", fmt.Errorf("no log available")
 	}
+	if tailLines <= 0 {
+		tailLines = 100
+	}
+	if tailLines > maxBackgroundTailLines {
+		return "", fmt.Errorf("tail_lines %d exceeds maximum allowed (%d)", tailLines, maxBackgroundTailLines)
+	}
+	if tailBytes < 0 || tailBytes > maxBackgroundTailBytes {
+		return "", fmt.Errorf("tail_bytes %d exceeds maximum allowed (%d)", tailBytes, maxBackgroundTailBytes)
+	}
+	if live, ok := readLiveBgLog(logPath); ok {
+		return trimBgLogTail(live, tailLines, tailBytes, false), nil
+	}
 	f, err := os.Open(logPath)
 	if err != nil {
 		return "", fmt.Errorf("read log: %w", err)
@@ -348,16 +429,6 @@ func readBackgroundLogTail(logPath string, tailLines, tailBytes int) (string, er
 	size := st.Size()
 	if size == 0 {
 		return "", nil
-	}
-
-	if tailLines <= 0 {
-		tailLines = 100
-	}
-	if tailLines > maxBackgroundTailLines {
-		return "", fmt.Errorf("tail_lines %d exceeds maximum allowed (%d)", tailLines, maxBackgroundTailLines)
-	}
-	if tailBytes < 0 || tailBytes > maxBackgroundTailBytes {
-		return "", fmt.Errorf("tail_bytes %d exceeds maximum allowed (%d)", tailBytes, maxBackgroundTailBytes)
 	}
 
 	// How many bytes to pull from the end. Prefer explicit tailBytes; else
@@ -390,25 +461,38 @@ func readBackgroundLogTail(logPath string, tailLines, tailBytes int) (string, er
 		return "", fmt.Errorf("read log: %w", err)
 	}
 	data = data[:n]
+	return trimBgLogTail(data, tailLines, tailBytes, offset > 0), nil
+}
 
-	// Drop partial first line when we started mid-file.
-	if offset > 0 {
+func readLiveBgLog(logPath string) ([]byte, bool) {
+	bgMu.Lock()
+	defer bgMu.Unlock()
+	for _, e := range bgProcs {
+		if e.LogPath == logPath && e.logWriter != nil {
+			b, err := e.logWriter.logicalBytes()
+			if err != nil {
+				return nil, false
+			}
+			return b, true
+		}
+	}
+	return nil, false
+}
+
+func trimBgLogTail(data []byte, tailLines, tailBytes int, droppedPrefix bool) string {
+	if droppedPrefix {
 		if i := bytes.IndexByte(data, '\n'); i >= 0 && i+1 <= len(data) {
 			data = data[i+1:]
 		}
 	}
-
-	// If tailBytes requested and we still have more (shouldn't after seek), trim.
 	if tailBytes > 0 && len(data) > tailBytes {
 		data = data[len(data)-tailBytes:]
 		if i := bytes.IndexByte(data, '\n'); i >= 0 && i+1 < len(data) {
 			data = data[i+1:]
 		}
 	}
-
 	if tailLines > 0 {
 		lines := bytes.Split(data, []byte{'\n'})
-		// Drop trailing empty from final newline.
 		if len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
 			lines = lines[:len(lines)-1]
 		}
@@ -417,13 +501,9 @@ func readBackgroundLogTail(logPath string, tailLines, tailBytes int) (string, er
 		}
 		data = bytes.Join(lines, []byte{'\n'})
 	}
-	// Keep the result on UTF-8 rune boundaries at BOTH ends: the byte window
-	// can start mid-rune (seek offset) and the file can end mid-rune (process
-	// killed mid-write). A raw string(data) would render a mojibake
-	// replacement character at the head.
 	data = dropLeadingPartialRune(data)
 	data = trimTrailingPartialRune(data)
-	return string(data), nil
+	return string(data)
 }
 
 // procStartTime reads field 22 (starttime, in clock ticks since boot) from
@@ -545,17 +625,24 @@ func killBackground(idOrPID string) (string, error) {
 			lastErr = err
 		}
 		time.Sleep(500 * time.Millisecond)
-		if err := killErr(syscall.Kill(-pgid, syscall.SIGKILL)); err != nil {
+		current = procStartTime(pid)
+		if current == 0 || current != starttime {
+			// Exited after SIGTERM, or PID was reused — do not SIGKILL.
+			lastErr = nil
+		} else if err := killErr(syscall.Kill(-pgid, syscall.SIGKILL)); err != nil {
 			lastErr = err
 		} else {
-			lastErr = nil // process gone or SIGKILL delivered
+			lastErr = nil
 		}
 	} else {
 		if err := killErr(syscall.Kill(pid, syscall.SIGTERM)); err != nil {
 			lastErr = err
 		}
 		time.Sleep(500 * time.Millisecond)
-		if err := killErr(syscall.Kill(pid, syscall.SIGKILL)); err != nil {
+		current = procStartTime(pid)
+		if current == 0 || current != starttime {
+			lastErr = nil
+		} else if err := killErr(syscall.Kill(pid, syscall.SIGKILL)); err != nil {
 			lastErr = err
 		} else {
 			lastErr = nil
@@ -759,20 +846,22 @@ func (s *server) toolBackgroundLog(ctx context.Context, _ *mcp.CallToolRequest, 
 		return nil, nil, err
 	}
 	type logResult struct {
-		ID       string `json:"id"`
-		PID      int    `json:"pid"`
-		Done     bool   `json:"done"`
-		ExitCode int    `json:"exit_code,omitempty"`
-		LogPath  string `json:"log_path,omitempty"`
-		Log      string `json:"log"`
+		ID           string `json:"id"`
+		PID          int    `json:"pid"`
+		Done         bool   `json:"done"`
+		ExitCode     int    `json:"exit_code,omitempty"`
+		LogPath      string `json:"log_path,omitempty"`
+		Log          string `json:"log"`
+		LogTruncated bool   `json:"log_truncated,omitempty"`
 	}
 	out := logResult{
-		ID:       entry.ID,
-		PID:      entry.PID,
-		Done:     entry.Done,
-		ExitCode: entry.ExitCode,
-		LogPath:  entry.LogPath,
-		Log:      logText,
+		ID:           entry.ID,
+		PID:          entry.PID,
+		Done:         entry.Done,
+		ExitCode:     entry.ExitCode,
+		LogPath:      entry.LogPath,
+		Log:          logText,
+		LogTruncated: entry.LogTruncated,
 	}
 	js, _ := json.MarshalIndent(out, "", "  ")
 	return &mcp.CallToolResult{
@@ -826,22 +915,24 @@ func (s *server) toolBackgroundWait(ctx context.Context, _ *mcp.CallToolRequest,
 
 	logText, _ := readBackgroundLogTail(entry.LogPath, 100, 0)
 	type waitResult struct {
-		ID       string `json:"id"`
-		PID      int    `json:"pid"`
-		Done     bool   `json:"done"`
-		ExitCode int    `json:"exit_code,omitempty"`
-		LogPath  string `json:"log_path,omitempty"`
-		Log      string `json:"log"`
-		TimedOut bool   `json:"timed_out,omitempty"`
+		ID           string `json:"id"`
+		PID          int    `json:"pid"`
+		Done         bool   `json:"done"`
+		ExitCode     int    `json:"exit_code,omitempty"`
+		LogPath      string `json:"log_path,omitempty"`
+		Log          string `json:"log"`
+		TimedOut     bool   `json:"timed_out,omitempty"`
+		LogTruncated bool   `json:"log_truncated,omitempty"`
 	}
 	out := waitResult{
-		ID:       entry.ID,
-		PID:      entry.PID,
-		Done:     entry.Done,
-		ExitCode: entry.ExitCode,
-		LogPath:  entry.LogPath,
-		Log:      logText,
-		TimedOut: !entry.Done,
+		ID:           entry.ID,
+		PID:          entry.PID,
+		Done:         entry.Done,
+		ExitCode:     entry.ExitCode,
+		LogPath:      entry.LogPath,
+		Log:          logText,
+		TimedOut:     !entry.Done,
+		LogTruncated: entry.LogTruncated,
 	}
 	js, _ := json.MarshalIndent(out, "", "  ")
 	return &mcp.CallToolResult{
@@ -1247,47 +1338,44 @@ func wrapCode(language, code string) string {
 
 // ---------- file content injection for ctx_run: execute_file ----------
 
-// injectFileContent prepends a FILE_CONTENT variable definition to the user's
-// code, so the subprocess script can access the file contents through a variable.
+// injectFileContent inserts a FILE_CONTENT variable so execute_file code can
+// read the target file. The declaration is spliced after language preambles
+// (Go package/import, Python __future__, PHP declare) so whole-file sources
+// still compile.
 func injectFileContent(language, code, fileContent string) string {
+	decl := fileContentDecl(language, fileContent)
+	if decl == "" {
+		return code
+	}
+	return spliceFileContentDecl(language, code, decl)
+}
+
+func fileContentDecl(language, fileContent string) string {
 	switch language {
 	case "shell":
-		// Single-quoted string: all characters are literal except single quote.
-		// Escape single quotes by ending the quote, adding an escaped quote, and
-		// reopening: 'text'\''more' evaluates to text'more.
 		escaped := strings.ReplaceAll(fileContent, `'`, `'\''`)
-		return fmt.Sprintf(`FILE_CONTENT='%s'
-%s`, escaped, code)
+		return fmt.Sprintf("FILE_CONTENT='%s'\n", escaped)
 
 	case "javascript", "typescript":
-		// Backtick template literal; escape backslash, backticks, and ${} interpolation.
-		// Order matters: backslash first so we don't re-escape injected backslashes.
 		escaped := strings.ReplaceAll(fileContent, `\`, `\\`)
 		escaped = strings.ReplaceAll(escaped, "`", "\\`")
 		escaped = strings.ReplaceAll(escaped, "${", "\\${")
-		return "const FILE_CONTENT = `" + escaped + "`;\n" + code
+		return "const FILE_CONTENT = `" + escaped + "`;\n"
 
 	case "python":
-		// Triple-quoted raw string. Raw strings cannot contain """, and a
-		// trailing quote would prematurely close the literal. A trailing
-		// backslash is also illegal in a Python raw string (r"foo\").
-		// Fall back to base64 for those cases.
 		if strings.Contains(fileContent, `"""`) ||
 			strings.HasSuffix(fileContent, `"`) ||
 			strings.HasSuffix(fileContent, `\`) {
 			encoded := base64.StdEncoding.EncodeToString([]byte(fileContent))
-			return "import base64\nFILE_CONTENT = base64.b64decode(\"" + encoded + "\").decode()\n" + code
+			return "import base64\nFILE_CONTENT = base64.b64decode(\"" + encoded + "\").decode()\n"
 		}
-		return "FILE_CONTENT = r\"\"\"" + fileContent + "\"\"\"\n" + code
+		return "FILE_CONTENT = r\"\"\"" + fileContent + "\"\"\"\n"
 
 	case "go":
-		// Go raw string literal (backtick-delimited); cannot contain backticks.
-		// Split on backticks and concatenate with escaped quotes.
 		parts := strings.Split(fileContent, "`")
 		if len(parts) == 1 {
-			return "FILE_CONTENT := `" + fileContent + "`\n" + code
+			return "FILE_CONTENT := `" + fileContent + "`\n"
 		}
-		// Multiple backticks: build a concatenation expression.
 		var sb strings.Builder
 		sb.WriteString("FILE_CONTENT := ")
 		for i, p := range parts {
@@ -1296,59 +1384,223 @@ func injectFileContent(language, code, fileContent string) string {
 			}
 			sb.WriteString("`" + p + "`")
 		}
-		sb.WriteString("\n" + code)
+		sb.WriteByte('\n')
 		return sb.String()
 
 	case "rust":
-		// Rust uses double-quoted strings with escaped quotes and backslashes.
 		escaped := strings.ReplaceAll(fileContent, `\`, `\\`)
 		escaped = strings.ReplaceAll(escaped, `"`, `\"`)
 		escaped = strings.ReplaceAll(escaped, "\n", `\n`)
 		escaped = strings.ReplaceAll(escaped, "\r", `\r`)
-		return `    let FILE_CONTENT = "` + escaped + `";` + "\n" + code
+		return `    let FILE_CONTENT = "` + escaped + `";` + "\n"
 
 	case "php":
-		// Single-quoted PHP string; escape single quotes and backslashes.
 		escaped := strings.ReplaceAll(fileContent, `\`, `\\`)
 		escaped = strings.ReplaceAll(escaped, `'`, `\'`)
-		return "$FILE_CONTENT = '" + escaped + "';\n" + code
+		return "$FILE_CONTENT = '" + escaped + "';\n"
 
 	case "perl":
-		// Single-quoted Perl string: only \\ and \' are special.
-		// Newlines are literal (multi-line string is valid).
 		escaped := strings.ReplaceAll(fileContent, `\`, `\\`)
 		escaped = strings.ReplaceAll(escaped, `'`, `\'`)
-		return "my $FILE_CONTENT = '" + escaped + "';\n" + code
+		return "my $FILE_CONTENT = '" + escaped + "';\n"
 
 	case "ruby":
-		// Single-quoted Ruby string.
 		escaped := strings.ReplaceAll(fileContent, `\`, `\\`)
 		escaped = strings.ReplaceAll(escaped, `'`, `\'`)
-		return "FILE_CONTENT = '" + escaped + "'\n" + code
+		return "FILE_CONTENT = '" + escaped + "'\n"
 
 	case "r":
-		// Single-quoted R string.
 		escaped := strings.ReplaceAll(fileContent, `\`, `\\`)
 		escaped = strings.ReplaceAll(escaped, `'`, `\'`)
-		return "FILE_CONTENT <- '" + escaped + "'\n" + code
+		return "FILE_CONTENT <- '" + escaped + "'\n"
 
 	case "elixir":
-		// ~S sigil disables interpolation and escapes.
-		// Triple-quote cannot be escaped inside ~S, so fall back to base64.
 		if strings.Contains(fileContent, `"""`) {
 			encoded := base64.StdEncoding.EncodeToString([]byte(fileContent))
-			return "FILE_CONTENT = Base.decode64!(\"" + encoded + "\")\n" + code
+			return "FILE_CONTENT = Base.decode64!(\"" + encoded + "\")\n"
 		}
-		return "FILE_CONTENT = ~S\"\"\"\n" + fileContent + "\n\"\"\"\n" + code
+		// ~S"""content""" — no extra wrapping newlines (those would become data).
+		return "FILE_CONTENT = ~S\"\"\"" + fileContent + "\"\"\"\n"
 
 	case "csharp":
-		// Verbatim string literal (@"").
 		escaped := strings.ReplaceAll(fileContent, `"`, `""`)
-		return "var FILE_CONTENT = @\"" + escaped + "\";\n" + code
+		return "var FILE_CONTENT = @\"" + escaped + "\";\n"
 
 	default:
-		return code
+		return ""
 	}
+}
+
+func spliceFileContentDecl(language, code, decl string) string {
+	switch language {
+	case "go":
+		return spliceAfterGoPreamble(code, decl)
+	case "python":
+		return spliceAfterPythonPreamble(code, decl)
+	case "php":
+		return spliceAfterPHPPreamble(code, decl)
+	default:
+		return decl + code
+	}
+}
+
+func spliceAfterGoPreamble(code, decl string) string {
+	if !strings.Contains(code, "package ") {
+		return decl + code
+	}
+	// After `package x` and an optional import / import ( ... ) block.
+	rest := code
+	var head strings.Builder
+	// package line
+	if i := strings.Index(rest, "package "); i >= 0 {
+		head.WriteString(rest[:i])
+		rest = rest[i:]
+		if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+			head.WriteString(rest[:nl+1])
+			rest = rest[nl+1:]
+		} else {
+			return code + "\n" + decl
+		}
+	}
+	// skip blanks and line comments
+	skipWSComments := func() {
+		for {
+			trim := strings.TrimLeft(rest, " \t")
+			if strings.HasPrefix(trim, "\n") {
+				head.WriteString(rest[:len(rest)-len(trim)+1])
+				rest = trim[1:]
+				continue
+			}
+			if strings.HasPrefix(trim, "//") {
+				if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+					head.WriteString(rest[:nl+1])
+					rest = rest[nl+1:]
+					continue
+				}
+			}
+			return
+		}
+	}
+	skipWSComments()
+	trim := strings.TrimLeft(rest, " \t")
+	if strings.HasPrefix(trim, "import (") {
+		if end := strings.Index(rest, "\n)"); end >= 0 {
+			// include closing line
+			nl := strings.IndexByte(rest[end+2:], '\n')
+			if nl >= 0 {
+				head.WriteString(rest[:end+2+nl+1])
+				rest = rest[end+2+nl+1:]
+			} else {
+				head.WriteString(rest)
+				rest = ""
+			}
+		}
+	} else if strings.HasPrefix(trim, "import ") {
+		if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+			head.WriteString(rest[:nl+1])
+			rest = rest[nl+1:]
+		}
+	}
+	head.WriteString(decl)
+	head.WriteString(rest)
+	return head.String()
+}
+
+func spliceAfterPythonPreamble(code, decl string) string {
+	rest := code
+	var head strings.Builder
+	takeLine := func() (string, bool) {
+		nl := strings.IndexByte(rest, '\n')
+		if nl < 0 {
+			line := rest
+			rest = ""
+			return line, false
+		}
+		line := rest[:nl+1]
+		rest = rest[nl+1:]
+		return line, true
+	}
+	if strings.HasPrefix(rest, "#!") {
+		line, _ := takeLine()
+		head.WriteString(line)
+	}
+	// encoding cookie / comments / blanks
+	for rest != "" {
+		trim := strings.TrimLeft(rest, " \t")
+		if strings.HasPrefix(trim, "\n") || strings.HasPrefix(trim, "#") {
+			line, _ := takeLine()
+			head.WriteString(line)
+			continue
+		}
+		break
+	}
+	// module docstring
+	trim := strings.TrimLeft(rest, " \t")
+	if strings.HasPrefix(trim, `"""`) || strings.HasPrefix(trim, "'''") {
+		q := `"""`
+		if strings.HasPrefix(trim, "'''") {
+			q = "'''"
+		}
+		// find closing quotes after the opener
+		start := strings.Index(rest, q)
+		if start >= 0 {
+			end := strings.Index(rest[start+3:], q)
+			if end >= 0 {
+				abs := start + 3 + end + 3
+				if nl := strings.IndexByte(rest[abs:], '\n'); nl >= 0 {
+					abs += nl + 1
+				}
+				head.WriteString(rest[:abs])
+				rest = rest[abs:]
+			}
+		}
+	}
+	for rest != "" {
+		trim = strings.TrimLeft(rest, " \t")
+		if strings.HasPrefix(trim, "from __future__ import") {
+			line, _ := takeLine()
+			head.WriteString(line)
+			continue
+		}
+		if strings.HasPrefix(trim, "\n") {
+			line, _ := takeLine()
+			head.WriteString(line)
+			continue
+		}
+		break
+	}
+	head.WriteString(decl)
+	head.WriteString(rest)
+	return head.String()
+}
+
+func spliceAfterPHPPreamble(code, decl string) string {
+	rest := code
+	var head strings.Builder
+	trim := strings.TrimLeft(rest, " \t")
+	if strings.HasPrefix(trim, "<?php") {
+		if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+			head.WriteString(rest[:nl+1])
+			rest = rest[nl+1:]
+		}
+	}
+	for rest != "" {
+		trim = strings.TrimLeft(rest, " \t")
+		if strings.HasPrefix(trim, "declare(") {
+			if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+				head.WriteString(rest[:nl+1])
+				rest = rest[nl+1:]
+				continue
+			}
+			head.WriteString(rest)
+			rest = ""
+			break
+		}
+		break
+	}
+	head.WriteString(decl)
+	head.WriteString(rest)
+	return head.String()
 }
 
 // ---------- core execution ----------
@@ -1660,9 +1912,10 @@ func runCompiledOpts(ctx context.Context, language string, rt runtimeConfig, tmp
 				os.Remove(outPath)
 			}
 			return &executeResult{
-				Stdout:   compileOutBuf.String(),
-				Stderr:   fmt.Sprintf("compilation failed: %v", err),
-				ExitCode: -1,
+				Stdout:    compileOutBuf.String(),
+				Stderr:    fmt.Sprintf("compilation failed: %v", err),
+				ExitCode:  -1,
+				Truncated: compileOutBuf.truncated,
 			}, nil
 		}
 		compileDone := make(chan error, 1)
@@ -1693,9 +1946,10 @@ func runCompiledOpts(ctx context.Context, language string, rt runtimeConfig, tmp
 				os.Remove(outPath)
 			}
 			return &executeResult{
-				Stdout:   compileOutBuf.String(),
-				Stderr:   fmt.Sprintf("compilation failed: %v", compileErr),
-				ExitCode: -1,
+				Stdout:    compileOutBuf.String(),
+				Stderr:    fmt.Sprintf("compilation failed: %v", compileErr),
+				ExitCode:  -1,
+				Truncated: compileOutBuf.truncated,
 			}, nil
 		}
 		cmd = exec.Command(outPath)

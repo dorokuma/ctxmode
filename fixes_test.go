@@ -106,6 +106,27 @@ func TestInjectFileContent_PythonTrailingBackslash(t *testing.T) {
 	}
 }
 
+func TestInjectFileContent_PythonFutureAndElixirBytes(t *testing.T) {
+	code := "from __future__ import annotations\nprint(FILE_CONTENT)\n"
+	out := injectFileContent("python", code, "hello")
+	fut := strings.Index(out, "from __future__ import annotations")
+	decl := strings.Index(out, "FILE_CONTENT")
+	if fut < 0 || decl < 0 || fut > decl {
+		t.Fatalf("FILE_CONTENT must come after __future__, got:\n%s", out)
+	}
+
+	el := injectFileContent("elixir", "IO.puts(FILE_CONTENT)", "abc")
+	if !strings.Contains(el, `~S"""abc"""`) {
+		t.Fatalf("elixir FILE_CONTENT must be exact bytes, got:\n%s", el)
+	}
+
+	goSrc := "package main\n\nfunc main() {}\n"
+	gout := injectFileContent("go", goSrc, "xyz")
+	if !strings.HasPrefix(strings.TrimSpace(gout), "package main") {
+		t.Fatalf("go package line must stay first:\n%s", gout)
+	}
+}
+
 // ---------- #4 HTTP non-2xx ----------
 
 func TestFetchURL_Non2xx(t *testing.T) {
@@ -148,6 +169,24 @@ func TestSearchWithPathPrefix_Batch(t *testing.T) {
 		if !strings.HasPrefix(h.Path, "batch:") {
 			t.Fatalf("non-batch path in scoped results: %q", h.Path)
 		}
+	}
+}
+
+func TestSearchPrefixScoped_ThisBatchRunOnly(t *testing.T) {
+	st := newTestStore(t)
+	fg := NewFloodGuard(time.Hour, 64)
+	sp := NewSearchPipeline(st, fg)
+	indexDoc(t, st, "batch:111-old:cmd:1:1", "OLD_BATCH_UNIQUE_FAIL_MARKER leftover")
+	indexDoc(t, st, "batch:222-new:cmd:1:1", "NEW_BATCH_OK_MARKER plus OLD_BATCH_UNIQUE_FAIL_MARKER")
+	hits, _, err := sp.SearchPrefixScoped("OLD_BATCH_UNIQUE_FAIL_MARKER", "batch:222-new:", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("expected only this-run hit, got %d", len(hits))
+	}
+	if !strings.HasPrefix(hits[0].Path, "batch:222-new:") {
+		t.Fatalf("historical batch leaked into this-run search: %q", hits[0].Path)
 	}
 }
 
@@ -569,8 +608,8 @@ func TestValidateURL_AllowsIfAnyIPSafe(t *testing.T) {
 
 func TestVersionAligned(t *testing.T) {
 	// Keep in sync with CHANGELOG release label.
-	if Version != "3.1.1" {
-		t.Fatalf("Version=%q, want 3.1.1 (CHANGELOG)", Version)
+	if Version != "3.1.2" {
+		t.Fatalf("Version=%q, want 3.1.2 (CHANGELOG)", Version)
 	}
 }
 
@@ -672,7 +711,7 @@ func TestAutoIndex_FailureHasPreviewNotIndexedAs(t *testing.T) {
 	if !strings.Contains(text, "NOT indexed") {
 		t.Fatalf("expected NOT indexed in failure message, got: %s", truncateForTest(text, 300))
 	}
-	if !strings.Contains(text, "--- Preview ---") {
+	if !strings.Contains(text, "--- Tail preview ---") && !strings.Contains(text, "--- Preview ---") {
 		t.Fatalf("expected truncated preview on index failure, got: %s", truncateForTest(text, 300))
 	}
 	// Preview should include some of the output body.

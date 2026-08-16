@@ -8,7 +8,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -20,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -29,7 +32,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "3.1.1"
+const Version = "3.1.2"
 
 // toolIndex walk / size limits.
 const (
@@ -47,6 +50,7 @@ var (
 type server struct {
 	workdirs       []string
 	dbPath         string
+	sessionID      string
 	mu             sync.Mutex
 	store          *Store
 	floodGuard     *FloodGuard
@@ -135,9 +139,12 @@ func main() {
 	floodGuard := NewFloodGuard(60*time.Second, 64)
 	searchPipeline := NewSearchPipeline(store, floodGuard)
 
+	sessionID := newSessionID()
+	log.Printf("ctxmode: session %s", sessionID)
 	s := &server{
 		workdirs:       workdirs,
 		dbPath:         dbPath,
+		sessionID:      sessionID,
 		store:          store,
 		floodGuard:     floodGuard,
 		searchPipeline: searchPipeline,
@@ -368,17 +375,11 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 
 	if len(outputText) > autoIndexThreshold {
 		// Unconditionally index large outputs.
-		label := uniqueIndexLabel("execute", args.Intent)
+		label := s.indexLabel("execute", args.Intent)
 		if err := s.storeIndexLocked(label, outputText); err != nil {
-			// Index failed: still return a truncated preview so the agent is not blind.
-			preview := outputText
-			if len(preview) > 2000 {
-				preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
-			}
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{
-					Text: fmt.Sprintf("Output is too large (%d bytes). Indexing failed: %v. Content was NOT indexed.\n\n--- Preview ---\n%s",
-						len(outputText), err, preview),
+					Text: formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, err),
 				}},
 			}, nil, nil
 		}
@@ -386,15 +387,14 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		result.IndexLabel = label
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{
-				Text: fmt.Sprintf("Output is too large (%d bytes). Indexed as %q. Use ctx_kb action=search query=%q to search the indexed content.",
-					len(outputText), label, label),
+				Text: formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, nil),
 			}},
 		}, nil, nil
 	}
 
 	if len(outputText) > intentThreshold && args.Intent != "" {
 		// Index and return a preview.
-		label := uniqueIndexLabel("execute", args.Intent)
+		label := s.indexLabel("execute", args.Intent)
 		if err := s.storeIndexLocked(label, outputText); err != nil {
 			preview := outputText
 			if len(preview) > 2000 {
@@ -596,7 +596,7 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		// If blocked by flood guard, return a friendly message.
 		if meta != nil && meta.FloodStatus == "blocked" {
 			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: "Search blocked: too many requests in a short time. Wait a moment, or use ctx_run action=batch (query_scope=batch searches bypass the flood guard)."}},
+				Content: []mcp.Content{&mcp.TextContent{Text: "Search blocked: too many requests in a short time. Wait a moment and retry. ctx_run action=batch with query_scope=batch only searches documents indexed by that batch run (not execute/run_task/fetch output) and bypasses this guard."}},
 			}, nil, nil
 		}
 		return nil, nil, fmt.Errorf("search failed: %w", err)
@@ -650,13 +650,14 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 
 // statsResult is the detailed response for ctx_kb action=stats.
 type statsResult struct {
-	DocsIndexed        int   `json:"docs_indexed"`
-	CacheEntries       int   `json:"cache_entries"`
-	DBSizeBytes        int64 `json:"db_size_bytes"`
-	TotalInput         int64 `json:"total_input_bytes"`
-	TotalOutput        int64 `json:"total_output_bytes"`
-	SavedEstimateBytes int64 `json:"saved_estimate_bytes"`
-	SearchCallsWindow  int   `json:"search_calls_60s,omitempty" jsonschema:"number of OK search calls in the 60s sliding window (counts only allowed calls, not throttled or blocked)"`
+	DocsIndexed        int    `json:"docs_indexed"`
+	CacheEntries       int    `json:"cache_entries"`
+	DBSizeBytes        int64  `json:"db_size_bytes"`
+	TotalInput         int64  `json:"total_input_bytes"`
+	TotalOutput        int64  `json:"total_output_bytes"`
+	SavedEstimateBytes int64  `json:"saved_estimate_bytes"`
+	SearchCallsWindow  int    `json:"search_calls_60s,omitempty" jsonschema:"number of OK search calls in the 60s sliding window (counts only allowed calls, not throttled or blocked)"`
+	SessionID          string `json:"session_id,omitempty"`
 }
 
 type statsArgs struct{}
@@ -691,6 +692,7 @@ func (s *server) toolStats(ctx context.Context, _ *mcp.CallToolRequest, _ statsA
 		TotalOutput:        s.totalOutput,
 		SavedEstimateBytes: savedBytes,
 		SearchCallsWindow:  windowCount,
+		SessionID:          s.sessionID,
 	}
 
 	js, _ := json.MarshalIndent(res, "", "  ")
@@ -736,10 +738,18 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		return nil, nil, fmt.Errorf("file %q appears to be binary, refusing to read as code input", target)
 	}
 
-	// Read file content.
-	fileContent, err := os.ReadFile(target)
+	// Read file content. O_NOFOLLOW rejects a last-component symlink swap.
+	rf, err := os.OpenFile(target, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read file: %w", err)
+	}
+	fileContent, err := io.ReadAll(io.LimitReader(rf, 10*1024*1024+1))
+	rf.Close()
+	if err != nil {
+		return nil, nil, fmt.Errorf("read file: %w", err)
+	}
+	if int64(len(fileContent)) > 10*1024*1024 {
+		return nil, nil, fmt.Errorf("file %q is too large (%d bytes, max 10MB)", target, len(fileContent))
 	}
 	if isBinaryContent(fileContent) {
 		return nil, nil, fmt.Errorf("file %q appears to be binary (content sample), refusing to read as code input", target)
@@ -793,6 +803,12 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		}
 		outputText += result.Stderr
 	}
+	if result.ExitCode != 0 {
+		if outputText != "" {
+			outputText += "\n"
+		}
+		outputText += fmt.Sprintf("(exited with code %d)", result.ExitCode)
+	}
 	if result.Truncated {
 		if outputText != "" {
 			outputText += "\n"
@@ -811,17 +827,11 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		if intent == "" {
 			intent = filepath.Base(target)
 		}
-		label := uniqueIndexLabel("execute_file", intent)
+		label := s.indexLabel("execute_file", intent)
 		if err := s.storeIndexLocked(label, outputText); err != nil {
-			// Index failed: still return a truncated preview so the agent is not blind.
-			preview := outputText
-			if len(preview) > 2000 {
-				preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
-			}
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{
-					Text: fmt.Sprintf("Output is too large (%d bytes). Indexing failed: %v. Content was NOT indexed.\n\n--- Preview ---\n%s",
-						len(outputText), err, preview),
+					Text: formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, err),
 				}},
 			}, nil, nil
 		}
@@ -829,14 +839,13 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		result.IndexLabel = label
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{
-				Text: fmt.Sprintf("Output is too large (%d bytes). Indexed as %q. Use ctx_kb action=search query=%q to search.",
-					len(outputText), label, label),
+				Text: formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, nil),
 			}},
 		}, nil, nil
 	}
 
 	if len(outputText) > intentThreshold && args.Intent != "" {
-		label := uniqueIndexLabel("execute_file", args.Intent)
+		label := s.indexLabel("execute_file", args.Intent)
 		if err := s.storeIndexLocked(label, outputText); err != nil {
 			preview := outputText
 			if len(preview) > 2000 {
@@ -893,8 +902,9 @@ func (s *server) indexFile(path string) error {
 	}
 	// Read with a hard cap (maxIndexFileBytes+1): an oversized file is never
 	// slurped into memory whole, and the +1 catches growth past the limit
-	// between the stat above and the read.
-	f, err := os.Open(real)
+	// between the stat above and the read. O_NOFOLLOW rejects a last-component
+	// symlink swap after ensureInsideWorkspaces.
+	f, err := os.OpenFile(real, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
 	}
@@ -1053,7 +1063,7 @@ func isSensitiveFilePath(path string) bool {
 	}
 	for _, seg := range strings.Split(lower, string(filepath.Separator)) {
 		switch seg {
-		case ".aws", ".ssh", ".gnupg", ".kube":
+		case ".aws", ".ssh", ".gnupg", ".kube", ".env":
 			return true
 		}
 	}
@@ -1106,6 +1116,40 @@ func uniqueIndexLabel(prefix, intent string) string {
 		base += ":" + intent
 	}
 	return fmt.Sprintf("%s:%d:%d", base, time.Now().UnixNano(), indexLabelSeq.Add(1))
+}
+
+func newSessionID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func (s *server) indexLabel(kind, intent string) string {
+	base := uniqueIndexLabel(kind, intent)
+	if s == nil || s.sessionID == "" {
+		return base
+	}
+	return "session:" + s.sessionID + ":" + base
+}
+
+func (s *server) batchRunPrefix(runID string) string {
+	p := batchIndexPrefix + runID + ":"
+	if s != nil && s.sessionID != "" {
+		return "session:" + s.sessionID + ":" + p
+	}
+	return p
+}
+
+func formatLargeIndexed(exitCode, n int, label, outputText string, indexErr error) string {
+	preview := tailUTF8(outputText, 2000)
+	if indexErr != nil {
+		return fmt.Sprintf("exit_code: %d\nOutput is too large (%d bytes). Indexing failed: %v. Content was NOT indexed.\n\n--- Tail preview ---\n%s",
+			exitCode, n, indexErr, preview)
+	}
+	return fmt.Sprintf("exit_code: %d\nOutput is too large (%d bytes). Indexed as %q. Use ctx_kb action=search query=%q to search the indexed content.\n\n--- Tail preview ---\n%s",
+		exitCode, n, label, label, preview)
 }
 
 // storeIndexLocked wraps store.Index with the server mutex, ensuring that

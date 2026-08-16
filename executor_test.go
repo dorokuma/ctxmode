@@ -539,24 +539,29 @@ func TestLimitedFileWriter_CapsAtLimit(t *testing.T) {
 	if err != nil || n != 80 {
 		t.Fatalf("first write: n=%d err=%v", n, err)
 	}
-	n, err = w.Write([]byte(strings.Repeat("b", 50))) // only 20 fit
+	n, err = w.Write([]byte(strings.Repeat("b", 50)))
 	if err != nil || n != 50 {
 		t.Fatalf("second write should accept full len: n=%d err=%v", n, err)
 	}
 	if !w.isTruncated() {
 		t.Fatal("expected truncated=true")
 	}
-	// Further writes discarded.
 	n, err = w.Write([]byte("ccccc"))
 	if err != nil || n != 5 {
 		t.Fatalf("third write: n=%d err=%v", n, err)
 	}
-	st, err := f.Stat()
+	got, err := w.logicalBytes()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Size() != 100 {
-		t.Fatalf("file size should be capped at 100, got %d", st.Size())
+	if len(got) != 100 {
+		t.Fatalf("logical size should be 100, got %d", len(got))
+	}
+	if !strings.HasSuffix(string(got), "ccccc") {
+		t.Fatalf("ring must keep newest bytes, tail=%q", string(got[len(got)-5:]))
+	}
+	if strings.Count(string(got), "a") == 80 {
+		t.Fatal("oldest bytes should have been overwritten")
 	}
 }
 
@@ -1199,26 +1204,22 @@ func TestLimitedFileWriter_DoesNotSplitUTF8(t *testing.T) {
 	if _, err := w.Write([]byte("ab")); err != nil {
 		t.Fatal(err)
 	}
-	n, err := w.Write([]byte("écd")) // only 1 byte fits — inside the 2-byte é
+	n, err := w.Write([]byte("écd"))
 	if err != nil || n != 4 {
 		t.Fatalf("Write: n=%d err=%v", n, err)
 	}
 	if !w.isTruncated() {
 		t.Fatal("expected truncated")
 	}
-	st, err := f.Stat()
+	data, err := w.logicalBytes()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Size() != 2 {
-		t.Fatalf("file must not contain a split rune: size=%d (want 2)", st.Size())
+	if !utf8.Valid(data) {
+		t.Fatalf("logical view must be valid UTF-8, got %q", data)
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "ab" {
-		t.Fatalf("file content must be exactly 'ab', got %q", string(data))
+	if strings.Contains(string(data), "\uFFFD") {
+		t.Fatalf("logical view must not contain U+FFFD, got %q", data)
 	}
 }
 

@@ -123,8 +123,8 @@ func checkIP(ip net.IP) error {
 		return fmt.Errorf("nil IP")
 	}
 
-	// Normalize to IPv4 if IPv4-mapped IPv6.
-	v4 := ip.To4()
+	// Normalize embedded IPv4 (mapped, compatible, NAT64 well-known, 6to4).
+	v4 := embeddedIPv4(ip)
 
 	if v4 != nil {
 		// 0.0.0.0/8 — "unspecified" / "this network" (RFC 791)
@@ -187,6 +187,43 @@ func checkIP(ip net.IP) error {
 		}
 	}
 
+	return nil
+}
+
+func ipv6Zeros(ip net.IP, start, end int) bool {
+	for i := start; i < end; i++ {
+		if ip[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// embeddedIPv4 extracts an IPv4 address hidden inside IPv6 (mapped, deprecated
+// compatible, NAT64 64:ff9b::/96, 6to4 2002::/16). Plain IPv4 is returned as-is.
+func embeddedIPv4(ip net.IP) net.IP {
+	if v4 := ip.To4(); v4 != nil {
+		return v4
+	}
+	if len(ip) != net.IPv6len {
+		return nil
+	}
+	// IPv4-compatible ::a.b.c.d (deprecated; To4() does not decode these).
+	// :: and ::1 are IPv6 unspecified/loopback, not IPv4-compatible.
+	if ipv6Zeros(ip, 0, 12) {
+		if ip[12] == 0 && ip[13] == 0 && ip[14] == 0 && (ip[15] == 0 || ip[15] == 1) {
+			return nil
+		}
+		return net.IP(ip[12:16])
+	}
+	// NAT64 well-known prefix 64:ff9b::/96
+	if ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b && ipv6Zeros(ip, 4, 12) {
+		return net.IP(ip[12:16])
+	}
+	// 6to4 2002:AABB:CCDD::/48 — bytes 2-5 are the IPv4 address.
+	if ip[0] == 0x20 && ip[1] == 0x02 {
+		return net.IP(ip[2:6])
+	}
 	return nil
 }
 
@@ -477,7 +514,7 @@ func splitLongText(s string, max int) []string {
 // first, then each new chunk is indexed. Returns the number of chunks written
 // and the first indexing error, if any.
 func (s *server) indexContentLocked(docPath, content string) (int, error) {
-	if err := s.storePurgePrefixLocked(docPath); err != nil {
+	if err := s.storePurgeExactAndChunksLocked(docPath); err != nil {
 		return 0, fmt.Errorf("clear stale documents under %q: %w", docPath, err)
 	}
 	chunks := chunkContent(content)
@@ -502,11 +539,26 @@ func (s *server) storePurgePrefixLocked(prefix string) error {
 	return err
 }
 
+func (s *server) storePurgeExactAndChunksLocked(docPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.store.PurgeExactAndChunks(docPath)
+	return err
+}
+
 // fetchDocPath builds the KB document path for a fetched URL. The format is
 // embedded between source and URL so the same URL can coexist in the KB in
 // several formats (markdown/html/json) without overwriting each other.
 func fetchDocPath(source, format, rawURL string) string {
 	return source + ":" + format + ":" + rawURL
+}
+
+func (s *server) fetchDocPath(source, format, rawURL string) string {
+	p := fetchDocPath(source, format, rawURL)
+	if s != nil && s.sessionID != "" {
+		return "session:" + s.sessionID + ":" + p
+	}
+	return p
 }
 
 // purgeLegacyFetchDocs removes documents that older versions indexed under
@@ -587,8 +639,8 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 				// in the KB and re-index it when missing, otherwise we'd report
 				// a cache hit for content that search cannot find. Only this
 				// format's document is checked/backfilled.
-				docPath := fetchDocPath(source, format, rawURL)
-				count, err := s.store.CountByPrefix(docPath)
+				docPath := s.fetchDocPath(source, format, rawURL)
+				count, err := s.store.CountExactAndChunks(docPath)
 				if err != nil || count == 0 {
 					if _, err := s.indexContentLocked(docPath, cached.Content); err != nil {
 						result.IndexError = fmt.Sprintf("cache hit re-index failed: %v", err)
@@ -632,7 +684,7 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 
 		// Index into store: clear stale chunks for this source:format:url first
 		// so a re-fetch with fewer chunks does not leave old chunks searchable.
-		docPath := fetchDocPath(source, format, rawURL)
+		docPath := s.fetchDocPath(source, format, rawURL)
 		chunkCount, indexErr := s.indexContentLocked(docPath, content)
 		result.ChunkCount = chunkCount
 		if indexErr != nil {
@@ -667,7 +719,7 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 
 		// Index into store: clear stale chunks for this source:format:url first
 		// so a re-fetch with fewer chunks does not leave old chunks searchable.
-		docPath := fetchDocPath(source, format, rawURL)
+		docPath := s.fetchDocPath(source, format, rawURL)
 		chunkCount, indexErr := s.indexContentLocked(docPath, content)
 		var indexErrString string
 		if indexErr != nil {

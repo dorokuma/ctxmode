@@ -556,6 +556,45 @@ func TestExecuteFile_IndexedHintUsesCtxKb(t *testing.T) {
 	}
 }
 
+func TestExecuteFile_ReportsExitCode(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+	mustWrite(t, filepath.Join(wd, "n.txt"), "x")
+	res, _, err := s.toolExecuteFile(context.Background(), nil, executeFileArgs{
+		Path:     "n.txt",
+		Language: "python",
+		Code:     "import sys; sys.exit(1)",
+		Timeout:  15000,
+	})
+	if err != nil {
+		t.Fatalf("toolExecuteFile: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "exited with code 1") {
+		t.Fatalf("execute_file must report exit code, got %q", text)
+	}
+}
+
+func TestExecute_LargeOutputKeepsExitAndTail(t *testing.T) {
+	st := newTestStore(t)
+	s := &server{workdirs: []string{t.TempDir()}, store: st}
+	res, _, err := s.toolExecute(context.Background(), nil, executeArgs{
+		Argv:    []string{"python3", "-c", "import sys; sys.stdout.write('X'*110000); sys.exit(3)"},
+		Timeout: 20000,
+	})
+	if err != nil {
+		t.Fatalf("toolExecute: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "exit_code: 3") {
+		t.Fatalf("large execute must include exit_code, got:\n%s", text)
+	}
+	if !strings.Contains(text, "--- Tail preview ---") {
+		t.Fatalf("large execute must include tail preview, got:\n%s", text)
+	}
+}
+
 // ============================================================================
 // 项：toolIndex 文件数 / 总字节 cap 后整棵 Walk 早停（SkipAll）
 // ============================================================================

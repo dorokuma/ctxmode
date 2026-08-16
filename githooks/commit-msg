@@ -10,11 +10,19 @@ die() { echo -e "${RED}❌ REJECTED:${NC} $*"; exit 1; }
 
 # ── 1. Non-ASCII block ──────────────────────────────────────────────
 # Chinese / Japanese / Korean / Cyrillic → reject.
-if echo "$MSG" | grep -Pn -- '[^\x00-\x7F]' > /dev/null 2>&1; then
-  nonascii=$(echo "$MSG" | grep -Pn -- '[^\x00-\x7F]' | head -5)
+# Portable: C locale + POSIX classes. Do not use grep -P (missing PCRE
+# used to make this check a silent no-op and let non-ASCII commits through).
+set +e
+nonascii=$(printf '%s\n' "$MSG" | LC_ALL=C grep -n -- '[^[:cntrl:][:print:]]')
+nonascii_rc=$?
+set -e
+if [ "$nonascii_rc" -ge 2 ]; then
+  die "non-ASCII check failed to run (grep exit $nonascii_rc). Refusing to proceed."
+fi
+if [ "$nonascii_rc" -eq 0 ]; then
   die "commit message contains non-ASCII characters. English only.
 Offending lines:
-$nonascii"
+$(printf '%s\n' "$nonascii" | head -5)"
 fi
 
 # ── 2. Noise-word block ─────────────────────────────────────────────
@@ -38,8 +46,9 @@ SECRET_PATTERNS=(
   'gho_[a-zA-Z0-9]{36}'           # GitHub OAuth
   'ghu_[a-zA-Z0-9]{36}'           # GitHub user token
   'ghs_[a-zA-Z0-9]{36}'           # GitHub server token
+  'github_pat_[a-zA-Z0-9_]{20,}'  # GitHub fine-grained PAT
   'xox[baprs]-[a-zA-Z0-9-]+'      # Slack
-  'sk-[a-zA-Z0-9]{32,}'           # OpenAI / generic API key
+  'sk-[a-zA-Z0-9-]{32,}'          # OpenAI / Anthropic / generic API key
   'AKIA[0-9A-Z]{16}'              # AWS Access Key
   '-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----'
   'password\s*[:=]\s*\S+'          # password=

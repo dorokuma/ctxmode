@@ -35,10 +35,35 @@ var fakeToken = "ghp_" + "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"[:26] + "ABCDEFGH
 // matches the hook's sk- pattern exactly.
 var fakeSkKey = "sk-" + "abcdefghijklmnopqrstuvwxyz1234567890ABCD"[:26] + "1234567890ABCD"
 
+// fakeGitHubPat is a fine-grained PAT (github_pat_ + body), assembled at
+// runtime so the complete literal never appears in the source or staged diff.
+var fakeGitHubPat = "github_pat_" + "ABCDEFGHIJabcdefghijAB" + "_" +
+	"ABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHI"
+
+// fakeSkProjKey / fakeSkAntKey are hyphenated sk- keys (sk-proj-...,
+// sk-ant-api03-...). Assembled at runtime for the same reason as fakeSkKey.
+var fakeSkProjKey = "sk-" + "proj-" + "abcdefghijklmnopqrstuvwxyz1234567890ABCD"
+var fakeSkAntKey = "sk-" + "ant-api03-" + "abcdefghijklmnopqrstuvwxyz1234567890ABCD"
+
 // fakePemHeader builds a PEM private-key header line. Assembled at runtime so
 // the complete literal never appears in the source or staged diff.
 func fakePemHeader(kind string) string {
 	return "-----BEGIN " + kind + " " + "PRIVATE KEY-----"
+}
+
+// hookUsesGrepP reports a real grep -P invocation. Comment lines that mention
+// the flag (for example explaining why it is banned) do not count.
+func hookUsesGrepP(data []byte) bool {
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		trim := bytes.TrimSpace(line)
+		if len(trim) == 0 || trim[0] == '#' {
+			continue
+		}
+		if bytes.Contains(trim, []byte("grep -P")) {
+			return true
+		}
+	}
+	return false
 }
 
 func hookEnv() []string {
@@ -278,6 +303,58 @@ func TestPrePushHook(t *testing.T) {
 			t.Fatalf("expected non-ASCII message to be rejected, got pass:\n%s", out)
 		}
 	})
+
+	t.Run("github_pat in file is rejected", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		head := commitFile(t, repo, "secret.txt",
+			"token = "+fakeGitHubPat+"\n", "feat: add config")
+		out, code := runHook(t, repo, script,
+			"refs/heads/main "+head+" refs/heads/main "+zeroSHA+"\n")
+		if code == 0 {
+			t.Fatalf("expected github_pat rejection, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("hyphenated sk-proj key in file is rejected", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		head := commitFile(t, repo, "secret.txt",
+			"key = "+fakeSkProjKey+"\n", "feat: add config")
+		out, code := runHook(t, repo, script,
+			"refs/heads/main "+head+" refs/heads/main "+zeroSHA+"\n")
+		if code == 0 {
+			t.Fatalf("expected sk-proj rejection, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("hyphenated sk-ant key in file is rejected", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		head := commitFile(t, repo, "secret.txt",
+			"key = "+fakeSkAntKey+"\n", "feat: add config")
+		out, code := runHook(t, repo, script,
+			"refs/heads/main "+head+" refs/heads/main "+zeroSHA+"\n")
+		if code == 0 {
+			t.Fatalf("expected sk-ant rejection, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("script scans new token shapes and does not use grep -P", func(t *testing.T) {
+		data, err := os.ReadFile(script)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hookUsesGrepP(data) {
+			t.Fatal("pre-push must not use grep -P; missing PCRE used to skip non-ASCII checks")
+		}
+		if !bytes.Contains(data, []byte("github_pat_")) {
+			t.Fatal("pre-push must scan github_pat_ tokens")
+		}
+		if !bytes.Contains(data, []byte(`sk-[a-zA-Z0-9-]{32,}`)) {
+			t.Fatal("pre-push sk- pattern must allow hyphens")
+		}
+	})
 }
 
 // ============================================================================
@@ -361,6 +438,57 @@ func TestCommitMsgHook(t *testing.T) {
 		out, code := run(t, repo, "feat: add config sample")
 		if code == 0 {
 			t.Fatalf("expected staged-diff fake key to be rejected, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("non-ASCII message is rejected", func(t *testing.T) {
+		repo := setup(t)
+		out, code := run(t, repo, "修复加载器")
+		if code == 0 {
+			t.Fatalf("expected non-ASCII message to be rejected, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("github_pat in message is rejected", func(t *testing.T) {
+		repo := setup(t)
+		out, code := run(t, repo, "rotate "+fakeGitHubPat+" now")
+		if code == 0 {
+			t.Fatalf("expected github_pat rejection, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("hyphenated sk-proj key in message is rejected", func(t *testing.T) {
+		repo := setup(t)
+		out, code := run(t, repo, "rotate "+fakeSkProjKey+" now")
+		if code == 0 {
+			t.Fatalf("expected sk-proj rejection, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("hyphenated sk-ant key in staged diff is rejected", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		commitFile(t, repo, "a.txt", "hello\n", "feat: seed")
+		stageFile(t, repo, "config.txt", "api_key"+" = "+fakeSkAntKey+"\n")
+		out, code := run(t, repo, "feat: add config sample")
+		if code == 0 {
+			t.Fatalf("expected staged-diff sk-ant rejection, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("script scans new token shapes and does not use grep -P", func(t *testing.T) {
+		data, err := os.ReadFile(script)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hookUsesGrepP(data) {
+			t.Fatal("commit-msg must not use grep -P; missing PCRE used to skip non-ASCII checks")
+		}
+		if !bytes.Contains(data, []byte("github_pat_")) {
+			t.Fatal("commit-msg must scan github_pat_ tokens")
+		}
+		if !bytes.Contains(data, []byte(`sk-[a-zA-Z0-9-]{32,}`)) {
+			t.Fatal("commit-msg sk- pattern must allow hyphens")
 		}
 	})
 }

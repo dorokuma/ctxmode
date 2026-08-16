@@ -718,3 +718,40 @@ func TestRgSystem_PassthroughKeepsEnv(t *testing.T) {
 		t.Fatalf("CTXMODE_ENV_PASSTHROUGH=1 must keep sensitive vars in rg child env, got %q", out)
 	}
 }
+
+func TestGlob_GitignoreNegationAndNested(t *testing.T) {
+	wd := t.TempDir()
+	mustWrite(t, filepath.Join(wd, ".gitignore"), "*.log\n!keep.log\n")
+	mustWrite(t, filepath.Join(wd, "a.log"), "x")
+	mustWrite(t, filepath.Join(wd, "keep.log"), "y")
+	mustWrite(t, filepath.Join(wd, "sub", ".gitignore"), "skip.txt\n")
+	mustWrite(t, filepath.Join(wd, "sub", "skip.txt"), "z")
+	mustWrite(t, filepath.Join(wd, "sub", "ok.txt"), "w")
+	s := testServerWithWorkdir(t, wd)
+	res, _, err := s.toolGlob(context.Background(), nil, globArgs{Pattern: "**/*", Limit: 50})
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if strings.Contains(text, "a.log") {
+		t.Fatalf("*.log should be ignored: %s", text)
+	}
+	if !strings.Contains(text, "keep.log") {
+		t.Fatalf("!keep.log should be visible: %s", text)
+	}
+	if strings.Contains(text, "skip.txt") {
+		t.Fatalf("nested gitignore should hide skip.txt: %s", text)
+	}
+	if !strings.Contains(text, "ok.txt") {
+		t.Fatalf("nested ok.txt should be visible: %s", text)
+	}
+}
+
+func TestSensitivePath_EnvDirectory(t *testing.T) {
+	if !isSensitiveFilePath("/proj/.env/production") {
+		t.Fatal(".env/production must be treated as sensitive")
+	}
+	if isSensitiveFilePath("/proj/src/main.go") {
+		t.Fatal("normal source must not be sensitive")
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -285,8 +286,8 @@ func (s *server) toolGlob(ctx context.Context, _ *mcp.CallToolRequest, args glob
 		return nil, nil, fmt.Errorf("path %q is not a directory", pathArg)
 	}
 
-	// Optional .gitignore basic ignore patterns (root only).
-	gitignore := loadBasicGitignore(root)
+	// Root + nested .gitignore (last match wins, including !).
+	gitignore := newGitignoreStack(root)
 
 	var matches []string
 	truncated := false
@@ -312,6 +313,9 @@ func (s *server) toolGlob(ctx context.Context, _ *mcp.CallToolRequest, args glob
 		}
 
 		rel, err := filepath.Rel(root, p)
+		if err == nil && fi.IsDir() && rel != "." {
+			gitignore.push(p, filepath.ToSlash(rel))
+		}
 		if err != nil {
 			return nil
 		}
@@ -453,49 +457,116 @@ func globMatchRec(pattern, name string) bool {
 	}
 }
 
-// basicGitignore holds simple gitignore-style rules from a single file.
-type basicGitignore struct {
-	// patterns are relative; trailing / means dir-only; leading ! means negation (ignored for simplicity — we skip !).
-	patterns []string
+type giRule struct {
+	neg     bool
+	dirOnly bool
+	pat     string
 }
 
-func loadBasicGitignore(root string) basicGitignore {
-	data, err := os.ReadFile(filepath.Join(root, ".gitignore"))
+// basicGitignore holds simple gitignore-style rules from a single file.
+// Last matching rule wins, including leading ! negation.
+type basicGitignore struct {
+	rules []giRule
+}
+
+func loadBasicGitignore(dir string) basicGitignore {
+	data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
 	if err != nil {
 		return basicGitignore{}
 	}
-	var pats []string
+	var rules []giRule
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		pats = append(pats, filepath.ToSlash(line))
-	}
-	return basicGitignore{patterns: pats}
-}
-
-func (g basicGitignore) ignores(rel string, isDir bool) bool {
-	rel = filepath.ToSlash(rel)
-	base := filepath.Base(rel)
-	for _, p := range g.patterns {
-		dirOnly := strings.HasSuffix(p, "/")
-		if dirOnly {
-			p = strings.TrimSuffix(p, "/")
-			if !isDir {
+		r := giRule{}
+		if strings.HasPrefix(line, "!") {
+			r.neg = true
+			line = strings.TrimSpace(line[1:])
+			if line == "" {
 				continue
 			}
 		}
-		p = strings.TrimPrefix(p, "/")
-		if matchGlobPattern(p, rel) || matchGlobPattern(p, base) {
-			return true
+		line = filepath.ToSlash(line)
+		if strings.HasSuffix(line, "/") {
+			r.dirOnly = true
+			line = strings.TrimSuffix(line, "/")
 		}
-		// **/pattern
-		if matchGlobPattern("**/"+p, rel) {
-			return true
+		r.pat = strings.TrimPrefix(line, "/")
+		if r.pat == "" {
+			continue
+		}
+		rules = append(rules, r)
+	}
+	return basicGitignore{rules: rules}
+}
+
+func (g basicGitignore) match(rel string, isDir bool) (matched, neg bool) {
+	rel = filepath.ToSlash(rel)
+	base := filepath.Base(rel)
+	for _, r := range g.rules {
+		if r.dirOnly && !isDir {
+			continue
+		}
+		if matchGlobPattern(r.pat, rel) || matchGlobPattern(r.pat, base) || matchGlobPattern("**/"+r.pat, rel) {
+			matched = true
+			neg = r.neg
 		}
 	}
-	return false
+	return matched, neg
+}
+
+func (g basicGitignore) ignores(rel string, isDir bool) bool {
+	matched, neg := g.match(rel, isDir)
+	return matched && !neg
+}
+
+// gitignoreStack applies root-to-current .gitignore layers (last match wins).
+type gitignoreStack struct {
+	layers []struct {
+		base string // slash-rel from walk root; "." = root
+		gi   basicGitignore
+	}
+}
+
+func newGitignoreStack(root string) gitignoreStack {
+	var s gitignoreStack
+	s.push(root, ".")
+	return s
+}
+
+func (s *gitignoreStack) push(absDir, relFromRoot string) {
+	gi := loadBasicGitignore(absDir)
+	if len(gi.rules) == 0 {
+		return
+	}
+	s.layers = append(s.layers, struct {
+		base string
+		gi   basicGitignore
+	}{base: filepath.ToSlash(relFromRoot), gi: gi})
+}
+
+func (s gitignoreStack) ignores(rel string, isDir bool) bool {
+	rel = filepath.ToSlash(rel)
+	ignored := false
+	for _, layer := range s.layers {
+		local := rel
+		if layer.base != "." && layer.base != "" {
+			pref := layer.base + "/"
+			if rel == layer.base {
+				local = "."
+			} else if strings.HasPrefix(rel, pref) {
+				local = rel[len(pref):]
+			} else {
+				continue
+			}
+		}
+		if matched, neg := layer.gi.match(local, isDir); matched {
+			ignored = !neg
+		}
+	}
+	return ignored
 }
 
 // ---------- ctx_fs: stat ----------
@@ -719,6 +790,7 @@ func (s *server) rgResult(text string, count int, truncated bool, engine string)
 
 func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs, limit, contextLines int) (string, bool, int, error) {
 	cmdArgs := []string{
+		"--no-config",
 		"--no-heading",
 		"--line-number",
 		"--color", "never",
@@ -935,7 +1007,7 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, limit, cont
 	matchCount := 0
 	truncated := false
 	stopped := false // walk halted by match limit / output cap (NOT by skipped lines)
-	gitignore := loadBasicGitignore(root)
+	gitignore := newGitignoreStack(root)
 
 	walkErr := filepath.Walk(root, func(p string, fi os.FileInfo, err error) error {
 		// Honour cancellation so long pure-Go walks do not outlive the request.
@@ -956,6 +1028,9 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, limit, cont
 				return filepath.SkipDir
 			}
 			rel, _ := filepath.Rel(root, p)
+			if rel != "." {
+				gitignore.push(p, filepath.ToSlash(rel))
+			}
 			if rel != "." && gitignore.ignores(filepath.ToSlash(rel), true) {
 				return filepath.SkipDir
 			}
@@ -987,7 +1062,7 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, limit, cont
 			return nil
 		}
 
-		f, err := os.Open(p)
+		f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
 			return nil
 		}

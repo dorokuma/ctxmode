@@ -5,6 +5,25 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [3.1.2] - 2026-08-16
+
+### Fixed
+- **`execute_file` reports exit codes** the same way `execute` does; large auto-indexed output from both paths now includes `exit_code` and a tail preview (same contract as `run_task`).
+- **Background logs keep the newest 16MB** (ring writer) instead of dropping new writes after the cap; `ctx_bg` `log`/`wait` report `log_truncated`. SIGKILL after SIGTERM re-checks `/proc` starttime.
+- **fetch SSRF** decodes NAT64 `64:ff9b::/96`, 6to4 `2002::/16`, and IPv4-compatible addresses before applying the IPv4 blocklist.
+- **System `rg` is invoked with `--no-config`** so `RIPGREP_CONFIG_PATH` / `~/.ripgreprc` cannot add `--follow`/`--pre` or extra roots.
+- **Re-fetch of a short URL no longer deletes a longer sibling** (`foo` vs `foobar`); stale chunks still use the `#chunk-` suffix only.
+- **Session purge works**: execute/batch/run_task/fetch documents are tagged `session:<id>:…` (id from `stats`/`doctor`).
+- **`query_scope=batch` searches only that batch run**, not historical `batch:` documents.
+- **`.env/` directories** are skipped by the sensitive-path gate; glob/`rgGo` honor nested `.gitignore` and `!` negation.
+- **`FILE_CONTENT` is spliced after** Go `package`/imports, Python `__future__`, and PHP `declare`; Elixir `~S"""` no longer adds wrapping newlines.
+- **doctor** lists missing runtimes under `warnings` and probes FTS with a sample MATCH.
+- **index / execute_file / rgGo** open files with `O_NOFOLLOW`.
+- rust compile failures propagate the 10MB `Truncated` flag.
+- **git hooks** match `github_pat_`, hyphenated `sk-proj-` / `sk-ant-api03-` keys, and fail closed when the non-ASCII check cannot run (no more silent skip without PCRE).
+- **`deploy.sh`** initializes the staged binary before `mv`; verification failure leaves the old binary in place and does not print success.
+- **Pi adapter** disposes the child on handshake failure and does not replay `tools/call` after disconnect.
+
 ## [3.1.1] - 2026-08-16
 
 ### Fixed

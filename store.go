@@ -535,7 +535,47 @@ func (s *Store) FTS5Health() error {
 		return fmt.Errorf("documents_trigram row count mismatch: trigram=%d docs=%d", trigramRows, docRows)
 	}
 
+	// Row counts matching is necessary but not sufficient. Probe one document
+	// so a stale FTS table with the right COUNT still fails.
+	if docRows > 0 {
+		var content string
+		if err := s.db.QueryRow(`SELECT content FROM documents LIMIT 1`).Scan(&content); err != nil {
+			return fmt.Errorf("sample document: %w", err)
+		}
+		if tok := firstFTSToken(content); tok != "" {
+			var n int
+			q := fts5LiteralEscape(tok)
+			if err := s.db.QueryRow(`SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?`, q).Scan(&n); err != nil {
+				return fmt.Errorf("documents_fts MATCH probe: %w", err)
+			}
+			if n == 0 {
+				return fmt.Errorf("documents_fts MATCH probe for %q returned 0 rows", tok)
+			}
+		}
+	}
+
 	return nil
+}
+
+func firstFTSToken(content string) string {
+	var b strings.Builder
+	for _, r := range content {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			if b.Len() >= 8 {
+				break
+			}
+			continue
+		}
+		if b.Len() >= 3 {
+			break
+		}
+		b.Reset()
+	}
+	if b.Len() < 3 {
+		return ""
+	}
+	return b.String()
 }
 
 // CachedResult represents a cached fetch entry.
@@ -629,6 +669,46 @@ func (s *Store) PurgeAll() (deletedDocs int, deletedCache int, err error) {
 		return 0, 0, fmt.Errorf("commit purge: %w", err)
 	}
 	return deletedDocs, deletedCache, nil
+}
+
+// PurgeExactAndChunks deletes path exactly and path#chunk-* children only.
+// Unlike PurgeByPrefix it will not delete a longer sibling (foo vs foobar).
+func (s *Store) PurgeExactAndChunks(docPath string) (deleted int, err error) {
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(`DELETE FROM documents WHERE path = ?`, docPath)
+	if err != nil {
+		return 0, fmt.Errorf("purge exact: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	deleted = int(rows)
+
+	chunkPrefix := docPath + "#chunk-"
+	res, err = tx.Exec(`DELETE FROM documents WHERE path >= ? AND path < ?`, chunkPrefix, chunkPrefix+"\U0010ffff")
+	if err != nil {
+		return 0, fmt.Errorf("purge chunks: %w", err)
+	}
+	rows, _ = res.RowsAffected()
+	deleted += int(rows)
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit exact/chunks purge: %w", err)
+	}
+	return deleted, nil
+}
+
+func (s *Store) CountExactAndChunks(docPath string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM documents
+		WHERE path = ? OR (path >= ? AND path < ?)`,
+		docPath, docPath+"#chunk-", docPath+"#chunk-\U0010ffff",
+	).Scan(&n)
+	return n, err
 }
 
 // PurgeByPrefix deletes documents whose path starts with the given prefix.

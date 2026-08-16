@@ -333,58 +333,65 @@ export class CtxmodeClient {
     })
     const proc = this.proc
 
-    // 禁止 console.*（污染 Pi TUI 输入行）。
-    proc.on("error", (err) => {
-      const intentional = this.intentionalClose
-      if (!intentional) {
-        diagLog(`process error: ${err.message}`)
-        this.dumpStderrBuffer(true)
-      } else {
-        this.clearStderrBuffer()
-      }
-      this.cleanup()
-      if (!intentional) this.scheduleRestart()
-    })
-
-    proc.on("exit", (code, signal) => this.handleProcExit(code, signal))
-
-    if (proc.stderr) {
-      proc.stderr.on("data", (chunk: Buffer | string) => {
-        // 兜底：dispose 已摘监听，但旧进程残留事件也不得污染新进程状态。
-        if (this.proc !== proc) return
-        this.handleStderrChunk(chunk)
-      })
-    }
-
-    this.rl = createInterface({ input: proc.stdout! })
-    this.rl.on("line", (line) => {
-      try {
-        const msg: MCPResponse = JSON.parse(line)
-        if (msg.id !== undefined && this.pending.has(msg.id)) {
-          const entry = this.pending.get(msg.id)!
-          this.pending.delete(msg.id)
-          if (entry.timer) clearTimeout(entry.timer)
-          if (msg.error) entry.reject(new Error(msg.error.message))
-          else entry.resolve(msg.result as MCPToolResult)
+    try {
+      // 禁止 console.*（污染 Pi TUI 输入行）。
+      proc.on("error", (err) => {
+        const intentional = this.intentionalClose
+        if (!intentional) {
+          diagLog(`process error: ${err.message}`)
+          this.dumpStderrBuffer(true)
+        } else {
+          this.clearStderrBuffer()
         }
-      } catch { /* non-JSON noise */ }
-    })
+        this.cleanup()
+        if (!intentional) this.scheduleRestart()
+      })
 
-    const initResult = await this.sendRequest("initialize", {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: { name: "pi-ctxmode", version: "1.0.0" },
-    }, START_TIMEOUT_MS)
-    this.serverInstructions = initResult.instructions ?? null
-    this.sendNotification("notifications/initialized")
+      proc.on("exit", (code, signal) => this.handleProcExit(code, signal))
 
-    const listResult = await this.sendRequest("tools/list", {}, START_TIMEOUT_MS)
-    const toolNames = (listResult.tools || []).map(t => t.name).join(", ")
-    this.initialized = true
+      if (proc.stderr) {
+        proc.stderr.on("data", (chunk: Buffer | string) => {
+          // 兜底：dispose 已摘监听，但旧进程残留事件也不得污染新进程状态。
+          if (this.proc !== proc) return
+          this.handleStderrChunk(chunk)
+        })
+      }
 
-    diagLog(
-      `started workdir=${this.workdir}, tools: ${toolNames}, out≤${OUTPUT_CHAR_CAP}c/${OUTPUT_LINE_CAP}L`,
-    )
+      this.rl = createInterface({ input: proc.stdout! })
+      this.rl.on("line", (line) => {
+        try {
+          const msg: MCPResponse = JSON.parse(line)
+          if (msg.id !== undefined && this.pending.has(msg.id)) {
+            const entry = this.pending.get(msg.id)!
+            this.pending.delete(msg.id)
+            if (entry.timer) clearTimeout(entry.timer)
+            if (msg.error) entry.reject(new Error(msg.error.message))
+            else entry.resolve(msg.result as MCPToolResult)
+          }
+        } catch { /* non-JSON noise */ }
+      })
+
+      const initResult = await this.sendRequest("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "pi-ctxmode", version: "1.0.0" },
+      }, START_TIMEOUT_MS)
+      this.serverInstructions = initResult.instructions ?? null
+      this.sendNotification("notifications/initialized")
+
+      const listResult = await this.sendRequest("tools/list", {}, START_TIMEOUT_MS)
+      const toolNames = (listResult.tools || []).map(t => t.name).join(", ")
+      this.initialized = true
+
+      diagLog(
+        `started workdir=${this.workdir}, tools: ${toolNames}, out≤${OUTPUT_CHAR_CAP}c/${OUTPUT_LINE_CAP}L`,
+      )
+    } finally {
+      // initialize / tools/list 失败时回收已 spawn 的子进程，避免泄漏。
+      if (!this.initialized) {
+        await this.shutDownProc()
+      }
+    }
   }
 
   private sendRequest(method: string, params: Record<string, unknown>, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<MCPToolResult> {
@@ -453,10 +460,11 @@ export class CtxmodeClient {
         throw err
       }
       if (/not running|disconnected/i.test(msg)) {
-        await this.start()
-        const result = await this.sendRequest("tools/call", { name, arguments: args }, timeoutMs)
-        const text = result.content?.map((c) => c.text).join("\n") || ""
-        return compressToolText(text)
+        // 可尝试拉起客户端，但不重放本次 tools/call（execute/batch 非幂等）。
+        await this.start().catch((startErr) => {
+          diagLog(`reconnect after disconnect failed: ${errMessage(startErr)}`)
+        })
+        throw err
       }
       throw err
     }
@@ -528,7 +536,9 @@ export default function (pi: ExtensionAPI) {
       }
       ctx.ui.notify(`ctxmode 已启动 (workdir: ${workdir})`, "info")
     } catch (err) {
-      client = null
+      if (client) {
+        try { await client.stop() } finally { client = null }
+      }
       const msg = err instanceof Error ? err.message : String(err)
       ctx.ui.notify(`ctxmode 启动失败: ${msg}`, "warning")
     }
@@ -576,6 +586,9 @@ ${serverInstructions}`,
         }
         ctx.ui.notify(`ctxmode 已启动 (workdir: ${workdir})`, "info")
       } catch (err) {
+        if (client) {
+          try { await client.stop() } finally { client = null }
+        }
         const msg = err instanceof Error ? err.message : String(err)
         ctx.ui.notify(`ctxmode 启动失败: ${msg}`, "error")
       }

@@ -213,7 +213,7 @@ func TestBatchExecute_DuplicateLabelsUniqueAndSearchable(t *testing.T) {
 		t.Fatalf("repeated batch command label must get distinct index labels, got %q", l1)
 	}
 	for _, l := range []string{l1, l2} {
-		if !strings.HasPrefix(l, batchIndexPrefix+"same:") {
+		if !strings.HasPrefix(l, batchIndexPrefix) || !strings.Contains(l, ":same:") {
 			t.Fatalf("label must stay identifiable by command, got %q", l)
 		}
 		if doc, _ := srv.store.Get(l); doc == nil {

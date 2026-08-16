@@ -231,12 +231,13 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 
 	// ---------- execute commands ----------
 
+	runID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), indexLabelSeq.Add(1))
 	if concurrency == 1 {
 		// Serial execution with a shared timeout.
-		s.executeBatchSerial(ctx, args.Commands, cwd, timeout, results)
+		s.executeBatchSerial(ctx, args.Commands, cwd, timeout, runID, results)
 	} else {
 		// Concurrent execution with per-command timeouts.
-		s.executeBatchConcurrent(ctx, args.Commands, cwd, timeout, concurrency, results)
+		s.executeBatchConcurrent(ctx, args.Commands, cwd, timeout, concurrency, runID, results)
 	}
 
 	// Count indexed commands, failures, and check for truncation.
@@ -268,9 +269,8 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 			}
 
 			if queryScope == "batch" {
-				// Path-scoped at store layer (no post-filter false negatives).
-				// Bypasses flood guard so batch is a reliable escape hatch.
-				hits, meta, err := s.searchPipeline.SearchBatchScoped(q, 5)
+				// This run only (batch:<runID>:…), not historical batch docs.
+				hits, meta, err := s.searchPipeline.SearchPrefixScoped(q, s.batchRunPrefix(runID), 5)
 				if err != nil {
 					msg := err.Error()
 					if meta != nil && meta.FloodStatus == "blocked" {
@@ -325,7 +325,7 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 // executeBatchSerial runs commands one by one with a shared timeout.
 // The timeout is the total budget for all commands combined.
 // If the shared context expires mid-way, remaining commands are marked as skipped.
-func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, results []batchResult) {
+func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, runID string, results []batchResult) {
 	var cmdCtx context.Context
 	var cancel context.CancelFunc
 	if timeout > 0 {
@@ -370,7 +370,7 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 		// repeated command label cannot silently overwrite an earlier document
 		// (INSERT OR REPLACE); the actual label is returned in the response.
 		if len(out) > maxOutputSize {
-			label := uniqueIndexLabel("batch", cmd.Label)
+			label := s.indexLabel("batch", runID+":"+cmd.Label)
 			s.mu.Lock()
 			if err := s.store.Index(label, out); err != nil {
 				r.IndexError = err.Error()
@@ -388,7 +388,7 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 // executeBatchConcurrent runs commands in parallel with per-command timeouts.
 // Each command gets its own timeout budget (the full timeout value).
 // Concurrency is limited by a semaphore. Store writes are serialized with a mutex.
-func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, concurrency int, results []batchResult) {
+func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, concurrency int, runID string, results []batchResult) {
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 
@@ -430,7 +430,7 @@ func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCom
 			// small output is not persisted. Mutex serializes SQLite single-writer.
 			// Unique label per index (see executeBatchSerial).
 			if len(out) > maxOutputSize {
-				label := uniqueIndexLabel("batch", c.Label)
+				label := s.indexLabel("batch", runID+":"+c.Label)
 				s.mu.Lock()
 				if err := s.store.Index(label, out); err != nil {
 					r.IndexError = err.Error()

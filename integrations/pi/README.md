@@ -24,6 +24,8 @@ install -m 644 integrations/pi/ctxmode.ts ~/.pi/agent/extensions/ctxmode.ts
 - `CTXMODE_DIAG_MAX_BYTES` — 日志轮转体积上限（默认 5MB；超限轮转为 `ctxmode.log.1/.2`，最多两个历史）
 - `CTXMODE_DISPOSE_WAIT_MS` — 换进程时 SIGTERM→SIGKILL 等待窗口（默认 3000ms）
 
+Handshake 失败（`initialize` / `tools/list`）会回收已 spawn 的子进程。`callTool` 遇到 disconnect / not running 时可以拉起客户端，但不会自动重放刚才那次 `tools/call`（execute/batch 非幂等）。
+
 ## Tests
 
 零新增依赖（node:test + `--experimental-strip-types`，Node ≥ 22.15）：

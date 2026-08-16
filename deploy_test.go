@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -67,6 +68,28 @@ func listTempFiles(t *testing.T, dir string) []string {
 	return matches
 }
 
+// writeStubBinary writes an executable that consumes stdin, prints stdout/stderr,
+// and exits with the given code. Used so the deploy fragment can run initialize
+// against a fake binary without touching the real ctxmode.
+func writeStubBinary(t *testing.T, path, stdout, stderr string, exitCode int) {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("#!/bin/sh\n")
+	b.WriteString("cat >/dev/null\n")
+	if stderr != "" {
+		b.WriteString("printf '%s\\n' " + shellQuote(stderr) + " >&2\n")
+	}
+	if stdout != "" {
+		b.WriteString("printf '%s\\n' " + shellQuote(stdout) + "\n")
+	}
+	b.WriteString("exit " + strconv.Itoa(exitCode) + "\n")
+	if err := os.WriteFile(path, []byte(b.String()), 0o755); err != nil {
+		t.Fatalf("write stub binary: %v", err)
+	}
+}
+
+const stubInitializeJSON = `{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"ctxmode","version":"9.9.9"}}}`
+
 // ---------- static constraints ----------
 
 func TestDeployScript_StaticConstraints(t *testing.T) {
@@ -91,6 +114,29 @@ func TestDeployScript_StaticConstraints(t *testing.T) {
 	// no direct install onto the target (the old non-atomic overwrite).
 	if strings.Contains(frag, `"$BUILD_OUT" "$BINARY"`) {
 		t.Error("fragment must not install directly onto the target path")
+	}
+	// initialize the staged file before replacing the live target.
+	initAt := strings.Index(frag, "initialize")
+	mvAt := strings.Index(frag, `mv -f -- "$TMP_FILE" "$BINARY"`)
+	if initAt < 0 || mvAt < 0 || initAt > mvAt {
+		t.Error("fragment must run initialize on the staged binary before mv")
+	}
+	if strings.Contains(frag, `timeout 5 "$BINARY"`) {
+		t.Error("fragment must not initialize the live target; verify the staged file first")
+	}
+	if !strings.Contains(frag, `timeout 5 "$TMP_FILE"`) && !strings.Contains(frag, `timeout 5 "$BUILD_OUT"`) {
+		t.Error("fragment must initialize $TMP_FILE or $BUILD_OUT before replace")
+	}
+	if strings.Contains(frag, "部署成功") {
+		t.Error("fragment must not print 部署成功 (verify-failure path must never claim success)")
+	}
+	// verify failure must be a hard exit, not a swallowed no-op.
+	if !strings.Contains(frag, "exit 1") {
+		t.Error("fragment must exit 1 when initialize verification fails")
+	}
+	// do not hide initialize stderr on the failure path.
+	if strings.Contains(frag, `"$TMP_FILE" 2>/dev/null`) || strings.Contains(frag, `"$BUILD_OUT" 2>/dev/null`) {
+		t.Error("fragment must not swallow initialize stderr with 2>/dev/null")
 	}
 	// every variable use must be double-quoted (BINARY may contain spaces).
 	for _, v := range []string{"$BINARY", "$BUILD_OUT", "$TMP_FILE", "$TARGET_DIR"} {
@@ -126,8 +172,9 @@ func TestDeployFragment_SuccessReplacesTargetAtomically(t *testing.T) {
 	}
 
 	buildOut := filepath.Join(t.TempDir(), "ctxmode-build")
-	newBin := []byte("NEWBIN-2.0")
-	if err := os.WriteFile(buildOut, newBin, 0o755); err != nil {
+	writeStubBinary(t, buildOut, stubInitializeJSON, "", 0)
+	newBin, err := os.ReadFile(buildOut)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -200,5 +247,88 @@ func TestDeployFragment_MkdirFailureLeavesNothing(t *testing.T) {
 	}
 	if tmp := listTempFiles(t, dir); len(tmp) != 0 {
 		t.Errorf("temp files left after mkdir failure: %v", tmp)
+	}
+}
+
+// ---------- behavior: initialize fails, old target stays ----------
+
+func TestDeployFragment_VerifyFailureKeepsOldTarget(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "ctxmode")
+	old := []byte("OLDV1")
+	if err := os.WriteFile(binary, old, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	buildOut := filepath.Join(t.TempDir(), "ctxmode-build")
+	writeStubBinary(t, buildOut, "not-a-json-rpc-response", "initialize boom from stub", 1)
+
+	out, err := runFragment(t, buildOut, binary)
+	if err == nil {
+		t.Fatalf("expected verify failure, got success\n%s", out)
+	}
+	if strings.Contains(out, "部署成功") {
+		t.Errorf("verify failure must not print 部署成功\n%s", out)
+	}
+	if !strings.Contains(out, "initialize boom from stub") {
+		t.Errorf("verify failure must surface initialize stderr, got:\n%s", out)
+	}
+
+	got, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatalf("old target lost after verify failure: %v", err)
+	}
+	if string(got) != string(old) {
+		t.Errorf("old target content = %q, want %q", got, old)
+	}
+	if tmp := listTempFiles(t, dir); len(tmp) != 0 {
+		t.Errorf("temp files not cleaned after verify failure: %v", tmp)
+	}
+}
+
+func TestDeployFragment_VerifyExitZeroWithoutVersionKeepsOldTarget(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "ctxmode")
+	old := []byte("OLDV1")
+	if err := os.WriteFile(binary, old, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	buildOut := filepath.Join(t.TempDir(), "ctxmode-build")
+	// Exit 0 but no "version" field: the old script still printed 部署成功.
+	writeStubBinary(t, buildOut, `{"jsonrpc":"2.0","id":1,"result":{}}`, "", 0)
+
+	out, err := runFragment(t, buildOut, binary)
+	if err == nil {
+		t.Fatalf("expected verify failure for missing version, got success\n%s", out)
+	}
+	if strings.Contains(out, "部署成功") {
+		t.Errorf("missing version must not print 部署成功\n%s", out)
+	}
+
+	got, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatalf("old target lost after verify failure: %v", err)
+	}
+	if string(got) != string(old) {
+		t.Errorf("old target content = %q, want %q", got, old)
+	}
+	if tmp := listTempFiles(t, dir); len(tmp) != 0 {
+		t.Errorf("temp files not cleaned after verify failure: %v", tmp)
+	}
+}
+
+func TestDeployScript_SuccessMessageRequiresVersion(t *testing.T) {
+	src := readDeployScript(t)
+	if strings.Contains(src, `${VERSION:-?}`) {
+		t.Error("must not print 部署成功 with a placeholder version")
+	}
+	successAt := strings.Index(src, "部署成功")
+	initAt := strings.Index(src, "initialize")
+	if successAt < 0 || initAt < 0 {
+		t.Fatal("expected both initialize and 部署成功 in deploy.sh")
+	}
+	if initAt > successAt {
+		t.Error("initialize must run before printing 部署成功")
 	}
 }

@@ -22,6 +22,7 @@ type doctorResult struct {
 	CacheCount  int               `json:"cache_count"`
 	Healthy     bool              `json:"healthy"`
 	Warnings    []string          `json:"warnings,omitempty"`
+	SessionID   string            `json:"session_id,omitempty"`
 }
 
 // runDoctor collects all diagnostic information.
@@ -61,6 +62,7 @@ func runDoctor(store *Store, dbPath string) (*doctorResult, error) {
 		} else {
 			rt := runtimes[name]
 			res.Runtimes[name] = "not found: " + rt.Exe
+			res.Warnings = append(res.Warnings, fmt.Sprintf("runtime %s not found (%s)", name, rt.Exe))
 		}
 	}
 
@@ -95,6 +97,7 @@ func (s *server) toolDoctor(ctx context.Context, _ *mcp.CallToolRequest, _ docto
 	if err != nil {
 		return nil, nil, fmt.Errorf("doctor check failed: %w", err)
 	}
+	result.SessionID = s.sessionID
 
 	js, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {

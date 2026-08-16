@@ -158,7 +158,12 @@ func (sp *SearchPipeline) Search(query string, limit int) ([]SearchResult, *Sear
 // SearchBatchScoped searches only documents under the batch: path prefix and
 // does NOT consume flood-guard quota (batch queries are internal, not agent spam).
 func (sp *SearchPipeline) SearchBatchScoped(query string, limit int) ([]SearchResult, *SearchMeta, error) {
-	return sp.search(query, "batch:", limit, false)
+	return sp.SearchPrefixScoped(query, "batch:", limit)
+}
+
+// SearchPrefixScoped searches documents under pathPrefix and skips the flood guard.
+func (sp *SearchPipeline) SearchPrefixScoped(query, pathPrefix string, limit int) ([]SearchResult, *SearchMeta, error) {
+	return sp.search(query, pathPrefix, limit, false)
 }
 
 // search is the shared implementation.
@@ -177,10 +182,10 @@ func (sp *SearchPipeline) search(query, pathPrefix string, limit int, applyFlood
 		case StatusBlocked:
 			meta.FloodStatus = "blocked"
 			meta.TimeMs = time.Since(start).Milliseconds()
-			return nil, meta, fmt.Errorf("search blocked: too many requests in a short time. Wait a moment, or use ctx_run action=batch (its query_scope=batch searches bypass the flood guard).")
+			return nil, meta, fmt.Errorf("search blocked: too many requests in a short time. Wait a moment and retry. ctx_run action=batch with query_scope=batch only searches that batch run's indexed output and bypasses this guard.")
 		case StatusThrottled:
 			meta.FloodStatus = "throttled"
-			meta.ThrottleMsg = "Search volume is high: showing limited results. Prefer ctx_run action=batch with query_scope=batch for multiple related queries."
+			meta.ThrottleMsg = "Search volume is high: showing limited results. Wait before retrying global search. ctx_run action=batch with query_scope=batch only searches that batch run's documents."
 			if limit > 1 {
 				limit = max(1, limit/2)
 			}
