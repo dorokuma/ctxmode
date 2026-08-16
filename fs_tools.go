@@ -861,6 +861,57 @@ func (s *server) rewriteRgLine(root, line string) string {
 	return line
 }
 
+// maxRgLineBytes is the explicit per-line resource cap for the pure-Go rg
+// engine. It deliberately exceeds the 5MB per-file skip so every line of a
+// regular file is searchable (the old 1MB bufio.Scanner cap failed the whole
+// search on any longer line). Only pathological lines (e.g. via a symlink to
+// a huge file) exceed it: those lines are skipped (drained, not accumulated)
+// and the result is flagged truncated so incomplete coverage is never silent.
+// Memory stays bounded at one line per file.
+var maxRgLineBytes = 8 * 1024 * 1024 // 8 MB
+
+// readRgLine reads one line (trailing newline/CR stripped) from br using
+// bounded memory: chunks are accumulated up to maxBytes, then discarded.
+// tooLong is true when the line exceeded maxBytes — the line is skipped
+// entirely (its remainder drained) so the next call starts at the following
+// line. io.EOF is returned only when no data remains.
+func readRgLine(br *bufio.Reader, maxBytes int) (line []byte, tooLong bool, err error) {
+	var buf []byte
+	for {
+		chunk, rerr := br.ReadSlice('\n')
+		if len(buf)+len(chunk) > maxBytes {
+			tooLong = true
+			// Drain the remainder of the oversized line without accumulating it.
+			for rerr == bufio.ErrBufferFull {
+				chunk, rerr = br.ReadSlice('\n')
+			}
+			return nil, true, nil
+		}
+		buf = append(buf, chunk...)
+		if rerr == bufio.ErrBufferFull {
+			continue
+		}
+		if rerr == io.EOF {
+			if len(buf) == 0 {
+				return nil, false, io.EOF
+			}
+			return trimRgLineEnd(buf), false, nil
+		}
+		return trimRgLineEnd(buf), false, nil
+	}
+}
+
+// trimRgLineEnd strips the trailing newline (and optional CR) from a line.
+func trimRgLineEnd(buf []byte) []byte {
+	if len(buf) > 0 && buf[len(buf)-1] == '\n' {
+		buf = buf[:len(buf)-1]
+	}
+	if len(buf) > 0 && buf[len(buf)-1] == '\r' {
+		buf = buf[:len(buf)-1]
+	}
+	return buf
+}
+
 func (s *server) rgGo(ctx context.Context, root string, args rgArgs, limit, contextLines int) (string, bool, int, error) {
 	pattern := args.Pattern
 	if args.Literal {
@@ -883,6 +934,7 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, limit, cont
 	var b strings.Builder
 	matchCount := 0
 	truncated := false
+	stopped := false // walk halted by match limit / output cap (NOT by skipped lines)
 	gitignore := loadBasicGitignore(root)
 
 	walkErr := filepath.Walk(root, func(p string, fi os.FileInfo, err error) error {
@@ -892,7 +944,7 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, limit, cont
 			return ctx.Err()
 		default:
 		}
-		if err != nil || truncated {
+		if err != nil || stopped {
 			return nil
 		}
 		if fi.IsDir() {
@@ -950,22 +1002,36 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, limit, cont
 		}
 		// Rewind with combined reader.
 		reader := io.MultiReader(bytes.NewReader(head), f)
-		scanner := bufio.NewScanner(reader)
-		// Increase buffer for long lines.
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		br := bufio.NewReaderSize(reader, 64*1024)
 
 		display := s.displayPath(p)
 		var ring []string // previous lines for context
 		lineNo := 0
 		pendingAfter := 0
-		for scanner.Scan() {
-			lineNo++
-			line := scanner.Text()
-			// Ensure valid display of possibly invalid UTF-8.
-			if !utf8.ValidString(line) {
-				line = strings.ToValidUTF8(line, "\uFFFD")
+		for {
+			line, tooLong, rerr := readRgLine(br, maxRgLineBytes)
+			if rerr != nil {
+				if rerr == io.EOF {
+					break
+				}
+				_ = f.Close()
+				return rerr
 			}
-			matched := re.MatchString(line)
+			lineNo++
+			if tooLong {
+				// Per-line resource cap hit: the line was drained and is skipped;
+				// scanning continues with the following line (and other files).
+				// Flag the result so incomplete coverage is not silent.
+				truncated = true
+				ring = ring[:0] // context window must not span the skipped line
+				continue
+			}
+			sline := string(line)
+			// Ensure valid display of possibly invalid UTF-8.
+			if !utf8.ValidString(sline) {
+				sline = strings.ToValidUTF8(sline, "\uFFFD")
+			}
+			matched := re.MatchString(sline)
 			if matched {
 				// Emit pre-context.
 				if contextLines > 0 && len(ring) > 0 {
@@ -978,36 +1044,33 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, limit, cont
 						fmt.Fprintf(&b, "%s-%d-%s\n", display, ctxNo, ring[i])
 					}
 				}
-				fmt.Fprintf(&b, "%s:%d:%s\n", display, lineNo, line)
+				fmt.Fprintf(&b, "%s:%d:%s\n", display, lineNo, sline)
 				matchCount++
 				pendingAfter = contextLines
 				if matchCount >= limit {
 					truncated = true
+					stopped = true
 					_ = f.Close()
 					return io.EOF // stop walk
 				}
 				if b.Len() > fsRgMaxOutputBytes {
 					truncated = true
+					stopped = true
 					_ = f.Close()
 					return io.EOF
 				}
 			} else if pendingAfter > 0 {
-				fmt.Fprintf(&b, "%s-%d-%s\n", display, lineNo, line)
+				fmt.Fprintf(&b, "%s-%d-%s\n", display, lineNo, sline)
 				pendingAfter--
 			}
 			if contextLines > 0 {
-				ring = append(ring, line)
+				ring = append(ring, sline)
 				if len(ring) > contextLines {
 					ring = ring[1:]
 				}
 			}
 		}
-		scanErr := scanner.Err()
-		closeErr := f.Close()
-		if scanErr != nil {
-			return scanErr
-		}
-		return closeErr
+		return f.Close()
 	})
 	if walkErr != nil && walkErr != io.EOF {
 		return "", false, 0, walkErr

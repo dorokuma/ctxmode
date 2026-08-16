@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -28,7 +29,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "3.1.0"
+const Version = "3.1.1"
 
 // toolIndex walk / size limits.
 const (
@@ -493,37 +494,44 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 				addSkip(fmt.Sprintf("%s: excluded dir", path))
 				return nil
 			}
-			if isSensitiveFilePath(path) {
-				sensitiveCount++
-				addSkip(fmt.Sprintf("%s: sensitive file (secrets)", path))
-				return nil
-			}
 			// Symlink fence: refuse paths that resolve outside workspaces.
-			if real, rerr := s.ensureInsideWorkspaces(path); rerr != nil {
+			real, rerr := s.ensureInsideWorkspaces(path)
+			if rerr != nil {
 				addSkip(fmt.Sprintf("%s: outside workspace (%v)", path, rerr))
 				return nil
-			} else {
-				path = real
 			}
-			if fi.Size() > maxIndexFileBytes {
-				addSkip(fmt.Sprintf("%s: too large (%d bytes)", path, fi.Size()))
+			// All gates run against the final real target: a harmless-looking
+			// link name must not smuggle a sensitive or oversized real file
+			// past the checks (the Walk info describes the link, not the target).
+			if isSensitiveFilePath(real) {
+				sensitiveCount++
+				addSkip(fmt.Sprintf("%s: sensitive file (secrets)", real))
 				return nil
 			}
-			if isProbablyBinaryName(fi.Name()) {
-				addSkip(fmt.Sprintf("%s: binary extension", path))
+			realInfo, serr := os.Stat(real)
+			if serr != nil {
+				addSkip(fmt.Sprintf("%s: stat: %v", path, serr))
 				return nil
 			}
-			if totalBytes+fi.Size() > maxIndexTotalBytes {
+			if realInfo.Size() > maxIndexFileBytes {
+				addSkip(fmt.Sprintf("%s: too large (%d bytes)", real, realInfo.Size()))
+				return nil
+			}
+			if isProbablyBinaryName(realInfo.Name()) {
+				addSkip(fmt.Sprintf("%s: binary extension", real))
+				return nil
+			}
+			if totalBytes+realInfo.Size() > maxIndexTotalBytes {
 				hitByteCap = true
-				addSkip(fmt.Sprintf("%s: total size cap reached", path))
+				addSkip(fmt.Sprintf("%s: total size cap reached", real))
 				return filepath.SkipAll
 			}
-			if err := s.indexFile(path); err != nil {
+			if err := s.indexFile(real); err != nil {
 				addSkip(fmt.Sprintf("%s: %v", path, err))
 				return nil
 			}
 			indexedCount++
-			totalBytes += fi.Size()
+			totalBytes += realInfo.Size()
 			return nil
 		})
 	} else {
@@ -862,14 +870,41 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 // ---------- db helpers ----------
 
 func (s *server) indexFile(path string) error {
-	// Re-check symlink fence at read time (Walk may encounter links).
+	// Resolve symlinks and re-check containment at read time (Walk may
+	// encounter links; callers may pass an unverified path).
 	real, err := s.ensureInsideWorkspaces(path)
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(real)
+	// Re-verify every gate on the final real target so both entry points
+	// (directory walk and single file) behave identically.
+	if isSensitiveFilePath(real) {
+		return fmt.Errorf("sensitive file (secrets): %s", real)
+	}
+	info, err := os.Stat(real)
 	if err != nil {
 		return err
+	}
+	if info.Size() > maxIndexFileBytes {
+		return fmt.Errorf("too large (%d bytes, max %d)", info.Size(), maxIndexFileBytes)
+	}
+	if isProbablyBinaryName(info.Name()) {
+		return fmt.Errorf("binary extension: %s", info.Name())
+	}
+	// Read with a hard cap (maxIndexFileBytes+1): an oversized file is never
+	// slurped into memory whole, and the +1 catches growth past the limit
+	// between the stat above and the read.
+	f, err := os.Open(real)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxIndexFileBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > maxIndexFileBytes {
+		return fmt.Errorf("too large: read exceeded %d bytes", maxIndexFileBytes)
 	}
 	if isBinaryContent(data) {
 		return fmt.Errorf("binary content detected")

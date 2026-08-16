@@ -5,6 +5,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [3.1.1] - 2026-08-16
+
 ### Fixed
 - **Git hooks hardened** (`githooks/pre-push`, `githooks/commit-msg`): pre-push now parses the four-field push line, handles branch deletions and new branches (zero SHA) correctly, scans only outgoing commits, and fails loudly on malformed input or git errors instead of silently passing; grep patterns are `--`-separated so patterns can never be parsed as options, and the noisy `bug.*fix`/`fix.*bug` words were dropped from commit-msg (normal bugfix messages pass again). Regression coverage in `githooks_test.go`.
 - **`scripts/install-hooks.sh` honors `core.hooksPath`**: relative hooksPath values resolve against the repo root, and a missing hooks directory fails fast instead of claiming installation into a directory git would never use.
@@ -15,6 +17,11 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 - **Go `execute_file` imports**: selector-like text inside string literals and comments (including the injected `FILE_CONTENT` data) no longer triggers imports, and the default `fmt` import was removed — the wrapped program compiles without unused imports.
 - **Background job memory**: background stdout/stderr stream straight to the capped disk log with no in-memory capture, removing up to 10MB per stream per job for concurrent jobs.
 - **Linux platform contract documented**: `ctx_bg kill` verifies the PID identity via `/proc/<pid>/stat` starttime; on non-Linux platforms the check fails closed (never signal an unknown identity), so `ctx_bg` termination is only guaranteed on Linux.
+- **Index walk resolves symlinks before any gate**: sensitive/size/binary checks and the total-byte accounting now run against the resolved real target, so a harmless-looking link name can no longer smuggle a sensitive or oversized file past the checks; `indexFile` re-verifies every gate at read time and reads with a hard cap (`maxIndexFileBytes+1`) instead of slurping the whole file.
+- **Unique index labels for `ctx_run` batch and `run_task`**: a repeated command label or run_task kind/intent no longer silently overwrites an earlier document (INSERT OR REPLACE); each index gets a unique label that stays identifiable by command, and the actual label is returned in the response (`index_label`).
+- **Pure-Go rg handles overlong lines**: the 1MB bufio.Scanner cap (which failed the entire search on any longer line) is replaced by a bounded per-line reader (8MB cap); lines beyond the cap are drained and skipped per line while scanning continues, and the result is flagged truncated so incomplete coverage is never silent.
+- **`ctx_kb` fetch singleflight error branch**: the Truncated state now travels in the shared singleflight return value, so the executing caller and every concurrent waiter agree on `Truncated` even when the fetch is truncated and then fails content processing.
+- **batch `Truncated` means real output cut**: the flag now comes only from the actual capture cap (10MB); output between 100KB and 10MB is auto-indexed but no longer misreported as truncated, and the batch-level flag aggregates the real truncation.
 
 ## [3.1.0] - 2026-08-11
 

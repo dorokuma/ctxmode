@@ -16,7 +16,7 @@ import (
 func TestExecuteCommand_Normal(t *testing.T) {
 	s := &server{}
 	ctx := context.Background()
-	out, exitCode, err := s.executeCommand(ctx, "echo hello_batch", "/tmp")
+	out, exitCode, err, _ := s.executeCommand(ctx, "echo hello_batch", "/tmp")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -31,7 +31,7 @@ func TestExecuteCommand_Normal(t *testing.T) {
 func TestExecuteCommand_NonZeroExit(t *testing.T) {
 	s := &server{}
 	ctx := context.Background()
-	_, exitCode, err := s.executeCommand(ctx, "exit 7", "/tmp")
+	_, exitCode, err, _ := s.executeCommand(ctx, "exit 7", "/tmp")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestExecuteCommand_NonZeroExit(t *testing.T) {
 func TestExecuteCommand_Stderr(t *testing.T) {
 	s := &server{}
 	ctx := context.Background()
-	out, exitCode, err := s.executeCommand(ctx, "echo to_stderr >&2", "/tmp")
+	out, exitCode, err, _ := s.executeCommand(ctx, "echo to_stderr >&2", "/tmp")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestExecuteCommand_Stderr(t *testing.T) {
 func TestExecuteCommand_WorkingDirectory(t *testing.T) {
 	s := &server{}
 	ctx := context.Background()
-	out, exitCode, err := s.executeCommand(ctx, "pwd", "/tmp")
+	out, exitCode, err, _ := s.executeCommand(ctx, "pwd", "/tmp")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestExecuteCommand_ContextCancellation(t *testing.T) {
 	s := &server{}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	_, exitCode, err := s.executeCommand(ctx, "sleep 60", "/tmp")
+	_, exitCode, err, _ := s.executeCommand(ctx, "sleep 60", "/tmp")
 	if err == nil {
 		t.Fatal("expected error from context cancellation")
 	}
@@ -97,7 +97,7 @@ func TestExecuteCommand_ContextCancelled(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		_, _, _ = s.executeCommand(ctx, "sleep 60", "/tmp")
+		_, _, _, _ = s.executeCommand(ctx, "sleep 60", "/tmp")
 		close(done)
 	}()
 
@@ -125,7 +125,7 @@ func TestExecuteCommand_WithSHELLEnv(t *testing.T) {
 	// 不带参数时也能正常工作。
 	s := &server{}
 	ctx := context.Background()
-	out, exitCode, err := s.executeCommand(ctx, "echo from_bash", "/tmp")
+	out, exitCode, err, _ := s.executeCommand(ctx, "echo from_bash", "/tmp")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestExecuteCommand_SHELLWithArgs(t *testing.T) {
 
 	s := &server{}
 	ctx := context.Background()
-	out, exitCode, err := s.executeCommand(ctx, "echo shell_split_ok", "/tmp")
+	out, exitCode, err, _ := s.executeCommand(ctx, "echo shell_split_ok", "/tmp")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestExecuteCommand_EmptySHELL_FallbackSh(t *testing.T) {
 
 	s := &server{}
 	ctx := context.Background()
-	out, exitCode, err := s.executeCommand(ctx, "echo from_sh", "/tmp")
+	out, exitCode, err, _ := s.executeCommand(ctx, "echo from_sh", "/tmp")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -190,12 +190,15 @@ func TestExecuteCommand_OutputUsesLimitedBuffer(t *testing.T) {
 	// 生成超过 maxCmdOutput 的输出（通过大量 echo）
 	// 但我们不真测 10MB，用已知受限的 small 测试即可——
 	// limitedBuffer 的单元测试在 executor_test.go 已覆盖。
-	out, exitCode, err := s.executeCommand(ctx, "printf '%-1000000s' x", "/tmp")
+	out, exitCode, err, truncated := s.executeCommand(ctx, "printf '%-1000000s' x", "/tmp")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if exitCode != 0 {
 		t.Fatalf("expected exit code 0, got %d", exitCode)
+	}
+	if truncated {
+		t.Fatal("1MB of output is below the 10MB buffer cap and must not be flagged truncated")
 	}
 	// 输出应该被 limitedBuffer 截断到 maxCmdOutput (10MB)
 	if len(out) > maxCmdOutput+1024 {
@@ -215,7 +218,7 @@ func TestExecuteCommand_CancellationSIGTERM_GracefulExit(t *testing.T) {
 	defer cancel()
 
 	script := `trap 'echo SIGTERM_RECEIVED; exit 0' TERM; sleep 60`
-	out, exitCode, err := s.executeCommand(ctx, script, "/tmp")
+	out, exitCode, err, _ := s.executeCommand(ctx, script, "/tmp")
 	if err == nil {
 		t.Fatal("expected error from context cancellation")
 	}
@@ -235,7 +238,7 @@ func TestExecuteCommand_CancellationSIGKILL_ForceKill(t *testing.T) {
 
 	script := `trap '' TERM; sleep 60`
 	start := time.Now()
-	_, exitCode, err := s.executeCommand(ctx, script, "/tmp")
+	_, exitCode, err, _ := s.executeCommand(ctx, script, "/tmp")
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected error from context cancellation")
@@ -290,8 +293,11 @@ func TestBatchExecute_LargeOutputIndexedSmallNot(t *testing.T) {
 	if !big.Indexed {
 		t.Fatalf("big output should be indexed: %+v", big)
 	}
-	if !big.Truncated {
-		t.Fatalf("big output should be truncated in response: %+v", big)
+	if big.Truncated {
+		t.Fatalf("100KB-10MB output must NOT be marked truncated (real cut only happens at 10MB): %+v", big)
+	}
+	if big.IndexLabel == "" {
+		t.Fatalf("expected unique index label in response: %+v", big)
 	}
 	small, ok := byLabel["small"]
 	if !ok {
@@ -301,9 +307,12 @@ func TestBatchExecute_LargeOutputIndexedSmallNot(t *testing.T) {
 		t.Fatalf("small output must NOT be indexed: %+v", small)
 	}
 
-	// Store must contain batch:big but not batch:small.
-	if doc, _ := srv.store.Get(batchIndexPrefix + "big"); doc == nil {
-		t.Fatal("batch:big should be present in store")
+	// Store must contain the unique label of the big command but nothing for small.
+	if !strings.HasPrefix(big.IndexLabel, batchIndexPrefix+"big:") {
+		t.Fatalf("index label must stay identifiable by command: %q", big.IndexLabel)
+	}
+	if doc, _ := srv.store.Get(big.IndexLabel); doc == nil {
+		t.Fatal("indexed document must exist under its returned unique label")
 	}
 	if doc, _ := srv.store.Get(batchIndexPrefix + "small"); doc != nil {
 		t.Fatal("batch:small must NOT be persisted (no-size-threshold indexing removed)")
@@ -338,12 +347,15 @@ func TestBatchExecute_ConcurrentIndexesLargeOutput(t *testing.T) {
 		if !r.Indexed {
 			t.Fatalf("expected all entries indexed in concurrent path: %+v", r)
 		}
-	}
-	if doc, _ := srv.store.Get(batchIndexPrefix + "c1"); doc == nil {
-		t.Fatal("batch:c1 should be in store")
-	}
-	if doc, _ := srv.store.Get(batchIndexPrefix + "c2"); doc == nil {
-		t.Fatal("batch:c2 should be in store")
+		if r.IndexLabel == "" {
+			t.Fatalf("expected unique index label for %s: %+v", r.Label, r)
+		}
+		if !strings.HasPrefix(r.IndexLabel, batchIndexPrefix+r.Label+":") {
+			t.Fatalf("index label must stay identifiable by command: %q", r.IndexLabel)
+		}
+		if doc, _ := srv.store.Get(r.IndexLabel); doc == nil {
+			t.Fatalf("document for %s must exist at %q", r.Label, r.IndexLabel)
+		}
 	}
 }
 
@@ -405,7 +417,7 @@ func TestExecuteCommand_StripsSensitiveEnv(t *testing.T) {
 	t.Setenv("FAKE_AUTH_SENTINEL", "super-secret-value")
 	s := &server{}
 	ctx := context.Background()
-	out, _, err := s.executeCommand(ctx,
+	out, _, err, _ := s.executeCommand(ctx,
 		`if env | grep -q '^FAKE_TOKEN_SENTINEL=' || env | grep -q '^FAKE_AUTH_SENTINEL='; then echo LEAKED; else echo CLEAN; fi; if env | grep -q '^PATH='; then echo HAS_PATH; else echo NO_PATH; fi`,
 		"/tmp")
 	if err != nil {
@@ -427,7 +439,7 @@ func TestExecuteCommand_PassthroughKeepsEnv(t *testing.T) {
 	t.Setenv("CTXMODE_ENV_PASSTHROUGH", "1")
 	s := &server{}
 	ctx := context.Background()
-	out, _, err := s.executeCommand(ctx,
+	out, _, err, _ := s.executeCommand(ctx,
 		`if env | grep -q '^FAKE_TOKEN_SENTINEL='; then echo HAS_FAKE_TOKEN; else echo NO_FAKE_TOKEN; fi`,
 		"/tmp")
 	if err != nil {

@@ -645,7 +645,6 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 
 	// skipCacheWrite=false: use singleflight to merge concurrent fetches.
 	sfKey := rawURL + "|" + cacheSource
-	var sfTruncated bool
 	sfResult, err, _ := fetchGroup.Do(sfKey, func() (interface{}, error) {
 		// Use a context that does not inherit the caller's cancel: when the
 		// first caller of a shared singleflight key times out or is cancelled,
@@ -655,13 +654,15 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 
 		body, contentType, truncated, err := s.fetchURL(sfCtx, rawURL, timeout)
 		if err != nil {
-			return nil, fmt.Errorf("fetch failed: %w", err)
+			// Error results still carry their state through the shared return
+			// value (singleflight hands the same value to every waiter), so all
+			// callers agree on Truncated instead of reading a closure-outer local.
+			return &fetchResultData{truncated: truncated}, fmt.Errorf("fetch failed: %w", err)
 		}
-		sfTruncated = truncated
 
 		content, err := processContent(body, contentType, format, truncated)
 		if err != nil {
-			return nil, fmt.Errorf("content processing failed: %w", err)
+			return &fetchResultData{truncated: truncated}, fmt.Errorf("content processing failed: %w", err)
 		}
 
 		// Index into store: clear stale chunks for this source:format:url first
@@ -686,7 +687,11 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 	})
 	if err != nil {
 		result.Error = err.Error()
-		result.Truncated = sfTruncated
+		// The error's state travels in the shared singleflight return value, so
+		// the executing caller and every waiter see the same Truncated value.
+		if data, ok := sfResult.(*fetchResultData); ok {
+			result.Truncated = data.truncated
+		}
 		return result, nil
 	}
 	data := sfResult.(*fetchResultData)

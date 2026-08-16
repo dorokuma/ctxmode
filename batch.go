@@ -37,6 +37,7 @@ type batchResult struct {
 	ExitCode   int    `json:"exit_code"`
 	Truncated  bool   `json:"truncated,omitempty"`
 	Indexed    bool   `json:"indexed,omitempty"`
+	IndexLabel string `json:"index_label,omitempty"` // actual unique store label
 	Size       int    `json:"size"`
 	Error      string `json:"error,omitempty"`
 	IndexError string `json:"index_error,omitempty"`
@@ -64,8 +65,11 @@ const (
 
 // executeCommand runs a shell command with the given context and working directory.
 // It captures stdout and stderr separately, then merges them.
-// Returns merged output, exit code, and any execution error.
-func (s *server) executeCommand(ctx context.Context, command, cwd string) (output string, exitCode int, execErr error) {
+// Returns merged output, exit code, and any execution error. The fourth return
+// value reports whether the captured output was actually cut at the buffer limit
+// (maxCmdOutput) — it is the ONLY source of the batch Truncated flag; the 100KB
+// auto-index threshold is unrelated to real truncation.
+func (s *server) executeCommand(ctx context.Context, command, cwd string) (output string, exitCode int, execErr error, truncated bool) {
 	var cmd *exec.Cmd
 	shellPath := os.Getenv("SHELL")
 	if shellPath != "" {
@@ -94,7 +98,7 @@ func (s *server) executeCommand(ctx context.Context, command, cwd string) (outpu
 
 	// Start the command.
 	if err := cmd.Start(); err != nil {
-		return "", -1, fmt.Errorf("failed to start command: %w", err)
+		return "", -1, fmt.Errorf("failed to start command: %w", err), false
 	}
 
 	// Wait for completion or context cancellation.
@@ -116,7 +120,7 @@ func (s *server) executeCommand(ctx context.Context, command, cwd string) (outpu
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			<-done
 		}
-		return stdoutBuf.String() + stderrBuf.String(), -1, fmt.Errorf("command cancelled: %w", ctx.Err())
+		return stdoutBuf.String() + stderrBuf.String(), -1, fmt.Errorf("command cancelled: %w", ctx.Err()), stdoutBuf.truncated || stderrBuf.truncated
 
 	case err := <-done:
 		stdout := stdoutBuf.String()
@@ -137,7 +141,7 @@ func (s *server) executeCommand(ctx context.Context, command, cwd string) (outpu
 				}
 				output += stderr
 			}
-			return output, exitCode, nil
+			return output, exitCode, nil, stdoutBuf.truncated || stderrBuf.truncated
 		}
 
 		// Success.
@@ -148,7 +152,7 @@ func (s *server) executeCommand(ctx context.Context, command, cwd string) (outpu
 			}
 			output += stderr
 		}
-		return output, cmd.ProcessState.ExitCode(), nil
+		return output, cmd.ProcessState.ExitCode(), nil, stdoutBuf.truncated || stderrBuf.truncated
 	}
 }
 
@@ -344,13 +348,14 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 			continue
 		}
 
-		out, exitCode, execErr := s.executeCommand(cmdCtx, cmd.Command, cwd)
+		out, exitCode, execErr, truncated := s.executeCommand(cmdCtx, cmd.Command, cwd)
 
 		r := batchResult{
-			Label:    cmd.Label,
-			Command:  cmd.Command,
-			ExitCode: exitCode,
-			Size:     len(out),
+			Label:     cmd.Label,
+			Command:   cmd.Command,
+			ExitCode:  exitCode,
+			Size:      len(out),
+			Truncated: truncated,
 		}
 
 		if execErr != nil {
@@ -360,18 +365,18 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 			r.Success = exitCode == 0
 		}
 
-		if len(out) > maxOutputSize {
-			r.Truncated = true
-		}
-
 		// Auto-index only large output (same 100KB threshold as the execute path);
-		// small output is not persisted. Indexed entries are flagged in the response.
+		// small output is not persisted. Each index gets a unique label so a
+		// repeated command label cannot silently overwrite an earlier document
+		// (INSERT OR REPLACE); the actual label is returned in the response.
 		if len(out) > maxOutputSize {
+			label := uniqueIndexLabel("batch", cmd.Label)
 			s.mu.Lock()
-			if err := s.store.Index(batchIndexPrefix+cmd.Label, out); err != nil {
+			if err := s.store.Index(label, out); err != nil {
 				r.IndexError = err.Error()
 			} else {
 				r.Indexed = true
+				r.IndexLabel = label
 			}
 			s.mu.Unlock()
 		}
@@ -404,13 +409,14 @@ func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCom
 			}
 			defer cmdCancel()
 
-			out, exitCode, execErr := s.executeCommand(cmdCtx, c.Command, cwd)
+			out, exitCode, execErr, truncated := s.executeCommand(cmdCtx, c.Command, cwd)
 
 			r := batchResult{
-				Label:    c.Label,
-				Command:  c.Command,
-				ExitCode: exitCode,
-				Size:     len(out),
+				Label:     c.Label,
+				Command:   c.Command,
+				ExitCode:  exitCode,
+				Size:      len(out),
+				Truncated: truncated,
 			}
 
 			if execErr != nil {
@@ -420,18 +426,17 @@ func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCom
 				r.Success = exitCode == 0
 			}
 
-			if len(out) > maxOutputSize {
-				r.Truncated = true
-			}
-
 			// Auto-index only large output (same 100KB threshold as the execute path);
 			// small output is not persisted. Mutex serializes SQLite single-writer.
+			// Unique label per index (see executeBatchSerial).
 			if len(out) > maxOutputSize {
+				label := uniqueIndexLabel("batch", c.Label)
 				s.mu.Lock()
-				if err := s.store.Index(batchIndexPrefix+c.Label, out); err != nil {
+				if err := s.store.Index(label, out); err != nil {
 					r.IndexError = err.Error()
 				} else {
 					r.Indexed = true
+					r.IndexLabel = label
 				}
 				s.mu.Unlock()
 			}

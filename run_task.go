@@ -238,7 +238,9 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 	}
 
 	if len(outputText) > runTaskAutoIndexBytes {
-		label := fmt.Sprintf("run_task:%s", labelBase)
+		// Unique label per index: a fixed "run_task:<kind>" label would let a
+		// later run silently overwrite an earlier document (INSERT OR REPLACE).
+		label := uniqueIndexLabel("run_task", labelBase)
 		if err := s.storeIndexLocked(label, outputText); err != nil {
 			preview := tailUTF8(outputText, runTaskTailBytes)
 			return &mcp.CallToolResult{
@@ -258,7 +260,7 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 	}
 
 	if len(outputText) > runTaskIntentIndexBytes && intent != "" {
-		label := "run_task:" + intent
+		label := uniqueIndexLabel("run_task", intent)
 		if err := s.storeIndexLocked(label, outputText); err != nil {
 			preview := tailUTF8(outputText, runTaskPreviewBytes)
 			return &mcp.CallToolResult{
