@@ -1207,8 +1207,13 @@ func rustWrapper(code string) string {
 `
 }
 
-// phpWrapper adds <?php tag.
+// phpWrapper adds a <?php tag unless the source already has one
+// (execute_file splices FILE_CONTENT after an existing opener).
 func phpWrapper(code string) string {
+	trim := strings.TrimLeft(code, " \t\r\n")
+	if strings.HasPrefix(trim, "<?php") || strings.HasPrefix(trim, "<?") {
+		return code
+	}
 	return "<?php\n" + code + "\n"
 }
 
@@ -1372,12 +1377,13 @@ func fileContentDecl(language, fileContent string) string {
 		return "FILE_CONTENT = r\"\"\"" + fileContent + "\"\"\"\n"
 
 	case "go":
+		// var (not :=) is legal both at package scope and inside func main.
 		parts := strings.Split(fileContent, "`")
 		if len(parts) == 1 {
-			return "FILE_CONTENT := `" + fileContent + "`\n"
+			return "var FILE_CONTENT = `" + fileContent + "`\n"
 		}
 		var sb strings.Builder
-		sb.WriteString("FILE_CONTENT := ")
+		sb.WriteString("var FILE_CONTENT = ")
 		for i, p := range parts {
 			if i > 0 {
 				sb.WriteString(" + \"`\" + ")
@@ -1415,7 +1421,9 @@ func fileContentDecl(language, fileContent string) string {
 		return "FILE_CONTENT <- '" + escaped + "'\n"
 
 	case "elixir":
-		if strings.Contains(fileContent, `"""`) {
+		if strings.Contains(fileContent, `"""`) ||
+			strings.HasSuffix(fileContent, `"`) ||
+			strings.HasSuffix(fileContent, `\`) {
 			encoded := base64.StdEncoding.EncodeToString([]byte(fileContent))
 			return "FILE_CONTENT = Base.decode64!(\"" + encoded + "\")\n"
 		}
@@ -2250,8 +2258,8 @@ FILE_CONTENT = base64.b64decode("%s").decode()
 %s`, encoded, code)
 	case "go":
 		return fmt.Sprintf(`import "encoding/base64"
-FILE_CONTENT_BYTES, _ := base64.StdEncoding.DecodeString("%s")
-FILE_CONTENT := string(FILE_CONTENT_BYTES)
+var FILE_CONTENT_BYTES, _ = base64.StdEncoding.DecodeString("%s")
+var FILE_CONTENT = string(FILE_CONTENT_BYTES)
 %s`, encoded, code)
 	default:
 		// For languages that don't have a native decode, inject the raw content

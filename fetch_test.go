@@ -877,6 +877,8 @@ func TestCheckIP_EmbeddedIPv4Blocked(t *testing.T) {
 	cases := []string{
 		"64:ff9b::a9fe:a9fe",
 		"64:ff9b::a00:1",
+		"64:ff9b:1::a9fe:a9fe",
+		"64:ff9b:1::a00:1",
 		"2002:a9fe:a9fe::",
 		"::169.254.169.254",
 		"::10.0.0.1",
@@ -910,5 +912,57 @@ func TestIndexContentLocked_DoesNotDeleteLongerURL(t *testing.T) {
 	}
 	if doc, _ := srv.store.Get(shortPath); doc == nil || doc.Content != "SHORT_V2" {
 		t.Fatalf("short URL not updated: %+v", doc)
+	}
+}
+
+func TestStripURLFragment(t *testing.T) {
+	if got := stripURLFragment("http://ex.com/foo#chunk-1"); got != "http://ex.com/foo" {
+		t.Fatalf("got %q", got)
+	}
+	if got := stripURLFragment("http://ex.com/foo"); got != "http://ex.com/foo" {
+		t.Fatalf("unchanged: %q", got)
+	}
+}
+
+func TestFetchAndIndex_StripsFragmentBeforePath(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "hello fragment")
+	}
+	srv := newFetchTestServer(t, handler)
+	res, err := srv.fetchAndIndex(context.Background(), "http://1.1.1.1/doc#chunk-1", "web", "html", true, 0, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != "" {
+		t.Fatalf("fetch error: %s", res.Error)
+	}
+	if res.URL != "http://1.1.1.1/doc" {
+		t.Fatalf("URL should drop fragment, got %q", res.URL)
+	}
+	if doc, _ := srv.store.Get(fetchDocPath("web", "html", "http://1.1.1.1/doc")); doc == nil {
+		t.Fatal("expected document at fragment-free path")
+	}
+}
+
+func TestToolFetchAndIndex_ReportsBodyTruncated(t *testing.T) {
+	big := strings.Repeat("A", maxBodySize+4096)
+	srv := newFetchTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(big))
+	})
+	ttl := 0
+	toolRes, _, err := srv.toolFetchAndIndex(context.Background(), nil, fetchArgs{
+		URL:    "http://1.1.1.1/huge",
+		Format: "html",
+		Force:  true,
+		TTL:    &ttl,
+	})
+	if err != nil {
+		t.Fatalf("toolFetchAndIndex: %v", err)
+	}
+	text := contentText(toolRes)
+	if !strings.Contains(text, "body truncated at 10MB") {
+		t.Fatalf("expected 10MB body-truncation notice, got:\n%s", text)
 	}
 }

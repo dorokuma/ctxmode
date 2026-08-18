@@ -56,3 +56,15 @@ func TestSearchThrottleMessage_UsesCtxRunBatch(t *testing.T) {
 		t.Fatalf("must not reference removed ctx_batch_execute tool: %s", meta.ThrottleMsg)
 	}
 }
+
+func TestSearch_OneSideErrorNotReportedAsNoHits(t *testing.T) {
+	store := newTestStore(t)
+	indexDoc(t, store, "p", "hello world unique-token-xyz")
+	if _, err := store.db.Exec(`DROP TABLE documents_fts`); err != nil {
+		t.Fatalf("drop porter: %v", err)
+	}
+	_, err := store.Search("no-such-token-zzzz-absent", 5)
+	if err == nil {
+		t.Fatal("expected error when porter is down and trigram has no hits")
+	}
+}

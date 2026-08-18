@@ -206,10 +206,19 @@ func (sp *SearchPipeline) search(query, pathPrefix string, limit int, applyFlood
 	porterResults, porterErr := sp.store.searchPorter(query, pathPrefix, extraLimit)
 	trigramResults, trigramErr := sp.store.searchTrigram(query, pathPrefix, extraLimit)
 
-	// If both failed, return the error.
+	// If both failed, return the error. One side failing with an empty
+	// other side is also an error — do not report it as "no matches".
 	if porterErr != nil && trigramErr != nil {
 		meta.TimeMs = time.Since(start).Milliseconds()
 		return nil, meta, fmt.Errorf("porter: %v / trigram: %v", porterErr, trigramErr)
+	}
+	if porterErr != nil && len(trigramResults) == 0 {
+		meta.TimeMs = time.Since(start).Milliseconds()
+		return nil, meta, porterErr
+	}
+	if trigramErr != nil && len(porterResults) == 0 {
+		meta.TimeMs = time.Since(start).Milliseconds()
+		return nil, meta, trigramErr
 	}
 
 	// 3. RRF merge.

@@ -27,6 +27,7 @@ interface ClientTestSurface {
   sendRequest(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<{ content?: Array<{ text: string }> }>
   start(): Promise<void>
   callTool(name: string, args: Record<string, unknown>): Promise<string>
+  timeoutForTool(name: string, args: Record<string, unknown>): number
   stderrBuffer: string[]
   stderrCarry: string
   stopped: boolean
@@ -358,4 +359,14 @@ test("callTool 在 disconnected 时不二次 tools/call", async () => {
     )
     assert.equal(toolCalls, 1, `${boom}: 不重放 tools/call`)
   }
+})
+
+test("timeoutForTool: fetch 默认大于服务端 150s，并读取 timeoutMs", () => {
+  const c = newClient()
+  const fetchDefault = c.timeoutForTool("ctx_kb", { action: "fetch" })
+  assert.ok(fetchDefault >= 180000, `fetch default ${fetchDefault} should be 150s+buffer`)
+  const custom = c.timeoutForTool("ctx_kb", { action: "fetch", timeoutMs: 200000 })
+  assert.ok(custom >= 230000, `timeoutMs 200000 + buffer, got ${custom}`)
+  const snake = c.timeoutForTool("ctx_run", { action: "run_task", timeout_ms: 400000 })
+  assert.ok(snake >= 430000, `timeout_ms still works, got ${snake}`)
 })

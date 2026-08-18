@@ -200,7 +200,8 @@ func ipv6Zeros(ip net.IP, start, end int) bool {
 }
 
 // embeddedIPv4 extracts an IPv4 address hidden inside IPv6 (mapped, deprecated
-// compatible, NAT64 64:ff9b::/96, 6to4 2002::/16). Plain IPv4 is returned as-is.
+// compatible, NAT64 64:ff9b::/96, RFC 8215 local-use 64:ff9b:1::/48, 6to4
+// 2002::/16). Plain IPv4 is returned as-is.
 func embeddedIPv4(ip net.IP) net.IP {
 	if v4 := ip.To4(); v4 != nil {
 		return v4
@@ -216,9 +217,12 @@ func embeddedIPv4(ip net.IP) net.IP {
 		}
 		return net.IP(ip[12:16])
 	}
-	// NAT64 well-known prefix 64:ff9b::/96
-	if ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b && ipv6Zeros(ip, 4, 12) {
-		return net.IP(ip[12:16])
+	// NAT64 well-known prefix 64:ff9b::/96 and RFC 8215 local-use 64:ff9b:1::/48
+	// (IPv4 in the last 32 bits, the /96 embedding used inside that /48).
+	if ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b {
+		if ipv6Zeros(ip, 4, 12) || (ip[4] == 0x00 && ip[5] == 0x01) {
+			return net.IP(ip[12:16])
+		}
 	}
 	// 6to4 2002:AABB:CCDD::/48 — bytes 2-5 are the IPv4 address.
 	if ip[0] == 0x20 && ip[1] == 0x02 {
@@ -585,7 +589,15 @@ func (s *server) purgeLegacyFetchDocs(source string) (int, error) {
 }
 
 // fetchAndIndex fetches a URL, processes the content, and indexes it into the store.
+func stripURLFragment(raw string) string {
+	if i := strings.Index(raw, "#"); i >= 0 {
+		return raw[:i]
+	}
+	return raw
+}
+
 func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format string, force bool, ttl int, timeout time.Duration) (*FetchResult, error) {
+	rawURL = stripURLFragment(rawURL)
 	// Default source avoids path becoming ":{url}".
 	if source == "" {
 		source = "fetch"
@@ -819,12 +831,14 @@ func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, 
 	seen := make(map[string]bool)
 	var urls []string
 	if args.URL != "" {
-		if !seen[args.URL] {
-			seen[args.URL] = true
-			urls = append(urls, args.URL)
+		u := stripURLFragment(args.URL)
+		if !seen[u] {
+			seen[u] = true
+			urls = append(urls, u)
 		}
 	}
-	for _, u := range args.URLs {
+	for _, raw := range args.URLs {
+		u := stripURLFragment(raw)
 		if u != "" && !seen[u] {
 			seen[u] = true
 			urls = append(urls, u)
@@ -896,6 +910,9 @@ func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, 
 		if r.ChunkCount > 0 {
 			chunkInfo = fmt.Sprintf(" (%d chunks)", r.ChunkCount)
 			totalChunks += r.ChunkCount
+		}
+		if r.Truncated && r.Error == "" {
+			chunkInfo += " [body truncated at 10MB — indexed content may be incomplete]"
 		}
 
 		summaryLines = append(summaryLines, fmt.Sprintf("- %s %s%s", status, r.URL, chunkInfo))

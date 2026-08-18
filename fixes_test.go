@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -124,6 +125,37 @@ func TestInjectFileContent_PythonFutureAndElixirBytes(t *testing.T) {
 	gout := injectFileContent("go", goSrc, "xyz")
 	if !strings.HasPrefix(strings.TrimSpace(gout), "package main") {
 		t.Fatalf("go package line must stay first:\n%s", gout)
+	}
+	if !strings.Contains(gout, "var FILE_CONTENT =") {
+		t.Fatalf("package-level FILE_CONTENT must use var, got:\n%s", gout)
+	}
+
+	elQ := injectFileContent("elixir", "IO.puts(FILE_CONTENT)", `abc"`)
+	if !strings.Contains(elQ, "decode64") {
+		t.Fatalf("elixir trailing quote must use base64, got:\n%s", elQ)
+	}
+}
+
+func TestInjectFileContent_GoPackageLevelCompiles(t *testing.T) {
+	src := "package main\n\nfunc main() {\n\t_ = FILE_CONTENT\n}\n"
+	injected := injectFileContent("go", src, "xyz")
+	wrapped := wrapCode("go", injected)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(p, []byte(wrapped), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("go", "run", p).CombinedOutput()
+	if err != nil {
+		t.Fatalf("go run injected package: %v\n%s\n%s", err, wrapped, out)
+	}
+}
+
+func TestPHPWrapper_DoesNotDoubleOpenTag(t *testing.T) {
+	injected := injectFileContent("php", "<?php\necho $FILE_CONTENT;\n", "hi")
+	wrapped := wrapCode("php", injected)
+	if n := strings.Count(wrapped, "<?php"); n != 1 {
+		t.Fatalf("expected one <?php, got %d in:\n%s", n, wrapped)
 	}
 }
 
@@ -388,7 +420,7 @@ func TestGoWrapper_SkipsInjectedFileContentSimpleRaw(t *testing.T) {
 	content := "plain data fmt.Println(os.Getenv(\"X\")) strings.Split(\"a,b\", \",\")"
 	code := "fmt.Println(len(FILE_CONTENT))"
 	injected := injectFileContent("go", code, content)
-	if !strings.HasPrefix(injected, "FILE_CONTENT := `") {
+	if !strings.HasPrefix(injected, "var FILE_CONTENT = `") {
 		t.Fatalf("expected simple raw form, got:\n%s", injected)
 	}
 	imports := detectGoImports(injected)
@@ -399,7 +431,7 @@ func TestGoWrapper_SkipsInjectedFileContentSimpleRaw(t *testing.T) {
 
 func TestGoWrapper_SkipsInjectedFileContentBacktickConcat(t *testing.T) {
 	// Backtick-concatenation injection form (file contains backticks):
-	// FILE_CONTENT := `a` + "`" + `b...` — the backticks inside the "`"
+	// var FILE_CONTENT = `a` + "`" + `b...` — the backticks inside the "`"
 	// strings are literal data, not raw-string delimiters, and the data must
 	// not trigger imports. Real selectors in the user code still do.
 	content := "a`b`c fmt.Println(os.Getenv(\"X\")) strings.Split(\"a,b\", \",\")"
@@ -608,8 +640,8 @@ func TestValidateURL_AllowsIfAnyIPSafe(t *testing.T) {
 
 func TestVersionAligned(t *testing.T) {
 	// Keep in sync with CHANGELOG release label.
-	if Version != "3.1.2" {
-		t.Fatalf("Version=%q, want 3.1.2 (CHANGELOG)", Version)
+	if Version != "3.1.3" {
+		t.Fatalf("Version=%q, want 3.1.3 (CHANGELOG)", Version)
 	}
 }
 

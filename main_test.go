@@ -363,6 +363,10 @@ func TestResolvePath_MultiWorkdirMatch(t *testing.T) {
 	if got, err := s.resolvePath(""); err != nil || got != wd1 {
 		t.Fatalf("resolvePath(\"\") = %q, err %v", got, err)
 	}
+	// "." exists under every workdir; it means the primary root, not "ambiguous".
+	if got, err := s.resolvePath("."); err != nil || got != wd1 {
+		t.Fatalf("resolvePath(\".\") = %q, err %v; want primary workdir", got, err)
+	}
 	abs, err := s.resolvePath(filepath.Join(wd1, "only1.txt"))
 	if err != nil || abs != filepath.Join(wd1, "only1.txt") {
 		t.Fatalf("resolvePath(abs) = %q, err %v", abs, err)
@@ -592,6 +596,26 @@ func TestExecute_LargeOutputKeepsExitAndTail(t *testing.T) {
 	}
 	if !strings.Contains(text, "--- Tail preview ---") {
 		t.Fatalf("large execute must include tail preview, got:\n%s", text)
+	}
+}
+
+func TestExecute_IntentMidSizeKeepsExitAndTail(t *testing.T) {
+	st := newTestStore(t)
+	s := &server{workdirs: []string{t.TempDir()}, store: st}
+	res, _, err := s.toolExecute(context.Background(), nil, executeArgs{
+		Argv:    []string{"python3", "-c", "import sys; sys.stdout.write('H'*6000); sys.exit(7)"},
+		Intent:  "recheck-mid",
+		Timeout: 20000,
+	})
+	if err != nil {
+		t.Fatalf("toolExecute: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "exit_code: 7") {
+		t.Fatalf("mid-size+intent must include exit_code, got:\n%s", text)
+	}
+	if !strings.Contains(text, "--- Tail preview ---") {
+		t.Fatalf("mid-size+intent must include tail preview, got:\n%s", text)
 	}
 }
 

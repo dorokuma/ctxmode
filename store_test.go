@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -212,5 +213,37 @@ func TestCountByPrefix_Basic(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("expected 0, got %d", n)
+	}
+}
+
+func TestNewStore_URISpecialChars(t *testing.T) {
+	cases := []string{"My Project", "foo%20bar", "foo#bar", "foo?bar", "foo&bar"}
+	for _, name := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), name)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			dbPath := filepath.Join(dir, "context_mode.db")
+			st, err := NewStore(dbPath)
+			if err != nil {
+				t.Fatalf("NewStore(%q): %v", dbPath, err)
+			}
+			defer st.Close()
+			marker := "dsn-marker-" + name
+			if err := st.Index("p", marker); err != nil {
+				t.Fatalf("Index: %v", err)
+			}
+			if _, err := os.Stat(dbPath); err != nil {
+				t.Fatalf("expected db at literal path %s: %v", dbPath, err)
+			}
+			hits, err := st.Search(marker, 5)
+			if err != nil {
+				t.Fatalf("Search: %v", err)
+			}
+			if len(hits) == 0 {
+				t.Fatalf("indexed row not searchable for dir %q", name)
+			}
+		})
 	}
 }

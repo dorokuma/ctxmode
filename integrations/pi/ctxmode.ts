@@ -422,10 +422,12 @@ export class CtxmodeClient {
     const fromArgs =
       typeof args.timeout_ms === "number" && args.timeout_ms > 0
         ? args.timeout_ms
-        : typeof args.timeout === "number" && args.timeout > 0
-          ? args.timeout
-          : 0
-    // Server defaults: run_task 300s, execute often 30s–hours; keep buffer for MCP overhead.
+        : typeof args.timeoutMs === "number" && args.timeoutMs > 0
+          ? args.timeoutMs
+          : typeof args.timeout === "number" && args.timeout > 0
+            ? args.timeout
+            : 0
+    // Server defaults: run_task 300s, fetch 150s, execute often 30s–hours; keep buffer for MCP overhead.
     let base = REQUEST_TIMEOUT_MS
     if (name === "ctx_run") {
       const act = String(args.action || "")
@@ -434,6 +436,8 @@ export class CtxmodeClient {
       } else {
         base = Math.max(REQUEST_TIMEOUT_MS, (fromArgs || 120000) + 30000)
       }
+    } else if (name === "ctx_kb" && String(args.action || "") === "fetch") {
+      base = Math.max(REQUEST_TIMEOUT_MS, (fromArgs || 150000) + 30000)
     } else if (name === "ctx_bg" && String(args.action || "") === "wait") {
       base = Math.max(REQUEST_TIMEOUT_MS, (fromArgs || 60000) + 15000)
     }

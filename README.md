@@ -4,7 +4,7 @@ A 100% NPM/NodeJS-free, Go implementation of Mert Koseoglu's [context-mode](http
 
 Local-first Model Context Protocol (MCP) server that virtualizes tool outputs, allowing AI coding agents to execute heavy tasks and save up to 98% in token usage.
 
-Current version: **3.1.2**.
+Current version: **3.1.3**.
 
 Supported platform: **Linux**. Background process identity verification reads `/proc/<pid>/stat`; on other platforms ctxmode still runs, but `ctx_bg` termination is not promised (see [ctx_bg](#ctx_bg--background-process-supervision-from-ctx_run-actionexecute-backgroundtrue)).
 
@@ -72,7 +72,7 @@ The following are defense-in-depth measures, never a security guarantee:
 
 - Subprocess environments strip inherited variables whose names look sensitive (`token`, `key`, `secret`, `password`, `passwd`, `credential`, `auth`, `cookie`, `session`, case-insensitive) by default; `CTXMODE_ENV_PASSTHROUGH=1` disables this. Caller-provided `env` overrides truly replace same-named inherited variables (deduplicated map, not appended duplicates), and the allowlist still rejects `PATH`/`HOME`/`SHELL`/`LD_*`/`DYLD_*` etc.
 - Indexing skips secret-like files by default: `.env`/`.env.*`, anything under a `.env/` directory, private keys (`*.pem`, `*.key`, `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`), `credentials.json`, `.npmrc`, `.netrc`, and anything under `.aws`/`.ssh`/`.gnupg`/`.kube`.
-- `ctx_kb action=fetch` refuses SSRF targets: IPv4 and IPv6 loopback, link-local (169.254.0.0/16, fe80::/10), multicast, reserved, private (RFC 1918, fc00::/7), CGNAT and benchmark ranges. Embedded IPv4 in IPv6 (IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`) is decoded and checked against the same IPv4 list. The blocklist is a single fixed set: the former strict/non-strict split was removed (`CTX_FETCH_STRICT` no longer exists) and the intercepted set cannot be changed via the environment.
+- `ctx_kb action=fetch` refuses SSRF targets: IPv4 and IPv6 loopback, link-local (169.254.0.0/16, fe80::/10), multicast, reserved, private (RFC 1918, fc00::/7), CGNAT and benchmark ranges. Embedded IPv4 in IPv6 (IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96`, RFC 8215 local-use `64:ff9b:1::/48`, 6to4 `2002::/16`) is decoded and checked against the same IPv4 list. The blocklist is a single fixed set: the former strict/non-strict split was removed (`CTX_FETCH_STRICT` no longer exists) and the intercepted set cannot be changed via the environment.
 
 ### Subprocess environment isolation
 
@@ -99,17 +99,17 @@ Side effects to be aware of:
 
 ### ctx_run — PRIMARY for commands/tests/builds
 
-- `execute` — 12-language subprocess execution (`javascript`, `typescript`, `python`, `shell`, `go`, `rust`, `php`, `perl`, `ruby`, `r`, `elixir`, `csharp`). `command` runs via shell (default language); `argv` execs directly without a shell (preferred). `env` (allowlist-validated), `stdin` (≤1MB), `timeout` (ms, max 1h), `background` (supervise via ctx_bg), `intent`, `cwd` (workdir-resolved). Output >100KB is auto-indexed (with `intent`, >5KB too).
-- `execute_file` — `path` + `code`: file content is injected as `FILE_CONTENT` and the code processes it. Files ≤10MB; binary files refused.
+- `execute` — 12-language subprocess execution (`javascript`, `typescript`, `python`, `shell`, `go`, `rust`, `php`, `perl`, `ruby`, `r`, `elixir`, `csharp`). `command` runs via shell (default language); `argv` execs directly without a shell (preferred). `env` (allowlist-validated), `stdin` (≤1MB), `timeout` (ms, max 1h), `background` (supervise via ctx_bg), `intent`, `cwd` (workdir-resolved). Output >100KB is auto-indexed (with `intent`, >5KB too). Auto-indexed replies include `exit_code` and a tail preview (same contract as `run_task`).
+- `execute_file` — `path` + `code`: file content is injected as `FILE_CONTENT` and the code processes it. Files ≤10MB; binary files refused. Whole-file Go sources use `var FILE_CONTENT` (legal at package scope); PHP does not add a second `<?php` when the source already has one. Auto-indexed replies match `execute` (`exit_code` + tail preview).
 - `batch` — `commands` (≤50, non-empty unique labels), `queries` (≤20), `concurrency` (1-8, default 1; out-of-range is an error), `query_scope` (`batch`|`global`, default `batch`; invalid is an error), `cwd`, `timeout` (default 30s, max 1h; serial: shared budget, concurrent: per-command). Only output >100KB is indexed (same threshold as `execute`); small output is not persisted. `query_scope=batch` searches only this run's indexed command output.
 - `run_task` — structured test/build with fixed argv (no shell): `kind` ∈ `go_test`|`go_build`|`go_vet`|`npm_test`|`npm_run_build`|`cargo_test`|`cargo_build`|`make`|`custom`, `target`, `args`, `timeout_ms` (default 300000, max 3600000), `cwd`, `intent`, `env`. `custom` requires `args[0]` as the executable.
 
 ### ctx_fs — workspace filesystem (paths limited to workdirs)
 
-- `ls` — list directory: `path`, `depth` (1-5, default 1; >5 is an error), `include_hidden`, `limit` (default 200, max 2000; >2000 is an error).
-- `glob` — `pattern` (`**` supported), `path`, `limit` (default 200, max 2000; >2000 is an error); skips `.git`/`node_modules`/`vendor` and applies basic `.gitignore` rules.
+- `ls` — list directory: `path` (omitted, `.`, or `./` is the primary workdir, even when several `workdirs` are configured), `depth` (1-5, default 1; >5 is an error), `include_hidden`, `limit` (default 200, max 2000; >2000 is an error).
+- `glob` — `pattern` (`**` supported), `path` (same default as `ls`), `limit` (default 200, max 2000; >2000 is an error); skips `.git`/`node_modules`/`vendor` and applies basic `.gitignore` rules.
 - `stat` — `path`: size/mode/mtime/symlink/workdir metadata (symlink-aware).
-- `rg` — content search: `pattern` (or `literal`), `path`, `glob`, `ignore_case`, `context` (0-5), `limit` (default 50, max 500; >500 is an error); system `rg` with `--no-config` (ignores `RIPGREP_CONFIG_PATH` / `~/.ripgreprc`) and a pure-Go fallback; skips binaries.
+- `rg` — content search: `pattern` (or `literal`), `path` (same default as `ls`), `glob`, `ignore_case`, `context` (0-5), `limit` (default 50, max 500; >500 is an error); system `rg` with `--no-config` (ignores `RIPGREP_CONFIG_PATH` / `~/.ripgreprc`) and a pure-Go fallback; skips binaries.
 
 ### ctx_git — read-only git (no commit/push/reset)
 
@@ -120,8 +120,8 @@ Side effects to be aware of:
 ### ctx_kb — local knowledge base
 
 - `index` — `path` (file or directory) into SQLite FTS5; skips `.git`/`node_modules`, sensitive/secret files, binaries and >1MB files; capped at 5000 files / 100MB total.
-- `search` — `query`: BM25 + Porter + Trigram + RRF + proximity rerank; flood-guarded. `ctx_run` batch `query_scope=batch` searches only that batch run's indexed documents and bypasses the guard; it does not search `execute`/`run_task`/fetch output.
-- `fetch` — `url`/`urls` (≤10) → markdown → index; `source`, `format` (markdown/html/json), `force`, `maxBytes` (default 50KB), `timeoutMs` (default 150000), `ttl` (default 24h, 0 = skip cache); SSRF protection as above. Indexed documents are isolated per `format`: the KB path embeds the format (`source:format:url`), so the same URL can coexist as markdown/html/json without overwriting, and re-fetching in one format never touches the others. Re-fetching a short URL does not delete a longer sibling URL.
+- `search` — `query`: BM25 + Porter + Trigram + RRF + proximity rerank; flood-guarded. If one FTS index errors and the other returns no hits, the error is returned (not a silent "no matches"). `ctx_run` batch `query_scope=batch` searches only that batch run's indexed documents and bypasses the guard; it does not search `execute`/`run_task`/fetch output.
+- `fetch` — `url`/`urls` (≤10) → markdown → index; `source`, `format` (markdown/html/json), `force`, `maxBytes` (default 50KB), `timeoutMs` (default 150000), `ttl` (default 24h, 0 = skip cache); SSRF protection as above. URL fragments (`#…`) are stripped before indexing so a user fragment cannot collide with internal `#chunk-` keys. Bodies cut at the 10MB fetch cap are still indexed, and the summary reports `body truncated at 10MB`. Indexed documents are isolated per `format`: the KB path embeds the format (`source:format:url`), so the same URL can coexist as markdown/html/json without overwriting, and re-fetching in one format never touches the others. Re-fetching a short URL does not delete a longer sibling URL. The Pi adapter default request timeout for `fetch` is 150s plus a 30s buffer (and honors `timeoutMs`).
 - `stats` — document/cache/DB statistics, token-savings estimate, and `session_id` for this server process.
 - `purge` — `confirm:true` is mandatory: missing or `false` returns an error (not a silent no-op). `scope=project` wipes the whole KB. `scope=session` deletes documents tagged with `sessionId` (the id from `stats`/`doctor`); execute/batch/run_task/fetch writes from this process are tagged automatically.
 - `doctor` — runtime availability (missing runtimes are listed under `warnings`), FTS5 self-test, storage info, `session_id`.
@@ -137,7 +137,7 @@ Side effects to be aware of:
 
 ## Database
 
-Each primary workdir gets its own SQLite database at `~/.local/share/ctxmode/<hash>-<basename>/context_mode.db`, where `<hash>` is the first 8 bytes of SHA-256 over the primary workdir's absolute path. Documents indexed in one project are never searchable from another. `CTXMODE_DB` overrides the location entirely. The legacy global shared database (`~/.local/share/ctxmode/context_mode.db`) is **no longer used and is not migrated automatically**.
+Each primary workdir gets its own SQLite database at `~/.local/share/ctxmode/<hash>-<basename>/context_mode.db`, where `<hash>` is the first 8 bytes of SHA-256 over the primary workdir's absolute path. The on-disk path is opened as a `file:` URI with special characters (`%`, `?`, `#`, spaces) percent-encoded, so a basename or `CTXMODE_DB` containing those characters does not get parsed as URI syntax. Documents indexed in one project are never searchable from another. `CTXMODE_DB` overrides the location entirely. The legacy global shared database (`~/.local/share/ctxmode/context_mode.db`) is **no longer used and is not migrated automatically**.
 
 ## License
 

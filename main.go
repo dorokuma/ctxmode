@@ -32,7 +32,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "3.1.2"
+const Version = "3.1.3"
 
 // toolIndex walk / size limits.
 const (
@@ -396,27 +396,18 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		// Index and return a preview.
 		label := s.indexLabel("execute", args.Intent)
 		if err := s.storeIndexLocked(label, outputText); err != nil {
-			preview := outputText
-			if len(preview) > 2000 {
-				preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
-			}
-			summary := fmt.Sprintf("Output (%d bytes) was NOT indexed (error: %v).\n\n--- Preview ---\n%s",
-				len(outputText), err, preview)
 			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: summary}},
+				Content: []mcp.Content{&mcp.TextContent{
+					Text: formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, err),
+				}},
 			}, nil, nil
 		}
 		result.Indexed = true
 		result.IndexLabel = label
-
-		preview := outputText
-		if len(preview) > 2000 {
-			preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
-		}
-		summary := fmt.Sprintf("Output (%d bytes) indexed as %q. Use ctx_kb action=search query=%q to search.\n\n--- Preview ---\n%s",
-			len(outputText), label, label, preview)
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: summary}},
+			Content: []mcp.Content{&mcp.TextContent{
+				Text: formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, nil),
+			}},
 		}, nil, nil
 	}
 
@@ -847,27 +838,18 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	if len(outputText) > intentThreshold && args.Intent != "" {
 		label := s.indexLabel("execute_file", args.Intent)
 		if err := s.storeIndexLocked(label, outputText); err != nil {
-			preview := outputText
-			if len(preview) > 2000 {
-				preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
-			}
-			summary := fmt.Sprintf("Output (%d bytes) was NOT indexed (error: %v).\n\n--- Preview ---\n%s",
-				len(outputText), err, preview)
 			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: summary}},
+				Content: []mcp.Content{&mcp.TextContent{
+					Text: formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, err),
+				}},
 			}, nil, nil
 		}
 		result.Indexed = true
 		result.IndexLabel = label
-
-		preview := outputText
-		if len(preview) > 2000 {
-			preview = truncateUTF8(preview, 2000) + "\n... (truncated)"
-		}
-		summary := fmt.Sprintf("Output (%d bytes) indexed as %q. Use ctx_kb action=search query=%q to search.\n\n--- Preview ---\n%s",
-			len(outputText), label, label, preview)
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: summary}},
+			Content: []mcp.Content{&mcp.TextContent{
+				Text: formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, nil),
+			}},
 		}, nil, nil
 	}
 
@@ -1152,6 +1134,16 @@ func formatLargeIndexed(exitCode, n int, label, outputText string, indexErr erro
 		exitCode, n, label, label, preview)
 }
 
+func formatIntentIndexed(exitCode, n int, label, outputText string, indexErr error) string {
+	preview := tailUTF8(outputText, 2000)
+	if indexErr != nil {
+		return fmt.Sprintf("exit_code: %d\nOutput (%d bytes) was NOT indexed (error: %v).\n\n--- Tail preview ---\n%s",
+			exitCode, n, indexErr, preview)
+	}
+	return fmt.Sprintf("exit_code: %d\nOutput (%d bytes) indexed as %q. Use ctx_kb action=search query=%q to search.\n\n--- Tail preview ---\n%s",
+		exitCode, n, label, label, preview)
+}
+
 // storeIndexLocked wraps store.Index with the server mutex, ensuring that
 // concurrent writes from different goroutines are serialized. Combined with
 // SetMaxOpenConns(1) in the store, this prevents SQLITE_BUSY on concurrent
@@ -1210,8 +1202,14 @@ func (s *server) validateArgv(argv []string, cwd string) ([]string, error) {
 // workdirs[0] made secondary roots unreachable and could drop files into the
 // wrong directory. Zero or multiple matches are errors that demand an
 // absolute path.
+// isWorkspaceRootRel reports paths that mean "the primary workspace root",
+// not "a relative name that happens to exist under every workdir".
+func isWorkspaceRootRel(p string) bool {
+	return p == "" || p == "." || p == "./"
+}
+
 func (s *server) resolvePath(p string) (string, error) {
-	if p == "" {
+	if isWorkspaceRootRel(p) {
 		return s.workdirs[0], nil
 	}
 	if filepath.IsAbs(p) {

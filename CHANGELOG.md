@@ -5,6 +5,19 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [3.1.3] - 2026-08-18
+
+### Fixed
+- **`ctx_fs` default path with multiple workdirs**: omitted `path`, `.`, and `./` resolve to the primary workdir instead of matching every root and erroring. `ls` / `glob` / `rg` and `cwd=.` work with the documented two-workdir config.
+- **`execute` / `execute_file` mid-size auto-index** (5KB–100KB with `intent`) now include `exit_code` and a tail preview, matching `run_task` and the >100KB path.
+- **`execute_file` Go** injects `var FILE_CONTENT` so whole-file sources with `package` still compile (package-level `:=` was a syntax error).
+- **`execute_file` PHP** no longer prepends a second `<?php` when the source already has an opener.
+- **`execute_file` Elixir** uses base64 when file content ends with `"` or `\`, same as the Python path.
+- **SQLite DSN**: filesystem paths are opened as encoded `file:` URIs so `%`, `?`, and `#` in `CTXMODE_DB` or a workdir basename no longer break open or write the wrong file.
+- **`ctx_kb` fetch**: URL fragments are stripped before indexing (no collision with `#chunk-`); bodies cut at 10MB report `body truncated at 10MB` in the tool summary; SSRF also decodes RFC 8215 local-use NAT64 `64:ff9b:1::/48`.
+- **Search**: one FTS side failing while the other returns no hits is an error, not a silent "no matches".
+- **Pi adapter**: `ctx_kb` `fetch` client timeout defaults to 150s plus a 30s buffer and honors `timeoutMs` as well as `timeout_ms`.
+
 ## [3.1.2] - 2026-08-16
 
 ### Fixed

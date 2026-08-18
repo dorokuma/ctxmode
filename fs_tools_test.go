@@ -755,3 +755,29 @@ func TestSensitivePath_EnvDirectory(t *testing.T) {
 		t.Fatal("normal source must not be sensitive")
 	}
 }
+
+func TestCtxLs_MultiWorkdirDotIsPrimary(t *testing.T) {
+	wd1 := t.TempDir()
+	wd2 := t.TempDir()
+	mustWrite(t, filepath.Join(wd1, "only1.txt"), "1")
+	mustWrite(t, filepath.Join(wd2, "only2.txt"), "2")
+	s := &server{workdirs: []string{wd1, wd2}}
+	res, _, err := s.toolLs(context.Background(), nil, lsArgs{})
+	if err != nil {
+		t.Fatalf("ls empty path with two workdirs: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "only1.txt") {
+		t.Fatalf("default ls should list primary workdir, got:\n%s", text)
+	}
+	if strings.Contains(text, "only2.txt") {
+		t.Fatalf("default ls must not list the second workdir, got:\n%s", text)
+	}
+	res2, _, err := s.toolLs(context.Background(), nil, lsArgs{Path: "."})
+	if err != nil {
+		t.Fatalf("ls path=. with two workdirs: %v", err)
+	}
+	if !strings.Contains(mcpResultText(t, res2), "only1.txt") {
+		t.Fatal("path=. should resolve to the primary workdir")
+	}
+}

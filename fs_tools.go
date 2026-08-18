@@ -653,7 +653,7 @@ func (s *server) toolStat(ctx context.Context, _ *mcp.CallToolRequest, args stat
 // checked with Lstat so a leaf symlink counts even when broken); zero or
 // multiple matches are errors that demand an absolute path.
 func (s *server) resolvePathKeepFinal(p string) (string, error) {
-	if p == "" {
+	if isWorkspaceRootRel(p) {
 		return s.workdirs[0], nil
 	}
 	if filepath.IsAbs(p) {

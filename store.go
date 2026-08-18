@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -30,23 +32,31 @@ type Store struct {
 	db *sql.DB
 }
 
+// sqliteDSN builds a file: URI DSN so paths containing space, %, ?, or #
+// are not parsed as URI syntax. :memory: and already-URI paths are left as-is
+// except for the per-connection pragmas.
+func sqliteDSN(dbPath string) string {
+	if dbPath == ":memory:" {
+		return dbPath
+	}
+	const pragmas = "_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
+	if strings.HasPrefix(dbPath, "file:") {
+		sep := "&"
+		if !strings.Contains(dbPath, "?") {
+			sep = "?"
+		}
+		return dbPath + sep + pragmas
+	}
+	u := url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}
+	return u.String() + "?" + pragmas
+}
+
 // NewStore opens or creates a SQLite database at dbPath and initializes
 // the schema (documents table, FTS5 virtual table, and sync triggers).
 func NewStore(dbPath string) (*Store, error) {
 	// Build DSN with per-connection pragmas so every new connection gets
 	// busy_timeout and synchronous settings, not just the first one.
-	dsn := dbPath
-	if dbPath != ":memory:" {
-		if strings.HasPrefix(dbPath, "file:") {
-			sep := "&"
-			if !strings.Contains(dbPath, "?") {
-				sep = "?"
-			}
-			dsn = dbPath + sep + "_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
-		} else {
-			dsn = "file:" + dbPath + "?_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
-		}
-	}
+	dsn := sqliteDSN(dbPath)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -264,6 +274,12 @@ func (s *Store) SearchWithPathPrefix(query, pathPrefix string, limit int) ([]Sea
 
 	if porterErr != nil && trigramErr != nil {
 		return nil, fmt.Errorf("porter: %v / trigram: %v", porterErr, trigramErr)
+	}
+	if porterErr != nil && len(trigramResults) == 0 {
+		return nil, porterErr
+	}
+	if trigramErr != nil && len(porterResults) == 0 {
+		return nil, trigramErr
 	}
 
 	if len(porterResults) == 0 && len(trigramResults) == 0 {
