@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -1410,6 +1411,72 @@ func TestBackground_CapRejectsOverflow(t *testing.T) {
 	if !strings.Contains(err.Error(), "too many") {
 		t.Fatalf("expected cap error mentioning the limit, got: %v", err)
 	}
+}
+
+func TestRegisterBackground_LogPathNoRace(t *testing.T) {
+	requireLinux(t)
+	bgMu.Lock()
+	var live []string
+	for id, e := range bgProcs {
+		if !e.Done {
+			live = append(live, id)
+		}
+	}
+	bgMu.Unlock()
+	for _, id := range live {
+		_, _ = killBackground(id)
+	}
+
+	const n = 6
+	ids := make([]string, 0, n)
+	defer func() {
+		for _, id := range ids {
+			_, _ = killBackground(id)
+		}
+	}()
+	for i := 0; i < n; i++ {
+		res, err := runShell(context.Background(), "sleep 30", "/tmp", 0, true)
+		if err != nil {
+			t.Fatalf("start %d: %v", i, err)
+		}
+		ids = append(ids, parseBgID(t, res.Stdout))
+	}
+
+	watch := append([]string(nil), ids...)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				listBackground()
+				for _, id := range watch {
+					e := findBackground(id)
+					if e != nil && e.LogPath != "" {
+						_, _ = readBackgroundLogTail(e.LogPath, 20, 0)
+					}
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 4; i++ {
+		res, err := runShell(context.Background(), "sleep 30", "/tmp", 0, true)
+		if err != nil {
+			t.Fatalf("extra start %d: %v", i, err)
+		}
+		extraID := parseBgID(t, res.Stdout)
+		ids = append(ids, extraID)
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }
 
 // ============================================================================

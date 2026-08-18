@@ -5,6 +5,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [3.1.5] - 2026-08-18
+
+### Fixed
+- **index / execute_file** refuse FIFO and other non-regular files before Open/ReadAll so a named pipe cannot hang the MCP session. Directory walks still follow a symlink to a regular file.
+- **Background log rename** updates `LogPath` under `bgMu`, closing a data race with `ctx_bg` list/log.
+- **fetch URLs** strip userinfo from KB paths, cache keys, `FetchResult.URL`, search hits, and error text. HTTP GET still sends credentials.
+- **Sensitive index** skips hardlinks of secret paths (same device+inode) and refuses OpenSSH/PEM/PGP private-key bodies. Public keys still index.
+
 ## [3.1.4] - 2026-08-18
 
 ### Fixed

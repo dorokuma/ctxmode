@@ -228,12 +228,8 @@ func registerBackground(cmd *exec.Cmd, language, command string, temps []string,
 	for _, t := range temps {
 		protectTemp(t)
 	}
-	bgMu.Unlock()
-
-	// Prefer stable log name that includes the id (rename if we used a temp
-	// name). Done after registration so a cap rejection never renames; e is
-	// the live registry entry, so updating e.LogPath keeps the registry in
-	// sync. The final path is protected once it exists.
+	// Rename + LogPath update stay under bgMu so list/log snapshots cannot
+	// race with the assignment (detected by -race at e.LogPath).
 	if logFile != nil && logPath != "" {
 		finalPath := filepath.Join(os.TempDir(), fmt.Sprintf("%s%s.log", bgTempPrefix, id))
 		if logPath != finalPath {
@@ -243,6 +239,7 @@ func registerBackground(cmd *exec.Cmd, language, command string, temps []string,
 			}
 		}
 	}
+	bgMu.Unlock()
 	return e, nil
 }
 

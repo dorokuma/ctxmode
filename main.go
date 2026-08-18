@@ -32,7 +32,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "3.1.4"
+const Version = "3.1.5"
 
 // toolIndex walk / size limits.
 const (
@@ -452,6 +452,7 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 	}
 
 	if info.IsDir() {
+		sensitiveInodes := make(map[fileID]struct{})
 		baseDepth := strings.Count(target, string(filepath.Separator))
 		err = filepath.Walk(target, func(path string, fi os.FileInfo, walkErr error) error {
 			if walkErr != nil {
@@ -494,15 +495,30 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 			// All gates run against the final real target: a harmless-looking
 			// link name must not smuggle a sensitive or oversized real file
 			// past the checks (the Walk info describes the link, not the target).
-			if isSensitiveFilePath(real) {
-				sensitiveCount++
-				addSkip(fmt.Sprintf("%s: sensitive file (secrets)", real))
-				return nil
-			}
 			realInfo, serr := os.Stat(real)
 			if serr != nil {
 				addSkip(fmt.Sprintf("%s: stat: %v", path, serr))
 				return nil
+			}
+			// Use the resolved target, not Walk's fi: a symlink to a regular
+			// file must still be indexed; FIFO/device/socket must not be opened.
+			if !realInfo.Mode().IsRegular() {
+				addSkip(fmt.Sprintf("%s: not a regular file", real))
+				return nil
+			}
+			if isSensitiveFilePath(real) {
+				if id, ok := fileDevIno(realInfo); ok {
+					sensitiveInodes[id] = struct{}{}
+				}
+				sensitiveCount++
+				addSkip(fmt.Sprintf("%s: sensitive file (secrets)", real))
+				return nil
+			}
+			if id, ok := fileDevIno(realInfo); ok {
+				if _, seen := sensitiveInodes[id]; seen {
+					addSkip(fmt.Sprintf("%s: hardlink to sensitive file", real))
+					return nil
+				}
 			}
 			if realInfo.Size() > maxIndexFileBytes {
 				addSkip(fmt.Sprintf("%s: too large (%d bytes)", real, realInfo.Size()))
@@ -526,6 +542,9 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 			return nil
 		})
 	} else {
+		if !info.Mode().IsRegular() {
+			return nil, nil, fmt.Errorf("refusing to index non-regular file %q", target)
+		}
 		if isSensitiveFilePath(target) {
 			return nil, nil, fmt.Errorf("refusing to index sensitive file %q (credentials/secrets)", target)
 		}
@@ -722,6 +741,9 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	if err != nil {
 		return nil, nil, fmt.Errorf("stat file: %w", err)
 	}
+	if !info.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("file %q is not a regular file", target)
+	}
 	if info.Size() > 10*1024*1024 {
 		return nil, nil, fmt.Errorf("file %q is too large (%d bytes, max 10MB)", target, info.Size())
 	}
@@ -876,6 +898,9 @@ func (s *server) indexFile(path string) error {
 	if err != nil {
 		return err
 	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file: %s", real)
+	}
 	if info.Size() > maxIndexFileBytes {
 		return fmt.Errorf("too large (%d bytes, max %d)", info.Size(), maxIndexFileBytes)
 	}
@@ -900,6 +925,9 @@ func (s *server) indexFile(path string) error {
 	}
 	if isBinaryContent(data) {
 		return fmt.Errorf("binary content detected")
+	}
+	if looksLikePrivateKey(data) {
+		return fmt.Errorf("refusing to index private key material")
 	}
 	return s.storeIndexLocked(real, string(data))
 }
@@ -1055,6 +1083,41 @@ func isSensitiveFilePath(path string) bool {
 	for _, seg := range strings.Split(lower, string(filepath.Separator)) {
 		switch seg {
 		case ".aws", ".ssh", ".gnupg", ".kube", ".env":
+			return true
+		}
+	}
+	return false
+}
+
+// fileID identifies a file by device+inode so hardlinks of a sensitive
+// path are skipped even when the other name looks harmless.
+type fileID struct {
+	dev uint64
+	ino uint64
+}
+
+func fileDevIno(info os.FileInfo) (fileID, bool) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileID{}, false
+	}
+	return fileID{dev: uint64(st.Dev), ino: uint64(st.Ino)}, true
+}
+
+// looksLikePrivateKey reports PEM/OpenSSH/PGP private-key markers.
+// Public-key banners (BEGIN PUBLIC KEY, BEGIN SSH2 PUBLIC KEY) are not matched.
+func looksLikePrivateKey(data []byte) bool {
+	markers := []string{
+		"BEGIN OPENSSH PRIVATE KEY",
+		"BEGIN RSA PRIVATE KEY",
+		"BEGIN DSA PRIVATE KEY",
+		"BEGIN EC PRIVATE KEY",
+		"BEGIN ENCRYPTED PRIVATE KEY",
+		"BEGIN PGP PRIVATE KEY",
+	}
+	s := string(data)
+	for _, m := range markers {
+		if strings.Contains(s, m) {
 			return true
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -303,7 +304,7 @@ func (s *server) fetchURL(ctx context.Context, rawURL string, timeout time.Durat
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return nil, "", false, fmt.Errorf("HTTP request failed: %w", err)
+		return nil, "", false, fmt.Errorf("HTTP request failed: %s", redactUserinfoInText(err.Error()))
 	}
 	defer resp.Body.Close()
 
@@ -554,7 +555,7 @@ func (s *server) storePurgeExactAndChunksLocked(docPath string) error {
 // embedded between source and URL so the same URL can coexist in the KB in
 // several formats (markdown/html/json) without overwriting each other.
 func fetchDocPath(source, format, rawURL string) string {
-	return source + ":" + format + ":" + rawURL
+	return source + ":" + format + ":" + redactURLUserinfo(rawURL)
 }
 
 func (s *server) fetchDocPath(source, format, rawURL string) string {
@@ -596,8 +597,32 @@ func stripURLFragment(raw string) string {
 	return raw
 }
 
+// redactURLUserinfo strips user:password from a URL so tokens are not stored
+// in the KB, cache keys, or tool results. HTTP GET still uses the original.
+func redactURLUserinfo(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if u.User == nil {
+		return raw
+	}
+	u.User = nil
+	return u.String()
+}
+
+// userinfoInURLRe matches http(s) userinfo (user or user:pass) so tokens can
+// be stripped from error text that embeds the request URL.
+var userinfoInURLRe = regexp.MustCompile(`(?i)(https?://)[^/\s?#]+@`)
+
+func redactUserinfoInText(s string) string {
+	return userinfoInURLRe.ReplaceAllString(s, "${1}")
+}
+
 func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format string, force bool, ttl int, timeout time.Duration) (*FetchResult, error) {
 	rawURL = stripURLFragment(rawURL)
+	requestURL := rawURL
+	rawURL = redactURLUserinfo(rawURL)
 	// Default source avoids path becoming ":{url}".
 	if source == "" {
 		source = "fetch"
@@ -680,9 +705,9 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 	// skipCacheWrite=true (ttl==0): direct fetch (no singleflight merge, no cache write).
 	// skipCacheWrite=false (normal or force): use singleflight to merge concurrent fetches for the same URL+source.
 	if skipCacheWrite {
-		body, contentType, truncated, err := s.fetchURL(ctx, rawURL, timeout)
+		body, contentType, truncated, err := s.fetchURL(ctx, requestURL, timeout)
 		if err != nil {
-			result.Error = fmt.Sprintf("fetch failed: %v", err)
+			result.Error = "fetch failed: " + redactUserinfoInText(err.Error())
 			return result, nil
 		}
 		result.Truncated = truncated
@@ -716,12 +741,12 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 		// An independent timeout is still applied by fetchURL below.
 		sfCtx := context.WithoutCancel(ctx)
 
-		body, contentType, truncated, err := s.fetchURL(sfCtx, rawURL, timeout)
+		body, contentType, truncated, err := s.fetchURL(sfCtx, requestURL, timeout)
 		if err != nil {
 			// Error results still carry their state through the shared return
 			// value (singleflight hands the same value to every waiter), so all
 			// callers agree on Truncated instead of reading a closure-outer local.
-			return &fetchResultData{truncated: truncated}, fmt.Errorf("fetch failed: %w", err)
+			return &fetchResultData{truncated: truncated}, fmt.Errorf("fetch failed: %s", redactUserinfoInText(err.Error()))
 		}
 
 		content, err := processContent(body, contentType, format, truncated)
@@ -750,7 +775,7 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 		return &fetchResultData{content: content, chunkCount: chunkCount, truncated: truncated, indexError: indexErrString}, nil
 	})
 	if err != nil {
-		result.Error = err.Error()
+		result.Error = redactUserinfoInText(err.Error())
 		// The error's state travels in the shared singleflight return value, so
 		// the executing caller and every waiter see the same Truncated value.
 		if data, ok := sfResult.(*fetchResultData); ok {
@@ -802,7 +827,7 @@ func (s *server) batchFetchAndIndex(ctx context.Context, urls []string, source, 
 			// Check context cancellation.
 			if err := ctx.Err(); err != nil {
 				results[idx] = &FetchResult{
-					URL:   url,
+					URL:   redactURLUserinfo(url),
 					Error: fmt.Sprintf("cancelled: %v", err),
 				}
 				return
@@ -811,7 +836,7 @@ func (s *server) batchFetchAndIndex(ctx context.Context, urls []string, source, 
 			result, err := s.fetchAndIndex(ctx, url, source, format, force, ttl, timeout)
 			if err != nil {
 				results[idx] = &FetchResult{
-					URL:   url,
+					URL:   redactURLUserinfo(url),
 					Error: err.Error(),
 				}
 			} else {

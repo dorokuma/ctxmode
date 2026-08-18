@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -921,6 +923,130 @@ func TestStripURLFragment(t *testing.T) {
 	}
 	if got := stripURLFragment("http://ex.com/foo"); got != "http://ex.com/foo" {
 		t.Fatalf("unchanged: %q", got)
+	}
+}
+
+func TestRedactUserinfoInText(t *testing.T) {
+	in := `Get "http://user:s3cret@1.1.1.1/x": EOF`
+	got := redactUserinfoInText(in)
+	if strings.Contains(got, "s3cret") || strings.Contains(got, "user:") {
+		t.Fatalf("leaked userinfo: %q", got)
+	}
+	if !strings.Contains(got, `http://1.1.1.1/x`) {
+		t.Fatalf("expected redacted URL kept, got %q", got)
+	}
+	plain := `Get "http://1.1.1.1/x": EOF`
+	if redactUserinfoInText(plain) != plain {
+		t.Fatalf("rewrote URL without userinfo: %q", redactUserinfoInText(plain))
+	}
+}
+
+func TestFetchURL_RedactsUserinfoInError(t *testing.T) {
+	s := newTestServer(t)
+	s.httpClient = &http.Client{Transport: roundTripError{err: &url.Error{
+		Op:  "Get",
+		URL: "http://user:s3cret@1.1.1.1/secret-doc",
+		Err: io.EOF,
+	}}}
+	_, _, _, err := s.fetchURL(context.Background(), "http://user:s3cret@1.1.1.1/secret-doc", 0)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), "s3cret") || strings.Contains(err.Error(), "user:") {
+		t.Fatalf("fetchURL error leaked userinfo: %v", err)
+	}
+
+	res, ferr := s.fetchAndIndex(context.Background(), "http://user:s3cret@1.1.1.1/secret-doc", "web", "html", true, 0, time.Second)
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	if res.Error == "" {
+		t.Fatal("expected fetchAndIndex error")
+	}
+	if strings.Contains(res.Error, "s3cret") || strings.Contains(res.Error, "user:") {
+		t.Fatalf("fetchAndIndex error leaked userinfo: %q", res.Error)
+	}
+}
+
+type roundTripError struct{ err error }
+
+func (r roundTripError) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, r.err
+}
+
+func TestRedactURLUserinfo(t *testing.T) {
+	got := redactURLUserinfo("https://user:s3cret@example.com/x")
+	if got != "https://example.com/x" {
+		t.Fatalf("got %q", got)
+	}
+	if got := redactURLUserinfo("https://example.com/x"); got != "https://example.com/x" {
+		t.Fatalf("unchanged: %q", got)
+	}
+	if p := fetchDocPath("web", "html", "https://user:s3cret@example.com/x"); strings.Contains(p, "user:s3cret") {
+		t.Fatalf("fetchDocPath leaked userinfo: %q", p)
+	}
+	if p := fetchDocPath("web", "html", "https://user:s3cret@example.com/x"); p != "web:html:https://example.com/x" {
+		t.Fatalf("fetchDocPath = %q", p)
+	}
+}
+
+func TestFetchAndIndex_RedactsUserinfoFromStorageAndSearch(t *testing.T) {
+	var sawUserinfo bool
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.User != nil {
+			pass, ok := r.URL.User.Password()
+			if r.URL.User.Username() == "user" && ok && pass == "s3cret" {
+				sawUserinfo = true
+			}
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "userinfo-body-marker")
+	}
+	srv := newFetchTestServer(t, handler)
+	srv.floodGuard = NewFloodGuard(60*time.Second, 64)
+	srv.searchPipeline = NewSearchPipeline(srv.store, srv.floodGuard)
+
+	const raw = "http://user:s3cret@1.1.1.1/secret-doc"
+	res, err := srv.fetchAndIndex(context.Background(), raw, "web", "html", true, 0, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != "" {
+		t.Fatalf("fetch error: %s", res.Error)
+	}
+	if !sawUserinfo {
+		t.Fatal("HTTP GET should still send userinfo")
+	}
+	if strings.Contains(res.URL, "user:s3cret") || strings.Contains(res.URL, "s3cret") {
+		t.Fatalf("FetchResult.URL leaked userinfo: %q", res.URL)
+	}
+	if res.URL != "http://1.1.1.1/secret-doc" {
+		t.Fatalf("FetchResult.URL = %q", res.URL)
+	}
+	if doc, _ := srv.store.Get(fetchDocPath("web", "html", "http://1.1.1.1/secret-doc")); doc == nil {
+		t.Fatal("expected document at redacted path")
+	}
+	if leak, _ := srv.store.Get(fetchDocPath("web", "html", raw)); leak != nil && strings.Contains(leak.Path, "s3cret") {
+		t.Fatalf("store path leaked userinfo: %q", leak.Path)
+	}
+
+	hits, err := srv.store.Search("userinfo-body-marker", 10)
+	if err != nil || len(hits) == 0 {
+		t.Fatalf("expected search hits (err %v, n %d)", err, len(hits))
+	}
+	for _, h := range hits {
+		if strings.Contains(h.Path, "user:s3cret") || strings.Contains(h.Path, "s3cret") {
+			t.Fatalf("store search path leaked userinfo: %q", h.Path)
+		}
+	}
+
+	sres, _, err := srv.toolSearch(context.Background(), nil, searchArgs{Query: "userinfo-body-marker"})
+	if err != nil {
+		t.Fatalf("toolSearch: %v", err)
+	}
+	stext := mcpResultText(t, sres)
+	if strings.Contains(stext, "user:s3cret") || strings.Contains(stext, "s3cret") {
+		t.Fatalf("toolSearch leaked userinfo:\n%s", stext)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -697,5 +698,173 @@ func TestToolIndex_StopsWalkAtByteCap(t *testing.T) {
 	}
 	if strings.Contains(text, "max depth") {
 		t.Fatalf("walk entered sibling dir after byte cap (SkipAll missing), got: %s", text)
+	}
+}
+
+func TestToolIndex_SkipsFIFOWithoutHang(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+
+	fifo := filepath.Join(wd, "pipe.fifo")
+	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	mustWrite(t, filepath.Join(wd, "ok.txt"), "fifo-sibling-ok")
+
+	done := make(chan error, 1)
+	go func() {
+		res, _, err := s.toolIndex(context.Background(), nil, indexArgs{Path: wd})
+		if err != nil {
+			done <- err
+			return
+		}
+		text := mcpResultText(t, res)
+		if !strings.Contains(text, "Indexed 1 file(s)") {
+			done <- fmt.Errorf("expected regular file indexed, got: %s", text)
+			return
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("toolIndex hung on FIFO")
+	}
+
+	hits, err := st.Search("fifo-sibling-ok", 5)
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("regular file must still be indexed (err %v, hits %d)", err, len(hits))
+	}
+
+	done = make(chan error, 1)
+	go func() {
+		_, _, err := s.toolIndex(context.Background(), nil, indexArgs{Path: fifo})
+		if err == nil {
+			done <- fmt.Errorf("expected single-file FIFO index to fail")
+			return
+		}
+		if !strings.Contains(err.Error(), "non-regular") {
+			done <- fmt.Errorf("expected non-regular error, got: %v", err)
+			return
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("toolIndex(single FIFO) hung")
+	}
+}
+
+func TestToolExecuteFile_FIFODoesNotHang(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+
+	fifo := filepath.Join(wd, "pipe.fifo")
+	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := s.toolExecuteFile(context.Background(), nil, executeFileArgs{
+			Path:     fifo,
+			Language: "python",
+			Code:     "print(FILE_CONTENT)",
+			Timeout:  2000,
+		})
+		if err == nil {
+			done <- fmt.Errorf("expected execute_file on FIFO to fail")
+			return
+		}
+		if !strings.Contains(err.Error(), "not a regular file") {
+			done <- fmt.Errorf("expected not-regular error, got: %v", err)
+			return
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("toolExecuteFile hung on FIFO")
+	}
+}
+
+func TestToolIndex_HardlinkAndPrivateKeyContent(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+
+	priv := "-----BEGIN " + "OPENSSH PRIVATE KEY-----\nAAAAfakeprivkey\n-----END OPENSSH PRIVATE KEY-----\n"
+	keyPath := filepath.Join(wd, ".ssh", "id_rsa")
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte(priv), 0600); err != nil {
+		t.Fatal(err)
+	}
+	notes := filepath.Join(wd, "notes.txt")
+	if err := os.Link(keyPath, notes); err != nil {
+		t.Fatalf("hardlink: %v", err)
+	}
+	mustWrite(t, filepath.Join(wd, "ok.txt"), "public-ok-marker")
+
+	res, _, err := s.toolIndex(context.Background(), nil, indexArgs{Path: wd})
+	if err != nil {
+		t.Fatalf("toolIndex: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if hits, _ := st.Search("AAAAfakeprivkey", 5); len(hits) != 0 {
+		t.Fatalf("private key body was indexed via hardlink: %+v (msg %s)", hits, text)
+	}
+	if doc, _ := st.Get(notes); doc != nil {
+		t.Fatalf("notes.txt hardlink must not be stored")
+	}
+	if hits, err := st.Search("public-ok-marker", 5); err != nil || len(hits) != 1 {
+		t.Fatalf("regular file should still be indexed (err %v, hits %d)", err, len(hits))
+	}
+
+	st2 := newTestStore(t)
+	s2 := &server{workdirs: []string{wd}, store: st2}
+	if err := s2.indexFile(notes); err == nil {
+		t.Fatal("indexFile(notes.txt) must refuse private-key content")
+	} else if !strings.Contains(err.Error(), "private key") {
+		t.Fatalf("expected private key error, got: %v", err)
+	}
+	if doc, _ := st2.Get(notes); doc != nil {
+		t.Fatalf("refused hardlink must not be stored")
+	}
+
+	pub := "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n-----END PUBLIC KEY-----\n"
+	pubPath := filepath.Join(wd, "pubkey.txt")
+	mustWrite(t, pubPath, pub)
+	if err := s.indexFile(pubPath); err != nil {
+		t.Fatalf("public key should still index: %v", err)
+	}
+}
+
+func TestLooksLikePrivateKey(t *testing.T) {
+	if !looksLikePrivateKey([]byte("-----BEGIN " + "RSA PRIVATE KEY-----\nMII\n")) {
+		t.Fatal("RSA private key not detected")
+	}
+	if looksLikePrivateKey([]byte("-----BEGIN PUBLIC KEY-----\nMII\n")) {
+		t.Fatal("PUBLIC KEY must not be treated as private")
+	}
+	if looksLikePrivateKey([]byte("-----BEGIN SSH2 PUBLIC KEY-----\nAAA\n")) {
+		t.Fatal("SSH2 PUBLIC KEY must not be treated as private")
+	}
+	if !looksLikePrivateKey([]byte("-----BEGIN PGP PRIVATE KEY BLOCK-----\n")) {
+		t.Fatal("PGP private key not detected")
 	}
 }
