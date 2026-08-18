@@ -57,7 +57,7 @@ func runDoctor(store *Store, dbPath string) (*doctorResult, error) {
 	}
 	sort.Strings(langs)
 	for _, name := range langs {
-		if checkRuntime(name, false) {
+		if checkRuntime(name, false, "") {
 			res.Runtimes[name] = "available"
 		} else {
 			rt := runtimes[name]

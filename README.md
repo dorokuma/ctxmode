@@ -4,7 +4,7 @@ A 100% NPM/NodeJS-free, Go implementation of Mert Koseoglu's [context-mode](http
 
 Local-first Model Context Protocol (MCP) server that virtualizes tool outputs, allowing AI coding agents to execute heavy tasks and save up to 98% in token usage.
 
-Current version: **3.1.3**.
+Current version: **3.1.4**.
 
 Supported platform: **Linux**. Background process identity verification reads `/proc/<pid>/stat`; on other platforms ctxmode still runs, but `ctx_bg` termination is not promised (see [ctx_bg](#ctx_bg--background-process-supervision-from-ctx_run-actionexecute-backgroundtrue)).
 
@@ -71,7 +71,7 @@ ctxmode executes arbitrary commands and code **with the server process's privile
 The following are defense-in-depth measures, never a security guarantee:
 
 - Subprocess environments strip inherited variables whose names look sensitive (`token`, `key`, `secret`, `password`, `passwd`, `credential`, `auth`, `cookie`, `session`, case-insensitive) by default; `CTXMODE_ENV_PASSTHROUGH=1` disables this. Caller-provided `env` overrides truly replace same-named inherited variables (deduplicated map, not appended duplicates), and the allowlist still rejects `PATH`/`HOME`/`SHELL`/`LD_*`/`DYLD_*` etc.
-- Indexing skips secret-like files by default: `.env`/`.env.*`, anything under a `.env/` directory, private keys (`*.pem`, `*.key`, `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`), `credentials.json`, `.npmrc`, `.netrc`, and anything under `.aws`/`.ssh`/`.gnupg`/`.kube`.
+- Indexing skips secret-like files by default: `.env`/`.env.*`, `.envrc`, anything under a `.env/` directory, private keys (`*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`), `credentials.json`, `.npmrc`, `.netrc`, `.docker/config.json` (not the rest of `.docker/`), and anything under `.aws`/`.ssh`/`.gnupg`/`.kube`.
 - `ctx_kb action=fetch` refuses SSRF targets: IPv4 and IPv6 loopback, link-local (169.254.0.0/16, fe80::/10), multicast, reserved, private (RFC 1918, fc00::/7), CGNAT and benchmark ranges. Embedded IPv4 in IPv6 (IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96`, RFC 8215 local-use `64:ff9b:1::/48`, 6to4 `2002::/16`) is decoded and checked against the same IPv4 list. The blocklist is a single fixed set: the former strict/non-strict split was removed (`CTX_FETCH_STRICT` no longer exists) and the intercepted set cannot be changed via the environment.
 
 ### Subprocess environment isolation
@@ -120,7 +120,7 @@ Side effects to be aware of:
 ### ctx_kb — local knowledge base
 
 - `index` — `path` (file or directory) into SQLite FTS5; skips `.git`/`node_modules`, sensitive/secret files, binaries and >1MB files; capped at 5000 files / 100MB total.
-- `search` — `query`: BM25 + Porter + Trigram + RRF + proximity rerank; flood-guarded. If one FTS index errors and the other returns no hits, the error is returned (not a silent "no matches"). `ctx_run` batch `query_scope=batch` searches only that batch run's indexed documents and bypasses the guard; it does not search `execute`/`run_task`/fetch output.
+- `search` — `query`: BM25 + Porter + Trigram + RRF + proximity rerank; flood-guarded (default 60-second window; 4 successful queries in the same window start throttling with half results; 9 attempts hard-reject). If one FTS index errors and the other returns no hits, the error is returned (not a silent "no matches"). `ctx_run` batch `query_scope=batch` searches only that batch run's indexed documents and bypasses the guard; it does not search `execute`/`run_task`/fetch output.
 - `fetch` — `url`/`urls` (≤10) → markdown → index; `source`, `format` (markdown/html/json), `force`, `maxBytes` (default 50KB), `timeoutMs` (default 150000), `ttl` (default 24h, 0 = skip cache); SSRF protection as above. URL fragments (`#…`) are stripped before indexing so a user fragment cannot collide with internal `#chunk-` keys. Bodies cut at the 10MB fetch cap are still indexed, and the summary reports `body truncated at 10MB`. Indexed documents are isolated per `format`: the KB path embeds the format (`source:format:url`), so the same URL can coexist as markdown/html/json without overwriting, and re-fetching in one format never touches the others. Re-fetching a short URL does not delete a longer sibling URL. The Pi adapter default request timeout for `fetch` is 150s plus a 30s buffer (and honors `timeoutMs`).
 - `stats` — document/cache/DB statistics, token-savings estimate, and `session_id` for this server process.
 - `purge` — `confirm:true` is mandatory: missing or `false` returns an error (not a silent no-op). `scope=project` wipes the whole KB. `scope=session` deletes documents tagged with `sessionId` (the id from `stats`/`doctor`); execute/batch/run_task/fetch writes from this process are tagged automatically.

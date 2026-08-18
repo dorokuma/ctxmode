@@ -120,7 +120,21 @@ function isInterestingStderrLine(line: string): boolean {
 const OUTPUT_CHAR_CAP = Number(process.env.CTXMODE_OUTPUT_CHARS || 50000)
 const OUTPUT_LINE_CAP = Number(process.env.CTXMODE_OUTPUT_LINES || 500)
 
-function compressToolText(text: string): string {
+// UTF-16-safe prefix/suffix. If index lands on a low surrogate, move it
+// off the pair (towardStart: include the high surrogate in the prefix).
+function clampUtf16Index(s: string, i: number, towardStart: boolean): number {
+  if (i <= 0) return 0
+  if (i >= s.length) return s.length
+  if ((s.charCodeAt(i) & 0xfc00) === 0xdc00) {
+    return towardStart ? i - 1 : i + 1
+  }
+  return i
+}
+
+// compressToolText: line overflow keeps ~75% head + remaining tail.
+// Char overflow uses the same 75%/25% split so a trailing
+// "(exited with code N)" survives. Surrogate pairs are not split.
+export function compressToolText(text: string): string {
   if (!text) return text
   let t = text.replace(/\r\n/g, "\n").replace(/[ \t]+$/gm, "")
   t = t.replace(/\n{4,}/g, "\n\n\n")
@@ -140,11 +154,12 @@ function compressToolText(text: string): string {
   }
 
   if (body.length <= OUTPUT_CHAR_CAP) return body
-  let truncAt = OUTPUT_CHAR_CAP
-  if (truncAt > 0 && (body.charCodeAt(truncAt - 1) & 0xfc00) === 0xd800) truncAt--
-  const nl = body.lastIndexOf("\n", truncAt)
-  const cut = nl > OUTPUT_CHAR_CAP * 0.7 ? nl : truncAt
-  return body.slice(0, cut) + `\n... (输出达上限 ${OUTPUT_CHAR_CAP} 字，已截断)`
+  const marker = `\n... (输出达上限 ${OUTPUT_CHAR_CAP} 字，已截断) ...\n`
+  const headN = Math.floor(OUTPUT_CHAR_CAP * 0.75)
+  const tailN = Math.max(0, OUTPUT_CHAR_CAP - headN)
+  const headEnd = clampUtf16Index(body, headN, true)
+  const tailStart = clampUtf16Index(body, body.length - tailN, false)
+  return body.slice(0, headEnd) + marker + body.slice(tailStart)
 }
 
 // ---- MCP client (minimal, same pattern as codegraph-go) ----

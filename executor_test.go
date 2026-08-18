@@ -50,7 +50,7 @@ func TestLimitedBuffer_WriteAtLimit(t *testing.T) {
 }
 
 func TestLimitedBuffer_WriteOverLimit_SingleWrite(t *testing.T) {
-	// 单次写入超过 limit：只保留 limit 字节，返回 len(p)。
+	// 单次写入超过 limit：保留最新 limit 字节，返回 len(p)。
 	lb := &limitedBuffer{limit: 5}
 	data := []byte("0123456789") // 10 bytes
 	n, err := lb.Write(data)
@@ -63,8 +63,8 @@ func TestLimitedBuffer_WriteOverLimit_SingleWrite(t *testing.T) {
 	if lb.buf.Len() != 5 {
 		t.Fatalf("buffer should be capped at 5, got %d", lb.buf.Len())
 	}
-	if lb.String() != "01234" {
-		t.Fatalf("String: expected '01234', got %q", lb.String())
+	if lb.String() != "56789" {
+		t.Fatalf("String: expected '56789', got %q", lb.String())
 	}
 }
 
@@ -89,10 +89,10 @@ func TestLimitedBuffer_WriteAfterLimitReached(t *testing.T) {
 }
 
 func TestLimitedBuffer_WriteCrossesLimit_Partial(t *testing.T) {
-	// 部分写入穿过 limit 边界：只写入剩余空间，返回完整 len(p)。
+	// 部分写入穿过 limit 边界：保留最新 8 字节，返回完整 len(p)。
 	lb := &limitedBuffer{limit: 8}
-	lb.Write([]byte(strings.Repeat("a", 6))) // 6 bytes, 2 remaining
-	n, err := lb.Write([]byte("bcdef"))      // 5 bytes, only 2 fit
+	lb.Write([]byte(strings.Repeat("a", 6))) // 6 bytes
+	n, err := lb.Write([]byte("bcdef"))      // 5 bytes; keep last 8 of aaaaaa+bcdef
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -103,11 +103,8 @@ func TestLimitedBuffer_WriteCrossesLimit_Partial(t *testing.T) {
 	if len(s) != 8 {
 		t.Fatalf("expected 8 bytes, got %d: %q", len(s), s)
 	}
-	if !strings.HasPrefix(s, "aaaaaa") {
-		t.Fatalf("expected prefix 'aaaaaa', got %q", s)
-	}
-	if !strings.HasSuffix(s, "bc") {
-		t.Fatalf("expected suffix 'bc', got %q", s)
+	if s != "aaabcdef" {
+		t.Fatalf("expected latest 8 bytes 'aaabcdef', got %q", s)
 	}
 }
 
@@ -1131,11 +1128,33 @@ func TestDetectTsNode_NpmProbeStripsSensitiveEnv(t *testing.T) {
 	t.Setenv("FAKE_NPM_TOKEN", "super-secret-value")
 	shimDir := writeExitCodeProbe(t, "npm", "FAKE_NPM_TOKEN")
 	t.Setenv("PATH", shimDir)
-	t.Chdir(t.TempDir())
 
-	avail, _ := detectTsNode()
+	avail, _ := detectTsNode(t.TempDir())
 	if !avail {
 		t.Fatal("npm ls probe must succeed: fake npm exited 0 only when FAKE_NPM_TOKEN was stripped")
+	}
+}
+
+func TestDetectTsNode_CwdLocalBin(t *testing.T) {
+	cwd := t.TempDir()
+	bin := filepath.Join(cwd, "node_modules", ".bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	local := filepath.Join(bin, "ts-node")
+	if err := os.WriteFile(local, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	other := t.TempDir()
+	t.Setenv("PATH", t.TempDir())
+
+	av, p := detectTsNode(cwd)
+	if !av || p != local {
+		t.Fatalf("cwd local bin: avail=%v path=%q want %q", av, p, local)
+	}
+	av2, p2 := detectTsNode(other)
+	if av2 {
+		t.Fatalf("other empty cwd must not find ts-node, got path %q", p2)
 	}
 }
 
@@ -1148,7 +1167,7 @@ func TestCheckRuntime_GoVersionProbeStripsSensitiveEnv(t *testing.T) {
 	shimDir := writeExitCodeProbe(t, "go", "FAKE_GO_AUTH")
 	t.Setenv("PATH", shimDir)
 
-	if !checkRuntime("go", false) {
+	if !checkRuntime("go", false, "") {
 		t.Fatal("go version probe must succeed: fake go exited 0 only when FAKE_GO_AUTH was stripped")
 	}
 }
@@ -1162,7 +1181,7 @@ func TestLimitedBuffer_DoesNotSplitUTF8(t *testing.T) {
 	if _, err := lb.Write([]byte("ab")); err != nil {
 		t.Fatal(err)
 	}
-	// "é" is 2 bytes; only 1 of the 4 input bytes fits, landing inside the rune.
+	// "é" is 2 bytes; keep latest 3 bytes of "abécd" (a9 63 64), drop leading half-rune.
 	n, err := lb.Write([]byte("écd"))
 	if err != nil || n != 4 {
 		t.Fatalf("Write: n=%d err=%v", n, err)
@@ -1170,8 +1189,26 @@ func TestLimitedBuffer_DoesNotSplitUTF8(t *testing.T) {
 	if !lb.truncated {
 		t.Fatal("expected truncated")
 	}
-	if got := lb.String(); got != "ab" {
-		t.Fatalf("buffer must not contain a split rune, got %q", got)
+	got := lb.String()
+	if !utf8.ValidString(got) {
+		t.Fatalf("String must be valid UTF-8, got %q", got)
+	}
+	if got != "cd" {
+		t.Fatalf("keep tail and drop incomplete rune, want %q got %q", "cd", got)
+	}
+}
+
+func TestLimitedBuffer_KeepsLatestFailureSummary(t *testing.T) {
+	lb := &limitedBuffer{limit: 32}
+	if _, err := lb.Write([]byte(strings.Repeat("N", 200))); err != nil {
+		t.Fatal(err)
+	}
+	summary := "FAIL: compile error at main.rs:1"
+	if _, err := lb.Write([]byte(summary)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(lb.String(), summary) {
+		t.Fatalf("truncated buffer must keep the latest summary, got %q", lb.String())
 	}
 }
 
@@ -1471,6 +1508,88 @@ func TestRunCmd_NegativeTimeoutNoPanic(t *testing.T) {
 // ============================================================================
 // tool-name messaging (fix #9)
 // ============================================================================
+
+func TestRustBackgroundArgv_Shape(t *testing.T) {
+	got := rustBackgroundArgv("/tmp/out", "/tmp/src.rs")
+	want := []string{"sh", "-c", `rustc -o "$1" "$2" && exec "$1"`, "_", "/tmp/out", "/tmp/src.rs"}
+	if len(got) != len(want) {
+		t.Fatalf("len=%d want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("argv[%d]=%q want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestRunCompiledOpts_BackgroundRustDoesNotSyncCompile(t *testing.T) {
+	dir := t.TempDir()
+	shim := "#!/bin/sh\nsleep 30\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "rustc"), []byte(shim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	src := filepath.Join(dir, "main.rs")
+	if err := os.WriteFile(src, []byte("fn main() {}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	result, err := runCompiledOpts(context.Background(), "rust", runtimes["rust"], src, dir, 0, true, nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("background rust: %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("background rust blocked on rustc: %v", elapsed)
+	}
+	if result == nil || !strings.Contains(result.Stdout, "Process started in background") {
+		t.Fatalf("expected immediate background start, got %+v", result)
+	}
+	id := parseBgID(t, result.Stdout)
+	_, _ = killBackground(id)
+}
+
+func TestBackgroundWait_LogErrorWhenMissing(t *testing.T) {
+	result, err := runShell(context.Background(), "echo WAIT_LOG_ERR; exit 3", "/tmp", 0, true)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := parseBgID(t, result.Stdout)
+	s := &server{workdirs: []string{"/tmp"}}
+	if _, _, err := s.toolBackgroundWait(context.Background(), nil, backgroundWaitArgs{ID: id, TimeoutMs: 5000}); err != nil {
+		t.Fatalf("first wait: %v", err)
+	}
+	entry := findBackground(id)
+	if entry == nil {
+		t.Fatal("background entry gone after wait")
+	}
+	if entry.LogPath != "" {
+		if err := os.Remove(entry.LogPath); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("remove log: %v", err)
+		}
+	}
+	wres, _, err := s.toolBackgroundWait(context.Background(), nil, backgroundWaitArgs{ID: id, TimeoutMs: 1000})
+	if err != nil {
+		t.Fatalf("wait after missing log: %v", err)
+	}
+	wtext := ""
+	for _, c := range wres.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			wtext = tc.Text
+			break
+		}
+	}
+	if !strings.Contains(wtext, `"done": true`) {
+		t.Fatalf("expected done=true: %s", wtext)
+	}
+	if !strings.Contains(wtext, `"exit_code": 3`) {
+		t.Fatalf("expected exit_code 3: %s", wtext)
+	}
+	if !strings.Contains(wtext, `"log_error"`) {
+		t.Fatalf("expected log_error when log is missing: %s", wtext)
+	}
+}
 
 func TestBackground_StartMessageMentionsCtxBg(t *testing.T) {
 	result, err := runShell(context.Background(), "sleep 30", "/tmp", 0, true)

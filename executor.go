@@ -913,7 +913,7 @@ func (s *server) toolBackgroundWait(ctx context.Context, _ *mcp.CallToolRequest,
 		}
 	}
 
-	logText, _ := readBackgroundLogTail(entry.LogPath, 100, 0)
+	logText, logErr := readBackgroundLogTail(entry.LogPath, 100, 0)
 	type waitResult struct {
 		ID           string `json:"id"`
 		PID          int    `json:"pid"`
@@ -921,6 +921,7 @@ func (s *server) toolBackgroundWait(ctx context.Context, _ *mcp.CallToolRequest,
 		ExitCode     int    `json:"exit_code,omitempty"`
 		LogPath      string `json:"log_path,omitempty"`
 		Log          string `json:"log"`
+		LogError     string `json:"log_error,omitempty"`
 		TimedOut     bool   `json:"timed_out,omitempty"`
 		LogTruncated bool   `json:"log_truncated,omitempty"`
 	}
@@ -933,6 +934,9 @@ func (s *server) toolBackgroundWait(ctx context.Context, _ *mcp.CallToolRequest,
 		Log:          logText,
 		TimedOut:     !entry.Done,
 		LogTruncated: entry.LogTruncated,
+	}
+	if logErr != nil {
+		out.LogError = logErr.Error()
 	}
 	js, _ := json.MarshalIndent(out, "", "  ")
 	return &mcp.CallToolResult{
@@ -1244,52 +1248,65 @@ func csWrapper(code string) string {
 
 // ---------- runtime checking ----------
 
-// tsNodeAvailable caches typescript runtime detection result.
+// tsNodeCacheEntry is the per-cwd result of detectTsNode.
+type tsNodeCacheEntry struct {
+	available bool
+	path      string
+}
+
 var (
-	tsNodeAvailable bool
-	tsNodePath      string
-	tsNodeCheckOnce sync.Once
-	tsNodePathMu    sync.Mutex
+	tsNodeCacheMu sync.Mutex
+	tsNodeByCwd   = map[string]tsNodeCacheEntry{}
 )
 
-// detectTsNode probes for a local ts-node installation without network access.
-// Returns whether it's available and the path to the executable.
-func detectTsNode() (bool, string) {
-	// 1. Check for global ts-node binary
+// detectTsNode probes for a ts-node installation without network access.
+// cwd may be empty: then only LookPath and npm ls (no Dir) are used.
+// Order: LookPath("ts-node"), then cwd/node_modules/.bin/ts-node, then npm ls.
+func detectTsNode(cwd string) (bool, string) {
 	if p, err := exec.LookPath("ts-node"); err == nil {
 		return true, p
 	}
-	// 2. Check cwd/node_modules/.bin/ts-node
-	cwd, err := os.Getwd()
-	if err == nil {
+	if cwd != "" {
 		p := filepath.Join(cwd, "node_modules", ".bin", "ts-node")
 		if _, err := os.Stat(p); err == nil {
 			return true, p
 		}
 	}
-	// 3. Fall back to npm ls (local only, reads package.json)
 	npmCtx, npmCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer npmCancel()
 	npmCmd := exec.CommandContext(npmCtx, "npm", "ls", "ts-node", "--depth=0")
 	npmCmd.Env = flattenEnv(childEnv(nil))
+	if cwd != "" {
+		npmCmd.Dir = cwd
+	}
 	if npmCmd.Run() == nil {
-		// ts-node is installed locally; use the local path
-		cwd, _ := os.Getwd()
-		p := filepath.Join(cwd, "node_modules", ".bin", "ts-node")
-		if _, err := os.Stat(p); err == nil {
-			return true, p
+		if cwd != "" {
+			p := filepath.Join(cwd, "node_modules", ".bin", "ts-node")
+			if _, err := os.Stat(p); err == nil {
+				return true, p
+			}
 		}
-		// Last resort: assume it's resolvable by name
 		return true, "ts-node"
 	}
 	return false, ""
 }
 
+func tsNodeForCwd(cwd string) string {
+	tsNodeCacheMu.Lock()
+	defer tsNodeCacheMu.Unlock()
+	if e, ok := tsNodeByCwd[cwd]; ok && e.path != "" {
+		return e.path
+	}
+	return "ts-node"
+}
+
 // checkRuntime checks if the runtime executable for the given language is
 // available on the system PATH. Shell is always available.
-// When useCache is true, TypeScript detection is cached via sync.Once
-// (for execution gating). When false, detection runs fresh (for doctor).
-func checkRuntime(language string, useCache bool) bool {
+// cwd is used only for TypeScript (local ts-node). Empty cwd means LookPath
+// plus the empty cache key (doctor / availableLanguages).
+// When useCache is true, TypeScript detection is reused per cwd. When false,
+// that cwd key is refreshed (doctor).
+func checkRuntime(language string, useCache bool, cwd string) bool {
 	if language == "shell" {
 		return true
 	}
@@ -1306,23 +1323,19 @@ func checkRuntime(language string, useCache bool) bool {
 		return cmd.Run() == nil
 	case "typescript":
 		if useCache {
-			tsNodeCheckOnce.Do(func() {
-				av, p := detectTsNode()
-				tsNodePathMu.Lock()
-				tsNodeAvailable = av
-				tsNodePath = p
-				tsNodePathMu.Unlock()
-			})
-			return tsNodeAvailable
+			tsNodeCacheMu.Lock()
+			e, ok := tsNodeByCwd[cwd]
+			tsNodeCacheMu.Unlock()
+			if ok {
+				return e.available
+			}
 		}
-		// Fresh detection for doctor — update cached path for execution use.
-		avail, p := detectTsNode()
-		if avail {
-			tsNodePathMu.Lock()
-			tsNodePath = p
-			tsNodePathMu.Unlock()
-		}
-		return avail
+		// Detect without holding the cache lock: npm ls can take seconds.
+		av, p := detectTsNode(cwd)
+		tsNodeCacheMu.Lock()
+		tsNodeByCwd[cwd] = tsNodeCacheEntry{available: av, path: p}
+		tsNodeCacheMu.Unlock()
+		return av
 	default:
 		// Use Go standard library instead of external "which" command.
 		_, err := exec.LookPath(rt.Exe)
@@ -1773,7 +1786,7 @@ func runCodeOpts(ctx context.Context, language, code, cwd string, timeout time.D
 		return nil, fmt.Errorf("unsupported language: %q (supported: javascript, typescript, python, shell, go, rust, php, perl, ruby, r, elixir, csharp)", language)
 	}
 
-	if !checkRuntime(language, true) {
+	if !checkRuntime(language, true, cwd) {
 		return nil, fmt.Errorf("runtime %q is not available for language %q — install it first or use a different language", rt.Exe, language)
 	}
 
@@ -1868,6 +1881,12 @@ func runArgv(ctx context.Context, argv []string, cwd string, timeout time.Durati
 	return runCmd(ctx, cmd, timeout, background, "argv", cmdStr)
 }
 
+// rustBackgroundArgv is compile+run as one argv so rustc does not block
+// the tool call when language=rust and background=true.
+func rustBackgroundArgv(outPath, srcPath string) []string {
+	return []string{"sh", "-c", `rustc -o "$1" "$2" && exec "$1"`, "_", outPath, srcPath}
+}
+
 // runCompiled executes a language that uses a temp source file.
 func runCompiled(ctx context.Context, language string, rt runtimeConfig, tmpPath, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
 	return runCompiledOpts(ctx, language, rt, tmpPath, cwd, timeout, background, nil)
@@ -1880,19 +1899,20 @@ func runCompiledOpts(ctx context.Context, language string, rt runtimeConfig, tmp
 
 	switch language {
 	case "rust":
-		// Two-step: compile via rustc, then run the binary.
 		outPath := tmpPath + "_bin"
-		if !background {
-			defer os.Remove(outPath)
-		} else {
+		if background {
+			// One background job: rustc then exec. Do not wait on rustc here.
 			cleanups = append(cleanups, outPath)
+			argv := rustBackgroundArgv(outPath, tmpPath)
+			cmd = exec.Command(argv[0], argv[1:]...)
+			cmd.Dir = cwd
+			break
 		}
+		// Foreground: two-step compile so rustc errors return immediately.
+		defer os.Remove(outPath)
 
 		compileStart := time.Now()
 		compileCtx := ctx
-		// Background jobs without an explicit caller timeout still cap the
-		// synchronous compile step at the background default so a hung rustc
-		// cannot block the tool call forever.
 		compileBudget := timeout
 		if compileBudget <= 0 {
 			compileBudget = defaultBackgroundMaxAge
@@ -1915,10 +1935,6 @@ func runCompiledOpts(ctx context.Context, language string, rt runtimeConfig, tmp
 		compileCmd.Stdout = &compileOutBuf
 		compileCmd.Stderr = &compileOutBuf
 		if err := compileCmd.Start(); err != nil {
-			if background {
-				os.Remove(tmpPath)
-				os.Remove(outPath)
-			}
 			return &executeResult{
 				Stdout:    compileOutBuf.String(),
 				Stderr:    fmt.Sprintf("compilation failed: %v", err),
@@ -1949,10 +1965,6 @@ func runCompiledOpts(ctx context.Context, language string, rt runtimeConfig, tmp
 			compileErr = <-compileDone
 		}
 		if compileErr != nil {
-			if background {
-				os.Remove(tmpPath)
-				os.Remove(outPath)
-			}
 			return &executeResult{
 				Stdout:    compileOutBuf.String(),
 				Stderr:    fmt.Sprintf("compilation failed: %v", compileErr),
@@ -1972,12 +1984,7 @@ func runCompiledOpts(ctx context.Context, language string, rt runtimeConfig, tmp
 		}
 
 	case "typescript":
-		tsNodePathMu.Lock()
-		exe := tsNodePath
-		tsNodePathMu.Unlock()
-		if exe == "" {
-			exe = "ts-node"
-		}
+		exe := tsNodeForCwd(cwd)
 		cmd = exec.Command(exe, tmpPath)
 		cmd.Dir = cwd
 
@@ -2008,9 +2015,9 @@ func runCompiledOpts(ctx context.Context, language string, rt runtimeConfig, tmp
 // dropped to prevent OOM.
 const maxCmdOutput = 10 * 1024 * 1024 // 10 MB
 
-// limitedBuffer is an io.Writer that wraps bytes.Buffer and silently drops
-// writes after the limit is reached. This prevents unbounded memory growth
-// from misbehaving subprocesses.
+// limitedBuffer is an io.Writer that keeps the newest `limit` bytes (same
+// "keep latest" policy as limitedFileWriter). Write always returns len(p).
+// String() drops incomplete UTF-8 runes at either end.
 type limitedBuffer struct {
 	buf       bytes.Buffer
 	limit     int
@@ -2018,25 +2025,36 @@ type limitedBuffer struct {
 }
 
 func (lb *limitedBuffer) Write(p []byte) (int, error) {
-	if lb.buf.Len() >= lb.limit {
-		lb.truncated = true
-		return len(p), nil
+	n := len(p)
+	if n == 0 {
+		return 0, nil
 	}
-	remaining := lb.limit - lb.buf.Len()
-	if len(p) <= remaining {
-		return lb.buf.Write(p)
+	if lb.limit <= 0 {
+		lb.truncated = true
+		return n, nil
+	}
+	if lb.buf.Len()+n <= lb.limit {
+		_, err := lb.buf.Write(p)
+		return n, err
 	}
 	lb.truncated = true
-	// Cut on a UTF-8 rune boundary: a hard byte cut would leave a half
-	// character at the tail of the captured output. The FULL input chunk is
-	// passed with the remaining budget so truncateUTF8's boundary back-off
-	// actually runs (passing p[:remaining] would short-circuit on len==max).
-	_, _ = lb.buf.WriteString(truncateUTF8(string(p), remaining))
-	return len(p), nil
+	if n >= lb.limit {
+		lb.buf.Reset()
+		_, _ = lb.buf.Write(p[n-lb.limit:])
+		return n, nil
+	}
+	drop := lb.buf.Len() + n - lb.limit
+	kept := append([]byte(nil), lb.buf.Bytes()[drop:]...)
+	lb.buf.Reset()
+	_, _ = lb.buf.Write(kept)
+	_, _ = lb.buf.Write(p)
+	return n, nil
 }
 
 func (lb *limitedBuffer) String() string {
-	return lb.buf.String()
+	b := dropLeadingPartialRune(lb.buf.Bytes())
+	b = trimTrailingPartialRune(b)
+	return string(b)
 }
 
 // runCmd is the shared execution loop for all languages.
@@ -2231,7 +2249,7 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 func availableLanguages() []string {
 	var langs []string
 	for name := range runtimes {
-		if checkRuntime(name, false) {
+		if checkRuntime(name, false, "") {
 			langs = append(langs, name)
 		}
 	}

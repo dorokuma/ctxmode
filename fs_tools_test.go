@@ -754,6 +754,24 @@ func TestSensitivePath_EnvDirectory(t *testing.T) {
 	if isSensitiveFilePath("/proj/src/main.go") {
 		t.Fatal("normal source must not be sensitive")
 	}
+	if !isSensitiveFilePath("/proj/.envrc") {
+		t.Fatal(".envrc must be treated as sensitive")
+	}
+	if !isSensitiveFilePath("/proj/cert.p12") {
+		t.Fatal("*.p12 must be treated as sensitive")
+	}
+	if !isSensitiveFilePath("/proj/cert.pfx") {
+		t.Fatal("*.pfx must be treated as sensitive")
+	}
+	if !isSensitiveFilePath("/home/u/.docker/config.json") {
+		t.Fatal(".docker/config.json must be treated as sensitive")
+	}
+	if isSensitiveFilePath("/proj/config.json") {
+		t.Fatal("plain config.json must not be sensitive")
+	}
+	if isSensitiveFilePath("/home/u/.docker/daemon.json") {
+		t.Fatal("other files under .docker/ must not be treated as sensitive")
+	}
 }
 
 func TestCtxLs_MultiWorkdirDotIsPrimary(t *testing.T) {

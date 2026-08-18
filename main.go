@@ -32,7 +32,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "3.1.3"
+const Version = "3.1.4"
 
 // toolIndex walk / size limits.
 const (
@@ -1021,17 +1021,19 @@ func pathHasExcludedSegment(path string, excluded ...string) bool {
 
 // isSensitiveFilePath reports whether the file should be excluded from
 // indexing because it likely holds credentials or other secrets: .env and its
-// variants (.env.local, .env.production, ...), private keys (*.pem, *.key,
-// id_rsa/id_ed25519/...), cloud/registry auth files (credentials.json,
-// .npmrc, .netrc), and anything under a dot-secret directory (.aws, .ssh,
+// variants (.env.local, .env.production, ...), .envrc, private keys (*.pem,
+// *.key, *.p12, *.pfx, id_rsa/id_ed25519/...), cloud/registry auth files
+// (credentials.json, .npmrc, .netrc, .docker/config.json — not the whole
+// .docker directory), and anything under a dot-secret directory (.aws, .ssh,
 // .gnupg, .kube). Matches are case-insensitive.
 func isSensitiveFilePath(path string) bool {
 	lower := strings.ToLower(path)
 	base := filepath.Base(lower)
-	if base == ".env" || strings.HasPrefix(base, ".env.") {
+	if base == ".env" || base == ".envrc" || strings.HasPrefix(base, ".env.") {
 		return true
 	}
-	if strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key") {
+	if strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key") ||
+		strings.HasSuffix(base, ".p12") || strings.HasSuffix(base, ".pfx") {
 		return true
 	}
 	for _, key := range []string{"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"} {
@@ -1042,6 +1044,13 @@ func isSensitiveFilePath(path string) bool {
 	switch base {
 	case "credentials.json", "credentials", ".npmrc", ".netrc":
 		return true
+	}
+	if base == "config.json" {
+		for _, seg := range strings.Split(lower, string(filepath.Separator)) {
+			if seg == ".docker" {
+				return true
+			}
+		}
 	}
 	for _, seg := range strings.Split(lower, string(filepath.Separator)) {
 		switch seg {

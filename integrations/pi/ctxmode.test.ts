@@ -38,6 +38,7 @@ interface ClientTestSurface {
 
 let CtxmodeClient: new (workdir: string) => ClientTestSurface
 let diagLog: (msg: string) => void
+let compressToolText: (text: string) => string
 
 let tmpDir: string
 const logPath = () => path.join(tmpDir, "ctxmode.log")
@@ -62,6 +63,7 @@ before(async () => {
   const mod = await import("./ctxmode.ts")
   CtxmodeClient = mod.CtxmodeClient
   diagLog = mod.diagLog
+  compressToolText = mod.compressToolText
 
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ctxmode-test-"))
   process.env.CTXMODE_DIAG_DIR = tmpDir
@@ -77,6 +79,16 @@ after(() => {
 })
 
 const newClient = () => new CtxmodeClient("/tmp/fake-workdir")
+
+test("compressToolText 字数超限保留头尾和退出码", () => {
+  const tail = "(exited with code 7)"
+  const text = "HEAD_MARKER\n" + "x".repeat(60000) + "\n" + tail
+  const out = compressToolText(text)
+  assert.ok(out.includes("HEAD_MARKER"), "keep head")
+  assert.ok(out.includes(tail), "keep trailing exit line")
+  assert.ok(out.includes("已截断"), "insert omission marker")
+  assert.ok(out.length < text.length, "must compress")
+})
 
 // ---- diagLog：写失败降级（缺陷 4）----
 // 必须第一个跑：此时 diagLogPath 尚未缓存，坏目录才会真正生效。

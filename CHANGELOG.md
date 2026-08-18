@@ -5,6 +5,16 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [3.1.4] - 2026-08-18
+
+### Fixed
+- **Background Rust** compiles and runs as one `sh -c` job (`rustc && exec`) instead of blocking the tool call on a synchronous `rustc`.
+- **TypeScript `ts-node` detection** uses the request `cwd` (LookPath, then `cwd/node_modules/.bin/ts-node`, then `npm ls` with `cmd.Dir=cwd`) and caches per cwd instead of a process-wide `sync.Once`.
+- **Pi `compressToolText`** keeps about 75% head plus a tail on character overflow so a trailing `(exited with code N)` is not sliced off.
+- **`ctx_bg` `wait`** reports `log_error` when the log cannot be read; `done` and `exit_code` are still returned.
+- **Sensitive-path skip list** now includes `.envrc`, `*.p12`/`*.pfx`, and `.docker/config.json` (not the rest of `.docker/`).
+- **Foreground `limitedBuffer`** keeps the newest bytes (same policy as the background ring log) and `String()` drops incomplete UTF-8 runes.
+
 ## [3.1.3] - 2026-08-18
 
 ### Fixed
