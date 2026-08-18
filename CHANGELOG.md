@@ -5,6 +5,15 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [3.1.6] - 2026-08-19
+
+### Fixed
+- **`ctx_git` log** ignores repository `log.showSignature` and `gpg.program` / `gpg.ssh.program` (command-line `-c` plus `--no-show-signature`) so a local git config cannot run an arbitrary verifier.
+- **Sensitive hardlinks** are detected by collecting secret-path inodes across workdirs first, then walking or indexing a single file against that table. Harmless names no longer depend on walk order. `indexFile` also collects when `Nlink>1` if no table was passed.
+- **`looksLikePrivateKey`** also matches PKCS#8 `BEGIN PRIVATE KEY`.
+- **`ctx_fs` stat** `abs_path` is the workdir-relative display path, same as `path`, and no longer returns a host absolute path.
+- **`ctx_kb` fetch** refuses to index private-key bodies before purge/write. Page text is still returned to the caller.
+
 ## [3.1.5] - 2026-08-18
 
 ### Fixed

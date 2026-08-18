@@ -11,6 +11,23 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+func assertStatNoHostAbs(t *testing.T, text, workdir string) {
+	t.Helper()
+	var parsed struct {
+		Path    string `json:"path"`
+		AbsPath string `json:"abs_path"`
+	}
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		t.Fatalf("stat json: %v\n%s", err, text)
+	}
+	if strings.Contains(parsed.Path, workdir) {
+		t.Fatalf("path leaked host prefix %q: %q", workdir, parsed.Path)
+	}
+	if strings.Contains(parsed.AbsPath, workdir) {
+		t.Fatalf("abs_path leaked host prefix %q: %q", workdir, parsed.AbsPath)
+	}
+}
+
 func testServerWithWorkdir(t *testing.T, wd string) *server {
 	t.Helper()
 	return &server{workdirs: []string{wd}}
@@ -305,9 +322,10 @@ func TestCtxStat_MultiWorkdirResolution(t *testing.T) {
 		t.Fatalf("stat wd2-only file: %v", err)
 	}
 	text := mcpResultText(t, res)
-	if !strings.Contains(text, filepath.Join(wd2, "only-wd2.txt")) {
-		t.Fatalf("expected wd2 path in result, got: %s", text)
+	if !strings.Contains(text, "only-wd2.txt") {
+		t.Fatalf("expected only-wd2.txt in result, got: %s", text)
 	}
+	assertStatNoHostAbs(t, text, wd2)
 
 	// Duplicate relative path in both workdirs: must demand an absolute path.
 	mustWrite(t, filepath.Join(wd1, "dup.txt"), "one")
@@ -334,9 +352,11 @@ func TestCtxStat_MultiWorkdirResolution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat absolute dup: %v", err)
 	}
-	if !strings.Contains(mcpResultText(t, res2), filepath.Join(wd1, "dup.txt")) {
-		t.Fatalf("expected wd1 dup path in result, got: %s", mcpResultText(t, res2))
+	text2 := mcpResultText(t, res2)
+	if !strings.Contains(text2, "dup.txt") {
+		t.Fatalf("expected dup.txt in result, got: %s", text2)
 	}
+	assertStatNoHostAbs(t, text2, wd1)
 
 	// Absolute path outside workspaces still rejected (no regression).
 	if _, _, err = s.toolStat(context.Background(), nil, statArgs{Path: "/etc/hostname"}); err == nil {
@@ -364,9 +384,10 @@ func TestCtxStat_Wd2LeafSymlink(t *testing.T) {
 	if !strings.Contains(text, `"is_symlink": true`) {
 		t.Fatalf("expected is_symlink, got: %s", text)
 	}
-	if !strings.Contains(text, filepath.Join(wd2, "leaf-link")) {
-		t.Fatalf("expected wd2 link path in result, got: %s", text)
+	if !strings.Contains(text, "leaf-link") {
+		t.Fatalf("expected leaf-link in result, got: %s", text)
 	}
+	assertStatNoHostAbs(t, text, wd2)
 
 	// Broken leaf symlink in wd2 must still match and be reported as a link.
 	broken := filepath.Join(wd2, "broken-link")

@@ -516,9 +516,13 @@ func splitLongText(s string, max int) []string {
 
 // indexContentLocked replaces the documents under docPath (source:format:url)
 // with freshly chunked content: stale chunks from an earlier fetch are removed
-// first, then each new chunk is indexed. Returns the number of chunks written
-// and the first indexing error, if any.
+// first, then each new chunk is indexed. Private-key material is refused
+// before any purge. Returns the number of chunks written and the first
+// indexing error, if any.
 func (s *server) indexContentLocked(docPath, content string) (int, error) {
+	if looksLikePrivateKey([]byte(content)) {
+		return 0, fmt.Errorf("refusing to index private key material")
+	}
 	if err := s.storePurgeExactAndChunksLocked(docPath); err != nil {
 		return 0, fmt.Errorf("clear stale documents under %q: %w", docPath, err)
 	}

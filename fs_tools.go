@@ -630,7 +630,7 @@ func (s *server) toolStat(ctx context.Context, _ *mcp.CallToolRequest, args stat
 	}
 	out := statResult{
 		Path:          s.displayPath(target),
-		AbsPath:       target,
+		AbsPath:       s.displayPath(target),
 		Size:          size,
 		Mode:          li.Mode().String(),
 		ModePerm:      li.Mode().Perm().String(),

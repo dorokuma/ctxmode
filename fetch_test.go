@@ -896,6 +896,41 @@ func TestCheckIP_EmbeddedIPv4Blocked(t *testing.T) {
 	}
 }
 
+func TestIndexContentLocked_RefusesPrivateKey(t *testing.T) {
+	srv := newTestServer(t)
+	const docPath = "src:markdown:http://example.com/key"
+	indexDoc(t, srv.store, docPath, "old safe page")
+
+	body := "-----BEGIN " + "PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKc\n-----END " + "PRIVATE KEY-----\n"
+	n, err := srv.indexContentLocked(docPath, body)
+	if err == nil {
+		t.Fatal("expected private key refusal")
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 chunks, got %d", n)
+	}
+	if !strings.Contains(err.Error(), "private key") {
+		t.Fatalf("got %v", err)
+	}
+	if doc, _ := srv.store.Get(docPath); doc == nil || doc.Content != "old safe page" {
+		t.Fatalf("existing document must remain after refuse, got %+v", doc)
+	}
+	if hits, _ := srv.store.Search("MIIEvQIBADANBgkqhki", 5); len(hits) != 0 {
+		t.Fatalf("private key material was indexed: %+v", hits)
+	}
+
+	n, err = srv.indexContentLocked(docPath, "harmless fetch body unique-ok-token")
+	if err != nil {
+		t.Fatalf("plain content: %v", err)
+	}
+	if n < 1 {
+		t.Fatalf("expected chunks, got %d", n)
+	}
+	if hits, err := srv.store.Search("unique-ok-token", 5); err != nil || len(hits) == 0 {
+		t.Fatalf("plain content should index (err %v hits %d)", err, len(hits))
+	}
+}
+
 func TestIndexContentLocked_DoesNotDeleteLongerURL(t *testing.T) {
 	srv := newTestServer(t)
 	shortPath := fetchDocPath("web", "markdown", "http://ex.com/foo")

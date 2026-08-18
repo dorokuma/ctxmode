@@ -32,7 +32,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "3.1.5"
+const Version = "3.1.6"
 
 // toolIndex walk / size limits.
 const (
@@ -451,8 +451,12 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 		}
 	}
 
+	// Collect secret-path inodes across every workdir first so a hardlink
+	// whose walk name is harmless is rejected even when it is visited before
+	// the sensitive name.
+	sensitiveInodes := s.collectSensitiveInodes()
+
 	if info.IsDir() {
-		sensitiveInodes := make(map[fileID]struct{})
 		baseDepth := strings.Count(target, string(filepath.Separator))
 		err = filepath.Walk(target, func(path string, fi os.FileInfo, walkErr error) error {
 			if walkErr != nil {
@@ -507,9 +511,6 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 				return nil
 			}
 			if isSensitiveFilePath(real) {
-				if id, ok := fileDevIno(realInfo); ok {
-					sensitiveInodes[id] = struct{}{}
-				}
 				sensitiveCount++
 				addSkip(fmt.Sprintf("%s: sensitive file (secrets)", real))
 				return nil
@@ -533,7 +534,7 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 				addSkip(fmt.Sprintf("%s: total size cap reached", real))
 				return filepath.SkipAll
 			}
-			if err := s.indexFile(real); err != nil {
+			if err := s.indexFileWithSensitive(real, sensitiveInodes); err != nil {
 				addSkip(fmt.Sprintf("%s: %v", path, err))
 				return nil
 			}
@@ -548,11 +549,16 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 		if isSensitiveFilePath(target) {
 			return nil, nil, fmt.Errorf("refusing to index sensitive file %q (credentials/secrets)", target)
 		}
+		if id, ok := fileDevIno(info); ok {
+			if _, seen := sensitiveInodes[id]; seen {
+				return nil, nil, fmt.Errorf("refusing to index %q: hardlink to sensitive file", target)
+			}
+		}
 		if isProbablyBinaryName(info.Name()) || info.Size() > maxIndexFileBytes {
 			return nil, nil, fmt.Errorf("file %q is binary or too large (> 1MB)", target)
 		}
 		// Content-based binary check happens in indexFile.
-		err = s.indexFile(target)
+		err = s.indexFileWithSensitive(target, sensitiveInodes)
 		if err == nil {
 			indexedCount = 1
 		} else {
@@ -883,6 +889,10 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 // ---------- db helpers ----------
 
 func (s *server) indexFile(path string) error {
+	return s.indexFileWithSensitive(path, nil)
+}
+
+func (s *server) indexFileWithSensitive(path string, sensitiveInodes map[fileID]struct{}) error {
 	// Resolve symlinks and re-check containment at read time (Walk may
 	// encounter links; callers may pass an unverified path).
 	real, err := s.ensureInsideWorkspaces(path)
@@ -900,6 +910,18 @@ func (s *server) indexFile(path string) error {
 	}
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("not a regular file: %s", real)
+	}
+	if sensitiveInodes == nil {
+		if st, ok := info.Sys().(*syscall.Stat_t); ok && uint64(st.Nlink) > 1 {
+			sensitiveInodes = s.collectSensitiveInodes()
+		}
+	}
+	if sensitiveInodes != nil {
+		if id, ok := fileDevIno(info); ok {
+			if _, seen := sensitiveInodes[id]; seen {
+				return fmt.Errorf("hardlink to sensitive file: %s", real)
+			}
+		}
 	}
 	if info.Size() > maxIndexFileBytes {
 		return fmt.Errorf("too large (%d bytes, max %d)", info.Size(), maxIndexFileBytes)
@@ -1104,7 +1126,47 @@ func fileDevIno(info os.FileInfo) (fileID, bool) {
 	return fileID{dev: uint64(st.Dev), ino: uint64(st.Ino)}, true
 }
 
-// looksLikePrivateKey reports PEM/OpenSSH/PGP private-key markers.
+// collectSensitiveInodes walks every workdir and records device+inode of
+// paths that match isSensitiveFilePath. Symlink targets are recorded via
+// Stat so a hardlink or alias of the real file is also blocked. .git and
+// node_modules are skipped; secret dirs such as .ssh are not.
+func (s *server) collectSensitiveInodes() map[fileID]struct{} {
+	out := make(map[fileID]struct{})
+	for _, wd := range s.workdirs {
+		if wd == "" {
+			continue
+		}
+		_ = filepath.Walk(wd, func(path string, fi os.FileInfo, walkErr error) error {
+			if walkErr != nil || fi == nil {
+				return nil
+			}
+			if fi.IsDir() {
+				base := filepath.Base(path)
+				if base == ".git" || base == "node_modules" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !isSensitiveFilePath(path) {
+				return nil
+			}
+			if id, ok := fileDevIno(fi); ok {
+				out[id] = struct{}{}
+			}
+			if fi.Mode()&os.ModeSymlink != 0 {
+				if ti, err := os.Stat(path); err == nil {
+					if id, ok := fileDevIno(ti); ok {
+						out[id] = struct{}{}
+					}
+				}
+			}
+			return nil
+		})
+	}
+	return out
+}
+
+// looksLikePrivateKey reports PEM/OpenSSH/PGP/PKCS#8 private-key markers.
 // Public-key banners (BEGIN PUBLIC KEY, BEGIN SSH2 PUBLIC KEY) are not matched.
 func looksLikePrivateKey(data []byte) bool {
 	markers := []string{
@@ -1113,6 +1175,7 @@ func looksLikePrivateKey(data []byte) bool {
 		"BEGIN DSA PRIVATE KEY",
 		"BEGIN EC PRIVATE KEY",
 		"BEGIN ENCRYPTED PRIVATE KEY",
+		"BEGIN PRIVATE KEY",
 		"BEGIN PGP PRIVATE KEY",
 	}
 	s := string(data)

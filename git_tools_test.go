@@ -108,6 +108,124 @@ func TestCtxGitDiff_PathAndOutside(t *testing.T) {
 	}
 }
 
+func TestHardenedGitArgs_DisablesShowSignature(t *testing.T) {
+	args := hardenedGitArgs("log", "-n", "1")
+	want := []string{
+		"core.fsmonitor=false",
+		"core.hooksPath=/dev/null",
+		"log.showSignature=false",
+		"gpg.program=/bin/true",
+		"gpg.ssh.program=/bin/true",
+	}
+	for _, w := range want {
+		found := false
+		for _, a := range args {
+			if a == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("hardenedGitArgs missing %q in %v", w, args)
+		}
+	}
+}
+
+func TestCtxGitLog_DoesNotRunRepoGpgProgram(t *testing.T) {
+	wd, s := setupGitRepo(t)
+	marker := filepath.Join(t.TempDir(), "gpg-ran.marker")
+	script := filepath.Join(t.TempDir(), "fake-gpg")
+	body := "#!/bin/sh\ntouch '" + marker + "'\n" +
+		"case \" $* \" in\n" +
+		"  *' -bsau '*|*' --detach-sign '*)\n" +
+		"    echo '-----BEGIN PGP SIGNATURE-----'\n" +
+		"    echo 'iQfake'\n" +
+		"    echo '-----END PGP SIGNATURE-----'\n" +
+		"    ;;\n" +
+		"esac\n" +
+		"exit 0\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = wd
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test",
+			"GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=Test",
+			"GIT_COMMITTER_EMAIL=test@example.com",
+			"GIT_CONFIG_NOSYSTEM=1",
+			"GIT_CONFIG_GLOBAL=/dev/null",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	// Inject a dummy gpgsig so `git log --show-signature` will invoke gpg.program
+	// without needing a working signer.
+	cat := exec.Command("git", "cat-file", "-p", "HEAD")
+	cat.Dir = wd
+	raw, err := cat.Output()
+	if err != nil {
+		t.Fatalf("cat-file: %v", err)
+	}
+	commit := string(raw)
+	blank := strings.Index(commit, "\n\n")
+	if blank < 0 {
+		t.Fatalf("unexpected commit object:\n%s", commit)
+	}
+	signed := commit[:blank+1] +
+		"gpgsig -----BEGIN PGP SIGNATURE-----\n" +
+		" \n" +
+		" iQfake\n" +
+		" -----END PGP SIGNATURE-----\n" +
+		commit[blank+1:]
+	hashCmd := exec.Command("git", "hash-object", "-t", "commit", "-w", "--stdin")
+	hashCmd.Dir = wd
+	hashCmd.Stdin = strings.NewReader(signed)
+	hashOut, err := hashCmd.Output()
+	if err != nil {
+		t.Fatalf("hash-object: %v", err)
+	}
+	run("git", "update-ref", "HEAD", strings.TrimSpace(string(hashOut)))
+	run("git", "config", "log.showSignature", "true")
+	run("git", "config", "gpg.program", script)
+
+	// Control: repo config must invoke gpg.program when signatures are shown.
+	ctrl := exec.Command("git", "log", "-n", "1", "--show-signature")
+	ctrl.Dir = wd
+	ctrl.Env = append(os.Environ(),
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+	)
+	if out, err := ctrl.CombinedOutput(); err != nil {
+		t.Fatalf("control git log --show-signature: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("control did not invoke gpg.program (marker missing): %v", err)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+
+	res, _, err := s.toolGitLog(context.Background(), nil, gitLogArgs{N: 5})
+	if err != nil {
+		t.Fatalf("toolGitLog: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "signed") && !strings.Contains(text, "initial") {
+		t.Fatalf("expected commit message:\n%s", text)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("gpg.program ran during toolGitLog; marker exists")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat marker: %v", err)
+	}
+}
+
 func TestCtxGitLog_Basic(t *testing.T) {
 	_, s := setupGitRepo(t)
 	res, _, err := s.toolGitLog(context.Background(), nil, gitLogArgs{N: 5})

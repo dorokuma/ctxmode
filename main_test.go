@@ -839,8 +839,8 @@ func TestToolIndex_HardlinkAndPrivateKeyContent(t *testing.T) {
 	s2 := &server{workdirs: []string{wd}, store: st2}
 	if err := s2.indexFile(notes); err == nil {
 		t.Fatal("indexFile(notes.txt) must refuse private-key content")
-	} else if !strings.Contains(err.Error(), "private key") {
-		t.Fatalf("expected private key error, got: %v", err)
+	} else if !strings.Contains(err.Error(), "private key") && !strings.Contains(err.Error(), "hardlink") {
+		t.Fatalf("expected private key or hardlink error, got: %v", err)
 	}
 	if doc, _ := st2.Get(notes); doc != nil {
 		t.Fatalf("refused hardlink must not be stored")
@@ -866,5 +866,71 @@ func TestLooksLikePrivateKey(t *testing.T) {
 	}
 	if !looksLikePrivateKey([]byte("-----BEGIN PGP PRIVATE KEY BLOCK-----\n")) {
 		t.Fatal("PGP private key not detected")
+	}
+	if !looksLikePrivateKey([]byte("-----BEGIN " + "PRIVATE KEY-----\nMII\n")) {
+		t.Fatal("PKCS#8 PRIVATE KEY not detected")
+	}
+	if looksLikePrivateKey([]byte("-----BEGIN PUBLIC KEY-----\nMII\n")) {
+		t.Fatal("PUBLIC KEY must not be treated as private")
+	}
+
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+	notes := filepath.Join(wd, "notes.txt")
+	mustWrite(t, notes, "-----BEGIN "+"PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKc\n-----END "+"PRIVATE KEY-----\n")
+	if err := s.indexFile(notes); err == nil {
+		t.Fatal("indexFile(notes.txt) must refuse PKCS#8 private key")
+	} else if !strings.Contains(err.Error(), "private key") {
+		t.Fatalf("expected private key error, got: %v", err)
+	}
+	if doc, _ := st.Get(notes); doc != nil {
+		t.Fatal("PKCS#8 body must not be stored")
+	}
+}
+
+func TestToolIndex_HardlinkEnvWalkOrder(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+
+	envDir := filepath.Join(wd, "z")
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(envDir, ".env")
+	mustWrite(t, envPath, "SECRET_TOKEN=abc\n")
+	aaa := filepath.Join(wd, "aaa.txt")
+	if err := os.Link(envPath, aaa); err != nil {
+		t.Fatalf("hardlink: %v", err)
+	}
+	mustWrite(t, filepath.Join(wd, "ok.txt"), "public-ok-marker")
+
+	res, _, err := s.toolIndex(context.Background(), nil, indexArgs{Path: wd})
+	if err != nil {
+		t.Fatalf("toolIndex: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if hits, _ := st.Search("SECRET_TOKEN", 5); len(hits) != 0 {
+		t.Fatalf("SECRET_TOKEN was indexed via hardlink: %+v (msg %s)", hits, text)
+	}
+	if doc, _ := st.Get(aaa); doc != nil {
+		t.Fatalf("aaa.txt hardlink must not be stored")
+	}
+	if hits, err := st.Search("public-ok-marker", 5); err != nil || len(hits) != 1 {
+		t.Fatalf("ok.txt should still be indexed (err %v, hits %d)", err, len(hits))
+	}
+
+	st2 := newTestStore(t)
+	s2 := &server{workdirs: []string{wd}, store: st2}
+	_, _, err = s2.toolIndex(context.Background(), nil, indexArgs{Path: aaa})
+	if err == nil {
+		t.Fatal("single-file index of hardlink to .env must refuse")
+	}
+	if !strings.Contains(err.Error(), "hardlink") {
+		t.Fatalf("expected hardlink error, got: %v", err)
+	}
+	if hits, _ := st2.Search("SECRET_TOKEN", 5); len(hits) != 0 {
+		t.Fatalf("single-file index stored SECRET_TOKEN: %+v", hits)
 	}
 }

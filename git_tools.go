@@ -126,7 +126,7 @@ func (s *server) toolGitLog(ctx context.Context, _ *mcp.CallToolRequest, args gi
 		oneline = *args.Oneline
 	}
 
-	gitArgs := []string{"log", "-n", strconv.Itoa(n)}
+	gitArgs := []string{"log", "--no-show-signature", "-n", strconv.Itoa(n)}
 	if oneline {
 		gitArgs = append(gitArgs, "--oneline")
 	} else {
@@ -257,7 +257,13 @@ func sanitizedGitEnv() []string {
 }
 
 func hardenedGitArgs(args ...string) []string {
-	prefix := []string{"-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"}
+	prefix := []string{
+		"-c", "core.fsmonitor=false",
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "log.showSignature=false",
+		"-c", "gpg.program=/bin/true",
+		"-c", "gpg.ssh.program=/bin/true",
+	}
 	return append(prefix, args...)
 }
 
