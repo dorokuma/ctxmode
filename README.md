@@ -4,7 +4,7 @@ A 100% NPM/NodeJS-free, Go implementation of Mert Koseoglu's [context-mode](http
 
 Local-first Model Context Protocol (MCP) server that virtualizes tool outputs, allowing AI coding agents to execute heavy tasks and save up to 98% in token usage.
 
-Current version: **3.1.6**.
+Current version: **3.1.7**.
 
 Supported platform: **Linux**. Background process identity verification reads `/proc/<pid>/stat`; on other platforms ctxmode still runs, but `ctx_bg` termination is not promised (see [ctx_bg](#ctx_bg--background-process-supervision-from-ctx_run-actionexecute-backgroundtrue)).
 
@@ -53,7 +53,7 @@ Optional YAML (`-config` / `$CTXMODE_CONFIG` / `./ctxmode-config.yaml` / `~/.con
 ```yaml
 workdirs:
   - /path/to/your/project
-  - /tmp
+  - /path/to/another/project
 ```
 
 `workdirs` defines the workspace roots; every `cwd`/`path` argument is resolved against them (see Tools below). See [`config.example.yaml`](config.example.yaml).
@@ -72,7 +72,7 @@ The following are defense-in-depth measures, never a security guarantee:
 
 - Subprocess environments strip inherited variables whose names look sensitive (`token`, `key`, `secret`, `password`, `passwd`, `credential`, `auth`, `cookie`, `session`, case-insensitive) by default; `CTXMODE_ENV_PASSTHROUGH=1` disables this. Caller-provided `env` overrides truly replace same-named inherited variables (deduplicated map, not appended duplicates), and the allowlist still rejects `PATH`/`HOME`/`SHELL`/`LD_*`/`DYLD_*` etc.
 - Indexing skips secret-like files by default: `.env`/`.env.*`, `.envrc`, anything under a `.env/` directory, private keys (`*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`), `credentials.json`, `.npmrc`, `.netrc`, `.docker/config.json` (not the rest of `.docker/`), and anything under `.aws`/`.ssh`/`.gnupg`/`.kube`.
-- `ctx_kb action=fetch` refuses SSRF targets: IPv4 and IPv6 loopback, link-local (169.254.0.0/16, fe80::/10), multicast, reserved, private (RFC 1918, fc00::/7), CGNAT and benchmark ranges. Embedded IPv4 in IPv6 (IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96`, RFC 8215 local-use `64:ff9b:1::/48`, 6to4 `2002::/16`) is decoded and checked against the same IPv4 list. The blocklist is a single fixed set: the former strict/non-strict split was removed (`CTX_FETCH_STRICT` no longer exists) and the intercepted set cannot be changed via the environment.
+- `ctx_kb action=fetch` refuses SSRF targets: IPv4 and IPv6 loopback, link-local (169.254.0.0/16, fe80::/10), multicast, reserved, private (RFC 1918, fc00::/7), CGNAT and benchmark ranges. Embedded IPv4 in IPv6 (IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96`, RFC 8215 local-use `64:ff9b:1::/48`, 6to4 `2002::/16`, Teredo `2001:0::/32`, ISATAP) is decoded and checked against the same IPv4 list. The blocklist is a single fixed set: the former strict/non-strict split was removed (`CTX_FETCH_STRICT` no longer exists) and the intercepted set cannot be changed via the environment.
 
 ### Subprocess environment isolation
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -613,7 +615,7 @@ func TestFetchAndIndex_DefaultSource(t *testing.T) {
 
 func TestValidateURL_AllowsIfAnyIPSafe(t *testing.T) {
 	// Hosts that resolve only to blocked IPs should fail.
-	err := validateURL("http://127.0.0.1/")
+	err := validateURL(context.Background(), "http://127.0.0.1/")
 	if err == nil {
 		t.Fatal("expected 127.0.0.1 blocked")
 	}
@@ -629,7 +631,7 @@ func TestValidateURL_AllowsIfAnyIPSafe(t *testing.T) {
 			}
 		}
 		if anySafe {
-			if err := validateURL("https://example.com/"); err != nil {
+			if err := validateURL(context.Background(), "https://example.com/"); err != nil {
 				t.Fatalf("expected example.com allowed when a public IP exists: %v", err)
 			}
 		}
@@ -640,8 +642,8 @@ func TestValidateURL_AllowsIfAnyIPSafe(t *testing.T) {
 
 func TestVersionAligned(t *testing.T) {
 	// Keep in sync with CHANGELOG release label.
-	if Version != "3.1.6" {
-		t.Fatalf("Version=%q, want 3.1.6 (CHANGELOG)", Version)
+	if Version != "3.1.7" {
+		t.Fatalf("Version=%q, want 3.1.7 (CHANGELOG)", Version)
 	}
 }
 
@@ -757,4 +759,438 @@ func truncateForTest(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// ---------- #18 concurrent & idempotent shutdownBackground ----------
+
+func TestShutdownBackground_ConcurrentAndIdempotent(t *testing.T) {
+	requireLinux(t)
+	// Clean slate: terminate any leftover background jobs from prior tests.
+	shutdownBackground()
+
+	// Start 3 background processes.
+	for i := 0; i < 3; i++ {
+		_, err := runShell(context.Background(), "sleep 30", "/tmp", 0, true)
+		if err != nil {
+			t.Fatalf("start bg proc %d: %v", i, err)
+		}
+	}
+
+	initial := listBackground()
+	if len(initial) != 3 {
+		t.Fatalf("expected 3 background entries before shutdown, got %d", len(initial))
+	}
+	var pids []int
+	for _, e := range initial {
+		pids = append(pids, e.PID)
+	}
+
+	// Concurrent callers invoking shutdownBackground simultaneously.
+	var wg sync.WaitGroup
+	const callers = 5
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			shutdownBackground()
+		}()
+	}
+	wg.Wait()
+
+	// All procs must be gone from registry.
+	if procs := listBackground(); len(procs) != 0 {
+		t.Fatalf("expected empty registry after shutdown, got %d", len(procs))
+	}
+
+	// Verify all processes are terminated deterministically.
+	for _, pid := range pids {
+		if pid <= 0 {
+			continue
+		}
+		dead := false
+		for attempt := 0; attempt < 100; attempt++ {
+			if procStartTime(pid) == 0 {
+				dead = true
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !dead {
+			t.Fatalf("background process %d still running after shutdown", pid)
+		}
+	}
+
+	// Idempotent: subsequent calls (both single and concurrent) must succeed safely
+	// and leave the registry empty.
+	shutdownBackground()
+	if procs := listBackground(); len(procs) != 0 {
+		t.Fatalf("expected empty registry after second shutdown, got %d", len(procs))
+	}
+
+	var wg2 sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			shutdownBackground()
+		}()
+	}
+	wg2.Wait()
+
+	if procs := listBackground(); len(procs) != 0 {
+		t.Fatalf("expected empty registry after concurrent second shutdown, got %d", len(procs))
+	}
+}
+
+// ---------- #19 ensureDBDir permissions ----------
+
+func TestEnsureDBDir_Permissions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// 1. Default DB path: ensureDBDir creates dedicated dir with 0700 permissions.
+	t.Setenv("CTXMODE_DB", "")
+	defPath, _, err := databasePath(filepath.Join(home, "myproject"))
+	if err != nil {
+		t.Fatalf("databasePath: %v", err)
+	}
+	if err := ensureDBDir(defPath); err != nil {
+		t.Fatalf("ensureDBDir: %v", err)
+	}
+	dirInfo, err := os.Stat(filepath.Dir(defPath))
+	if err != nil {
+		t.Fatalf("stat default db dir: %v", err)
+	}
+	if mode := dirInfo.Mode().Perm(); mode != 0o700 {
+		t.Fatalf("default db directory permissions = %o, want 0700", mode)
+	}
+
+	// 2. Custom CTXMODE_DB: parent dir permissions must NOT be chmodded to 0700.
+	sharedDir := filepath.Join(home, "shared_dir")
+	if err := os.MkdirAll(sharedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sharedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	customDB := filepath.Join(sharedDir, "custom.db")
+	t.Setenv("CTXMODE_DB", customDB)
+	if err := ensureDBDir(customDB); err != nil {
+		t.Fatalf("ensureDBDir custom: %v", err)
+	}
+	sharedInfo, err := os.Stat(sharedDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := sharedInfo.Mode().Perm(); mode != 0o755 {
+		t.Fatalf("custom CTXMODE_DB modified parent dir permissions to %o, want 0755", mode)
+	}
+}
+
+// ---------- #20 Teredo / ISATAP / Transitions checkIP ----------
+
+func TestCheckIP_TeredoISATAPAndTransitions(t *testing.T) {
+	// Teredo (2001:0000::/32): bytes 4..7 is server IPv4, bytes 12..15 XOR 0xFFFFFFFF is client IPv4.
+	// Server private (10.0.0.1 -> 0a 00 00 01)
+	teredoPrivServer := net.IP{0x20, 0x01, 0x00, 0x00, 10, 0, 0, 1, 0, 0, 0, 0, 0xfe, 0xfe, 0xfe, 0xfe}
+	if err := checkIP(teredoPrivServer); err == nil {
+		t.Fatal("expected Teredo with private server IP to be blocked")
+	}
+
+	// Server public (1.1.1.1), Client private (192.168.1.1 -> XOR with FF -> 192^0xff=63, 168^0xff=87, 1^0xff=254)
+	teredoPrivClient := net.IP{0x20, 0x01, 0x00, 0x00, 1, 1, 1, 1, 0, 0, 0, 0, 192 ^ 0xff, 168 ^ 0xff, 1 ^ 0xff, 1 ^ 0xff}
+	if err := checkIP(teredoPrivClient); err == nil {
+		t.Fatal("expected Teredo with private client IP to be blocked")
+	}
+
+	// Server public (1.1.1.1), Client public (8.8.8.8 -> XOR with FF -> 8^0xff = 0xf7)
+	teredoPublic := net.IP{0x20, 0x01, 0x00, 0x00, 1, 1, 1, 1, 0, 0, 0, 0, 8 ^ 0xff, 8 ^ 0xff, 8 ^ 0xff, 8 ^ 0xff}
+	if err := checkIP(teredoPublic); err != nil {
+		t.Fatalf("expected Teredo with public server & client IPs to be allowed: %v", err)
+	}
+
+	// ISATAP: bytes 8..11 is 00:00:5E:FE or 02:00:5E:FE, bytes 12..15 is IPv4.
+	isatapPriv1 := net.IP{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0x00, 0x00, 0x5e, 0xfe, 10, 0, 0, 1}
+	if err := checkIP(isatapPriv1); err == nil {
+		t.Fatal("expected ISATAP (00-00-5E-FE) with private IPv4 to be blocked")
+	}
+	isatapPriv2 := net.IP{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0x02, 0x00, 0x5e, 0xfe, 192, 168, 1, 1}
+	if err := checkIP(isatapPriv2); err == nil {
+		t.Fatal("expected ISATAP (02-00-5E-FE) with private IPv4 to be blocked")
+	}
+	isatapPublic := net.IP{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0x02, 0x00, 0x5e, 0xfe, 8, 8, 8, 8}
+	if err := checkIP(isatapPublic); err != nil {
+		t.Fatalf("expected ISATAP with public IPv4 to be allowed: %v", err)
+	}
+
+	// Plain public IPv6
+	pubV6 := net.ParseIP("2606:4700:4700::1111")
+	if err := checkIP(pubV6); err != nil {
+		t.Fatalf("expected public IPv6 to be allowed: %v", err)
+	}
+
+	// 6to4 (2002::/16)
+	sixToFourPriv := net.IP{0x20, 0x02, 10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	if err := checkIP(sixToFourPriv); err == nil {
+		t.Fatal("expected 6to4 private to be blocked")
+	}
+	sixToFourPub := net.IP{0x20, 0x02, 8, 8, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	if err := checkIP(sixToFourPub); err != nil {
+		t.Fatalf("expected 6to4 public to be allowed: %v", err)
+	}
+
+	// NAT64 well-known (64:ff9b::/96) and local-use (64:ff9b:1::/48)
+	nat64Priv := net.IP{0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1}
+	if err := checkIP(nat64Priv); err == nil {
+		t.Fatal("expected NAT64 private to be blocked")
+	}
+	nat64Pub := net.IP{0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1}
+	if err := checkIP(nat64Pub); err != nil {
+		t.Fatalf("expected NAT64 public to be allowed: %v", err)
+	}
+
+	// IPv4-compatible (::a.b.c.d)
+	compatPriv := net.IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1}
+	if err := checkIP(compatPriv); err == nil {
+		t.Fatal("expected IPv4-compatible private to be blocked")
+	}
+	compatPub := net.IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8}
+	if err := checkIP(compatPub); err != nil {
+		t.Fatalf("expected IPv4-compatible public to be allowed: %v", err)
+	}
+}
+
+// ---------- #21 migrateFromJSON tests ----------
+
+func TestMigrateFromJSON_OversizedSymlinkAndValid(t *testing.T) {
+	// 1. Oversized JSON DB: must return error and NOT rename.
+	t.Run("oversized file rejected", func(t *testing.T) {
+		wd := t.TempDir()
+		st := newTestStore(t)
+		s := &server{workdirs: []string{wd}, store: st}
+		jsonPath := filepath.Join(wd, ".context_mode_db.json")
+
+		origLimit := maxJSONMigrationBytes
+		defer func() { maxJSONMigrationBytes = origLimit }()
+		maxJSONMigrationBytes = 32
+
+		f, err := os.Create(jsonPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Truncate(64); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		f.Close()
+
+		err = s.migrateFromJSON()
+		if err == nil {
+			t.Fatal("expected error for oversized JSON DB")
+		}
+		if !strings.Contains(err.Error(), "too large") {
+			t.Fatalf("expected too large error, got: %v", err)
+		}
+		if _, err := os.Lstat(jsonPath); err != nil {
+			t.Fatalf("original file must remain in place: %v", err)
+		}
+		if _, err := os.Lstat(jsonPath + ".bak"); !os.IsNotExist(err) {
+			t.Fatal("backup file must not exist on failed migration")
+		}
+	})
+
+	// 2. Symlink JSON DB: must return error and NOT rename.
+	t.Run("symlink rejected", func(t *testing.T) {
+		wd := t.TempDir()
+		st := newTestStore(t)
+		s := &server{workdirs: []string{wd}, store: st}
+		target := filepath.Join(t.TempDir(), "target.json")
+		if err := os.WriteFile(target, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		jsonPath := filepath.Join(wd, ".context_mode_db.json")
+		if err := os.Symlink(target, jsonPath); err != nil {
+			t.Fatal(err)
+		}
+
+		err := s.migrateFromJSON()
+		if err == nil {
+			t.Fatal("expected error for symlink JSON DB")
+		}
+		if !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("expected not a regular file error, got: %v", err)
+		}
+		if _, err := os.Lstat(jsonPath); err != nil {
+			t.Fatalf("symlink must remain in place: %v", err)
+		}
+		if _, err := os.Lstat(jsonPath + ".bak"); !os.IsNotExist(err) {
+			t.Fatal("backup file must not exist on rejected symlink")
+		}
+	})
+
+	// 3. Valid small JSON DB: documents migrated and renamed to .bak.
+	t.Run("valid small JSON DB migrated", func(t *testing.T) {
+		wd := t.TempDir()
+		st := newTestStore(t)
+		s := &server{workdirs: []string{wd}, store: st}
+		jsonPath := filepath.Join(wd, ".context_mode_db.json")
+		validJSON := `{"doc1": {"path": "doc1.txt", "content": "migrated content alpha"}}`
+		if err := os.WriteFile(jsonPath, []byte(validJSON), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		err := s.migrateFromJSON()
+		if err != nil {
+			t.Fatalf("migrateFromJSON failed: %v", err)
+		}
+		if _, err := os.Lstat(jsonPath); !os.IsNotExist(err) {
+			t.Fatal("original JSON file should have been renamed")
+		}
+		if _, err := os.Lstat(jsonPath + ".bak"); err != nil {
+			t.Fatalf("backup file .bak must exist: %v", err)
+		}
+		doc, err := st.Get("doc1.txt")
+		if err != nil || doc == nil {
+			t.Fatalf("expected doc1.txt in store: %v", err)
+		}
+		if doc.Content != "migrated content alpha" {
+			t.Fatalf("unexpected content: %q", doc.Content)
+		}
+	})
+
+	// 4. File appears within limit on Stat but exceeds limit during Read (LimitReader overflow path).
+	// Must return "exceeded maximum allowed size" error, must NOT rename file, and .bak must not exist.
+	t.Run("limit reader exceeded during read", func(t *testing.T) {
+		wd := t.TempDir()
+		st := newTestStore(t)
+		s := &server{workdirs: []string{wd}, store: st}
+		jsonPath := filepath.Join(wd, ".context_mode_db.json")
+
+		// Write 100 bytes of content.
+		content := strings.Repeat("A", 100)
+		if err := os.WriteFile(jsonPath, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		origLimit := maxJSONMigrationBytes
+		origHook := jsonMigrationStatHook
+		defer func() {
+			maxJSONMigrationBytes = origLimit
+			jsonMigrationStatHook = origHook
+		}()
+
+		maxJSONMigrationBytes = 32
+		realFi, err := os.Lstat(jsonPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Stat hook reports size 10 (<= maxJSONMigrationBytes), but reading the file yields 100 bytes (> 32 bytes).
+		jsonMigrationStatHook = func(p string) (os.FileInfo, error) {
+			return fakeFileInfo{
+				name:    realFi.Name(),
+				size:    10,
+				mode:    realFi.Mode(),
+				modTime: realFi.ModTime(),
+			}, nil
+		}
+
+		err = s.migrateFromJSON()
+		if err == nil {
+			t.Fatal("expected error when LimitReader exceeds maxJSONMigrationBytes during read")
+		}
+		if !strings.Contains(err.Error(), "exceeded maximum allowed size") {
+			t.Fatalf("expected exceeded maximum allowed size error, got: %v", err)
+		}
+		if _, err := os.Lstat(jsonPath); err != nil {
+			t.Fatalf("original file must remain in place: %v", err)
+		}
+		if _, err := os.Lstat(jsonPath + ".bak"); !os.IsNotExist(err) {
+			t.Fatal("backup file must not exist on failed migration")
+		}
+	})
+}
+
+type fakeFileInfo struct {
+	name    string
+	size    int64
+	mode    os.FileMode
+	modTime time.Time
+}
+
+func (f fakeFileInfo) Name() string       { return f.name }
+func (f fakeFileInfo) Size() int64        { return f.size }
+func (f fakeFileInfo) Mode() os.FileMode  { return f.mode }
+func (f fakeFileInfo) ModTime() time.Time { return f.modTime }
+func (f fakeFileInfo) IsDir() bool        { return f.mode.IsDir() }
+func (f fakeFileInfo) Sys() any           { return nil }
+
+// ---------- #22 single-link sensitive inode scan skip ----------
+
+func TestIndexFile_SingleLinkNoInodeScan(t *testing.T) {
+	wd := t.TempDir()
+	st := newTestStore(t)
+	s := &server{workdirs: []string{wd}, store: st}
+
+	// Create sensitive file .env in workdir.
+	envFile := filepath.Join(wd, ".env")
+	if err := os.WriteFile(envFile, []byte("SEC"+"RET=123\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create regular file (nlink == 1).
+	normalFile := filepath.Join(wd, "normal.txt")
+	if err := os.WriteFile(normalFile, []byte("hello normal\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reset scan counter.
+	s.sensitiveInodesScans.Store(0)
+
+	// Indexing single regular file must NOT trigger collectSensitiveInodes.
+	res, _, err := s.toolIndex(context.Background(), nil, indexArgs{Path: normalFile})
+	if err != nil {
+		t.Fatalf("toolIndex normalFile: %v", err)
+	}
+	if !strings.Contains(mcpResultText(t, res), "Indexed 1 file(s)") {
+		t.Fatalf("expected 1 indexed file: %s", mcpResultText(t, res))
+	}
+	if scans := s.sensitiveInodesScans.Load(); scans != 0 {
+		t.Fatalf("expected 0 sensitive inodes scans for nlink=1 file, got %d", scans)
+	}
+
+	// Hardlink to .env (nlink == 2) with harmless name:
+	// nlink > 1 triggers scan and hardlink protection rejects it.
+	hardlinkToEnv := filepath.Join(wd, "safe_name.txt")
+	if err := os.Link(envFile, hardlinkToEnv); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = s.toolIndex(context.Background(), nil, indexArgs{Path: hardlinkToEnv})
+	if err == nil {
+		t.Fatal("expected hardlink to .env to be rejected")
+	}
+	if !strings.Contains(err.Error(), "hardlink to sensitive file") {
+		t.Fatalf("expected hardlink to sensitive file error, got: %v", err)
+	}
+	if scans := s.sensitiveInodesScans.Load(); scans == 0 {
+		t.Fatal("expected sensitive inodes scan to run for nlink > 1 file")
+	}
+}
+
+// ---------- #23 validateURL canceled context ----------
+
+func TestValidateURL_CanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Canceled context returns immediately for hostnames.
+	err := validateURL(ctx, "https://example.com/test")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled for hostname, got: %v", err)
+	}
+
+	// Canceled context returns immediately even for IP literals.
+	err = validateURL(ctx, "http://1.1.1.1/test")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled for IP literal, got: %v", err)
+	}
 }

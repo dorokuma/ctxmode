@@ -12,8 +12,38 @@ SECRET_PATTERNS=(
   'github_pat_[a-zA-Z0-9_]{20,}'
   'xox[baprs]-[a-zA-Z0-9-]+' 'sk-[a-zA-Z0-9-]{32,}'
   'AKIA[0-9A-Z]{16}' '-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----'
-  'password\s*[:=]\s*\S+' 'api_key\s*[:=]\s*\S+' 'secret\s*[:=]\s*\S+'
 )
+
+check_assignments() {
+  local text="$1"
+  local target="$2"
+  shopt -s nocasematch
+  while IFS= read -r line; do
+    [[ "$line" =~ ^(\+\+\+|---|@@|-) ]] && continue
+    if [[ "$line" =~ (password|api_key|secret)[[:space:]]*[:=]+[[:space:]]*(.*) ]]; then
+      local rest="${BASH_REMATCH[2]}"
+      local val=""
+      if [[ "$rest" =~ ^\"([^\"]*)\" ]]; then
+        val="${BASH_REMATCH[1]}"
+      elif [[ "$rest" =~ ^\'([^\']*)\' ]]; then
+        val="${BASH_REMATCH[1]}"
+      elif [[ "$rest" =~ ^([^[:space:];,]+) ]]; then
+        val="${BASH_REMATCH[1]}"
+      fi
+      val=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      local lower
+      lower=$(echo "$val" | tr '[:upper:]' '[:lower:]')
+      case "$lower" in
+        ""|"none"|"optional"|"removed"|"unchanged"|"empty"|"null"|"nil"|"undefined"|"true"|"false"|"todo"|"changeme"|"placeholder"|"<"*">"|"\$"*|"\"\""|"''")
+          continue
+          ;;
+      esac
+      if [ ${#val} -ge 6 ]; then
+        die "$target contains a hardcoded credential assignment: \"$line\""
+      fi
+    fi
+  done <<< "$text"
+}
 
 scan_commit() {
   local sha=$1
@@ -30,6 +60,7 @@ scan_commit() {
       die "commit $sha contains a secret matching: \"$pat\""
     fi
   done
+  check_assignments "$combined" "commit $sha"
   # Portable: C locale + POSIX classes. Do not use grep -P (missing PCRE
   # used to make this check a silent no-op and let non-ASCII commits through).
   set +e

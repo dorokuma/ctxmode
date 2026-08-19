@@ -72,12 +72,21 @@ type fetchArgs struct {
 
 // ---------- SSRF validation ----------
 
+const dnsValidationTimeout = 5 * time.Second
+
 // validateURL performs SSRF-protection checks on a URL.
-// It verifies the scheme is http/https, resolves DNS, and checks the IP
-// against blocklists. Multi-address hosts are allowed when at least one
-// resolved IP is safe (aligned with DialContext, which also picks the first
-// safe IP rather than requiring every address to pass).
-func validateURL(rawURL string) error {
+// It verifies the context, scheme (http/https), resolves DNS with a short timeout,
+// and checks the IP against blocklists. Multi-address hosts are allowed when at
+// least one resolved IP is safe (aligned with DialContext, which also picks the
+// first safe IP rather than requiring every address to pass).
+func validateURL(ctx context.Context, rawURL string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
@@ -88,10 +97,27 @@ func validateURL(rawURL string) error {
 	}
 
 	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("empty host in URL")
+	}
 
-	// Resolve DNS to check IP addresses.
-	ips, err := net.LookupIP(host)
+	// If host is already an IP literal, skip DNS resolution.
+	if ip := net.ParseIP(host); ip != nil {
+		if err := checkIP(ip); err != nil {
+			return fmt.Errorf("blocked IP %v for host %q: %w", ip, host, err)
+		}
+		return nil
+	}
+
+	// Resolve DNS with a dedicated short timeout bounded by the request context.
+	dnsCtx, cancel := context.WithTimeout(ctx, dnsValidationTimeout)
+	defer cancel()
+
+	ips, err := net.DefaultResolver.LookupIP(dnsCtx, "ip", host)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("DNS resolution failed for %q: %w", host, err)
 	}
 
@@ -111,6 +137,57 @@ func validateURL(rawURL string) error {
 	return fmt.Errorf("all resolved IPs for %q blocked by SSRF rules: %v", host, firstErr)
 }
 
+// checkIPv4 returns an error if the IPv4 address is in a blocked range.
+func checkIPv4(v4 net.IP) error {
+	if len(v4) != 4 {
+		v4 = v4.To4()
+	}
+	if v4 == nil {
+		return fmt.Errorf("nil or non-IPv4 address")
+	}
+	// 0.0.0.0/8 — "unspecified" / "this network" (RFC 791)
+	if v4[0] == 0 {
+		return fmt.Errorf("0.0.0.0/8 (unspecified address)")
+	}
+	// 127.0.0.0/8 — loopback
+	if v4[0] == 127 {
+		return fmt.Errorf("127.0.0.0/8 (loopback)")
+	}
+	// 169.254.0.0/16 — link-local / IMDS
+	if v4[0] == 169 && v4[1] == 254 {
+		return fmt.Errorf("169.254.0.0/16 (link-local / IMDS)")
+	}
+	// 224.0.0.0/4 — multicast
+	if v4[0] >= 224 && v4[0] <= 239 {
+		return fmt.Errorf("224.0.0.0/4 (multicast)")
+	}
+	// 240.0.0.0/4 — reserved (formerly Class E)
+	if v4[0] >= 240 {
+		return fmt.Errorf("240.0.0.0/4 (reserved)")
+	}
+	// 10.0.0.0/8 — private (RFC 1918)
+	if v4[0] == 10 {
+		return fmt.Errorf("10.0.0.0/8 (private)")
+	}
+	// 172.16.0.0/12 — private (RFC 1918)
+	if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 {
+		return fmt.Errorf("172.16.0.0/12 (private)")
+	}
+	// 192.168.0.0/16 — private (RFC 1918)
+	if v4[0] == 192 && v4[1] == 168 {
+		return fmt.Errorf("192.168.0.0/16 (private)")
+	}
+	// 100.64.0.0/10 — CGNAT (RFC 6598)
+	if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+		return fmt.Errorf("100.64.0.0/10 (CGNAT)")
+	}
+	// 198.18.0.0/15 — benchmark / testing (RFC 2544)
+	if v4[0] == 198 && v4[1] >= 18 && v4[1] <= 19 {
+		return fmt.Errorf("198.18.0.0/15 (benchmark)")
+	}
+	return nil
+}
+
 // checkIP returns an error if the IP is in a blocked range.
 // The blocklist is a single fixed set: 0.0.0.0/8 (unspecified), 127.0.0.0/8
 // (loopback), 169.254.0.0/16 (link-local/IMDS), 224.0.0.0/4 (multicast),
@@ -119,58 +196,25 @@ func validateURL(rawURL string) error {
 // IPv6 loopback (::1), IPv6 private (fc00::/7, RFC 4193), IPv6 link-local,
 // unspecified, and multicast. IPv6 rules are symmetric with IPv4: loopback
 // and private addresses are always blocked.
+// Embedded IPv4 in IPv6 (mapped, compatible, NAT64, 6to4, Teredo, ISATAP) is decoded
+// and checked against the IPv4 rules.
 func checkIP(ip net.IP) error {
 	if ip == nil {
 		return fmt.Errorf("nil IP")
 	}
 
-	// Normalize embedded IPv4 (mapped, compatible, NAT64 well-known, 6to4).
-	v4 := embeddedIPv4(ip)
+	// Plain IPv4 (4-byte representation)
+	if len(ip) == 4 {
+		return checkIPv4(ip)
+	}
 
-	if v4 != nil {
-		// 0.0.0.0/8 — "unspecified" / "this network" (RFC 791)
-		if v4[0] == 0 {
-			return fmt.Errorf("0.0.0.0/8 (unspecified address)")
-		}
-		// 127.0.0.0/8 — loopback
-		if v4[0] == 127 {
-			return fmt.Errorf("127.0.0.0/8 (loopback)")
-		}
-		// 169.254.0.0/16 — link-local / IMDS
-		if v4[0] == 169 && v4[1] == 254 {
-			return fmt.Errorf("169.254.0.0/16 (link-local / IMDS)")
-		}
-		// 224.0.0.0/4 — multicast
-		if v4[0] >= 224 && v4[0] <= 239 {
-			return fmt.Errorf("224.0.0.0/4 (multicast)")
-		}
-		// 240.0.0.0/4 — reserved (formerly Class E)
-		if v4[0] >= 240 {
-			return fmt.Errorf("240.0.0.0/4 (reserved)")
-		}
-		// 10.0.0.0/8 — private (RFC 1918)
-		if v4[0] == 10 {
-			return fmt.Errorf("10.0.0.0/8 (private)")
-		}
-		// 172.16.0.0/12 — private (RFC 1918)
-		if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 {
-			return fmt.Errorf("172.16.0.0/12 (private)")
-		}
-		// 192.168.0.0/16 — private (RFC 1918)
-		if v4[0] == 192 && v4[1] == 168 {
-			return fmt.Errorf("192.168.0.0/16 (private)")
-		}
-		// 100.64.0.0/10 — CGNAT (RFC 6598)
-		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
-			return fmt.Errorf("100.64.0.0/10 (CGNAT)")
-		}
-		// 198.18.0.0/15 — benchmark / testing (RFC 2544)
-		if v4[0] == 198 && v4[1] >= 18 && v4[1] <= 19 {
-			return fmt.Errorf("198.18.0.0/15 (benchmark)")
-		}
-	} else {
-		// IPv6 — symmetric with IPv4: loopback and private (ULA) addresses are
-		// always blocked.
+	// IPv4-mapped IPv6 (e.g. ::ffff:192.0.2.1)
+	if v4 := ip.To4(); v4 != nil {
+		return checkIPv4(v4)
+	}
+
+	if len(ip) == net.IPv6len {
+		// IPv6 standard checks
 		if ip.IsLoopback() {
 			return fmt.Errorf("::1 (IPv6 loopback) blocked")
 		}
@@ -185,6 +229,57 @@ func checkIP(ip net.IP) error {
 		}
 		if ip.IsPrivate() {
 			return fmt.Errorf("IPv6 private address (fc00::/7) blocked")
+		}
+
+		// IPv4-compatible ::a.b.c.d (deprecated; To4() does not decode these).
+		// :: and ::1 are already handled above.
+		if ipv6Zeros(ip, 0, 12) {
+			if !(ip[12] == 0 && ip[13] == 0 && ip[14] == 0 && (ip[15] == 0 || ip[15] == 1)) {
+				if err := checkIPv4(net.IP(ip[12:16])); err != nil {
+					return fmt.Errorf("IPv4-compatible embedded IP: %w", err)
+				}
+			}
+		}
+
+		// NAT64 well-known prefix 64:ff9b::/96 and RFC 8215 local-use 64:ff9b:1::/48
+		if ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b {
+			if ipv6Zeros(ip, 4, 12) || (ip[4] == 0x00 && ip[5] == 0x01 && ipv6Zeros(ip, 6, 12)) {
+				if err := checkIPv4(net.IP(ip[12:16])); err != nil {
+					return fmt.Errorf("NAT64 embedded IP: %w", err)
+				}
+			}
+		}
+
+		// 6to4 2002:AABB:CCDD::/48 — bytes 2-5 are the IPv4 address.
+		if ip[0] == 0x20 && ip[1] == 0x02 {
+			if err := checkIPv4(net.IP(ip[2:6])); err != nil {
+				return fmt.Errorf("6to4 embedded IP: %w", err)
+			}
+		}
+
+		// Teredo 2001:0000::/32 (RFC 4380)
+		// Bytes 0..3: 2001:0000 prefix
+		// Bytes 4..7: Server IPv4
+		// Bytes 8..9: Flags
+		// Bytes 10..11: Port (XOR'd)
+		// Bytes 12..15: Client IPv4 (XOR with 0xFFFFFFFF)
+		if ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x00 {
+			serverV4 := net.IP(ip[4:8])
+			if err := checkIPv4(serverV4); err != nil {
+				return fmt.Errorf("Teredo server IPv4 blocked: %w", err)
+			}
+			clientV4 := net.IP{ip[12] ^ 0xff, ip[13] ^ 0xff, ip[14] ^ 0xff, ip[15] ^ 0xff}
+			if err := checkIPv4(clientV4); err != nil {
+				return fmt.Errorf("Teredo client IPv4 blocked: %w", err)
+			}
+		}
+
+		// ISATAP (RFC 5214): interface identifier in bytes 8..11 is 00-00-5E-FE or 02-00-5E-FE
+		if (ip[8] == 0x00 || ip[8] == 0x02) && ip[9] == 0x00 && ip[10] == 0x5e && ip[11] == 0xfe {
+			isatapV4 := net.IP(ip[12:16])
+			if err := checkIPv4(isatapV4); err != nil {
+				return fmt.Errorf("ISATAP embedded IPv4 blocked: %w", err)
+			}
 		}
 	}
 
@@ -202,7 +297,7 @@ func ipv6Zeros(ip net.IP, start, end int) bool {
 
 // embeddedIPv4 extracts an IPv4 address hidden inside IPv6 (mapped, deprecated
 // compatible, NAT64 64:ff9b::/96, RFC 8215 local-use 64:ff9b:1::/48, 6to4
-// 2002::/16). Plain IPv4 is returned as-is.
+// 2002::/16, or ISATAP). Plain IPv4 is returned as-is.
 func embeddedIPv4(ip net.IP) net.IP {
 	if v4 := ip.To4(); v4 != nil {
 		return v4
@@ -221,13 +316,17 @@ func embeddedIPv4(ip net.IP) net.IP {
 	// NAT64 well-known prefix 64:ff9b::/96 and RFC 8215 local-use 64:ff9b:1::/48
 	// (IPv4 in the last 32 bits, the /96 embedding used inside that /48).
 	if ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b {
-		if ipv6Zeros(ip, 4, 12) || (ip[4] == 0x00 && ip[5] == 0x01) {
+		if ipv6Zeros(ip, 4, 12) || (ip[4] == 0x00 && ip[5] == 0x01 && ipv6Zeros(ip, 6, 12)) {
 			return net.IP(ip[12:16])
 		}
 	}
 	// 6to4 2002:AABB:CCDD::/48 — bytes 2-5 are the IPv4 address.
 	if ip[0] == 0x20 && ip[1] == 0x02 {
 		return net.IP(ip[2:6])
+	}
+	// ISATAP 0000:5efe / 0200:5efe
+	if (ip[8] == 0x00 || ip[8] == 0x02) && ip[9] == 0x00 && ip[10] == 0x5e && ip[11] == 0xfe {
+		return net.IP(ip[12:16])
 	}
 	return nil
 }
@@ -516,25 +615,23 @@ func splitLongText(s string, max int) []string {
 
 // indexContentLocked replaces the documents under docPath (source:format:url)
 // with freshly chunked content: stale chunks from an earlier fetch are removed
-// first, then each new chunk is indexed. Private-key material is refused
-// before any purge. Returns the number of chunks written and the first
-// indexing error, if any.
+// and new chunks are indexed atomically. All sensitive patterns are refused
+// before any purge. If validation or indexing fails, existing documents are preserved.
+// Returns the number of chunks written and the first indexing error, if any.
 func (s *server) indexContentLocked(docPath, content string) (int, error) {
-	if looksLikePrivateKey([]byte(content)) {
-		return 0, fmt.Errorf("refusing to index private key material")
-	}
-	if err := s.storePurgeExactAndChunksLocked(docPath); err != nil {
-		return 0, fmt.Errorf("clear stale documents under %q: %w", docPath, err)
+	if err := checkSensitiveContent(content); err != nil {
+		return 0, err
 	}
 	chunks := chunkContent(content)
-	for i, chunk := range chunks {
-		chunkPath := docPath
-		if len(chunks) > 1 {
-			chunkPath = fmt.Sprintf("%s#chunk-%d", docPath, i)
+	for _, chunk := range chunks {
+		if err := checkSensitiveContent(chunk); err != nil {
+			return 0, err
 		}
-		if err := s.storeIndexLocked(chunkPath, chunk); err != nil {
-			return len(chunks), fmt.Errorf("index chunk %d: %w", i, err)
-		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.store.ReplaceExactAndChunks(docPath, chunks); err != nil {
+		return len(chunks), err
 	}
 	return len(chunks), nil
 }
@@ -694,7 +791,7 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 	}
 
 	// SSRF validation.
-	if err := validateURL(rawURL); err != nil {
+	if err := validateURL(ctx, rawURL); err != nil {
 		result.Error = fmt.Sprintf("SSRF check failed: %v", err)
 		return result, nil
 	}

@@ -120,7 +120,16 @@ func (s *server) executeCommand(ctx context.Context, command, cwd string) (outpu
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			<-done
 		}
-		return stdoutBuf.String() + stderrBuf.String(), -1, fmt.Errorf("command cancelled: %w", ctx.Err()), stdoutBuf.truncated || stderrBuf.truncated
+		stdout := stdoutBuf.String()
+		stderr := stderrBuf.String()
+		output := stdout
+		if stderr != "" {
+			if output != "" {
+				output += "\n"
+			}
+			output += stderr
+		}
+		return output, -1, fmt.Errorf("command cancelled: %w", ctx.Err()), stdoutBuf.truncated || stderrBuf.truncated
 
 	case err := <-done:
 		stdout := stdoutBuf.String()
@@ -371,14 +380,18 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 		// (INSERT OR REPLACE); the actual label is returned in the response.
 		if len(out) > maxOutputSize {
 			label := s.indexLabel("batch", runID+":"+cmd.Label)
-			s.mu.Lock()
-			if err := s.store.Index(label, out); err != nil {
+			if err := checkSensitiveContent(out); err != nil {
 				r.IndexError = err.Error()
 			} else {
-				r.Indexed = true
-				r.IndexLabel = label
+				s.mu.Lock()
+				if err := s.store.Index(label, out); err != nil {
+					r.IndexError = err.Error()
+				} else {
+					r.Indexed = true
+					r.IndexLabel = label
+				}
+				s.mu.Unlock()
 			}
-			s.mu.Unlock()
 		}
 
 		results[i] = r
@@ -431,14 +444,18 @@ func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCom
 			// Unique label per index (see executeBatchSerial).
 			if len(out) > maxOutputSize {
 				label := s.indexLabel("batch", runID+":"+c.Label)
-				s.mu.Lock()
-				if err := s.store.Index(label, out); err != nil {
+				if err := checkSensitiveContent(out); err != nil {
 					r.IndexError = err.Error()
 				} else {
-					r.Indexed = true
-					r.IndexLabel = label
+					s.mu.Lock()
+					if err := s.store.Index(label, out); err != nil {
+						r.IndexError = err.Error()
+					} else {
+						r.Indexed = true
+						r.IndexLabel = label
+					}
+					s.mu.Unlock()
 				}
-				s.mu.Unlock()
 			}
 
 			results[idx] = r

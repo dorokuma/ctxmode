@@ -12,13 +12,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,7 +35,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "3.1.6"
+const Version = "3.1.7"
 
 // toolIndex walk / size limits.
 const (
@@ -48,19 +51,21 @@ var (
 )
 
 type server struct {
-	workdirs       []string
-	dbPath         string
-	sessionID      string
-	mu             sync.Mutex
-	store          *Store
-	floodGuard     *FloodGuard
-	searchPipeline *SearchPipeline
-	httpClient     *http.Client
-	totalInput     int64
-	totalOutput    int64
+	workdirs             []string
+	dbPath               string
+	sessionID            string
+	mu                   sync.Mutex
+	store                *Store
+	floodGuard           *FloodGuard
+	searchPipeline       *SearchPipeline
+	httpClient           *http.Client
+	totalInput           int64
+	totalOutput          int64
+	sensitiveInodesScans atomic.Int64
 }
 
 func fatal(s *Store, format string, args ...any) {
+	shutdownBackground()
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	if s != nil {
 		s.Close()
@@ -69,6 +74,7 @@ func fatal(s *Store, format string, args ...any) {
 }
 
 func main() {
+	defer shutdownBackground()
 	var workdir string
 	var configPath string
 	flag.StringVar(&workdir, "workdir", "", "workspace root (default: cwd)")
@@ -158,7 +164,10 @@ func main() {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: Version}, &mcp.ServerOptions{Instructions: serverInstructions})
 	s.registerCategoryTools(srv)
 
-	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := srv.Run(ctx, &mcp.StdioTransport{}); err != nil && !errors.Is(err, context.Canceled) {
 		fatal(store, "server exited: %v", err)
 	}
 }
@@ -250,11 +259,23 @@ func databasePath(workdir string) (string, string, error) {
 	return filepath.Join(dir, "context_mode.db"), legacy, nil
 }
 
-// ensureDBDir creates the parent directory of the database file (0755).
+// ensureDBDir creates the parent directory of the database file.
+// Dedicated database directory is created/secured with 0700 permissions.
+// If CTXMODE_DB is set, the custom directory is created with 0755 if needed,
+// but existing parent directories are never chmodded.
 func ensureDBDir(dbPath string) error {
 	dir := filepath.Dir(dbPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if os.Getenv("CTXMODE_DB") != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create database directory %q: %w", dir, err)
+		}
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create database directory %q: %w", dir, err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("chmod database directory %q (0700): %w", dir, err)
 	}
 	return nil
 }
@@ -265,7 +286,7 @@ type executeArgs struct {
 	Command    string            `json:"command,omitempty" jsonschema:"Command or code to execute (ignored when argv is non-empty)"`
 	Language   string            `json:"language,omitempty" jsonschema:"Runtime language (javascript/python/shell/go/...). Ignored in argv mode"`
 	Timeout    int               `json:"timeout,omitempty" jsonschema:"Max execution time in ms"`
-	Background bool              `json:"background,omitempty" jsonschema:"Keep running after timeout (for servers/daemons)"`
+	Background bool              `json:"background,omitempty" jsonschema:"Run asynchronously in background (terminated on timeout if specified, default max 1h). Manage via ctx_bg"`
 	Intent     string            `json:"intent,omitempty" jsonschema:"What you're looking for in the output (for auto-indexing)"`
 	CWD        string            `json:"cwd,omitempty" jsonschema:"Working directory"`
 	Argv       []string          `json:"argv,omitempty" jsonschema:"If non-empty, exec directly without shell (preferred over command). argv[0]=executable"`
@@ -376,10 +397,16 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 	if len(outputText) > autoIndexThreshold {
 		// Unconditionally index large outputs.
 		label := s.indexLabel("execute", args.Intent)
-		if err := s.storeIndexLocked(label, outputText); err != nil {
+		var indexErr error
+		if err := checkSensitiveContent(outputText); err != nil {
+			indexErr = err
+		} else {
+			indexErr = s.storeIndexLocked(label, outputText)
+		}
+		if indexErr != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{
-					Text: formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, err),
+					Text: formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, indexErr),
 				}},
 			}, nil, nil
 		}
@@ -395,10 +422,16 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 	if len(outputText) > intentThreshold && args.Intent != "" {
 		// Index and return a preview.
 		label := s.indexLabel("execute", args.Intent)
-		if err := s.storeIndexLocked(label, outputText); err != nil {
+		var indexErr error
+		if err := checkSensitiveContent(outputText); err != nil {
+			indexErr = err
+		} else {
+			indexErr = s.storeIndexLocked(label, outputText)
+		}
+		if indexErr != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{
-					Text: formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, err),
+					Text: formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, indexErr),
 				}},
 			}, nil, nil
 		}
@@ -451,11 +484,7 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 		}
 	}
 
-	// Collect secret-path inodes across every workdir first so a hardlink
-	// whose walk name is harmless is rejected even when it is visited before
-	// the sensitive name.
-	sensitiveInodes := s.collectSensitiveInodes()
-
+	var sensitiveInodes map[fileID]struct{}
 	if info.IsDir() {
 		baseDepth := strings.Count(target, string(filepath.Separator))
 		err = filepath.Walk(target, func(path string, fi os.FileInfo, walkErr error) error {
@@ -512,13 +541,25 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 			}
 			if isSensitiveFilePath(real) {
 				sensitiveCount++
+				if sensitiveInodes != nil {
+					if id, ok := fileDevIno(realInfo); ok {
+						sensitiveInodes[id] = struct{}{}
+					}
+				}
 				addSkip(fmt.Sprintf("%s: sensitive file (secrets)", real))
 				return nil
 			}
-			if id, ok := fileDevIno(realInfo); ok {
-				if _, seen := sensitiveInodes[id]; seen {
-					addSkip(fmt.Sprintf("%s: hardlink to sensitive file", real))
-					return nil
+			if st, ok := realInfo.Sys().(*syscall.Stat_t); ok && uint64(st.Nlink) > 1 {
+				if sensitiveInodes == nil {
+					sensitiveInodes = s.collectSensitiveInodes()
+				}
+			}
+			if sensitiveInodes != nil {
+				if id, ok := fileDevIno(realInfo); ok {
+					if _, seen := sensitiveInodes[id]; seen {
+						addSkip(fmt.Sprintf("%s: hardlink to sensitive file", real))
+						return nil
+					}
 				}
 			}
 			if realInfo.Size() > maxIndexFileBytes {
@@ -549,16 +590,11 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 		if isSensitiveFilePath(target) {
 			return nil, nil, fmt.Errorf("refusing to index sensitive file %q (credentials/secrets)", target)
 		}
-		if id, ok := fileDevIno(info); ok {
-			if _, seen := sensitiveInodes[id]; seen {
-				return nil, nil, fmt.Errorf("refusing to index %q: hardlink to sensitive file", target)
-			}
-		}
 		if isProbablyBinaryName(info.Name()) || info.Size() > maxIndexFileBytes {
 			return nil, nil, fmt.Errorf("file %q is binary or too large (> 1MB)", target)
 		}
-		// Content-based binary check happens in indexFile.
-		err = s.indexFileWithSensitive(target, sensitiveInodes)
+		// Content-based binary check and hardlink checks happen in indexFile.
+		err = s.indexFile(target)
 		if err == nil {
 			indexedCount = 1
 		} else {
@@ -742,6 +778,14 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		return nil, nil, err
 	}
 
+	// Reject sensitive files BEFORE reading or executing to prevent secrets from entering FILE_CONTENT or tool output.
+	if isSensitiveFilePath(target) {
+		return nil, nil, fmt.Errorf("refusing to execute on sensitive file %q", target)
+	}
+	if realTarget, err := filepath.EvalSymlinks(target); err == nil && isSensitiveFilePath(realTarget) {
+		return nil, nil, fmt.Errorf("refusing to execute on sensitive file %q", target)
+	}
+
 	// Check file size before reading to prevent OOM on huge files.
 	info, err := os.Stat(target)
 	if err != nil {
@@ -749,6 +793,14 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	}
 	if !info.Mode().IsRegular() {
 		return nil, nil, fmt.Errorf("file %q is not a regular file", target)
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && uint64(st.Nlink) > 1 {
+		sensitiveInodes := s.collectSensitiveInodes()
+		if id, ok := fileDevIno(info); ok {
+			if _, seen := sensitiveInodes[id]; seen {
+				return nil, nil, fmt.Errorf("refusing to execute on sensitive file %q (hardlink to sensitive file)", target)
+			}
+		}
 	}
 	if info.Size() > 10*1024*1024 {
 		return nil, nil, fmt.Errorf("file %q is too large (%d bytes, max 10MB)", target, info.Size())
@@ -847,10 +899,18 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 			intent = filepath.Base(target)
 		}
 		label := s.indexLabel("execute_file", intent)
-		if err := s.storeIndexLocked(label, outputText); err != nil {
+		var indexErr error
+		if isSensitiveFilePath(target) || looksLikePrivateKey(fileContent) {
+			indexErr = fmt.Errorf("refusing to index sensitive file content (%s)", filepath.Base(target))
+		} else if err := checkSensitiveContent(outputText); err != nil {
+			indexErr = err
+		} else {
+			indexErr = s.storeIndexLocked(label, outputText)
+		}
+		if indexErr != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{
-					Text: formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, err),
+					Text: formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, indexErr),
 				}},
 			}, nil, nil
 		}
@@ -865,10 +925,18 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 
 	if len(outputText) > intentThreshold && args.Intent != "" {
 		label := s.indexLabel("execute_file", args.Intent)
-		if err := s.storeIndexLocked(label, outputText); err != nil {
+		var indexErr error
+		if isSensitiveFilePath(target) || looksLikePrivateKey(fileContent) {
+			indexErr = fmt.Errorf("refusing to index sensitive file content (%s)", filepath.Base(target))
+		} else if err := checkSensitiveContent(outputText); err != nil {
+			indexErr = err
+		} else {
+			indexErr = s.storeIndexLocked(label, outputText)
+		}
+		if indexErr != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{
-					Text: formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, err),
+					Text: formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, indexErr),
 				}},
 			}, nil, nil
 		}
@@ -954,15 +1022,48 @@ func (s *server) indexFileWithSensitive(path string, sensitiveInodes map[fileID]
 	return s.storeIndexLocked(real, string(data))
 }
 
+var (
+	maxJSONMigrationBytes int64 = 50 * 1024 * 1024 // 50 MB
+	jsonMigrationStatHook func(path string) (os.FileInfo, error)
+)
+
 func (s *server) migrateFromJSON() error {
 	oldPath := filepath.Join(s.workdirs[0], ".context_mode_db.json")
 
-	data, err := os.ReadFile(oldPath)
+	var fi os.FileInfo
+	var err error
+	if jsonMigrationStatHook != nil {
+		fi, err = jsonMigrationStatHook(oldPath)
+	} else {
+		fi, err = os.Lstat(oldPath)
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
+		return fmt.Errorf("stat old JSON db %q: %w", oldPath, err)
+	}
+
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("old JSON db %q is not a regular file: %v", oldPath, fi.Mode())
+	}
+
+	if fi.Size() > maxJSONMigrationBytes {
+		return fmt.Errorf("old JSON db %q too large (%d bytes, max %d)", oldPath, fi.Size(), maxJSONMigrationBytes)
+	}
+
+	f, err := os.OpenFile(oldPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open old JSON db: %w", err)
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, maxJSONMigrationBytes+1))
+	if err != nil {
 		return fmt.Errorf("read old JSON db: %w", err)
+	}
+	if int64(len(data)) > maxJSONMigrationBytes {
+		return fmt.Errorf("old JSON db %q exceeded maximum allowed size of %d bytes during read", oldPath, maxJSONMigrationBytes)
 	}
 
 	// Check if we already have data in SQLite.
@@ -972,7 +1073,9 @@ func (s *server) migrateFromJSON() error {
 	}
 	if docCount > 0 {
 		// Already migrated; just backup the old file.
-		_ = os.Rename(oldPath, oldPath+".bak")
+		if err := os.Rename(oldPath, oldPath+".bak"); err != nil {
+			return fmt.Errorf("backup old JSON db: %w", err)
+		}
 		return nil
 	}
 
@@ -988,8 +1091,10 @@ func (s *server) migrateFromJSON() error {
 		}
 	}
 
-	// Rename old file as backup.
-	_ = os.Rename(oldPath, oldPath+".bak")
+	// Rename old file as backup only after successful migration.
+	if err := os.Rename(oldPath, oldPath+".bak"); err != nil {
+		return fmt.Errorf("backup old JSON db: %w", err)
+	}
 	return nil
 }
 
@@ -1131,6 +1236,7 @@ func fileDevIno(info os.FileInfo) (fileID, bool) {
 // Stat so a hardlink or alias of the real file is also blocked. .git and
 // node_modules are skipped; secret dirs such as .ssh are not.
 func (s *server) collectSensitiveInodes() map[fileID]struct{} {
+	s.sensitiveInodesScans.Add(1)
 	out := make(map[fileID]struct{})
 	for _, wd := range s.workdirs {
 		if wd == "" {
@@ -1164,6 +1270,38 @@ func (s *server) collectSensitiveInodes() map[fileID]struct{} {
 		})
 	}
 	return out
+}
+
+var (
+	// AWS access key ID: 20 chars starting with AKIA, ASIA, ABIA, ACCA.
+	awsAccessKeyRe = regexp.MustCompile(`\b(AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b`)
+	// GitHub tokens: ghp_, gho_, ghu_, ghs_, ghr_, github_pat_.
+	githubTokenRe = regexp.MustCompile(`\b(gh[pousr]_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]{82})\b`)
+	// Slack token: xox[baprs]-...
+	slackTokenRe = regexp.MustCompile(`\bxox[baprs]-[0-9A-Za-z]{10,}\b`)
+	// Generic credential assignment pattern: key/secret/password/token = "..." (high confidence).
+	genericSecretRe  = regexp.MustCompile(`(?i)\b(?:api[_-]?key|access[_-]?token|secret[_-]?key|auth[_-]?token|client[_-]?secret|private[_-]?key)\s*[:=]\s*['"][a-zA-Z0-9_\-.~!@#$%^&*+=]{16,}['"]`)
+	passwordAssignRe = regexp.MustCompile(`(?i)\b(?:password|passwd)\s*[:=]\s*['"][^'"\r\n]{8,}['"]`)
+	// JWT bearer token.
+	jwtTokenRe = regexp.MustCompile(`\beyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_.+/=]+\b`)
+)
+
+// checkSensitiveContent reports whether content contains private-key material
+// or matches known credential patterns (AWS, GitHub, Slack, JWT, or explicit secret assignments).
+// Note: This matches recognized patterns and does not claim to detect arbitrary unformatted tokens.
+func checkSensitiveContent(content string) error {
+	if looksLikePrivateKey([]byte(content)) {
+		return fmt.Errorf("refusing to index sensitive content (private key material)")
+	}
+	if awsAccessKeyRe.MatchString(content) ||
+		githubTokenRe.MatchString(content) ||
+		slackTokenRe.MatchString(content) ||
+		genericSecretRe.MatchString(content) ||
+		passwordAssignRe.MatchString(content) ||
+		jwtTokenRe.MatchString(content) {
+		return fmt.Errorf("refusing to index sensitive content (credential / secret material detected)")
+	}
+	return nil
 }
 
 // looksLikePrivateKey reports PEM/OpenSSH/PGP/PKCS#8 private-key markers.

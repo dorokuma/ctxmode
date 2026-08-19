@@ -687,7 +687,7 @@ func TestBackground_BigOutputLogAndWait(t *testing.T) {
 	// stdout alone exceeds the old 10MB per-stream limitedBuffer cap; the
 	// full stream must land on the disk log, and ctx_bg log/wait must keep
 	// working with no in-memory capture.
-	script := "head -c 11000000 /dev/zero | tr '\\0' O; echo; head -c 3000000 /dev/zero | tr '\\0' E 1>&2; echo; echo BG_BIG_TAIL_MARKER"
+	script := "head -c 11000000 /dev/zero | tr '\\0' O; echo; echo BG_BIG_TAIL_MARKER; head -c 3000000 /dev/zero | tr '\\0' E 1>&2; echo 1>&2; echo BG_BIG_TAIL_MARKER 1>&2"
 	result, err := runShell(context.Background(), script, "/tmp", 0, true)
 	if err != nil {
 		t.Fatalf("start background: %v", err)

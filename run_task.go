@@ -241,12 +241,18 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 		// Unique label per index: a fixed "run_task:<kind>" label would let a
 		// later run silently overwrite an earlier document (INSERT OR REPLACE).
 		label := s.indexLabel("run_task", labelBase)
-		if err := s.storeIndexLocked(label, outputText); err != nil {
+		var indexErr error
+		if err := checkSensitiveContent(outputText); err != nil {
+			indexErr = err
+		} else {
+			indexErr = s.storeIndexLocked(label, outputText)
+		}
+		if indexErr != nil {
 			preview := tailUTF8(outputText, runTaskTailBytes)
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{
 					Text: fmt.Sprintf("exit_code: %d\nOutput is too large (%d bytes). Indexing failed: %v. Content was NOT indexed.\n\n--- Tail preview ---\n%s",
-						exitCode, len(outputText), err, preview),
+						exitCode, len(outputText), indexErr, preview),
 				}},
 			}, nil, nil
 		}
@@ -261,12 +267,18 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 
 	if len(outputText) > runTaskIntentIndexBytes && intent != "" {
 		label := s.indexLabel("run_task", intent)
-		if err := s.storeIndexLocked(label, outputText); err != nil {
+		var indexErr error
+		if err := checkSensitiveContent(outputText); err != nil {
+			indexErr = err
+		} else {
+			indexErr = s.storeIndexLocked(label, outputText)
+		}
+		if indexErr != nil {
 			preview := tailUTF8(outputText, runTaskPreviewBytes)
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{
 					Text: fmt.Sprintf("exit_code: %d\nOutput (%d bytes) was NOT indexed (error: %v).\n\n--- Tail preview ---\n%s",
-						exitCode, len(outputText), err, preview),
+						exitCode, len(outputText), indexErr, preview),
 				}},
 			}, nil, nil
 		}

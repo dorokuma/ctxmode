@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -29,7 +30,9 @@ type SearchResult struct {
 
 // Store wraps a SQLite database with FTS5 full-text search.
 type Store struct {
-	db *sql.DB
+	db      *sql.DB
+	dbPath  string
+	secured atomic.Bool
 }
 
 // sqliteDSN builds a file: URI DSN so paths containing space, %, ?, or #
@@ -54,6 +57,18 @@ func sqliteDSN(dbPath string) string {
 // NewStore opens or creates a SQLite database at dbPath and initializes
 // the schema (documents table, FTS5 virtual table, and sync triggers).
 func NewStore(dbPath string) (*Store, error) {
+	cleanPath := extractFilePath(dbPath)
+	if cleanPath != "" {
+		f, err := os.OpenFile(cleanPath, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("create database file %q: %w", cleanPath, err)
+		}
+		f.Close()
+		if err := os.Chmod(cleanPath, 0o600); err != nil {
+			return nil, fmt.Errorf("chmod database file %q (0600): %w", cleanPath, err)
+		}
+	}
+
 	// Build DSN with per-connection pragmas so every new connection gets
 	// busy_timeout and synchronous settings, not just the first one.
 	dsn := sqliteDSN(dbPath)
@@ -200,7 +215,7 @@ func NewStore(dbPath string) (*Store, error) {
 	// Only rebuild FTS on startup if inconsistency detected.
 	// FTS5Health checks row count parity between documents and FTS tables;
 	// triggers normally keep them in sync.
-	s := &Store{db: db}
+	s := &Store{db: db, dbPath: dbPath}
 	if err := s.FTS5Health(); err != nil {
 		if _, err2 := db.Exec(`INSERT INTO documents_fts(documents_fts) VALUES('rebuild')`); err2 != nil {
 			db.Close()
@@ -213,7 +228,10 @@ func NewStore(dbPath string) (*Store, error) {
 	}
 
 	// Restrict DB file permissions to owner read/write only (after file exists).
-	secureDBFile(dbPath)
+	if err := secureDBFile(dbPath); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("secure database file: %w", err)
+	}
 
 	return s, nil
 }
@@ -221,12 +239,18 @@ func NewStore(dbPath string) (*Store, error) {
 // Index inserts or replaces a document in the store. The FTS5 index is
 // automatically kept in sync via triggers.
 func (s *Store) Index(path, content string) error {
+	if err := checkSensitiveContent(content); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(
 		`INSERT OR REPLACE INTO documents (path, content, indexed_at) VALUES (?, ?, ?)`,
 		path, content, time.Now().Unix(),
 	)
 	if err != nil {
 		return fmt.Errorf("index document: %w", err)
+	}
+	if err := s.secureDBFiles(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -236,6 +260,9 @@ func (s *Store) Unindex(path string) error {
 	_, err := s.db.Exec(`DELETE FROM documents WHERE path = ?`, path)
 	if err != nil {
 		return fmt.Errorf("unindex document: %w", err)
+	}
+	if err := s.secureDBFiles(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -408,10 +435,10 @@ func (s *Store) searchTrigram(query, pathPrefix string, limit int) ([]SearchResu
 	return results, nil
 }
 
-// secureDBFile chmods the database file (and WAL/SHM sidecars) to 0600.
-func secureDBFile(dbPath string) {
+// extractFilePath extracts clean filesystem path from dbPath / file: URI.
+func extractFilePath(dbPath string) string {
 	if dbPath == "" || dbPath == ":memory:" {
-		return
+		return ""
 	}
 	path := dbPath
 	if strings.HasPrefix(path, "file:") {
@@ -420,10 +447,50 @@ func secureDBFile(dbPath string) {
 			path = path[:i]
 		}
 	}
-	_ = os.Chmod(path, 0o600)
-	for _, ext := range []string{"-wal", "-shm"} {
-		_ = os.Chmod(path+ext, 0o600)
+	return path
+}
+
+// ensureFilePerm0600 checks if the file exists and restores permissions to 0600 if relaxed.
+func ensureFilePerm0600(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
+	if fi.Mode().Perm() != 0o600 {
+		if err := os.Chmod(path, 0o600); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("chmod %q (0600): %w", path, err)
+		}
+	}
+	return nil
+}
+
+// secureDBFile ensures the database file (and WAL/SHM sidecars) have 0600 permissions.
+func secureDBFile(dbPath string) error {
+	path := extractFilePath(dbPath)
+	if path == "" {
+		return nil
+	}
+	if err := ensureFilePerm0600(path); err != nil {
+		return fmt.Errorf("secure db file %q: %w", path, err)
+	}
+	for _, ext := range []string{"-wal", "-shm"} {
+		sidecar := path + ext
+		if err := ensureFilePerm0600(sidecar); err != nil {
+			return fmt.Errorf("secure sidecar %q: %w", sidecar, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) secureDBFiles() error {
+	path := s.dbPath
+	if path == "" {
+		path = s.DBPath()
+	}
+	return secureDBFile(path)
 }
 
 // PurgeSessionKeys deletes documents whose path is exactly session:{id}
@@ -461,6 +528,9 @@ func (s *Store) PurgeSessionKeys(sessionID string) (deleted int, err error) {
 
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit session purge: %w", err)
+	}
+	if err := s.secureDBFiles(); err != nil {
+		return deleted, err
 	}
 	return deleted, nil
 }
@@ -625,6 +695,9 @@ func (s *Store) SetCache(url, source, content string) error {
 	if err != nil {
 		return fmt.Errorf("set cache: %w", err)
 	}
+	if err := s.secureDBFiles(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -645,6 +718,9 @@ func (s *Store) Close() error {
 
 // DBPath returns the filesystem path of the database file.
 func (s *Store) DBPath() string {
+	if s.dbPath != "" {
+		return extractFilePath(s.dbPath)
+	}
 	var dbPath string
 	var dbSeq int
 	var dbName string
@@ -684,6 +760,9 @@ func (s *Store) PurgeAll() (deletedDocs int, deletedCache int, err error) {
 	if err := tx.Commit(); err != nil {
 		return 0, 0, fmt.Errorf("commit purge: %w", err)
 	}
+	if err := s.secureDBFiles(); err != nil {
+		return deletedDocs, deletedCache, err
+	}
 	return deletedDocs, deletedCache, nil
 }
 
@@ -714,7 +793,62 @@ func (s *Store) PurgeExactAndChunks(docPath string) (deleted int, err error) {
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit exact/chunks purge: %w", err)
 	}
+	if err := s.secureDBFiles(); err != nil {
+		return deleted, err
+	}
 	return deleted, nil
+}
+
+// ReplaceExactAndChunks atomically removes existing docPath and docPath#chunk-* entries
+// and inserts the provided chunks within a single transaction. If any check or step fails,
+// the transaction is rolled back and existing entries are preserved.
+func (s *Store) ReplaceExactAndChunks(docPath string, chunks []string) error {
+	for _, chunk := range chunks {
+		if err := checkSensitiveContent(chunk); err != nil {
+			return err
+		}
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM documents WHERE path = ?`, docPath); err != nil {
+		return fmt.Errorf("purge exact: %w", err)
+	}
+	chunkPrefix := docPath + "#chunk-"
+	if _, err := tx.Exec(`DELETE FROM documents WHERE path >= ? AND path < ?`, chunkPrefix, chunkPrefix+"\U0010ffff"); err != nil {
+		return fmt.Errorf("purge chunks: %w", err)
+	}
+
+	now := time.Now().Unix()
+	if len(chunks) == 1 {
+		if _, err := tx.Exec(
+			`INSERT INTO documents (path, content, indexed_at) VALUES (?, ?, ?)`,
+			docPath, chunks[0], now,
+		); err != nil {
+			return fmt.Errorf("insert doc: %w", err)
+		}
+	} else {
+		for i, chunk := range chunks {
+			chunkPath := fmt.Sprintf("%s#chunk-%d", docPath, i)
+			if _, err := tx.Exec(
+				`INSERT INTO documents (path, content, indexed_at) VALUES (?, ?, ?)`,
+				chunkPath, chunk, now,
+			); err != nil {
+				return fmt.Errorf("insert chunk %d: %w", i, err)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit replace: %w", err)
+	}
+	if err := s.secureDBFiles(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) CountExactAndChunks(docPath string) (int, error) {
@@ -745,6 +879,9 @@ func (s *Store) PurgeByPrefix(prefix string) (deleted int, err error) {
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit prefix purge: %w", err)
 	}
+	if err := s.secureDBFiles(); err != nil {
+		return deleted, err
+	}
 	return deleted, nil
 }
 
@@ -767,6 +904,9 @@ func (s *Store) Vacuum() error {
 	_, err := s.db.Exec(`VACUUM`)
 	if err != nil {
 		return fmt.Errorf("vacuum: %w", err)
+	}
+	if err := s.secureDBFiles(); err != nil {
+		return fmt.Errorf("vacuum secure db files: %w", err)
 	}
 	return nil
 }

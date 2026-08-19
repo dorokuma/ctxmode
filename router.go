@@ -20,7 +20,7 @@ type ctxRunArgs struct {
 	Command    string            `json:"command,omitempty"`
 	Language   string            `json:"language,omitempty"`
 	Timeout    int               `json:"timeout,omitempty"`
-	Background bool              `json:"background,omitempty"`
+	Background bool              `json:"background,omitempty" jsonschema:"Run asynchronously in background (terminated on timeout if specified, default max 1h). Manage via ctx_bg"`
 	Intent     string            `json:"intent,omitempty"`
 	CWD        string            `json:"cwd,omitempty"`
 	Argv       []string          `json:"argv,omitempty"`

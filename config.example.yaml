@@ -6,6 +6,6 @@
 
 workdirs:
   # Workspace roots: every cwd/path argument is resolved against them.
-  # Replace with your own directories; /tmp exists on any machine.
+  # Replace with your own directories.
   - /path/to/your/project
-  - /tmp
+  - /path/to/another/project

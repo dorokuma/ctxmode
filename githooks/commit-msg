@@ -28,7 +28,7 @@ fi
 # ── 2. Noise-word block ─────────────────────────────────────────────
 # Lines that scream "process diary" instead of "what changed".
 NOISE_WORDS=(
-  "审计" "审查" "review.*round" "round.*review" "轮审"
+  "审计" "审查" "轮审"
   "fix.*audit" "audit.*fix"
   "修了" "改了" "搞了" "弄了"
 )
@@ -51,16 +51,47 @@ SECRET_PATTERNS=(
   'sk-[a-zA-Z0-9-]{32,}'          # OpenAI / Anthropic / generic API key
   'AKIA[0-9A-Z]{16}'              # AWS Access Key
   '-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----'
-  'password\s*[:=]\s*\S+'          # password=
-  'api_key\s*[:=]\s*\S+'           # api_key=
-  'secret\s*[:=]\s*\S+'            # secret=
 )
+
+check_assignments() {
+  local text="$1"
+  local target="$2"
+  shopt -s nocasematch
+  while IFS= read -r line; do
+    [[ "$line" =~ ^(\+\+\+|---|@@|-) ]] && continue
+    if [[ "$line" =~ (password|api_key|secret)[[:space:]]*[:=]+[[:space:]]*(.*) ]]; then
+      local rest="${BASH_REMATCH[2]}"
+      local val=""
+      if [[ "$rest" =~ ^\"([^\"]*)\" ]]; then
+        val="${BASH_REMATCH[1]}"
+      elif [[ "$rest" =~ ^\'([^\']*)\' ]]; then
+        val="${BASH_REMATCH[1]}"
+      elif [[ "$rest" =~ ^([^[:space:];,]+) ]]; then
+        val="${BASH_REMATCH[1]}"
+      fi
+      val=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      local lower
+      lower=$(echo "$val" | tr '[:upper:]' '[:lower:]')
+      case "$lower" in
+        ""|"none"|"optional"|"removed"|"unchanged"|"empty"|"null"|"nil"|"undefined"|"true"|"false"|"todo"|"changeme"|"placeholder"|"<"*">"|"\$"*|"\"\""|"''")
+          continue
+          ;;
+      esac
+      if [ ${#val} -ge 6 ]; then
+        die "$target appears to contain a hardcoded credential assignment: \"$line\"
+Secrets must never be committed. Use environment variables."
+      fi
+    fi
+  done <<< "$text"
+}
+
 for pat in "${SECRET_PATTERNS[@]}"; do
   if echo "$MSG" | grep -qiE -- "$pat"; then
     die "commit message appears to contain a secret matching: \"$pat\"
 Secrets must never be committed. Use environment variables."
   fi
 done
+check_assignments "$MSG" "commit message"
 
 # ── 4. Staged-diff secret check ─────────────────────────────────────
 # Also scan the actual staged diff for secrets, not just the message.
@@ -75,5 +106,6 @@ for pat in "${SECRET_PATTERNS[@]}"; do
 Secrets must never be committed. Use environment variables."
   fi
 done
+check_assignments "$DIFF" "staged changes"
 
 exit 0

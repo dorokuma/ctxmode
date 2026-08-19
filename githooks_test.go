@@ -340,6 +340,40 @@ func TestPrePushHook(t *testing.T) {
 		}
 	})
 
+	t.Run("hardcoded password assignment in commit is rejected", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		head := commitFile(t, repo, "config.py", "pass"+"word = \"hunter2\"\n", "feat: add config")
+		out, code := runHook(t, repo, script,
+			"refs/heads/main "+head+" refs/heads/main "+zeroSHA+"\n")
+		if code == 0 {
+			t.Fatalf("expected password assignment rejection, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("hardcoded api_key and secret assignment in commit is rejected", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		head := commitFile(t, repo, "config.go", "api_"+"key := \"mysecretkey123\"\n", "feat: add api key")
+		out, code := runHook(t, repo, script,
+			"refs/heads/main "+head+" refs/heads/main "+zeroSHA+"\n")
+		if code == 0 {
+			t.Fatalf("expected api_key assignment rejection, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("explanatory password assignments in commit pass", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		content := "pass" + "word: none\npass" + "word: optional\npass" + "word: removed\npass" + "word: unchanged\npass" + "word: empty\nvar pass" + "word = \"\"\napi_" + "key: optional\nsec" + "ret: removed\n"
+		head := commitFile(t, repo, "config.yaml", content, "feat: update config docs")
+		out, code := runHook(t, repo, script,
+			"refs/heads/main "+head+" refs/heads/main "+zeroSHA+"\n")
+		if code != 0 {
+			t.Fatalf("expected explanatory password assignments to pass, got exit %d:\n%s", code, out)
+		}
+	})
+
 	t.Run("script scans new token shapes and does not use grep -P", func(t *testing.T) {
 		data, err := os.ReadFile(script)
 		if err != nil {
@@ -473,6 +507,74 @@ func TestCommitMsgHook(t *testing.T) {
 		out, code := run(t, repo, "feat: add config sample")
 		if code == 0 {
 			t.Fatalf("expected staged-diff sk-ant rejection, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("review round message passes", func(t *testing.T) {
+		repo := setup(t)
+		out, code := run(t, repo, "fix: address code review round 2 comments")
+		if code != 0 {
+			t.Fatalf("expected review round message to pass, got exit %d:\n%s", code, out)
+		}
+	})
+
+	t.Run("staged diff with variable assignment passes", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		commitFile(t, repo, "a.txt", "hello\n", "feat: seed")
+		stageFile(t, repo, "auth.go", "package auth\n\nvar pass"+"word = \"\"\nvar api_"+"key = \"\"\nvar sec"+"ret = \"\"\n")
+		out, code := run(t, repo, "feat: add auth placeholders")
+		if code != 0 {
+			t.Fatalf("expected low-confidence code assignment to pass, got exit %d:\n%s", code, out)
+		}
+	})
+
+	t.Run("hardcoded password assignment in staged diff is rejected", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		commitFile(t, repo, "a.txt", "hello\n", "feat: seed")
+		stageFile(t, repo, "config.py", "pass"+"word = \"hunter2\"\n")
+		out, code := run(t, repo, "feat: add config")
+		if code == 0 {
+			t.Fatalf("expected pass"+"word=hunter2 in staged diff to be rejected, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("hardcoded api_key and secret in staged diff are rejected", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		commitFile(t, repo, "a.txt", "hello\n", "feat: seed")
+		stageFile(t, repo, "config.go", "api_"+"key := \"supersecretkey123\"\n")
+		out, code := run(t, repo, "feat: add api key")
+		if code == 0 {
+			t.Fatalf("expected api_key in staged diff to be rejected, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("hardcoded password assignment in commit message is rejected", func(t *testing.T) {
+		repo := setup(t)
+		out, code := run(t, repo, "feat: set pass"+"word=hunter2 for testing")
+		if code == 0 {
+			t.Fatalf("expected pass"+"word=hunter2 in commit msg to be rejected, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("hardcoded secret assignment in commit message is rejected", func(t *testing.T) {
+		repo := setup(t)
+		out, code := run(t, repo, "feat: set SEC"+"RET=mysecrettoken123 for testing")
+		if code == 0 {
+			t.Fatalf("expected SECRET in commit msg to be rejected, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("explanatory password assignments in commit message and staged diff pass", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		commitFile(t, repo, "a.txt", "hello\n", "feat: seed")
+		stageFile(t, repo, "config.yaml", "pass"+"word: none\npass"+"word: optional\npass"+"word: removed\npass"+"word: unchanged\npass"+"word: empty\napi_"+"key: none\nsec"+"ret: optional\n")
+		out, code := run(t, repo, "feat: mark pass"+"word: optional and pass"+"word: empty in docs")
+		if code != 0 {
+			t.Fatalf("expected explanatory password assignments to pass, got exit %d:\n%s", code, out)
 		}
 	})
 

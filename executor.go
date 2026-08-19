@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -33,7 +34,8 @@ const (
 	// maxBackgroundProcs caps concurrently running background jobs. Reaching
 	// the cap rejects new background launches with an error instead of
 	// silently queueing or spawning unbounded processes.
-	maxBackgroundProcs = 16
+	maxBackgroundProcs         = 16
+	maxCompletedBackgroundJobs = 64
 )
 
 // ---------- background process registry ----------
@@ -257,9 +259,38 @@ func liveBackgroundCount() int {
 	return n
 }
 
+// pruneCompletedBackgroundJobsLocked removes the oldest completed jobs if the count
+// exceeds maxCompletedBackgroundJobs, keeping memory and disk bounded.
+func pruneCompletedBackgroundJobsLocked() []string {
+	var doneEntries []*bgEntry
+	for _, e := range bgProcs {
+		if e.Done {
+			doneEntries = append(doneEntries, e)
+		}
+	}
+	if len(doneEntries) <= maxCompletedBackgroundJobs {
+		return nil
+	}
+	sort.Slice(doneEntries, func(i, j int) bool {
+		return doneEntries[i].StartedAt.Before(doneEntries[j].StartedAt)
+	})
+	excess := len(doneEntries) - maxCompletedBackgroundJobs
+	var logsToRemove []string
+	for i := 0; i < excess; i++ {
+		ent := doneEntries[i]
+		lp := ent.LogPath
+		ent.LogPath = ""
+		delete(bgProcs, ent.ID)
+		if lp != "" {
+			logsToRemove = append(logsToRemove, lp)
+		}
+	}
+	return logsToRemove
+}
+
 // finishBackground marks entry done, closes the log FD, and cleans temps.
 // Safe to call after markBackgroundKilled: if Done is already set, still
-// closes log and schedules reaping (kill intentionally leaves the log open
+// closes log and clears temps (kill intentionally leaves the log open
 // so the process can flush remaining output before Wait returns).
 // Fully idempotent once log is closed and temps cleared.
 func finishBackground(id string, exitCode int) {
@@ -270,19 +301,9 @@ func finishBackground(id string, exitCode int) {
 		return
 	}
 	// Already fully finalized (log closed, temps cleared).
-	if e.Done && e.logFile == nil && len(e.TempFiles) == 0 {
+	if e.Done && e.logFile == nil && e.logWriter == nil && len(e.TempFiles) == 0 {
 		bgMu.Unlock()
 		return
-	}
-	if !e.Done {
-		e.Done = true
-		e.ExitCode = exitCode
-	} else if exitCode >= 0 {
-		// Prefer real Wait exit code over kill's placeholder (-1) when available.
-		e.ExitCode = exitCode
-	}
-	if e.logWriter != nil && e.logWriter.isTruncated() {
-		e.LogTruncated = true
 	}
 	temps := append([]string(nil), e.TempFiles...)
 	e.TempFiles = nil
@@ -290,48 +311,42 @@ func finishBackground(id string, exitCode int) {
 	logWriter := e.logWriter
 	e.logFile = nil
 	e.logWriter = nil
-	logPath := e.LogPath
-	// Keep entry briefly for list visibility, but unprotect temps for cleanup.
 	for _, t := range temps {
 		unprotectTemp(t)
 	}
-	scheduleReap := !e.reapScheduled
-	if scheduleReap {
-		e.reapScheduled = true
-	}
 	bgMu.Unlock()
+
+	for _, t := range temps {
+		_ = os.Remove(t)
+	}
 	if logWriter != nil && logFile != nil {
 		_ = logWriter.compact()
 	}
 	if logFile != nil {
 		_ = logFile.Close()
 	}
-	for _, t := range temps {
-		os.Remove(t)
-	}
-	if !scheduleReap {
-		return
-	}
-	// Remove from registry after a short grace so list/log can still show it.
-	go func() {
-		time.Sleep(30 * time.Second)
-		bgMu.Lock()
-		if ent, ok := bgProcs[id]; ok {
-			lp := ent.LogPath
-			delete(bgProcs, id)
-			bgMu.Unlock()
-			if lp != "" {
-				unprotectTemp(lp)
-				os.Remove(lp)
-			}
-			return
+
+	bgMu.Lock()
+	var logsToRemove []string
+	if ent, ok := bgProcs[id]; ok {
+		if !ent.Done {
+			ent.Done = true
+			ent.ExitCode = exitCode
+		} else if exitCode >= 0 {
+			// Prefer real Wait exit code over kill's placeholder (-1) when available.
+			ent.ExitCode = exitCode
 		}
-		bgMu.Unlock()
-		if logPath != "" {
-			unprotectTemp(logPath)
-			os.Remove(logPath)
+		if logWriter != nil && logWriter.isTruncated() {
+			ent.LogTruncated = true
 		}
-	}()
+		logsToRemove = pruneCompletedBackgroundJobsLocked()
+	}
+	bgMu.Unlock()
+
+	for _, lp := range logsToRemove {
+		unprotectTemp(lp)
+		_ = os.Remove(lp)
+	}
 }
 
 // markBackgroundKilled marks the entry Done without closing the log FD.
@@ -503,42 +518,37 @@ func trimBgLogTail(data []byte, tailLines, tailBytes int, droppedPrefix bool) st
 	return string(data)
 }
 
-// procStartTime reads field 22 (starttime, in clock ticks since boot) from
+// procStartTimeErr reads field 22 (starttime, in clock ticks since boot) from
 // /proc/<pid>/stat — a stable per-process identity that survives PID reuse.
 //
-// Linux-specific: this depends on procfs (/proc/<pid>/stat), which is present
-// on Linux (and a few BSDs with procfs mounted); there is no portable
-// equivalent that is also race-free against PID reuse. On platforms where the
-// file cannot be read, 0 is returned and callers fail closed: killBackground
-// refuses to signal on an unknown identity, so a recycled PID can never be
-// killed. That fail-closed behavior is the contract — no fake cross-platform
-// implementation is attempted, and the pid-reuse guard degrades to "never
-// kill" rather than "kill blind".
-//
-// Returns 0 when the process no longer exists or the file is unreadable.
-// The comm field (2) is parenthesized and may contain spaces/parens, so the
-// remainder is parsed after the LAST ')'.
-func procStartTime(pid int) uint64 {
+// Linux-specific: this depends on procfs (/proc/<pid>/stat).
+// Returns os.ErrNotExist if the process does not exist.
+// Returns other errors if the stat file cannot be read or parsed.
+func procStartTimeErr(pid int) (uint64, error) {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	i := bytes.LastIndexByte(data, ')')
 	if i < 0 || i+2 >= len(data) {
-		return 0
+		return 0, fmt.Errorf("malformed /proc/%d/stat", pid)
 	}
 	fields := strings.Fields(string(data[i+2:]))
-	// Fields after comm: state(1) ppid(2) pgrp(3) session(4) tty_nr(5)
-	// tpgid(6) flags(7) minflt(8) cminflt(9) majflt(10) cmajflt(11)
-	// utime(12) stime(13) cutime(14) cstime(15) priority(16) nice(17)
-	// num_threads(18) itrealvalue(19) starttime(20) → index 19.
 	if len(fields) < 20 {
-		return 0
+		return 0, fmt.Errorf("malformed /proc/%d/stat: insufficient fields", pid)
 	}
 	v, err := strconv.ParseUint(fields[19], 10, 64)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("parse starttime for PID %d: %w", pid, err)
 	}
+	return v, nil
+}
+
+// procStartTime reads field 22 (starttime, in clock ticks since boot) from
+// /proc/<pid>/stat — a stable per-process identity that survives PID reuse.
+// Returns 0 when the process no longer exists or the file is unreadable.
+func procStartTime(pid int) uint64 {
+	v, _ := procStartTimeErr(pid)
 	return v
 }
 
@@ -570,6 +580,73 @@ func trimTrailingPartialRune(b []byte) []byte {
 	return b
 }
 
+// currentSessionID reads the session ID from /proc/self/stat.
+func currentSessionID() int {
+	data, err := os.ReadFile("/proc/self/stat")
+	if err != nil {
+		return 0
+	}
+	i := bytes.LastIndexByte(data, ')')
+	if i < 0 || i+2 >= len(data) {
+		return 0
+	}
+	fields := strings.Fields(string(data[i+2:]))
+	if len(fields) < 4 {
+		return 0
+	}
+	sessionVal, err := strconv.Atoi(fields[3])
+	if err != nil {
+		return 0
+	}
+	return sessionVal
+}
+
+// findProcessGroupPIDs finds all alive processes belonging to pgid in the current session.
+// Returns an empty slice on non-Linux systems or when no matching processes exist.
+func findProcessGroupPIDs(pgid int, minStartTime uint64) []int {
+	if pgid <= 0 {
+		return nil
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	mySession := currentSessionID()
+	var pids []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil {
+			continue
+		}
+		i := bytes.LastIndexByte(data, ')')
+		if i < 0 || i+2 >= len(data) {
+			continue
+		}
+		fields := strings.Fields(string(data[i+2:]))
+		if len(fields) < 20 {
+			continue
+		}
+		pgrpVal, err := strconv.Atoi(fields[2]) // field 5 is pgrp (0-indexed 2 after comm)
+		if err != nil || pgrpVal != pgid {
+			continue
+		}
+		sessionVal, err := strconv.Atoi(fields[3]) // field 6 is session (0-indexed 3 after comm)
+		if err != nil || (mySession > 0 && sessionVal != mySession) {
+			continue
+		}
+		stVal, err := strconv.ParseUint(fields[19], 10, 64) // field 20 is starttime (0-indexed 19 after comm)
+		if err != nil || (minStartTime > 0 && stVal < minStartTime) {
+			continue
+		}
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
 // killBackground kills by id or by PID string. Returns a status message.
 // On success the entry is marked Done promptly so list no longer shows it as live.
 // Kill errors (other than ESRCH / already gone) are returned to the caller.
@@ -590,23 +667,17 @@ func killBackground(idOrPID string) (string, error) {
 		bgMu.Unlock()
 		return "", fmt.Errorf("no background process matching %q", idOrPID)
 	}
-	if target.Done {
-		id := target.ID
-		bgMu.Unlock()
-		return fmt.Sprintf("process %s already exited", id), nil
-	}
 	pgid := target.pgid
 	id := target.ID
 	pid := target.PID
 	starttime := target.starttime
+	done := target.Done
 	bgMu.Unlock()
 
-	// PID-reuse guard: verify the process identity before signaling. The PID
-	// (and its process group) may have been recycled by an unrelated process
-	// since registration; signaling blindly could kill an innocent process.
-	current := procStartTime(pid)
-	if current == 0 || current != starttime {
-		return "", fmt.Errorf("refusing to kill %s (PID %d): process identity mismatch (starttime recorded %d, current %d); PID likely reused or process already gone", id, pid, starttime, current)
+	// If registered starttime is 0, process identity is unknown/unverifiable.
+	// Fail closed: must return error, do not signal, do not mark Done, do not release slot.
+	if starttime == 0 {
+		return "", fmt.Errorf("refusing to kill %s (PID %d): process identity unknown (unable to read proc starttime)", id, pid)
 	}
 
 	// Two-stage kill of the process group; surface real failures (ignore ESRCH).
@@ -616,19 +687,88 @@ func killBackground(idOrPID string) (string, error) {
 		}
 		return err
 	}
+
+	current, err := procStartTimeErr(pid)
+	if err != nil {
+		if !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("refusing to kill %s (PID %d): unable to verify process identity: %w", id, pid, err)
+		}
+		// os.ErrNotExist: leader has definitively exited and its identity is confirmed.
+	} else if current != starttime {
+		return "", fmt.Errorf("refusing to kill %s (PID %d): process identity mismatch (starttime recorded %d, current %d); PID reused", id, pid, starttime, current)
+	}
+
+	leaderAlive := (err == nil && current == starttime)
+
+	if !leaderAlive {
+		// Leader already exited. Check if any child processes in the same process group survive.
+		survivingPIDs := findProcessGroupPIDs(pgid, starttime)
+		if len(survivingPIDs) == 0 {
+			if done {
+				return fmt.Sprintf("process %s already exited", id), nil
+			}
+			markBackgroundKilled(id)
+			return fmt.Sprintf("process %s (PID %d) already exited", id, pid), nil
+		}
+		// Terminate surviving processes in the process group.
+		var lastErr error
+		if pgid != 0 {
+			if err := killErr(syscall.Kill(-pgid, syscall.SIGTERM)); err != nil {
+				lastErr = err
+			}
+		}
+		for _, childPID := range survivingPIDs {
+			_ = killErr(syscall.Kill(childPID, syscall.SIGTERM))
+		}
+		time.Sleep(500 * time.Millisecond)
+		remaining := findProcessGroupPIDs(pgid, starttime)
+		if len(remaining) > 0 {
+			if pgid != 0 {
+				if err := killErr(syscall.Kill(-pgid, syscall.SIGKILL)); err != nil {
+					lastErr = err
+				}
+			}
+			for _, childPID := range remaining {
+				_ = killErr(syscall.Kill(childPID, syscall.SIGKILL))
+			}
+			time.Sleep(100 * time.Millisecond)
+			remaining = findProcessGroupPIDs(pgid, starttime)
+		}
+		if len(remaining) > 0 {
+			return "", fmt.Errorf("failed to kill orphan background processes %v in process group %d", remaining, pgid)
+		}
+		if lastErr != nil {
+			return "", fmt.Errorf("kill background process group %s (PGID %d): %w", id, pgid, lastErr)
+		}
+		markBackgroundKilled(id)
+		return fmt.Sprintf("killed orphan background process group for %s (PGID %d, %d processes)", id, pgid, len(survivingPIDs)), nil
+	}
+
+	if done {
+		return fmt.Sprintf("process %s already exited", id), nil
+	}
+
 	var lastErr error
 	if pgid != 0 {
 		if err := killErr(syscall.Kill(-pgid, syscall.SIGTERM)); err != nil {
 			lastErr = err
 		}
 		time.Sleep(500 * time.Millisecond)
-		current = procStartTime(pid)
-		if current == 0 || current != starttime {
-			// Exited after SIGTERM, or PID was reused — do not SIGKILL.
+		current, err = procStartTimeErr(pid)
+		if err != nil || current != starttime {
+			// Exited after SIGTERM. Check if any child processes in group survived.
+			if rem := findProcessGroupPIDs(pgid, starttime); len(rem) > 0 {
+				_ = killErr(syscall.Kill(-pgid, syscall.SIGKILL))
+				for _, cp := range rem {
+					_ = killErr(syscall.Kill(cp, syscall.SIGKILL))
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
 			lastErr = nil
 		} else if err := killErr(syscall.Kill(-pgid, syscall.SIGKILL)); err != nil {
 			lastErr = err
 		} else {
+			time.Sleep(100 * time.Millisecond)
 			lastErr = nil
 		}
 	} else {
@@ -636,12 +776,13 @@ func killBackground(idOrPID string) (string, error) {
 			lastErr = err
 		}
 		time.Sleep(500 * time.Millisecond)
-		current = procStartTime(pid)
-		if current == 0 || current != starttime {
+		current, err = procStartTimeErr(pid)
+		if err != nil || current != starttime {
 			lastErr = nil
 		} else if err := killErr(syscall.Kill(pid, syscall.SIGKILL)); err != nil {
 			lastErr = err
 		} else {
+			time.Sleep(100 * time.Millisecond)
 			lastErr = nil
 		}
 	}
@@ -649,29 +790,118 @@ func killBackground(idOrPID string) (string, error) {
 	if lastErr != nil {
 		return "", fmt.Errorf("kill background process %s (PID %d): %w", id, pid, lastErr)
 	}
-	// Mark Done ASAP so list no longer shows a live task, but do NOT close the
-	// log FD here — closing early races the dying process and drops log tail.
-	// Wait goroutine calls finishBackground, which closes the log after exit.
 	markBackgroundKilled(id)
 	return fmt.Sprintf("killed background process %s (PID %d)", id, pid), nil
 }
 
-// backgroundReaperLoop kills processes that exceed defaultBackgroundMaxAge.
+// backgroundReaperLoop kills processes that exceed defaultBackgroundMaxAge and reaps stale completed entries.
 func backgroundReaperLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
 		now := time.Now()
 		bgMu.Lock()
-		var stale []string
+		var staleRunning []string
+		var staleDone []string
 		for id, e := range bgProcs {
 			if !e.Done && now.Sub(e.StartedAt) > defaultBackgroundMaxAge {
-				stale = append(stale, id)
+				staleRunning = append(staleRunning, id)
+			} else if e.Done && now.Sub(e.StartedAt) > defaultBackgroundMaxAge {
+				staleDone = append(staleDone, id)
+			}
+		}
+		var toRemoveLogs []string
+		for _, id := range staleDone {
+			if ent, ok := bgProcs[id]; ok {
+				lp := ent.LogPath
+				ent.LogPath = ""
+				delete(bgProcs, id)
+				if lp != "" {
+					toRemoveLogs = append(toRemoveLogs, lp)
+				}
 			}
 		}
 		bgMu.Unlock()
-		for _, id := range stale {
+		for _, lp := range toRemoveLogs {
+			unprotectTemp(lp)
+			_ = os.Remove(lp)
+		}
+		for _, id := range staleRunning {
 			_, _ = killBackground(id)
+		}
+	}
+}
+
+var shutdownMu sync.Mutex
+
+// shutdownBackground terminates all running background processes and cleans up
+// their logs and temporary files on normal server shutdown. Idempotent and thread-safe.
+func shutdownBackground() {
+	shutdownMu.Lock()
+	defer shutdownMu.Unlock()
+
+	bgMu.Lock()
+	var runningIDs []string
+	for id, e := range bgProcs {
+		if !e.Done {
+			runningIDs = append(runningIDs, id)
+		}
+	}
+	bgMu.Unlock()
+
+	if len(runningIDs) > 0 {
+		var wg sync.WaitGroup
+		for _, id := range runningIDs {
+			wg.Add(1)
+			go func(jobID string) {
+				defer wg.Done()
+				_, _ = killBackground(jobID)
+			}(id)
+		}
+		wg.Wait()
+	}
+
+	bgMu.Lock()
+	type cleanupItem struct {
+		temps     []string
+		logFile   *os.File
+		logWriter *limitedFileWriter
+		logPath   string
+	}
+	var toClean []cleanupItem
+	for id, e := range bgProcs {
+		temps := append([]string(nil), e.TempFiles...)
+		e.TempFiles = nil
+		logFile := e.logFile
+		logWriter := e.logWriter
+		e.logFile = nil
+		e.logWriter = nil
+		logPath := e.LogPath
+		e.LogPath = ""
+		delete(bgProcs, id)
+		toClean = append(toClean, cleanupItem{
+			temps:     temps,
+			logFile:   logFile,
+			logWriter: logWriter,
+			logPath:   logPath,
+		})
+	}
+	bgMu.Unlock()
+
+	for _, item := range toClean {
+		for _, t := range item.temps {
+			unprotectTemp(t)
+			_ = os.Remove(t)
+		}
+		if item.logWriter != nil && item.logFile != nil {
+			_ = item.logWriter.compact()
+		}
+		if item.logFile != nil {
+			_ = item.logFile.Close()
+		}
+		if item.logPath != "" {
+			unprotectTemp(item.logPath)
+			_ = os.Remove(item.logPath)
 		}
 	}
 }
@@ -2077,10 +2307,16 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 		// the lock (authoritative); this pre-check avoids starting a doomed
 		// process in the common case.
 		if liveBackgroundCount() >= maxBackgroundProcs {
+			for _, t := range cleanups {
+				_ = os.Remove(t)
+			}
 			return nil, fmt.Errorf("too many concurrent background processes (%d max): wait for some to finish or kill them first", maxBackgroundProcs)
 		}
 		f, err := os.CreateTemp(os.TempDir(), bgTempPrefix+"*.log")
 		if err != nil {
+			for _, t := range cleanups {
+				_ = os.Remove(t)
+			}
 			return nil, fmt.Errorf("create background log: %w", err)
 		}
 		logFile = f
@@ -2098,6 +2334,9 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 			logFile.Close()
 			os.Remove(logPath)
 		}
+		for _, t := range cleanups {
+			_ = os.Remove(t)
+		}
 		return nil, fmt.Errorf("failed to start process: %w", err)
 	}
 
@@ -2114,6 +2353,9 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 			if logFile != nil {
 				logFile.Close()
 				os.Remove(logPath)
+			}
+			for _, t := range cleanups {
+				_ = os.Remove(t)
 			}
 			return nil, err
 		}

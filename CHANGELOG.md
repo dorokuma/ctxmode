@@ -5,6 +5,16 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [3.1.7] - 2026-08-19
+
+### Fixed
+- **Background process shutdown cleanup**: `shutdownBackground` terminates all running background processes concurrently and cleans up temporary files and disk logs on server exit (SIGINT, SIGTERM, fatal error) in an idempotent and thread-safe manner.
+- **DNS and SSRF validation**: `validateURL` bounds DNS resolution with a dedicated 5s timeout chained to request context, directly allows safe IP literals without DNS lookup, and expands embedded IPv4 detection in IPv6 to include Teredo (`2001:0::/32`) and ISATAP (`0000:5efe`/`0200:5efe`).
+- **Database permissions**: `ensureDBDir` restricts the dedicated database directory to `0700` and creates SQLite database files with `0600` permissions; custom directories from `CTXMODE_DB` are created with `0755` without mutating existing permissions.
+- **JSON migration boundaries**: `migrateFromJSON` enforces a 50MB file size limit with `LimitReader` and verifies regular file status without following symlinks before reading, ensuring the backup `.bak` rename occurs only after successful migration.
+- **Index performance for single-link files**: single-file indexing skips the global sensitive inode collection when `nlink == 1`, only scanning when hardlinks (`nlink > 1`) are detected.
+- **Git hooks credential checks**: `commit-msg` and `pre-push` hooks scan assignment patterns with placeholder exceptions and allow code review round commit messages.
+
 ## [3.1.6] - 2026-08-19
 
 ### Fixed
