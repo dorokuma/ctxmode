@@ -5,6 +5,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [3.1.8] - 2026-08-21
+
+### Changed
+- **Background process waiting**: background execution now returns explicit one-shot wait guidance, supports bounded blocking waits with stable terminal results, and rejects ambiguous id/pid usage.
+- **Pi integration guidance**: tool schemas document the background wait workflow and timeout semantics.
+
 ## [3.1.7] - 2026-08-19
 
 ### Fixed

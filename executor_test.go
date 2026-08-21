@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -447,9 +448,125 @@ func TestBackgroundWait_TimeoutNoKill(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// H1: background log tail seeks from end (no full-file ReadFile)
-// ============================================================================
+func TestBackground_TombstoneWaitLookupAndWindow(t *testing.T) {
+	bgMu.Lock()
+	savedProcs, savedTombs := bgProcs, bgTombstones
+	bgProcs, bgTombstones = make(map[string]*bgEntry), make(map[string]bgTombstone)
+	bgMu.Unlock()
+	defer func() { bgMu.Lock(); bgProcs, bgTombstones = savedProcs, savedTombs; bgMu.Unlock() }()
+
+	const id = "tomb-bg-id"
+	const pid = 49123
+	bgMu.Lock()
+	bgTombstones[id] = bgTombstone{entry: bgEntry{ID: id, PID: pid, Done: true, ExitCode: 23, finishedAt: time.Now()}}
+	bgMu.Unlock()
+
+	if got := findBackground(id); got == nil || !got.Done || got.ExitCode != 23 {
+		t.Fatalf("id tombstone lookup lost terminal result: %#v", got)
+	}
+	if got := findBackground(strconv.Itoa(pid)); got == nil || got.ID != id || got.ExitCode != 23 {
+		t.Fatalf("pid tombstone lookup lost terminal result: %#v", got)
+	}
+	s := &server{workdirs: []string{t.TempDir()}}
+	for _, args := range []backgroundWaitArgs{{ID: id, TimeoutMs: 100}, {PID: pid, TimeoutMs: 100}} {
+		res, _, err := s.toolBackgroundWait(context.Background(), nil, args)
+		if err != nil {
+			t.Fatalf("tombstone wait: %v", err)
+		}
+		text := mcpResultText(t, res)
+		if !strings.Contains(text, `"done": true`) || !strings.Contains(text, `"exit_code": 23`) {
+			t.Fatalf("wait must return tombstone result: %s", text)
+		}
+	}
+	if _, err := killBackground(id); err == nil || !strings.Contains(err.Error(), "no background process") {
+		t.Fatalf("kill of tombstone must be an explicit no-match: %v", err)
+	}
+	if _, err := killBackground("unknown-tombstone"); err == nil || !strings.Contains(err.Error(), "no background process") {
+		t.Fatalf("kill of unknown must be an explicit no-match: %v", err)
+	}
+
+	// Isolate the retention-window assertion from the handoff lookup fixture.
+	bgMu.Lock()
+	bgTombstones = make(map[string]bgTombstone)
+	bgMu.Unlock()
+
+	// Add completed entries in deterministic order and force the retention boundary.
+	for i := 0; i < maxCompletedBackgroundJobs+maxBackgroundTombstones+2; i++ {
+		id := fmt.Sprintf("window-%03d", i)
+		bgMu.Lock()
+		bgProcs[id] = &bgEntry{ID: id, PID: 50000 + i, StartedAt: time.Unix(int64(i), 0), ExitCode: i, finishedAt: time.Unix(int64(i), 0), done: make(chan struct{})}
+		bgMu.Unlock()
+		finishBackground(id, i)
+	}
+	bgMu.Lock()
+	defer bgMu.Unlock()
+	if len(bgTombstones) != maxBackgroundTombstones {
+		t.Fatalf("tombstone window = %d, want %d", len(bgTombstones), maxBackgroundTombstones)
+	}
+	if _, ok := bgTombstones["window-000"]; ok {
+		t.Fatal("oldest tombstone must be evicted")
+	}
+	if _, ok := bgTombstones[fmt.Sprintf("window-%03d", maxBackgroundTombstones+1)]; !ok {
+		t.Fatal("newest tombstone must remain")
+	}
+}
+
+func TestBackground_ConcurrentWaitAndKillFinishOrdering(t *testing.T) {
+	bgMu.Lock()
+	savedProcs, savedTombs := bgProcs, bgTombstones
+	bgProcs, bgTombstones = make(map[string]*bgEntry), make(map[string]bgTombstone)
+	bgMu.Unlock()
+	defer func() { bgMu.Lock(); bgProcs, bgTombstones = savedProcs, savedTombs; bgMu.Unlock() }()
+
+	f, err := os.CreateTemp(t.TempDir(), "wait-order-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := f.Name()
+	w := &limitedFileWriter{f: f, limit: bgLogMaxBytes}
+	const id = "ordered-bg"
+	bgMu.Lock()
+	bgProcs[id] = &bgEntry{ID: id, PID: 49234, StartedAt: time.Now(), LogPath: path, logFile: f, logWriter: w, done: make(chan struct{})}
+	bgMu.Unlock()
+
+	s := &server{workdirs: []string{t.TempDir()}}
+	const waiters = 12
+	results := make(chan string, waiters)
+	var wg sync.WaitGroup
+	for i := 0; i < waiters; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, _, err := s.toolBackgroundWait(context.Background(), nil, backgroundWaitArgs{ID: id, TimeoutMs: 2000})
+			if err != nil {
+				t.Errorf("concurrent wait: %v", err)
+				return
+			}
+			results <- mcpResultText(t, res)
+		}()
+	}
+	time.Sleep(20 * time.Millisecond)
+	markBackgroundKilled(id)
+	finishBackground(id, 37)
+	finishBackground(id, 37) // idempotent: must not close the FD twice.
+	wg.Wait()
+	close(results)
+	for text := range results {
+		if !strings.Contains(text, `"done": true`) || !strings.Contains(text, `"exit_code": 37`) {
+			t.Fatalf("wait observed wrong terminal result: %s", text)
+		}
+	}
+	bgMu.Lock()
+	entry := bgProcs[id]
+	if entry == nil || !entry.Done || entry.ExitCode != 37 || entry.logFile != nil || entry.logWriter != nil {
+		bgMu.Unlock()
+		t.Fatalf("finish ordering left invalid entry: %#v", entry)
+	}
+	bgMu.Unlock()
+	if _, err := f.WriteString("after-close"); err == nil {
+		t.Fatal("finish must close the log FD exactly once")
+	}
+}
 
 func TestReadBackgroundLogTail_TailBytesEndOnly(t *testing.T) {
 	dir := t.TempDir()

@@ -36,6 +36,9 @@ const (
 	// silently queueing or spawning unbounded processes.
 	maxBackgroundProcs         = 16
 	maxCompletedBackgroundJobs = 64
+	// Bounded result-only handoff records let wait consume an id returned just
+	// before pruning without retaining process handles or log files.
+	maxBackgroundTombstones = 64
 )
 
 // ---------- background process registry ----------
@@ -65,6 +68,15 @@ type bgEntry struct {
 	logFile       *os.File
 	logWriter     *limitedFileWriter
 	reapScheduled bool // grace-period removal already started
+	// done is closed once the job reaches a terminal state; wait callers block on it.
+	done         chan struct{}
+	doneSignaled bool
+	finishedAt   time.Time
+}
+
+// bgTombstone contains only the bounded terminal result needed for wait.
+type bgTombstone struct {
+	entry bgEntry
 }
 
 // limitedFileWriter keeps the newest `limit` bytes of a background log.
@@ -175,10 +187,11 @@ func (w *limitedFileWriter) compact() error {
 }
 
 var (
-	bgMu     sync.Mutex
-	bgProcs  = map[string]*bgEntry{}
-	bgSeq    atomic.Uint64
-	bgReaper sync.Once
+	bgMu         sync.Mutex
+	bgProcs      = map[string]*bgEntry{}
+	bgTombstones = map[string]bgTombstone{}
+	bgSeq        atomic.Uint64
+	bgReaper     sync.Once
 )
 
 // registerBackground records a live background process.
@@ -209,6 +222,7 @@ func registerBackground(cmd *exec.Cmd, language, command string, temps []string,
 		logWriter: logWriter,
 		pgid:      pgid,
 		cmd:       cmd,
+		done:      make(chan struct{}),
 		// Identity snapshot for the PID-reuse guard in killBackground.
 		starttime: procStartTime(cmd.Process.Pid),
 	}
@@ -264,7 +278,7 @@ func liveBackgroundCount() int {
 func pruneCompletedBackgroundJobsLocked() []string {
 	var doneEntries []*bgEntry
 	for _, e := range bgProcs {
-		if e.Done {
+		if e.Done && e.logFile == nil && e.logWriter == nil && len(e.TempFiles) == 0 {
 			doneEntries = append(doneEntries, e)
 		}
 	}
@@ -278,6 +292,7 @@ func pruneCompletedBackgroundJobsLocked() []string {
 	var logsToRemove []string
 	for i := 0; i < excess; i++ {
 		ent := doneEntries[i]
+		storeBackgroundTombstoneLocked(ent)
 		lp := ent.LogPath
 		ent.LogPath = ""
 		delete(bgProcs, ent.ID)
@@ -286,6 +301,27 @@ func pruneCompletedBackgroundJobsLocked() []string {
 		}
 	}
 	return logsToRemove
+}
+
+func storeBackgroundTombstoneLocked(ent *bgEntry) {
+	cp := snapshotBgEntry(ent)
+	cp.LogPath = ""
+	bgTombstones[cp.ID] = bgTombstone{entry: cp}
+	pruneBackgroundTombstonesLocked()
+}
+
+func pruneBackgroundTombstonesLocked() {
+	if len(bgTombstones) <= maxBackgroundTombstones {
+		return
+	}
+	tombs := make([]bgTombstone, 0, len(bgTombstones))
+	for _, tomb := range bgTombstones {
+		tombs = append(tombs, tomb)
+	}
+	sort.Slice(tombs, func(i, j int) bool { return tombs[i].entry.finishedAt.Before(tombs[j].entry.finishedAt) })
+	for i := 0; i < len(tombs)-maxBackgroundTombstones; i++ {
+		delete(bgTombstones, tombs[i].entry.ID)
+	}
 }
 
 // finishBackground marks entry done, closes the log FD, and cleans temps.
@@ -322,6 +358,7 @@ func finishBackground(id string, exitCode int) {
 	if logWriter != nil && logFile != nil {
 		_ = logWriter.compact()
 	}
+	logTruncated := logWriter != nil && logWriter.isTruncated()
 	if logFile != nil {
 		_ = logFile.Close()
 	}
@@ -332,11 +369,19 @@ func finishBackground(id string, exitCode int) {
 		if !ent.Done {
 			ent.Done = true
 			ent.ExitCode = exitCode
+			ent.finishedAt = time.Now()
 		} else if exitCode >= 0 {
 			// Prefer real Wait exit code over kill's placeholder (-1) when available.
 			ent.ExitCode = exitCode
 		}
-		if logWriter != nil && logWriter.isTruncated() {
+		if ent.done == nil {
+			ent.done = make(chan struct{})
+		}
+		if !ent.doneSignaled {
+			close(ent.done)
+			ent.doneSignaled = true
+		}
+		if logTruncated {
 			ent.LogTruncated = true
 		}
 		logsToRemove = pruneCompletedBackgroundJobsLocked()
@@ -361,14 +406,36 @@ func markBackgroundKilled(id string) {
 	}
 	e.Done = true
 	e.ExitCode = -1
+	if e.done == nil {
+		e.done = make(chan struct{})
+	}
+}
+
+func lookupBackgroundLocked(idOrPID string) *bgEntry {
+	if e, ok := bgProcs[idOrPID]; ok {
+		return e
+	}
+	if tomb, ok := bgTombstones[idOrPID]; ok {
+		return &tomb.entry
+	}
+	if pid, err := strconv.Atoi(idOrPID); err == nil {
+		for _, e := range bgProcs {
+			if e.PID == pid {
+				return e
+			}
+		}
+		for _, tomb := range bgTombstones {
+			if tomb.entry.PID == pid {
+				return &tomb.entry
+			}
+		}
+	}
+	return nil
 }
 
 // snapshotBgEntry copies a registry entry for external use (no live handles).
 func snapshotBgEntry(e *bgEntry) bgEntry {
 	cp := *e
-	if cp.logWriter != nil && cp.logWriter.isTruncated() {
-		cp.LogTruncated = true
-	}
 	cp.cmd = nil
 	cp.logFile = nil
 	cp.logWriter = nil
@@ -393,22 +460,30 @@ func listBackground() []bgEntry {
 func findBackground(idOrPID string) *bgEntry {
 	bgMu.Lock()
 	defer bgMu.Unlock()
-	if e, ok := bgProcs[idOrPID]; ok {
-		cp := snapshotBgEntry(e)
-		return &cp
+	e := lookupBackgroundLocked(idOrPID)
+	if e == nil {
+		return nil
 	}
-	if pid, err := strconv.Atoi(idOrPID); err == nil {
-		for _, e := range bgProcs {
-			if e.PID == pid {
-				cp := snapshotBgEntry(e)
-				return &cp
-			}
-		}
-	}
-	return nil
+	cp := snapshotBgEntry(e)
+	return &cp
 }
 
-// readBackgroundLogTail returns the tail of a background process log.
+func backgroundWaitSnapshot(idOrPID string) (*bgEntry, <-chan struct{}) {
+	bgMu.Lock()
+	defer bgMu.Unlock()
+	e := lookupBackgroundLocked(idOrPID)
+	if e == nil {
+		return nil, nil
+	}
+	if e.done == nil {
+		// Legacy/test-created entries have no wait channel; completed entries
+		// are handled before waiting, while live entries get an event channel.
+		e.done = make(chan struct{})
+	}
+	cp := snapshotBgEntry(e)
+	return &cp, e.done
+}
+
 // Seeks from the end of the file — never loads the whole file into memory.
 // tailLines defaults to 100; if tailBytes > 0 it is applied as a byte window
 // (and still refined by tailLines when > 0).
@@ -806,7 +881,7 @@ func backgroundReaperLoop() {
 		for id, e := range bgProcs {
 			if !e.Done && now.Sub(e.StartedAt) > defaultBackgroundMaxAge {
 				staleRunning = append(staleRunning, id)
-			} else if e.Done && now.Sub(e.StartedAt) > defaultBackgroundMaxAge {
+			} else if e.Done && e.logFile == nil && e.logWriter == nil && len(e.TempFiles) == 0 && now.Sub(e.StartedAt) > defaultBackgroundMaxAge {
 				staleDone = append(staleDone, id)
 			}
 		}
@@ -814,6 +889,7 @@ func backgroundReaperLoop() {
 		for _, id := range staleDone {
 			if ent, ok := bgProcs[id]; ok {
 				lp := ent.LogPath
+				storeBackgroundTombstoneLocked(ent)
 				ent.LogPath = ""
 				delete(bgProcs, id)
 				if lp != "" {
@@ -1097,15 +1173,18 @@ func (s *server) toolBackgroundLog(ctx context.Context, _ *mcp.CallToolRequest, 
 }
 
 type backgroundWaitArgs struct {
-	ID        string `json:"id,omitempty" jsonschema:"Background process id from ctx_bg action=list"`
-	PID       int    `json:"pid,omitempty" jsonschema:"Process PID"`
-	TimeoutMs int    `json:"timeout_ms,omitempty" jsonschema:"Max wait in ms (default: 60000). Does not kill on timeout."`
+	ID        string `json:"id,omitempty" jsonschema:"Background process id (use either id or pid, not both)"`
+	PID       int    `json:"pid,omitempty" jsonschema:"Process PID (use either pid or id, not both)"`
+	TimeoutMs int    `json:"timeout_ms,omitempty" jsonschema:"Max blocking wait in ms (default: 60000, maximum: 3600000). Does not kill on timeout."`
 }
 
 func (s *server) toolBackgroundWait(ctx context.Context, _ *mcp.CallToolRequest, args backgroundWaitArgs) (*mcp.CallToolResult, any, error) {
 	key := args.ID
 	if key == "" && args.PID != 0 {
 		key = strconv.Itoa(args.PID)
+	}
+	if args.ID != "" && args.PID != 0 {
+		return nil, nil, fmt.Errorf("id and pid are mutually exclusive; provide exactly one")
 	}
 	if key == "" {
 		return nil, nil, fmt.Errorf("id or pid is required")
@@ -1117,26 +1196,37 @@ func (s *server) toolBackgroundWait(ctx context.Context, _ *mcp.CallToolRequest,
 	if timeoutMs > maxBackgroundWaitMs {
 		return nil, nil, fmt.Errorf("timeout_ms %dms exceeds maximum allowed (1 hour)", timeoutMs)
 	}
-	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
-	var entry *bgEntry
-	for {
-		entry = findBackground(key)
-		if entry == nil {
-			return nil, nil, fmt.Errorf("no background process matching %q", key)
-		}
-		if entry.Done {
-			break
-		}
-		if time.Now().After(deadline) {
-			break
-		}
+	entry, done := backgroundWaitSnapshot(key)
+	if entry == nil {
+		return nil, nil, fmt.Errorf("no background process matching %q", key)
+	}
+	timedOut := false
+	if !entry.Done || (entry.ExitCode == -1 && !entry.doneSignaled) {
+		timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
 		select {
+		case <-done:
+		case <-timer.C:
+			timedOut = true
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return nil, nil, ctx.Err()
-		case <-ticker.C:
+		}
+		if !timer.Stop() && !timedOut {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		if !timedOut {
+			entry, _ = backgroundWaitSnapshot(key)
+			if entry == nil {
+				return nil, nil, fmt.Errorf("no background process matching %q", key)
+			}
 		}
 	}
 
@@ -1159,7 +1249,7 @@ func (s *server) toolBackgroundWait(ctx context.Context, _ *mcp.CallToolRequest,
 		ExitCode:     entry.ExitCode,
 		LogPath:      entry.LogPath,
 		Log:          logText,
-		TimedOut:     !entry.Done,
+		TimedOut:     timedOut,
 		LogTruncated: entry.LogTruncated,
 	}
 	if logErr != nil {
@@ -2383,8 +2473,8 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 			_, _ = killBackground(entry.ID)
 		})
 		return &executeResult{
-			Stdout: fmt.Sprintf("Process started in background (id: %s, PID: %d). Use ctx_bg action=list|kill|log|wait. Max age %s.",
-				entry.ID, cmd.Process.Pid, maxAge),
+			Stdout: fmt.Sprintf("Process started in background (id: %s, PID: %d). Next: call ctx_bg action=wait with id %s (default timeout 60000ms; timeout does not kill). No proactive push; do not poll list/log. ctx_bg action=list|kill|log|wait remains available for snapshots, logs, and termination. Max age %s.",
+				entry.ID, cmd.Process.Pid, entry.ID, maxAge),
 			ExitCode: 0,
 		}, nil
 	}

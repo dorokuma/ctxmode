@@ -20,7 +20,7 @@ type ctxRunArgs struct {
 	Command    string            `json:"command,omitempty"`
 	Language   string            `json:"language,omitempty"`
 	Timeout    int               `json:"timeout,omitempty"`
-	Background bool              `json:"background,omitempty" jsonschema:"Run asynchronously in background (terminated on timeout if specified, default max 1h). Manage via ctx_bg"`
+	Background bool              `json:"background,omitempty" jsonschema:"Only for action=execute: start and return immediately; no proactive push. Configured execution timeout terminates on timeout; ctx_bg wait timeout does not kill. After receiving id, call ctx_bg action=wait once (default 60000ms, max 3600000ms); not supported by other actions. (terminated on timeout)"`
 	Intent     string            `json:"intent,omitempty"`
 	CWD        string            `json:"cwd,omitempty"`
 	Argv       []string          `json:"argv,omitempty"`
@@ -45,6 +45,9 @@ type ctxRunArgs struct {
 }
 
 func (s *server) toolCtxRun(ctx context.Context, req *mcp.CallToolRequest, args ctxRunArgs) (*mcp.CallToolResult, any, error) {
+	if args.Background && strings.ToLower(strings.TrimSpace(args.Action)) != "execute" {
+		return nil, nil, fmt.Errorf("background is only supported for ctx_run action=execute")
+	}
 	switch strings.ToLower(strings.TrimSpace(args.Action)) {
 	case "execute":
 		return s.toolExecute(ctx, req, executeArgs{
@@ -208,6 +211,9 @@ type ctxBgArgs struct {
 }
 
 func (s *server) toolCtxBg(ctx context.Context, req *mcp.CallToolRequest, args ctxBgArgs) (*mcp.CallToolResult, any, error) {
+	if args.ID != "" && args.PID != 0 {
+		return nil, nil, fmt.Errorf("id and pid are mutually exclusive; provide exactly one")
+	}
 	switch strings.ToLower(strings.TrimSpace(args.Action)) {
 	case "list":
 		return s.toolBackgroundList(ctx, req, backgroundListArgs{})
@@ -230,7 +236,7 @@ func (s *server) toolCtxBg(ctx context.Context, req *mcp.CallToolRequest, args c
 
 // ctxRunDescription is the registered description of the ctx_run tool.
 // The kind list must match validRunTaskKinds (run_task.go).
-const ctxRunDescription = "PRIMARY for commands/tests/builds. action=execute (shell/code; prefer argv), " +
+const ctxRunDescription = "PRIMARY for commands/tests/builds. action=execute (shell/code; prefer argv; background is only valid here, returns immediately without proactive push—use ctx_bg action=wait once with id or pid), " +
 	"execute_file (code over FILE_CONTENT), batch (many commands + optional queries), " +
 	"run_task (go_test|go_build|go_vet|npm_test|npm_run_build|cargo_test|cargo_build|make|custom; fixed argv). Large output auto-indexed."
 
@@ -260,8 +266,7 @@ func (s *server) registerCategoryTools(srv *mcp.Server) {
 	}, s.toolCtxKb)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name: "ctx_bg",
-		Description: "Background processes started via ctx_run action=execute background:true. " +
-			"action=list|kill|log|wait (id or pid).",
+		Name:        "ctx_bg",
+		Description: "Background processes from ctx_run action=execute background:true. Starts return immediately and never proactively push notifications. action=wait (preferred once after launch; blocking, default 60000ms, max 1h, timeout does not kill), list (snapshot), log (tail output), kill (terminate). Identify with either id or pid; do not poll list/log.",
 	}, s.toolCtxBg)
 }
