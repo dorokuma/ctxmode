@@ -648,6 +648,7 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		// If blocked by flood guard, return a friendly message.
 		if meta != nil && meta.FloodStatus == "blocked" {
 			return &mcp.CallToolResult{
+				IsError: true,
 				Content: []mcp.Content{&mcp.TextContent{Text: "Search blocked: too many requests in a short time. Wait a moment and retry. ctx_run action=batch with query_scope=batch only searches documents indexed by that batch run (not execute/run_task/fetch output) and bypasses this guard."}},
 			}, nil, nil
 		}
@@ -814,6 +815,29 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	if err != nil {
 		return nil, nil, fmt.Errorf("read file: %w", err)
 	}
+	// Re-check the opened descriptor to close the Stat/Open TOCTOU window.
+	fdInfo, err := rf.Stat()
+	if err != nil {
+		rf.Close()
+		return nil, nil, fmt.Errorf("fstat file: %w", err)
+	}
+	if !fdInfo.Mode().IsRegular() {
+		rf.Close()
+		return nil, nil, fmt.Errorf("file %q is not a regular file", target)
+	}
+	if st, ok := fdInfo.Sys().(*syscall.Stat_t); ok && uint64(st.Nlink) > 1 {
+		for id := range s.collectSensitiveInodes() {
+			if current, ok := fileDevIno(fdInfo); ok && current == id {
+				rf.Close()
+				return nil, nil, fmt.Errorf("refusing to execute on sensitive file %q (hardlink to sensitive file)", target)
+			}
+		}
+	}
+	if fdInfo.Size() > 10*1024*1024 {
+		rf.Close()
+		return nil, nil, fmt.Errorf("file %q is too large (%d bytes, max 10MB)", target, fdInfo.Size())
+	}
+
 	fileContent, err := io.ReadAll(io.LimitReader(rf, 10*1024*1024+1))
 	rf.Close()
 	if err != nil {

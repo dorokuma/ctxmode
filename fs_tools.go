@@ -112,11 +112,16 @@ func (s *server) toolLs(ctx context.Context, _ *mcp.CallToolRequest, args lsArgs
 	// BFS / Walk with depth limit relative to walkRoot.
 	baseDepth := strings.Count(walkRoot, string(filepath.Separator))
 	err = filepath.Walk(walkRoot, func(p string, fi os.FileInfo, walkErr error) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if walkErr != nil {
-			return nil // skip unreadable
+			return nil
 		}
 		if p == walkRoot {
-			return nil // skip root itself
+			return nil
 		}
 		// Symlink fence: never follow escapes.
 		if real, rerr := s.ensureInsideWorkspaces(p); rerr != nil {
@@ -294,10 +299,12 @@ func (s *server) toolGlob(ctx context.Context, _ *mcp.CallToolRequest, args glob
 	pattern := filepath.ToSlash(args.Pattern)
 
 	err = filepath.Walk(root, func(p string, fi os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return nil
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
-		if p == root {
+		if walkErr != nil {
 			return nil
 		}
 		base := fi.Name()
@@ -311,16 +318,25 @@ func (s *server) toolGlob(ctx context.Context, _ *mcp.CallToolRequest, args glob
 			}
 			return nil
 		}
+		if isSensitiveFilePath(p) {
+			return nil
+		}
 
 		rel, err := filepath.Rel(root, p)
-		if err == nil && fi.IsDir() && rel != "." {
-			gitignore.push(p, filepath.ToSlash(rel))
-		}
 		if err != nil {
 			return nil
 		}
 		relSlash := filepath.ToSlash(rel)
-
+		for len(gitignore.layers) > 1 {
+			base := gitignore.layers[len(gitignore.layers)-1].base
+			if base == "." || relSlash == base || strings.HasPrefix(relSlash, base+"/") {
+				break
+			}
+			gitignore.layers = gitignore.layers[:len(gitignore.layers)-1]
+		}
+		if fi.IsDir() && rel != "." {
+			gitignore.push(p, relSlash)
+		}
 		if gitignore.ignores(relSlash, fi.IsDir()) {
 			if fi.IsDir() {
 				return filepath.SkipDir
@@ -547,7 +563,7 @@ func (s *gitignoreStack) push(absDir, relFromRoot string) {
 	}{base: filepath.ToSlash(relFromRoot), gi: gi})
 }
 
-func (s gitignoreStack) ignores(rel string, isDir bool) bool {
+func (s *gitignoreStack) ignores(rel string, isDir bool) bool {
 	rel = filepath.ToSlash(rel)
 	ignored := false
 	for _, layer := range s.layers {
@@ -798,6 +814,22 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 		"--glob", "!.git/**",
 		"--glob", "!node_modules/**",
 		"--glob", "!vendor/**",
+		"--glob", "!.env*",
+		"--glob", "!*.pem",
+		"--glob", "!*.key",
+		"--glob", "!*.p12",
+		"--glob", "!*.pfx",
+		"--glob", "!id_rsa*",
+		"--glob", "!id_dsa*",
+		"--glob", "!id_ecdsa*",
+		"--glob", "!id_ed25519*",
+		"--glob", "!.npmrc",
+		"--glob", "!.netrc",
+		"--glob", "!credentials*",
+		"--glob", "!.aws/**",
+		"--glob", "!.ssh/**",
+		"--glob", "!.gnupg/**",
+		"--glob", "!.kube/**",
 		"-m", strconv.Itoa(limit),
 	}
 	if args.IgnoreCase {
@@ -1028,8 +1060,16 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, limit, cont
 				return filepath.SkipDir
 			}
 			rel, _ := filepath.Rel(root, p)
+			relSlash := filepath.ToSlash(rel)
+			for len(gitignore.layers) > 1 {
+				base := gitignore.layers[len(gitignore.layers)-1].base
+				if base == "." || relSlash == base || strings.HasPrefix(relSlash, base+"/") {
+					break
+				}
+				gitignore.layers = gitignore.layers[:len(gitignore.layers)-1]
+			}
 			if rel != "." {
-				gitignore.push(p, filepath.ToSlash(rel))
+				gitignore.push(p, relSlash)
 			}
 			if rel != "." && gitignore.ignores(filepath.ToSlash(rel), true) {
 				return filepath.SkipDir
@@ -1062,6 +1102,9 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, limit, cont
 			return nil
 		}
 
+		if isSensitiveFilePath(p) {
+			return nil
+		}
 		f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
 			return nil

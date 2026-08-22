@@ -355,19 +355,22 @@ func newHTTPClient() *http.Client {
 					return nil, fmt.Errorf("DNS resolution in DialContext: %w", err)
 				}
 
-				var safeIP net.IP
+				var lastErr error
 				for _, ip := range ips {
-					if err := checkIP(ip.IP); err == nil {
-						safeIP = ip.IP
-						break
+					if err := checkIP(ip.IP); err != nil {
+						continue
 					}
+					safeAddr := net.JoinHostPort(ip.IP.String(), portFromAddr)
+					conn, dialErr := (&net.Dialer{}).DialContext(ctx, network, safeAddr)
+					if dialErr == nil {
+						return conn, nil
+					}
+					lastErr = dialErr
 				}
-				if safeIP == nil {
-					return nil, fmt.Errorf("all resolved IPs for %q blocked by SSRF rules", hostFromAddr)
+				if lastErr != nil {
+					return nil, lastErr
 				}
-
-				safeAddr := net.JoinHostPort(safeIP.String(), portFromAddr)
-				return (&net.Dialer{}).DialContext(ctx, network, safeAddr)
+				return nil, fmt.Errorf("all resolved IPs for %q blocked by SSRF rules", hostFromAddr)
 			},
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -986,6 +989,9 @@ func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, 
 
 	// Default timeout.
 	timeout := defaultFetchTimeout
+	if args.TimeoutMs > 3600000 {
+		return nil, nil, fmt.Errorf("timeoutMs %d exceeds maximum allowed (3600000)", args.TimeoutMs)
+	}
 	if args.TimeoutMs > 0 {
 		timeout = time.Duration(args.TimeoutMs) * time.Millisecond
 	}

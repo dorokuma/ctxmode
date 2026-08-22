@@ -123,20 +123,63 @@ func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args r
 	return s.finishRunTaskOutput(outputText, result.ExitCode, args.Kind, args.Intent)
 }
 
+var makeArgRe = regexp.MustCompile(`^[A-Za-z0-9_.-]+(?:=[A-Za-z0-9_.-]+)?$`)
+var makeJobsRe = regexp.MustCompile(`^(?:-j[0-9]+|--jobs=[0-9]+)$`)
+
+func validateGoRunTaskInputs(target string, args []string) error {
+	if target != "" && strings.HasPrefix(target, "-") {
+		return fmt.Errorf("go task target %q must not start with '-'", target)
+	}
+	for i, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			return fmt.Errorf("go task args[%d] %q must not start with '-'", i, arg)
+		}
+	}
+	return nil
+}
+
+func validateMakeArg(arg string) error {
+	if strings.HasPrefix(arg, "-") {
+		if makeJobsRe.MatchString(arg) {
+			return nil
+		}
+		return fmt.Errorf("make argument %q is invalid", arg)
+	}
+	if makeArgRe.MatchString(arg) {
+		if i := strings.IndexByte(arg, '='); i > 0 {
+			key := strings.ToUpper(arg[:i])
+			if key == "SHELL" || key == "MAKEFLAGS" || key == "MAKEFILES" {
+				return fmt.Errorf("make argument %q assigns forbidden variable %s", arg, key)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("make argument %q is invalid", arg)
+}
+
 // buildRunTaskArgv maps kind + target + args to a fixed argv slice (no shell).
 func buildRunTaskArgv(kind, target string, args []string) ([]string, error) {
 	switch kind {
 	case "go_test":
+		if err := validateGoRunTaskInputs(target, args); err != nil {
+			return nil, err
+		}
 		if target == "" {
 			target = "./..."
 		}
 		return append([]string{"go", "test", target}, args...), nil
 	case "go_build":
+		if err := validateGoRunTaskInputs(target, args); err != nil {
+			return nil, err
+		}
 		if target == "" {
 			target = "./..."
 		}
 		return append([]string{"go", "build", target}, args...), nil
 	case "go_vet":
+		if err := validateGoRunTaskInputs(target, args); err != nil {
+			return nil, err
+		}
 		if target == "" {
 			target = "./..."
 		}
@@ -167,6 +210,11 @@ func buildRunTaskArgv(kind, target string, args []string) ([]string, error) {
 				return nil, fmt.Errorf("make target %q is invalid (must match [A-Za-z0-9_.-]+)", target)
 			}
 			out = append(out, target)
+		}
+		for _, arg := range args {
+			if err := validateMakeArg(arg); err != nil {
+				return nil, err
+			}
 		}
 		return append(out, args...), nil
 	case "custom":

@@ -20,12 +20,15 @@ type Document struct {
 	Path      string
 	Content   string
 	IndexedAt time.Time
+	MtimeNS   int64
+	Size      int64
 }
 
 // SearchResult represents a search hit with a highlighted snippet.
 type SearchResult struct {
 	Path    string
 	Snippet string
+	Stale   bool
 }
 
 // Store wraps a SQLite database with FTS5 full-text search.
@@ -92,14 +95,26 @@ func NewStore(dbPath string) (*Store, error) {
 		CREATE TABLE IF NOT EXISTS documents (
 			path       TEXT PRIMARY KEY,
 			content    TEXT,
-			indexed_at INTEGER
+			indexed_at INTEGER,
+			mtime_ns   INTEGER NOT NULL DEFAULT 0,
+			size       INTEGER NOT NULL DEFAULT 0
 		)
 	`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create documents table: %w", err)
 	}
 
-	// Create the FTS5 virtual table with Porter stemmer + unicode61 tokenizer.
+	// Migrate columns for databases created before stale detection.
+	for _, stmt := range []string{
+		`ALTER TABLE documents ADD COLUMN mtime_ns INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE documents ADD COLUMN size INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("migrate documents schema: %w", err)
+		}
+	}
+
 	// path and content are indexed columns; the external content table is 'documents'.
 	if _, err := db.Exec(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
@@ -242,12 +257,27 @@ func (s *Store) Index(path, content string) error {
 	if err := checkSensitiveContent(content); err != nil {
 		return err
 	}
-	_, err := s.db.Exec(
-		`INSERT OR REPLACE INTO documents (path, content, indexed_at) VALUES (?, ?, ?)`,
-		path, content, time.Now().Unix(),
-	)
+	var mtimeNS, size int64
+	if info, statErr := os.Stat(path); statErr == nil {
+		mtimeNS = info.ModTime().UnixNano()
+		size = info.Size()
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
 	if err != nil {
+		return fmt.Errorf("begin index tx: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM documents WHERE path = ?`, path); err != nil {
 		return fmt.Errorf("index document: %w", err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO documents (path, content, indexed_at, mtime_ns, size) VALUES (?, ?, ?, ?, ?)`,
+		path, content, time.Now().Unix(), mtimeNS, size,
+	); err != nil {
+		return fmt.Errorf("index document: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit index: %w", err)
 	}
 	if err := s.secureDBFiles(); err != nil {
 		return err
@@ -269,16 +299,18 @@ func (s *Store) Unindex(path string) error {
 
 // Get retrieves a single document by path. Returns nil if not found.
 func (s *Store) Get(path string) (*Document, error) {
-	row := s.db.QueryRow(`SELECT path, content, indexed_at FROM documents WHERE path = ?`, path)
+	var mtimeNS, size int64
+	row := s.db.QueryRow(`SELECT path, content, indexed_at, mtime_ns, size FROM documents WHERE path = ?`, path)
+
 	var p, c string
 	var ts int64
-	if err := row.Scan(&p, &c, &ts); err != nil {
+	if err := row.Scan(&p, &c, &ts, &mtimeNS, &size); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get document: %w", err)
 	}
-	return &Document{Path: p, Content: c, IndexedAt: time.Unix(ts, 0)}, nil
+	return &Document{Path: p, Content: c, IndexedAt: time.Unix(ts, 0), MtimeNS: mtimeNS, Size: size}, nil
 }
 
 // Search runs a full-text search across both the porter and trigram indices,
@@ -313,7 +345,22 @@ func (s *Store) SearchWithPathPrefix(query, pathPrefix string, limit int) ([]Sea
 		return nil, nil
 	}
 
-	return rrfMerge(porterResults, trigramResults, limit), nil
+	results := rrfMerge(porterResults, trigramResults, limit)
+	for i := range results {
+		var mtimeNS, size int64
+		err := s.db.QueryRow(`SELECT mtime_ns, size FROM documents WHERE path = ?`, results[i].Path).Scan(&mtimeNS, &size)
+		if err == nil {
+			statPath := results[i].Path
+			if marker := strings.Index(statPath, "#chunk-"); marker >= 0 {
+				statPath = statPath[:marker]
+			}
+			if info, statErr := os.Stat(statPath); statErr != nil || info.ModTime().UnixNano() != mtimeNS || info.Size() != size {
+				results[i].Stale = true
+				results[i].Snippet = "[STALE: reindex required] " + results[i].Snippet
+			}
+		}
+	}
+	return results, nil
 }
 
 // searchPorter searches the porter-stemmed FTS5 index.
@@ -822,11 +869,19 @@ func (s *Store) ReplaceExactAndChunks(docPath string, chunks []string) error {
 		return fmt.Errorf("purge chunks: %w", err)
 	}
 
+	// Keep metadata semantics identical to Index. Chunk paths normally do not
+	// exist on disk, so they retain zero mtime/size like a missing path.
+	var mtimeNS, size int64
+	if info, statErr := os.Stat(docPath); statErr == nil {
+		mtimeNS = info.ModTime().UnixNano()
+		size = info.Size()
+	}
+
 	now := time.Now().Unix()
 	if len(chunks) == 1 {
 		if _, err := tx.Exec(
-			`INSERT INTO documents (path, content, indexed_at) VALUES (?, ?, ?)`,
-			docPath, chunks[0], now,
+			`INSERT INTO documents (path, content, indexed_at, mtime_ns, size) VALUES (?, ?, ?, ?, ?)`,
+			docPath, chunks[0], now, mtimeNS, size,
 		); err != nil {
 			return fmt.Errorf("insert doc: %w", err)
 		}
@@ -834,8 +889,8 @@ func (s *Store) ReplaceExactAndChunks(docPath string, chunks []string) error {
 		for i, chunk := range chunks {
 			chunkPath := fmt.Sprintf("%s#chunk-%d", docPath, i)
 			if _, err := tx.Exec(
-				`INSERT INTO documents (path, content, indexed_at) VALUES (?, ?, ?)`,
-				chunkPath, chunk, now,
+				`INSERT INTO documents (path, content, indexed_at, mtime_ns, size) VALUES (?, ?, ?, ?, ?)`,
+				chunkPath, chunk, now, mtimeNS, size,
 			); err != nil {
 				return fmt.Errorf("insert chunk %d: %w", i, err)
 			}

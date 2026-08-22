@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -188,8 +190,7 @@ func (s *server) resolveGitPathspec(cwd, p string) (string, error) {
 	}
 	// Symlink fence when the path (or a parent) exists.
 	if _, err := s.ensureInsideWorkspaces(target); err != nil {
-		// Missing path: still allow if lexical check passed (pathspec may not exist yet).
-		if strings.Contains(strings.ToLower(err.Error()), "outside") {
+		if !errors.Is(err, fs.ErrNotExist) {
 			return "", err
 		}
 	}

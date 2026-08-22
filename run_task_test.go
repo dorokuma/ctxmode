@@ -10,11 +10,11 @@ import (
 )
 
 func TestBuildRunTaskArgv_GoKinds(t *testing.T) {
-	argv, err := buildRunTaskArgv("go_test", "", []string{"-run", "TestFoo", "-count=1"})
+	argv, err := buildRunTaskArgv("go_test", "", []string{"./pkg/..."})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"go", "test", "./...", "-run", "TestFoo", "-count=1"}
+	want := []string{"go", "test", "./...", "./pkg/..."}
 	if strings.Join(argv, " ") != strings.Join(want, " ") {
 		t.Fatalf("got %v want %v", argv, want)
 	}
@@ -33,6 +33,17 @@ func TestBuildRunTaskArgv_GoKinds(t *testing.T) {
 	}
 	if strings.Join(argv, " ") != "go vet ./..." {
 		t.Fatalf("go_vet default: %v", argv)
+	}
+}
+
+func TestBuildRunTaskArgv_GoKindsRejectFlags(t *testing.T) {
+	for _, kind := range []string{"go_test", "go_build", "go_vet"} {
+		if _, err := buildRunTaskArgv(kind, "-run", nil); err == nil {
+			t.Fatalf("%s accepted flag target", kind)
+		}
+		if _, err := buildRunTaskArgv(kind, "./...", []string{"-run"}); err == nil {
+			t.Fatalf("%s accepted flag arg", kind)
+		}
 	}
 }
 
@@ -75,13 +86,23 @@ func TestBuildRunTaskArgv_MakeTargetRejectInjection(t *testing.T) {
 		t.Fatal("expected make target with spaces/&& rejected")
 	}
 
-	argv, err := buildRunTaskArgv("make", "test", []string{"-j4"})
-	if err != nil {
-		t.Fatal(err)
+	_, err = buildRunTaskArgv("make", "", []string{"-f", "x.mk"})
+	if err == nil {
+		t.Fatal("expected -f rejected")
 	}
-	if strings.Join(argv, " ") != "make test -j4" {
-		t.Fatalf("make: %v", argv)
+	_, err = buildRunTaskArgv("make", "", []string{"--file=evil.mk"})
+	if err == nil {
+		t.Fatal("expected --file rejected")
 	}
+	_, err = buildRunTaskArgv("make", "", []string{"-C", "/tmp"})
+	if err == nil {
+		t.Fatal("expected -C rejected")
+	}
+	argv, err := buildRunTaskArgv("make", "", []string{"V=1", "-j4"})
+	if err != nil || strings.Join(argv, " ") != "make V=1 -j4" {
+		t.Fatalf("expected V=1 and -j4 accepted: argv=%v err=%v", argv, err)
+	}
+
 }
 
 func TestBuildRunTaskArgv_CustomEmptyRejected(t *testing.T) {
@@ -113,25 +134,23 @@ func TestToolRunTask_GoTest(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go not available")
 	}
-	// Use this module so `go test` is meaningful.
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := testServerWithWorkdir(t, wd)
-
+	// Use a standard-library package so the subprocess does not recursively run this test binary.
 	res, _, err := s.toolRunTask(context.Background(), nil, runTaskArgs{
 		Kind:      "go_test",
-		Target:    ".",
-		Args:      []string{"-run", "TestNonexistentXYZ123", "-count=1"},
+		Target:    "fmt",
+		Args:      nil,
 		TimeoutMs: 120000,
 	})
 	if err != nil {
 		t.Fatalf("toolRunTask: %v", err)
 	}
 	text := mcpResultText(t, res)
-	// Non-matching -run exits 0 with "no tests to run" OR exit 0 with ok.
-	// Either way we must see structured fields.
+	// Package targets are valid; go flags are intentionally rejected by buildRunTaskArgv.
 	if !strings.Contains(text, "exit_code:") {
 		t.Fatalf("expected exit_code field:\n%s", text)
 	}
@@ -141,7 +160,7 @@ func TestToolRunTask_GoTest(t *testing.T) {
 	if !strings.Contains(text, "argv: go test") {
 		t.Fatalf("expected argv field:\n%s", text)
 	}
-	// go test with no matching tests typically exit 0
+	// The command must report a structured exit code.
 	if !strings.Contains(text, "exit_code: 0") && !strings.Contains(text, "exit_code: 1") {
 		t.Fatalf("unexpected exit reporting:\n%s", text)
 	}

@@ -2140,6 +2140,7 @@ func runCodeOpts(ctx context.Context, language, code, cwd string, timeout time.D
 
 	if _, err := tmpFile.WriteString(wrapped); err != nil {
 		tmpFile.Close()
+		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf("write temp file: %w", err)
 	}
 	tmpFile.Close()

@@ -768,6 +768,22 @@ func TestGlob_GitignoreNegationAndNested(t *testing.T) {
 	}
 }
 
+func TestCtxLs_UnreadableAndCancellation(t *testing.T) {
+	wd := t.TempDir()
+	if err := os.Mkdir(filepath.Join(wd, "private"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(wd, "private"), 0o700) })
+	s := testServerWithWorkdir(t, wd)
+	if _, _, err := s.toolLs(context.Background(), nil, lsArgs{Path: wd}); err != nil {
+		t.Fatalf("unreadable tree must not panic or fail: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := s.toolLs(ctx, nil, lsArgs{Path: wd}); err == nil || !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("expected canceled walk, got %v", err)
+	}
+}
 func TestSensitivePath_EnvDirectory(t *testing.T) {
 	if !isSensitiveFilePath("/proj/.env/production") {
 		t.Fatal(".env/production must be treated as sensitive")
