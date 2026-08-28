@@ -5,6 +5,28 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-08-28
+
+### Added
+- **`ctx_fs` rg git-aware ranking**: search results prioritize modified and untracked files (`git status -uall`) with dirty-file weighting to surface actively edited code first.
+- **`ctx_fs` rg auto-indexing & grouped summary**: searches exceeding match limits or the 200KB capture ceiling automatically index into `ctx_kb` under stable content-hashed labels (`rg:<hash>`), returning a concise per-file match count summary.
+- **`ctx_fs` rg offset paging**: linear pagination via `offset` parameter while preserving ranking baselines across pages.
+- **`ctx_fs` rg rollback switches**: `CTXMODE_RG_SUMMARY` and `CTXMODE_RG_GIT_RANK` environment variables allow disabling auto-indexing fallback and git-aware ranking.
+
+### Changed
+- **`ctx_fs` rg default limit**: default limit reduced from 50 to 20 matches to reduce initial noise and context overhead.
+
+### Fixed
+- **`ctx_fs` rg match parsing & context preservation**: `splitRgMatchLine` scans colon pairs for numeric line numbers to handle file paths containing colons and `#` symbols; `sliceGroupsWithContext` preserves `-C` context lines across fallback paths.
+- **Security audit fixes across tools**:
+  - `run_task`: rejects leading-dash targets/args for Go kinds; restricts `make` arguments against `-f`/`-C`/`SHELL=` overrides.
+  - `ctx_fs` rg: filters sensitive paths across both search engines.
+  - `execute_file`: re-validates opened file descriptors against TOCTOU hardlink swap attacks.
+  - `git` pathspec: fails closed on unexpected `EvalSymlinks` errors.
+  - `store`: records mtime/size at index time, marks stale hits, enforces atomic indexing, and verifies chunk base documents.
+  - `executor`: cleans up leaked temporary files on background execution write failure.
+  - Search flood guard returns tool error; directory walks honor context cancellation; fetch caps timeout at 1h and exhausts safe IP endpoints.
+
 ## [3.1.8] - 2026-08-21
 
 ### Changed

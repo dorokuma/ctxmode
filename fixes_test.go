@@ -642,8 +642,8 @@ func TestValidateURL_AllowsIfAnyIPSafe(t *testing.T) {
 
 func TestVersionAligned(t *testing.T) {
 	// Keep in sync with CHANGELOG release label.
-	if Version != "3.1.8" {
-		t.Fatalf("Version=%q, want 3.1.8 (CHANGELOG)", Version)
+	if Version != "3.2.0" {
+		t.Fatalf("Version=%q, want 3.2.0 (CHANGELOG)", Version)
 	}
 }
 
