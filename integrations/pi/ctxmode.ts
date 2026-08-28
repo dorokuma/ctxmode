@@ -692,7 +692,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
   pi.registerTool({
     name: "ctx_fs",
     label: "CTX FS",
-    description: "工作区文件（沙箱）。action=ls|glob|stat|rg。",
+    description: "工作区文件（沙箱）。action=ls|glob|stat|rg（rg 默认 limit=20，超限自动落库并返回摘要，支持 offset 线性翻页）。",
     promptSnippet: "List, glob, stat, or search files under workdirs",
     promptGuidelines: ["Prefer ctx_fs over shell find/ls/rg when listing or searching workspace files."],
     parameters: Type.Object({
@@ -703,6 +703,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       depth: Type.Optional(Type.Number()),
       include_hidden: Type.Optional(Type.Boolean()),
       limit: Type.Optional(Type.Number()),
+      offset: Type.Optional(Type.Number()),
       ignore_case: Type.Optional(Type.Boolean()),
       context: Type.Optional(Type.Number()),
       literal: Type.Optional(Type.Boolean()),

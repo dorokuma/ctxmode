@@ -87,6 +87,7 @@ type ctxFsArgs struct {
 	Depth         int    `json:"depth,omitempty"`
 	IncludeHidden bool   `json:"include_hidden,omitempty"`
 	Limit         int    `json:"limit,omitempty"`
+	Offset        int    `json:"offset,omitempty"`
 	IgnoreCase    bool   `json:"ignore_case,omitempty"`
 	Context       int    `json:"context,omitempty"`
 	Literal       bool   `json:"literal,omitempty"`
@@ -110,6 +111,7 @@ func (s *server) toolCtxFs(ctx context.Context, req *mcp.CallToolRequest, args c
 		return s.toolRg(ctx, req, rgArgs{
 			Pattern: args.Pattern, Path: args.Path, Glob: args.Glob,
 			IgnoreCase: args.IgnoreCase, Context: args.Context, Limit: args.Limit, Literal: args.Literal,
+			Offset: args.Offset,
 		})
 	case "":
 		return nil, nil, fmt.Errorf("action is required (ls|glob|stat|rg)")
@@ -175,7 +177,7 @@ func (s *server) toolCtxKb(ctx context.Context, req *mcp.CallToolRequest, args c
 	case "index":
 		return s.toolIndex(ctx, req, indexArgs{Path: args.Path})
 	case "search":
-		return s.toolSearch(ctx, req, searchArgs{Query: args.Query})
+		return s.toolSearch(ctx, req, searchArgs{Query: args.Query, Scope: args.Scope})
 	case "fetch":
 		return s.toolFetchAndIndex(ctx, req, fetchArgs{
 			URL: args.URL, URLs: args.URLs, Source: args.Source, Format: args.Format,
@@ -250,7 +252,7 @@ func (s *server) registerCategoryTools(srv *mcp.Server) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctx_fs",
 		Description: "Workspace filesystem (sandboxed). action=ls (list), glob (pattern), " +
-			"stat (metadata), rg (content search). Prefer over ad-hoc shell find/ls/rg when possible.",
+			"stat (metadata), rg (content search; default limit=20; matches > limit auto-indexed to ctx_kb with summary returned; use offset for linear paging). Prefer over ad-hoc shell find/ls/rg when possible.",
 	}, s.toolCtxFs)
 
 	mcp.AddTool(srv, &mcp.Tool{

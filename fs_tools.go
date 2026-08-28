@@ -730,7 +730,8 @@ type rgArgs struct {
 	Glob       string `json:"glob,omitempty" jsonschema:"Optional file glob filter (e.g. *.go)"`
 	IgnoreCase bool   `json:"ignore_case,omitempty" jsonschema:"Case-insensitive match"`
 	Context    int    `json:"context,omitempty" jsonschema:"Lines of context around match (0-5)"`
-	Limit      int    `json:"limit,omitempty" jsonschema:"Max matches (default: 50, hard max: 500)"`
+	Limit      int    `json:"limit,omitempty" jsonschema:"Max matches (default: 20, hard max: 500)"`
+	Offset     int    `json:"offset,omitempty" jsonschema:"Skip the first N matches for linear paging; match lines only, no context. offset+limit <= 500"`
 	Literal    bool   `json:"literal,omitempty" jsonschema:"Treat pattern as literal string"`
 }
 
@@ -818,6 +819,12 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 	if limit > fsRgHardLimit {
 		return nil, nil, fmt.Errorf("invalid limit %d: exceeds maximum %d (valid range: 1-%d, default %d)", limit, fsRgHardLimit, fsRgHardLimit, fsRgDefaultLimit)
 	}
+	if args.Offset < 0 {
+		return nil, nil, fmt.Errorf("invalid offset %d: must be >= 0", args.Offset)
+	}
+	if args.Offset+limit > fsRgHardLimit {
+		return nil, nil, fmt.Errorf("invalid offset+limit %d: exceeds maximum %d (offset=%d, limit=%d, hard max: %d)", args.Offset+limit, fsRgHardLimit, args.Offset, limit, fsRgHardLimit)
+	}
 	contextLines := args.Context
 	if contextLines < 0 {
 		contextLines = 0
@@ -833,24 +840,29 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 
 	dirty, gitStatus := s.gitDirtyFiles(ctx, root)
 
-	fetchLimit := limit
-	fetchBytes := fsRgMaxOutputBytes
+	indexingPossible := s.store != nil && rgSummaryEnabled && args.Offset == 0
+	var fetchLimit, fetchBytes int
+	if indexingPossible {
+		fetchLimit, fetchBytes = fsRgHardLimit, fsRgProcessCaptureBytes
+	} else {
+		fetchLimit, fetchBytes = min(fsRgHardLimit, limit+args.Offset), fsRgMaxOutputBytes
+	}
 
 	var text string
 	var truncated bool
-	var n int
 	engine := "rg"
 
 	// Prefer system rg when available.
 	if rgPath, lookErr := exec.LookPath("rg"); lookErr == nil {
 		var sysErr error
-		text, truncated, n, sysErr = s.rgSystem(ctx, rgPath, root, args, fetchLimit, contextLines, fetchBytes)
+		text, truncated, _, sysErr = s.rgSystem(ctx, rgPath, root, args, fetchLimit, contextLines, fetchBytes)
 		if sysErr != nil {
 			if ee, ok := sysErr.(*exec.ExitError); ok && ee.ExitCode() == 1 {
 				hdr := rgHeader{
 					Engine:    "rg",
 					Matches:   0,
 					Limit:     limit,
+					Offset:    args.Offset,
 					Truncated: false,
 					GitDirty:  0,
 					GitStatus: gitStatus,
@@ -858,11 +870,11 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 				return s.rgRenderResult(hdr, ""), nil, nil
 			}
 			// Other errors: fallback to pure-Go.
-			text, truncated, n, err = s.rgGo(ctx, root, args, fetchLimit, contextLines, fetchBytes)
+			text, truncated, _, err = s.rgGo(ctx, root, args, fetchLimit, contextLines, fetchBytes)
 			engine = "go"
 		}
 	} else {
-		text, truncated, n, err = s.rgGo(ctx, root, args, fetchLimit, contextLines, fetchBytes)
+		text, truncated, _, err = s.rgGo(ctx, root, args, fetchLimit, contextLines, fetchBytes)
 		engine = "go"
 	}
 
@@ -875,7 +887,11 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		lines := strings.Split(text, "\n")
 		groups = groupRgLines(lines)
 		rankGroups(groups, dirty, root)
-		text = renderGroups(groups)
+	}
+
+	totalHits := 0
+	for _, g := range groups {
+		totalHits += g.hits
 	}
 
 	var gitDirtyCount int
@@ -885,16 +901,100 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		}
 	}
 
-	hdr := rgHeader{
-		Engine:    engine,
-		Matches:   n,
-		Files:     len(groups),
-		Limit:     limit,
-		Truncated: truncated,
-		GitDirty:  gitDirtyCount,
-		GitStatus: gitStatus,
+	dedupKey := fmt.Sprintf("%s|%s|%s|%v|%v|%d", root, args.Pattern, args.Glob, args.IgnoreCase, args.Literal, contextLines)
+
+	switch {
+	case args.Offset > 0:
+		slicedText := sliceMatchLines(groups, args.Offset, limit)
+		hdr := rgHeader{
+			Engine:    engine,
+			Matches:   totalHits,
+			Limit:     limit,
+			Offset:    args.Offset,
+			Truncated: args.Offset+limit < totalHits,
+			GitDirty:  gitDirtyCount,
+			GitStatus: gitStatus,
+			Indexed:   s.getRgIndexLabel(dedupKey),
+		}
+		return s.rgRenderResult(hdr, slicedText), nil, nil
+
+	case totalHits <= limit:
+		hdr := rgHeader{
+			Engine:    engine,
+			Matches:   totalHits,
+			Files:     len(groups),
+			Limit:     limit,
+			Truncated: truncated,
+			GitDirty:  gitDirtyCount,
+			GitStatus: gitStatus,
+		}
+		return s.rgRenderResult(hdr, renderGroups(groups)), nil, nil
+
+	case !indexingPossible:
+		// Fallback: old behavior (first limit match lines with truncated=true)
+		slicedText := sliceMatchLines(groups, 0, limit)
+		hdr := rgHeader{
+			Engine:    engine,
+			Matches:   totalHits,
+			Files:     len(groups),
+			Limit:     limit,
+			Truncated: true,
+			GitDirty:  gitDirtyCount,
+			GitStatus: gitStatus,
+		}
+		return s.rgRenderResult(hdr, slicedText), nil, nil
+
+	default:
+		// Exceeds limit: index to ctx_kb and return summary
+		rawText := renderGroups(groups)
+		textToStore := indexHeader(args.Pattern, root, args.Glob, totalHits) + rawText
+		if serr := checkSensitiveContent(textToStore); serr != nil {
+			// Sensitive content fallback: return raw match lines up to limit with note
+			slicedText := sliceMatchLines(groups, 0, limit)
+			hdr := rgHeader{
+				Engine:    engine,
+				Matches:   totalHits,
+				Files:     len(groups),
+				Limit:     limit,
+				Truncated: true,
+				GitDirty:  gitDirtyCount,
+				GitStatus: gitStatus,
+			}
+			return s.rgRenderResult(hdr, fmt.Sprintf("%s\n(sensitive content detected: indexing skipped, returning first %d matches)", slicedText, limit)), nil, nil
+		}
+
+		slug := slugifyRgPattern(args.Pattern, args.Glob)
+		label, reused := s.rgIndexDedup(dedupKey, textToStore, slug)
+		if !reused {
+			if ierr := s.storeIndexLocked(label, textToStore); ierr != nil {
+				// Fallback on index failure
+				slicedText := sliceMatchLines(groups, 0, limit)
+				hdr := rgHeader{
+					Engine:    engine,
+					Matches:   totalHits,
+					Files:     len(groups),
+					Limit:     limit,
+					Truncated: true,
+					GitDirty:  gitDirtyCount,
+					GitStatus: gitStatus,
+				}
+				return s.rgRenderResult(hdr, fmt.Sprintf("%s\n(indexing failed: %v, returning first %d matches)", slicedText, ierr, limit)), nil, nil
+			}
+		}
+
+		summary := renderRgSummary(groups, totalHits, limit, label, args.Pattern, reused)
+		hdr := rgHeader{
+			Engine:    engine,
+			Matches:   totalHits,
+			Files:     len(groups),
+			Limit:     limit,
+			Truncated: false,
+			GitDirty:  gitDirtyCount,
+			GitStatus: gitStatus,
+			Indexed:   label,
+		}
+		return s.rgRenderResult(hdr, summary), nil, nil
 	}
-	return s.rgRenderResult(hdr, text), nil, nil
 }
 
 func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs, fetchLimit, contextLines, fetchCapBytes int) (string, bool, int, error) {
@@ -905,6 +1005,9 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 		"--color", "never",
 		"--hidden",
 		"--glob", "!.git/**",
+		"--glob", "!.git/*",
+		"--glob", "!.git",
+		"--glob", "!**/.git/**",
 		"--glob", "!node_modules/**",
 		"--glob", "!vendor/**",
 		"--glob", "!.env*",
@@ -975,6 +1078,9 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 		}
 		// Match lines look like path:line:content or path-line-content (context).
 		rewritten := s.rewriteRgLine(root, line)
+		if strings.HasPrefix(rewritten, ".git/") || strings.HasPrefix(rewritten, "./.git/") || strings.Contains(rewritten, "/.git/") {
+			continue
+		}
 		// Count real matches (colon form with line number), not context separators.
 		if isRgMatchLine(rewritten) {
 			if matchCount >= fetchLimit {
@@ -999,7 +1105,7 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 
 func isRgMatchLine(line string) bool {
 	// path:123:content — not path-123-content (context) and not "--"
-	if line == "--" {
+	if line == "--" || strings.HasPrefix(line, "#") {
 		return false
 	}
 	// Find first :digits:
@@ -1039,10 +1145,10 @@ func (s *server) rewriteRgLine(root, line string) string {
 			}
 			// If rest starts with : or - keep; if with path sep already trimmed.
 			if len(rest) > 0 && rest[0] != ':' && rest[0] != '-' {
-				return displayRoot + "/" + rest
+				return rest
 			}
 			// root file itself: ".:n:..." doesn't make sense; use basename path
-			return s.displayPath(root) + rest
+			return filepath.Base(root) + rest
 		}
 		return displayRoot + rest
 	}

@@ -140,6 +140,10 @@ func TestGitDirtyFiles_TTLCacheAndNegativeCache(t *testing.T) {
 
 // 4. TestGitDirtyFiles_NonGitDir
 func TestGitDirtyFiles_NonGitDir(t *testing.T) {
+	orig := rgGitRankEnabled
+	rgGitRankEnabled = true
+	defer func() { rgGitRankEnabled = orig }()
+
 	tempDir := t.TempDir()
 	s := &server{
 		workdirs:      []string{tempDir},
@@ -187,6 +191,10 @@ func TestRankGroups_DirtyFirstStable(t *testing.T) {
 
 // 6. TestGitRank_Integration
 func TestGitRank_Integration(t *testing.T) {
+	orig := rgGitRankEnabled
+	rgGitRankEnabled = true
+	defer func() { rgGitRankEnabled = orig }()
+
 	repoDir := t.TempDir()
 	initTestRepo(t, repoDir)
 	s := &server{

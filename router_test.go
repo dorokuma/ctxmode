@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCtxRunUnknownAction(t *testing.T) {
@@ -128,5 +130,45 @@ func TestCtxRunDescriptionListsAllRunTaskKinds(t *testing.T) {
 	// Removed v1 tool names must not be advertised.
 	if strings.Contains(ctxRunDescription, "ctx_search") || strings.Contains(ctxRunDescription, "ctx_batch_execute") {
 		t.Fatalf("ctx_run description references removed tool names: %s", ctxRunDescription)
+	}
+}
+
+func TestCtxFsOffsetPassThrough(t *testing.T) {
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}}
+	mustWrite(t, filepath.Join(wd, "test.txt"), "hello world\n")
+	res, _, err := s.toolCtxFs(context.Background(), nil, ctxFsArgs{
+		Action:  "rg",
+		Pattern: "hello",
+		Path:    wd,
+		Offset:  1,
+	})
+	if err != nil {
+		t.Fatalf("toolCtxFs failed: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "offset=1") {
+		t.Errorf("expected offset=1 in output: %s", text)
+	}
+}
+
+func TestCtxKbScopePassThrough(t *testing.T) {
+	st := newTestStore(t)
+	fg := NewFloodGuard(60*time.Second, 64)
+	sp := NewSearchPipeline(st, fg)
+	s := &server{
+		sessionID:      "sess1",
+		store:          st,
+		floodGuard:     fg,
+		searchPipeline: sp,
+	}
+
+	_, _, err := s.toolCtxKb(context.Background(), nil, ctxKbArgs{
+		Action: "search",
+		Query:  "some_query",
+		Scope:  "invalid_scope",
+	})
+	if err == nil {
+		t.Fatal("expected invalid scope to be rejected via router")
 	}
 }

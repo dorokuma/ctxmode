@@ -161,6 +161,12 @@ func (sp *SearchPipeline) SearchBatchScoped(query string, limit int) ([]SearchRe
 	return sp.SearchPrefixScoped(query, "batch:", limit)
 }
 
+// SearchRgScoped searches only documents under rgSessionPrefix and
+// does NOT consume flood-guard quota.
+func (sp *SearchPipeline) SearchRgScoped(query, rgSessionPrefix string, limit int) ([]SearchResult, *SearchMeta, error) {
+	return sp.SearchPrefixScoped(query, rgSessionPrefix, limit)
+}
+
 // SearchPrefixScoped searches documents under pathPrefix and skips the flood guard.
 func (sp *SearchPipeline) SearchPrefixScoped(query, pathPrefix string, limit int) ([]SearchResult, *SearchMeta, error) {
 	return sp.search(query, pathPrefix, limit, false)

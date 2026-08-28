@@ -66,6 +66,8 @@ type server struct {
 	gitDirtyCache        map[string]gitDirtyEntry
 	gitStatusClock       func() time.Time
 	gitDirtyRunner       func(ctx context.Context, cwd string, args ...string) (string, error)
+	rgIndexMu            sync.Mutex
+	rgIndexDedupMap      map[string]rgIndexEntry
 }
 
 func fatal(s *Store, format string, args ...any) {
@@ -160,6 +162,7 @@ func main() {
 		searchPipeline: searchPipeline,
 		httpClient:     newHTTPClient(),
 		gitDirtyCache:  make(map[string]gitDirtyEntry),
+		rgIndexDedupMap: make(map[string]rgIndexEntry),
 	}
 	if err := s.migrateFromJSON(); err != nil {
 		fatal(store, "failed to migrate database: %v", err)
@@ -640,6 +643,7 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 
 type searchArgs struct {
 	Query string `json:"query" jsonschema:"search terms or pattern"`
+	Scope string `json:"scope,omitempty" jsonschema:"optional scope filter (rg)"`
 }
 
 func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, any, error) {
@@ -648,7 +652,21 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		return nil, nil, fmt.Errorf("query is required")
 	}
 
-	results, meta, err := s.searchPipeline.Search(q, 20)
+	scope := strings.TrimSpace(args.Scope)
+	if scope != "" && scope != "rg" {
+		return nil, nil, fmt.Errorf("invalid scope %q: valid scopes are \"\" or \"rg\"", scope)
+	}
+
+	var results []SearchResult
+	var meta *SearchMeta
+	var err error
+
+	if scope == "rg" {
+		results, meta, err = s.searchPipeline.SearchRgScoped(q, s.rgIndexPrefix(), 20)
+	} else {
+		results, meta, err = s.searchPipeline.Search(q, 20)
+	}
+
 	if err != nil {
 		// If blocked by flood guard, return a friendly message.
 		if meta != nil && meta.FloodStatus == "blocked" {
@@ -1424,6 +1442,13 @@ func (s *server) batchRunPrefix(runID string) string {
 		return "session:" + s.sessionID + ":" + p
 	}
 	return p
+}
+
+func (s *server) rgIndexPrefix() string {
+	if s != nil && s.sessionID != "" {
+		return "session:" + s.sessionID + ":rg:"
+	}
+	return "session:rg:"
 }
 
 func formatLargeIndexed(exitCode, n int, label, outputText string, indexErr error) string {
