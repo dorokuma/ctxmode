@@ -111,7 +111,7 @@ func (s *server) gitDirtyFiles(ctx context.Context, root string) (map[string]str
 		return fail()
 	}
 
-	out, err := run(gctx, cleanRoot, "status", "--porcelain=v1", "-z")
+	out, err := run(gctx, cleanRoot, "status", "--porcelain=v1", "-uall", "-z")
 	if err != nil {
 		return fail()
 	}

@@ -1448,7 +1448,7 @@ func (s *server) rgIndexPrefix() string {
 	if s != nil && s.sessionID != "" {
 		return "session:" + s.sessionID + ":rg:"
 	}
-	return "session:rg:"
+	return "rg:"
 }
 
 func formatLargeIndexed(exitCode, n int, label, outputText string, indexErr error) string {

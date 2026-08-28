@@ -747,23 +747,36 @@ type rgHeader struct {
 	Indexed   string
 }
 
+func defaultRgLimit() int {
+	if rgSummaryEnabled {
+		return fsRgDefaultLimit
+	}
+	return 50
+}
+
 func formatRgHeader(hdr rgHeader) string {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("engine=%s", hdr.Engine))
 	parts = append(parts, fmt.Sprintf("matches=%d", hdr.Matches))
-	if hdr.Files > 0 {
-		parts = append(parts, fmt.Sprintf("files=%d", hdr.Files))
-	}
-	if hdr.Limit > 0 {
-		parts = append(parts, fmt.Sprintf("limit=%d", hdr.Limit))
-	}
-	if hdr.Offset > 0 {
-		parts = append(parts, fmt.Sprintf("offset=%d", hdr.Offset))
-	}
-	if hdr.Truncated {
-		parts = append(parts, "truncated=true")
+	if rgSummaryEnabled {
+		if hdr.Files > 0 {
+			parts = append(parts, fmt.Sprintf("files=%d", hdr.Files))
+		}
+		if hdr.Limit > 0 {
+			parts = append(parts, fmt.Sprintf("limit=%d", hdr.Limit))
+		}
+		if hdr.Offset > 0 {
+			parts = append(parts, fmt.Sprintf("offset=%d", hdr.Offset))
+		}
+		if hdr.Truncated {
+			parts = append(parts, "truncated=true")
+		} else {
+			parts = append(parts, "truncated=false")
+		}
 	} else {
-		parts = append(parts, "truncated=false")
+		if hdr.Truncated {
+			parts = append(parts, "truncated=true")
+		}
 	}
 	if rgGitRankEnabled {
 		if hdr.GitStatus == "none" {
@@ -814,10 +827,10 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 	}
 	limit := args.Limit
 	if limit <= 0 {
-		limit = fsRgDefaultLimit
+		limit = defaultRgLimit()
 	}
 	if limit > fsRgHardLimit {
-		return nil, nil, fmt.Errorf("invalid limit %d: exceeds maximum %d (valid range: 1-%d, default %d)", limit, fsRgHardLimit, fsRgHardLimit, fsRgDefaultLimit)
+		return nil, nil, fmt.Errorf("invalid limit %d: exceeds maximum %d (valid range: 1-%d, default %d)", limit, fsRgHardLimit, fsRgHardLimit, defaultRgLimit())
 	}
 	if args.Offset < 0 {
 		return nil, nil, fmt.Errorf("invalid offset %d: must be >= 0", args.Offset)
@@ -842,10 +855,10 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 
 	indexingPossible := s.store != nil && rgSummaryEnabled && args.Offset == 0
 	var fetchLimit, fetchBytes int
-	if indexingPossible {
-		fetchLimit, fetchBytes = fsRgHardLimit, fsRgProcessCaptureBytes
-	} else {
+	if !rgSummaryEnabled {
 		fetchLimit, fetchBytes = min(fsRgHardLimit, limit+args.Offset), fsRgMaxOutputBytes
+	} else {
+		fetchLimit, fetchBytes = fsRgHardLimit, fsRgProcessCaptureBytes
 	}
 
 	var text string
@@ -893,6 +906,14 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 	for _, g := range groups {
 		totalHits += g.hits
 	}
+	truncated = truncated || (totalHits >= fetchLimit)
+
+	var validGroups []rgFileGroup
+	for _, g := range groups {
+		if g.hits > 0 {
+			validGroups = append(validGroups, g)
+		}
+	}
 
 	var gitDirtyCount int
 	for _, g := range groups {
@@ -909,9 +930,10 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		hdr := rgHeader{
 			Engine:    engine,
 			Matches:   totalHits,
+			Files:     len(validGroups),
 			Limit:     limit,
 			Offset:    args.Offset,
-			Truncated: args.Offset+limit < totalHits,
+			Truncated: args.Offset+limit < totalHits || truncated,
 			GitDirty:  gitDirtyCount,
 			GitStatus: gitStatus,
 			Indexed:   s.getRgIndexLabel(dedupKey),
@@ -922,7 +944,7 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		hdr := rgHeader{
 			Engine:    engine,
 			Matches:   totalHits,
-			Files:     len(groups),
+			Files:     len(validGroups),
 			Limit:     limit,
 			Truncated: truncated,
 			GitDirty:  gitDirtyCount,
@@ -931,12 +953,12 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		return s.rgRenderResult(hdr, renderGroups(groups)), nil, nil
 
 	case !indexingPossible:
-		// Fallback: old behavior (first limit match lines with truncated=true)
-		slicedText := sliceMatchLines(groups, 0, limit)
+		// Fallback: old behavior (first limit match lines with context preserved and truncated=true)
+		slicedText := sliceGroupsWithContext(groups, limit)
 		hdr := rgHeader{
 			Engine:    engine,
 			Matches:   totalHits,
-			Files:     len(groups),
+			Files:     len(validGroups),
 			Limit:     limit,
 			Truncated: true,
 			GitDirty:  gitDirtyCount,
@@ -949,12 +971,12 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		rawText := renderGroups(groups)
 		textToStore := indexHeader(args.Pattern, root, args.Glob, totalHits) + rawText
 		if serr := checkSensitiveContent(textToStore); serr != nil {
-			// Sensitive content fallback: return raw match lines up to limit with note
-			slicedText := sliceMatchLines(groups, 0, limit)
+			// Sensitive content fallback: return raw match lines up to limit with context preserved
+			slicedText := sliceGroupsWithContext(groups, limit)
 			hdr := rgHeader{
 				Engine:    engine,
 				Matches:   totalHits,
-				Files:     len(groups),
+				Files:     len(validGroups),
 				Limit:     limit,
 				Truncated: true,
 				GitDirty:  gitDirtyCount,
@@ -967,12 +989,12 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		label, reused := s.rgIndexDedup(dedupKey, textToStore, slug)
 		if !reused {
 			if ierr := s.storeIndexLocked(label, textToStore); ierr != nil {
-				// Fallback on index failure
-				slicedText := sliceMatchLines(groups, 0, limit)
+				// Fallback on index failure: return raw match lines with context preserved
+				slicedText := sliceGroupsWithContext(groups, limit)
 				hdr := rgHeader{
 					Engine:    engine,
 					Matches:   totalHits,
-					Files:     len(groups),
+					Files:     len(validGroups),
 					Limit:     limit,
 					Truncated: true,
 					GitDirty:  gitDirtyCount,
@@ -982,13 +1004,13 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 			}
 		}
 
-		summary := renderRgSummary(groups, totalHits, limit, label, args.Pattern, reused)
+		summary := renderRgSummary(groups, totalHits, limit, label, args.Pattern, reused, truncated)
 		hdr := rgHeader{
 			Engine:    engine,
 			Matches:   totalHits,
-			Files:     len(groups),
+			Files:     len(validGroups),
 			Limit:     limit,
-			Truncated: false,
+			Truncated: truncated,
 			GitDirty:  gitDirtyCount,
 			GitStatus: gitStatus,
 			Indexed:   label,
@@ -1001,6 +1023,7 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 	cmdArgs := []string{
 		"--no-config",
 		"--no-heading",
+		"--with-filename",
 		"--line-number",
 		"--color", "never",
 		"--hidden",
@@ -1047,7 +1070,7 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 	// Strip sensitive inherited variables (same default as the execute path).
 	cmd.Env = flattenEnv(childEnv(nil))
 	var stdout limitedBuffer
-	stdout.limit = fsRgProcessCaptureBytes
+	stdout.limit = fetchCapBytes
 	var stderr limitedBuffer
 	stderr.limit = 64 * 1024
 	cmd.Stdout = &stdout
@@ -1069,9 +1092,14 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 
 	// Rewrite absolute paths to display paths and count matches.
 	lines := strings.Split(stdout.String(), "\n")
+	truncated := stdout.truncated
+	if stdout.truncated && !strings.HasSuffix(stdout.String(), "\n") && len(lines) > 0 {
+		// Discard incomplete trailing half-line
+		lines = lines[:len(lines)-1]
+	}
+
 	var b strings.Builder
 	matchCount := 0
-	truncated := stdout.truncated
 	for _, line := range lines {
 		if line == "" {
 			continue
@@ -1096,38 +1124,15 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 		b.WriteString(rewritten)
 		b.WriteByte('\n')
 	}
-	// rg -m may stop early; if we got exactly limit matches, note truncated possibility.
-	if matchCount >= fetchLimit {
+	if matchCount >= fetchLimit || stdout.truncated {
 		truncated = true
 	}
 	return strings.TrimRight(b.String(), "\n"), truncated, matchCount, nil
 }
 
 func isRgMatchLine(line string) bool {
-	// path:123:content — not path-123-content (context) and not "--"
-	if line == "--" || strings.HasPrefix(line, "#") {
-		return false
-	}
-	// Find first :digits:
-	i := strings.IndexByte(line, ':')
-	if i < 0 {
-		return false
-	}
-	rest := line[i+1:]
-	j := strings.IndexByte(rest, ':')
-	if j < 0 {
-		return false
-	}
-	num := rest[:j]
-	if num == "" {
-		return false
-	}
-	for _, c := range num {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
+	_, _, ok := splitRgMatchLine(line)
+	return ok
 }
 
 func (s *server) rewriteRgLine(root, line string) string {

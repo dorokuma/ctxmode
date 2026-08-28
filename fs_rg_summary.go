@@ -31,6 +31,46 @@ func fnv64a(s string) uint64 {
 	return h
 }
 
+func isAllDigits(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// splitRgMatchLine parses a line to determine if it is a match line of the form path:lineNum:content.
+// It scans pairs of colons from left to right to find the first non-empty, all-digit segment between two colons.
+// Known limitation: filenames containing an all-digit segment between colons (e.g. foo:12:bar.txt:1:...) may be ambiguous.
+func splitRgMatchLine(line string) (path string, lineNum string, ok bool) {
+	if line == "--" ||
+		strings.HasPrefix(line, "# rg ") ||
+		strings.HasPrefix(line, "# pattern=") ||
+		strings.HasPrefix(line, "# indexed for ") {
+		return "", "", false
+	}
+	c1 := -1
+	for {
+		nextC := strings.IndexByte(line[c1+1:], ':')
+		if nextC < 0 {
+			break
+		}
+		c := c1 + 1 + nextC
+		if c1 >= 0 {
+			seg := line[c1+1 : c]
+			if isAllDigits(seg) {
+				return line[:c1], seg, true
+			}
+		}
+		c1 = c
+	}
+	return "", "", false
+}
+
 func slugifyRgPattern(pat, glob string) string {
 	raw := pat
 	if glob != "" {
@@ -51,7 +91,18 @@ func slugifyRgPattern(pat, glob string) string {
 	return strings.Trim(res, "_")
 }
 
-func (s *server) rgIndexDedup(key, text, intent string) (label string, reused bool) {
+// rgStableIndexLabel generates a deterministic label based on session, slug, and the FNV-64a hash of the stored text.
+// Format: session:<sid>:rg:<slug>:<hash16hex> (or rg:<slug>:<hash16hex> when sessionID is empty).
+// FNV-64a produces a 64-bit hash (collision probability ~ 1/(2^32) for ~5 billion items by birthday paradox, virtually zero within a single session).
+func (s *server) rgStableIndexLabel(slug string, hash uint64) string {
+	prefix := s.rgIndexPrefix()
+	if slug != "" {
+		return fmt.Sprintf("%s%s:%016x", prefix, slug, hash)
+	}
+	return fmt.Sprintf("%s%016x", prefix, hash)
+}
+
+func (s *server) rgIndexDedup(key, text, slug string) (label string, reused bool) {
 	s.rgIndexMu.Lock()
 	defer s.rgIndexMu.Unlock()
 
@@ -87,7 +138,7 @@ func (s *server) rgIndexDedup(key, text, intent string) (label string, reused bo
 		}
 	}
 
-	label = s.indexLabel("rg", intent)
+	label = s.rgStableIndexLabel(slug, h)
 	s.rgIndexDedupMap[key] = rgIndexEntry{
 		label:     label,
 		hash:      h,
@@ -114,11 +165,9 @@ func groupRgLines(lines []string) []rgFileGroup {
 		if line == "" {
 			continue
 		}
-		if isRgMatchLine(line) {
-			colonIdx := strings.IndexByte(line, ':')
-			filePath := line[:colonIdx]
-			if len(groups) == 0 || groups[len(groups)-1].file != filePath {
-				groups = append(groups, rgFileGroup{file: filePath})
+		if path, _, ok := splitRgMatchLine(line); ok {
+			if len(groups) == 0 || groups[len(groups)-1].file != path {
+				groups = append(groups, rgFileGroup{file: path})
 			}
 			last := &groups[len(groups)-1]
 			last.lines = append(last.lines, line)
@@ -161,6 +210,47 @@ func renderGroups(groups []rgFileGroup) string {
 	return b.String()
 }
 
+func sliceGroupsWithContext(groups []rgFileGroup, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	var resLines []string
+	remainingLimit := limit
+	for _, g := range groups {
+		if remainingLimit <= 0 {
+			break
+		}
+		if g.hits == 0 {
+			continue
+		}
+		if g.hits <= remainingLimit {
+			resLines = append(resLines, g.lines...)
+			remainingLimit -= g.hits
+		} else {
+			hitCount := 0
+			for _, line := range g.lines {
+				if isRgMatchLine(line) {
+					hitCount++
+					if hitCount > remainingLimit {
+						break
+					}
+					resLines = append(resLines, line)
+				} else {
+					if hitCount == remainingLimit && line == "--" {
+						break
+					}
+					if hitCount <= remainingLimit {
+						resLines = append(resLines, line)
+					}
+				}
+			}
+			remainingLimit = 0
+			break
+		}
+	}
+	return strings.Join(resLines, "\n")
+}
+
 func sliceMatchLines(groups []rgFileGroup, offset, limit int) string {
 	var matchLines []string
 	for _, g := range groups {
@@ -185,20 +275,30 @@ func indexHeader(pattern, root, glob string, totalHits int) string {
 	return fmt.Sprintf("# rg pattern=%q root=%q glob=%q matches=%d timestamp=%s\n# indexed for ctx_fs action=rg\n---\n", pattern, root, glob, totalHits, ts)
 }
 
-func renderRgSummary(groups []rgFileGroup, totalHits, limit int, label, pattern string, reused bool) string {
+func renderRgSummary(groups []rgFileGroup, totalHits, limit int, label, pattern string, reused, truncated bool) string {
 	var b strings.Builder
 
 	indexedTag := "full set indexed"
-	if reused {
+	if truncated {
+		indexedTag = "capture truncated at 200KB / 500-match cap"
+		if reused {
+			indexedTag = "capture truncated at 200KB / 500-match cap (reused)"
+		}
+	} else if reused {
 		indexedTag = "full set indexed (reused)"
 	}
 
+	var summaryGroups []rgFileGroup
+	for _, g := range groups {
+		if g.hits > 0 {
+			summaryGroups = append(summaryGroups, g)
+		}
+	}
+
 	fmt.Fprintf(&b, "%d matches in %d files (%s, > first-screen limit %d). Retrieve details: ctx_kb action=search query=%q scope=rg or page raw lines: ctx_fs action=rg pattern=%q offset=%d\n",
-		totalHits, len(groups), indexedTag, limit, label, pattern, limit)
+		totalHits, len(summaryGroups), indexedTag, limit, label, pattern, limit)
 	b.WriteString("Files (* = git modified/staged/untracked, then by match count):\n")
 
-	summaryGroups := make([]rgFileGroup, len(groups))
-	copy(summaryGroups, groups)
 	sort.SliceStable(summaryGroups, func(i, j int) bool {
 		if summaryGroups[i].dirty != summaryGroups[j].dirty {
 			return summaryGroups[i].dirty
@@ -229,20 +329,16 @@ func renderRgSummary(groups []rgFileGroup, totalHits, limit int, label, pattern 
 
 		var matchPreviews []string
 		for _, line := range g.lines {
-			if isRgMatchLine(line) {
-				colon1 := strings.IndexByte(line, ':')
-				if colon1 >= 0 {
-					rest := line[colon1+1:]
-					colon2 := strings.IndexByte(rest, ':')
-					if colon2 >= 0 {
-						lineNo := rest[:colon2]
-						content := rest[colon2+1:]
-						matchPreviews = append(matchPreviews, fmt.Sprintf("  %s: %s", lineNo, strings.TrimLeft(content, " \t")))
-					}
+			if path, lineNo, ok := splitRgMatchLine(line); ok {
+				prefixLen := len(path) + 1 + len(lineNo) + 1
+				content := ""
+				if len(line) >= prefixLen {
+					content = line[prefixLen:]
 				}
-			}
-			if len(matchPreviews) == 2 {
-				break
+				matchPreviews = append(matchPreviews, fmt.Sprintf("  %s: %s", lineNo, strings.TrimLeft(content, " \t")))
+				if len(matchPreviews) == 2 {
+					break
+				}
 			}
 		}
 
