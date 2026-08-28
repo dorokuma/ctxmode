@@ -344,6 +344,10 @@ func (s *server) runGit(ctx context.Context, cwd string, args ...string) (string
 		return "", err
 	}
 
+	return s.runGitIn(ctx, cwd, args...)
+}
+
+func (s *server) runGitIn(ctx context.Context, cwd string, args ...string) (string, error) {
 	gctx, cancel := context.WithTimeout(ctx, gitTimeout)
 	defer cancel()
 
@@ -372,7 +376,10 @@ func (s *server) runGit(ctx context.Context, cwd string, args ...string) (string
 		if isNotGitRepoMessage(msg) {
 			return "", fmt.Errorf("not a git repository (cwd=%s): %s", cwd, msg)
 		}
-		return "", fmt.Errorf("git %s failed: %s", args[0], msg)
+		if len(args) > 0 {
+			return "", fmt.Errorf("git %s failed: %s", args[0], msg)
+		}
+		return "", fmt.Errorf("git failed: %s", msg)
 	}
 	return stdout.String(), nil
 }

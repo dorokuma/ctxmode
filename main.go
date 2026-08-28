@@ -62,6 +62,10 @@ type server struct {
 	totalInput           int64
 	totalOutput          int64
 	sensitiveInodesScans atomic.Int64
+	gitDirtyMu           sync.Mutex
+	gitDirtyCache        map[string]gitDirtyEntry
+	gitStatusClock       func() time.Time
+	gitDirtyRunner       func(ctx context.Context, cwd string, args ...string) (string, error)
 }
 
 func fatal(s *Store, format string, args ...any) {
@@ -155,6 +159,7 @@ func main() {
 		floodGuard:     floodGuard,
 		searchPipeline: searchPipeline,
 		httpClient:     newHTTPClient(),
+		gitDirtyCache:  make(map[string]gitDirtyEntry),
 	}
 	if err := s.migrateFromJSON(); err != nil {
 		fatal(store, "failed to migrate database: %v", err)

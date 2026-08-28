@@ -734,6 +734,75 @@ type rgArgs struct {
 	Literal    bool   `json:"literal,omitempty" jsonschema:"Treat pattern as literal string"`
 }
 
+type rgHeader struct {
+	Engine    string
+	Matches   int
+	Files     int
+	Limit     int
+	Offset    int
+	Truncated bool
+	GitDirty  int
+	GitStatus string
+	Indexed   string
+}
+
+func formatRgHeader(hdr rgHeader) string {
+	var parts []string
+	parts = append(parts, fmt.Sprintf("engine=%s", hdr.Engine))
+	parts = append(parts, fmt.Sprintf("matches=%d", hdr.Matches))
+	if hdr.Files > 0 {
+		parts = append(parts, fmt.Sprintf("files=%d", hdr.Files))
+	}
+	if hdr.Limit > 0 {
+		parts = append(parts, fmt.Sprintf("limit=%d", hdr.Limit))
+	}
+	if hdr.Offset > 0 {
+		parts = append(parts, fmt.Sprintf("offset=%d", hdr.Offset))
+	}
+	if hdr.Truncated {
+		parts = append(parts, "truncated=true")
+	} else {
+		parts = append(parts, "truncated=false")
+	}
+	if rgGitRankEnabled {
+		if hdr.GitStatus == "none" {
+			parts = append(parts, "git=none")
+		} else if hdr.GitStatus == "ok" {
+			parts = append(parts, fmt.Sprintf("git_dirty=%d", hdr.GitDirty))
+		}
+	}
+	if hdr.Indexed != "" {
+		parts = append(parts, fmt.Sprintf("indexed=%s", hdr.Indexed))
+	}
+	return strings.Join(parts, " ")
+}
+
+func (s *server) rgRenderResult(hdr rgHeader, text string) *mcp.CallToolResult {
+	if text == "" {
+		header := formatRgHeader(hdr)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: header + "\n(no matches)"}},
+		}
+	}
+	// Cap total response size.
+	if len(text) > fsRgMaxOutputBytes {
+		text = truncateUTF8(text, fsRgMaxOutputBytes) + "\n... (output truncated at 100KB)"
+		hdr.Truncated = true
+	}
+	header := formatRgHeader(hdr)
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: header + "\n" + text}},
+	}
+}
+
+func (s *server) rgResult(text string, count int, truncated bool, engine string) *mcp.CallToolResult {
+	return s.rgRenderResult(rgHeader{
+		Engine:    engine,
+		Matches:   count,
+		Truncated: truncated,
+	}, text)
+}
+
 func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs) (*mcp.CallToolResult, any, error) {
 	if args.Pattern == "" {
 		return nil, nil, fmt.Errorf("pattern is required")
@@ -762,59 +831,70 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		return nil, nil, err
 	}
 
+	dirty, gitStatus := s.gitDirtyFiles(ctx, root)
+
 	fetchLimit := limit
 	fetchBytes := fsRgMaxOutputBytes
 
+	var text string
+	var truncated bool
+	var n int
+	engine := "rg"
+
 	// Prefer system rg when available.
 	if rgPath, lookErr := exec.LookPath("rg"); lookErr == nil {
-		text, truncated, n, err := s.rgSystem(ctx, rgPath, root, args, fetchLimit, contextLines, fetchBytes)
-		if err == nil {
-			if text != "" {
-				lines := strings.Split(text, "\n")
-				groups := groupRgLines(lines)
-				text = renderGroups(groups)
+		var sysErr error
+		text, truncated, n, sysErr = s.rgSystem(ctx, rgPath, root, args, fetchLimit, contextLines, fetchBytes)
+		if sysErr != nil {
+			if ee, ok := sysErr.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+				hdr := rgHeader{
+					Engine:    "rg",
+					Matches:   0,
+					Limit:     limit,
+					Truncated: false,
+					GitDirty:  0,
+					GitStatus: gitStatus,
+				}
+				return s.rgRenderResult(hdr, ""), nil, nil
 			}
-			return s.rgResult(text, n, truncated, "rg"), nil, nil
+			// Other errors: fallback to pure-Go.
+			text, truncated, n, err = s.rgGo(ctx, root, args, fetchLimit, contextLines, fetchBytes)
+			engine = "go"
 		}
-		// Fall through to pure-Go on unexpected failure (e.g. bad flags).
-		// If rg exits 1 (no matches) that is success with empty output.
-		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
-			return s.rgResult("", 0, false, "rg"), nil, nil
-		}
-		// Other errors: try Go fallback.
+	} else {
+		text, truncated, n, err = s.rgGo(ctx, root, args, fetchLimit, contextLines, fetchBytes)
+		engine = "go"
 	}
 
-	text, truncated, n, err := s.rgGo(ctx, root, args, fetchLimit, contextLines, fetchBytes)
 	if err != nil {
 		return nil, nil, err
 	}
+
+	var groups []rgFileGroup
 	if text != "" {
 		lines := strings.Split(text, "\n")
-		groups := groupRgLines(lines)
+		groups = groupRgLines(lines)
+		rankGroups(groups, dirty, root)
 		text = renderGroups(groups)
 	}
-	return s.rgResult(text, n, truncated, "go"), nil, nil
-}
 
-func (s *server) rgResult(text string, count int, truncated bool, engine string) *mcp.CallToolResult {
-	header := fmt.Sprintf("engine=%s matches=%d", engine, count)
-	if truncated {
-		header += " truncated=true"
-	}
-	if text == "" {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: header + "\n(no matches)"}},
+	var gitDirtyCount int
+	for _, g := range groups {
+		if g.dirty {
+			gitDirtyCount++
 		}
 	}
-	// Cap total response size.
-	if len(text) > fsRgMaxOutputBytes {
-		text = truncateUTF8(text, fsRgMaxOutputBytes) + "\n... (output truncated at 100KB)"
-		truncated = true
-		header = fmt.Sprintf("engine=%s matches=%d truncated=true", engine, count)
+
+	hdr := rgHeader{
+		Engine:    engine,
+		Matches:   n,
+		Files:     len(groups),
+		Limit:     limit,
+		Truncated: truncated,
+		GitDirty:  gitDirtyCount,
+		GitStatus: gitStatus,
 	}
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: header + "\n" + text}},
-	}
+	return s.rgRenderResult(hdr, text), nil, nil
 }
 
 func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs, fetchLimit, contextLines, fetchCapBytes int) (string, bool, int, error) {
