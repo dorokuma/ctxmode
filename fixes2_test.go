@@ -240,7 +240,7 @@ func TestRgGo_LongLineSearchable(t *testing.T) {
 	long := strings.Repeat("x", 1500*1024) + "LONG_LINE_TOKEN_XYZ"
 	mustWrite(t, filepath.Join(wd, "longline.txt"), long)
 
-	text, truncated, n, err := s.rgGo(context.Background(), wd, rgArgs{Pattern: "LONG_LINE_TOKEN_XYZ", Limit: 50}, 50, 0)
+	text, truncated, n, err := s.rgGo(context.Background(), wd, rgArgs{Pattern: "LONG_LINE_TOKEN_XYZ", Limit: 50}, 50, 0, fsRgMaxOutputBytes)
 	if err != nil {
 		t.Fatalf("rg over a long line must not fail the whole search: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestRgGo_LongLineSearchable(t *testing.T) {
 
 	// Short-line matches are unaffected: other files are still searched.
 	mustWrite(t, filepath.Join(wd, "other.txt"), "NORMAL_RG_TOKEN\n")
-	text2, truncated2, n2, err := s.rgGo(context.Background(), wd, rgArgs{Pattern: "NORMAL_RG_TOKEN", Limit: 50}, 50, 0)
+	text2, truncated2, n2, err := s.rgGo(context.Background(), wd, rgArgs{Pattern: "NORMAL_RG_TOKEN", Limit: 50}, 50, 0, fsRgMaxOutputBytes)
 	if err != nil || n2 != 1 || !strings.Contains(text2, "NORMAL_RG_TOKEN") {
 		t.Fatalf("other files must still be searched: err=%v n=%d text=%q", err, n2, text2)
 	}
@@ -287,7 +287,7 @@ func TestRgGo_OversizedLineSkippedNotFatal(t *testing.T) {
 	mustWrite(t, filepath.Join(wd, "buried.txt"), strings.Repeat("q", 100*1024)+"BURIED_RG_TOKEN\n")
 	mustWrite(t, filepath.Join(wd, "normal.txt"), "VISIBLE_RG_TOKEN\n")
 
-	text, truncated, n, err := s.rgGo(context.Background(), wd, rgArgs{Pattern: "RG_TOKEN", Limit: 50}, 50, 0)
+	text, truncated, n, err := s.rgGo(context.Background(), wd, rgArgs{Pattern: "RG_TOKEN", Limit: 50}, 50, 0, fsRgMaxOutputBytes)
 	if err != nil {
 		t.Fatalf("oversized line must not fail the search: %v", err)
 	}

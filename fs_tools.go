@@ -28,7 +28,7 @@ const (
 	fsHardLimit             = 2000
 	fsDefaultDepth          = 1
 	fsMaxDepth              = 5
-	fsRgDefaultLimit        = 50
+	fsRgDefaultLimit        = 20
 	fsRgHardLimit           = 500
 	fsRgMaxContext          = 5
 	fsRgMaxOutputBytes      = 100 * 1024 // 100 KB
@@ -762,10 +762,18 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		return nil, nil, err
 	}
 
+	fetchLimit := limit
+	fetchBytes := fsRgMaxOutputBytes
+
 	// Prefer system rg when available.
 	if rgPath, lookErr := exec.LookPath("rg"); lookErr == nil {
-		text, truncated, n, err := s.rgSystem(ctx, rgPath, root, args, limit, contextLines)
+		text, truncated, n, err := s.rgSystem(ctx, rgPath, root, args, fetchLimit, contextLines, fetchBytes)
 		if err == nil {
+			if text != "" {
+				lines := strings.Split(text, "\n")
+				groups := groupRgLines(lines)
+				text = renderGroups(groups)
+			}
 			return s.rgResult(text, n, truncated, "rg"), nil, nil
 		}
 		// Fall through to pure-Go on unexpected failure (e.g. bad flags).
@@ -776,9 +784,14 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		// Other errors: try Go fallback.
 	}
 
-	text, truncated, n, err := s.rgGo(ctx, root, args, limit, contextLines)
+	text, truncated, n, err := s.rgGo(ctx, root, args, fetchLimit, contextLines, fetchBytes)
 	if err != nil {
 		return nil, nil, err
+	}
+	if text != "" {
+		lines := strings.Split(text, "\n")
+		groups := groupRgLines(lines)
+		text = renderGroups(groups)
 	}
 	return s.rgResult(text, n, truncated, "go"), nil, nil
 }
@@ -804,7 +817,7 @@ func (s *server) rgResult(text string, count int, truncated bool, engine string)
 	}
 }
 
-func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs, limit, contextLines int) (string, bool, int, error) {
+func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs, fetchLimit, contextLines, fetchCapBytes int) (string, bool, int, error) {
 	cmdArgs := []string{
 		"--no-config",
 		"--no-heading",
@@ -830,7 +843,7 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 		"--glob", "!.ssh/**",
 		"--glob", "!.gnupg/**",
 		"--glob", "!.kube/**",
-		"-m", strconv.Itoa(limit),
+		"-m", strconv.Itoa(fetchLimit),
 	}
 	if args.IgnoreCase {
 		cmdArgs = append(cmdArgs, "-i")
@@ -884,13 +897,13 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 		rewritten := s.rewriteRgLine(root, line)
 		// Count real matches (colon form with line number), not context separators.
 		if isRgMatchLine(rewritten) {
-			if matchCount >= limit {
+			if matchCount >= fetchLimit {
 				truncated = true
 				break
 			}
 			matchCount++
 		}
-		if b.Len()+len(rewritten)+1 > fsRgMaxOutputBytes {
+		if b.Len()+len(rewritten)+1 > fetchCapBytes {
 			truncated = true
 			break
 		}
@@ -898,7 +911,7 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 		b.WriteByte('\n')
 	}
 	// rg -m may stop early; if we got exactly limit matches, note truncated possibility.
-	if matchCount >= limit {
+	if matchCount >= fetchLimit {
 		truncated = true
 	}
 	return strings.TrimRight(b.String(), "\n"), truncated, matchCount, nil
@@ -1016,7 +1029,7 @@ func trimRgLineEnd(buf []byte) []byte {
 	return buf
 }
 
-func (s *server) rgGo(ctx context.Context, root string, args rgArgs, limit, contextLines int) (string, bool, int, error) {
+func (s *server) rgGo(ctx context.Context, root string, args rgArgs, fetchLimit, contextLines, fetchCapBytes int) (string, bool, int, error) {
 	pattern := args.Pattern
 	if args.Literal {
 		pattern = regexp.QuoteMeta(pattern)
@@ -1165,13 +1178,13 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, limit, cont
 				fmt.Fprintf(&b, "%s:%d:%s\n", display, lineNo, sline)
 				matchCount++
 				pendingAfter = contextLines
-				if matchCount >= limit {
+				if matchCount >= fetchLimit {
 					truncated = true
 					stopped = true
 					_ = f.Close()
 					return io.EOF // stop walk
 				}
-				if b.Len() > fsRgMaxOutputBytes {
+				if b.Len() > fetchCapBytes {
 					truncated = true
 					stopped = true
 					_ = f.Close()

@@ -714,7 +714,7 @@ func TestRgSystem_StripsSensitiveEnv(t *testing.T) {
 	t.Setenv("CTXMODE_ENV_PROBE", "1")
 	dir := t.TempDir()
 	s := &server{}
-	out, _, _, err := s.rgSystem(context.Background(), writeFakeRg(t), dir, rgArgs{Pattern: "x", Limit: 50}, 50, 0)
+	out, _, _, err := s.rgSystem(context.Background(), writeFakeRg(t), dir, rgArgs{Pattern: "x", Limit: 50}, 50, 0, fsRgMaxOutputBytes)
 	if err != nil {
 		t.Fatalf("rgSystem: %v", err)
 	}
@@ -731,7 +731,7 @@ func TestRgSystem_PassthroughKeepsEnv(t *testing.T) {
 	t.Setenv("CTXMODE_ENV_PASSTHROUGH", "1")
 	dir := t.TempDir()
 	s := &server{}
-	out, _, _, err := s.rgSystem(context.Background(), writeFakeRg(t), dir, rgArgs{Pattern: "x", Limit: 50}, 50, 0)
+	out, _, _, err := s.rgSystem(context.Background(), writeFakeRg(t), dir, rgArgs{Pattern: "x", Limit: 50}, 50, 0, fsRgMaxOutputBytes)
 	if err != nil {
 		t.Fatalf("rgSystem: %v", err)
 	}
