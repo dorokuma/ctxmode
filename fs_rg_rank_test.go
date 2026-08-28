@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -15,11 +16,12 @@ func TestParsePorcelainZ_States(t *testing.T) {
 	toplevel := "/workspace/repo"
 	// \x00 separated
 	// XY path\x00
-	raw := []byte("?? untracked.go\x00 M modified_worktree.go\x00M  staged.go\x00MM both.go\x00")
+	raw := []byte("?? untracked.go\x00?? untracked_dir/\x00 M modified_worktree.go\x00M  staged.go\x00MM both.go\x00")
 	dirty := parsePorcelainZ(raw, toplevel)
 
 	expected := []string{
 		filepath.Join(toplevel, "untracked.go"),
+		filepath.Join(toplevel, "untracked_dir"),
 		filepath.Join(toplevel, "modified_worktree.go"),
 		filepath.Join(toplevel, "staged.go"),
 		filepath.Join(toplevel, "both.go"),
@@ -256,5 +258,96 @@ func TestGitRank_EnvSwitchOff(t *testing.T) {
 	text := mcpResultText(t, res)
 	if strings.Contains(text, "git_dirty=") || strings.Contains(text, "git=none") {
 		t.Errorf("expected no git header fields when disabled, got: %s", text)
+	}
+}
+
+// 8. TestGitDirtyFiles_TTL_RealRepo (E2E TTL on real git repository)
+func TestGitDirtyFiles_TTL_RealRepo(t *testing.T) {
+	orig := rgGitRankEnabled
+	rgGitRankEnabled = true
+	defer func() { rgGitRankEnabled = orig }()
+
+	repoDir := t.TempDir()
+	initTestRepo(t, repoDir)
+
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	var clockTime atomic.Int64
+	clockTime.Store(now.UnixNano())
+
+	s := &server{
+		workdirs: []string{repoDir},
+		gitStatusClock: func() time.Time {
+			return time.Unix(0, clockTime.Load())
+		},
+		gitDirtyCache: make(map[string]gitDirtyEntry),
+	}
+
+	commitFile(t, repoDir, "file1.go", "package main\n", "initial commit")
+
+	// 1. Initially clean
+	dirty1, stat1 := s.gitDirtyFiles(context.Background(), repoDir)
+	if stat1 != "ok" || len(dirty1) != 0 {
+		t.Fatalf("expected 0 dirty initially, got status=%s, dirty=%v", stat1, dirty1)
+	}
+
+	// 2. Modify file on disk, but before TTL expiry (1 second), query again -> should get cached empty set
+	mustWrite(t, filepath.Join(repoDir, "file1.go"), "package main\n// modified\n")
+	clockTime.Store(now.Add(1 * time.Second).UnixNano())
+
+	dirty2, stat2 := s.gitDirtyFiles(context.Background(), repoDir)
+	if stat2 != "ok" || len(dirty2) != 0 {
+		t.Fatalf("expected cached 0 dirty before TTL expiry, got: %v", dirty2)
+	}
+
+	// 3. Advance clock past 3s TTL (4 seconds) -> should refresh and see file1.go dirty
+	clockTime.Store(now.Add(4 * time.Second).UnixNano())
+	dirty3, stat3 := s.gitDirtyFiles(context.Background(), repoDir)
+	if stat3 != "ok" || len(dirty3) != 1 {
+		t.Fatalf("expected 1 dirty file after TTL expiry, got: %v", dirty3)
+	}
+	if _, ok := dirty3[filepath.Join(repoDir, "file1.go")]; !ok {
+		t.Fatalf("expected file1.go in dirty set after TTL refresh")
+	}
+}
+
+// 9. TestGitRank_UntrackedDirectory (Untracked directory files correctly weighted)
+func TestGitRank_UntrackedDirectory(t *testing.T) {
+	orig := rgGitRankEnabled
+	rgGitRankEnabled = true
+	defer func() { rgGitRankEnabled = orig }()
+
+	repoDir := t.TempDir()
+	initTestRepo(t, repoDir)
+	s := &server{
+		workdirs:      []string{repoDir},
+		gitDirtyCache: make(map[string]gitDirtyEntry),
+	}
+
+	commitFile(t, repoDir, "clean.go", "// TOKEN\n", "commit clean")
+
+	newDir := filepath.Join(repoDir, "brand_new_dir")
+	if err := os.MkdirAll(newDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(newDir, "new_file.go"), "// TOKEN\n")
+
+	res, _, err := s.toolRg(context.Background(), nil, rgArgs{
+		Pattern: "TOKEN",
+		Path:    repoDir,
+	})
+	if err != nil {
+		t.Fatalf("toolRg failed: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "git_dirty=1") {
+		t.Errorf("expected git_dirty=1 for untracked directory file, got: %s", text)
+	}
+	dirtyIdx := strings.Index(text, "brand_new_dir/new_file.go")
+	cleanIdx := strings.Index(text, "clean.go")
+	if dirtyIdx < 0 || cleanIdx < 0 {
+		t.Fatalf("expected both files in output: %s", text)
+	}
+	if dirtyIdx > cleanIdx {
+		t.Errorf("expected untracked directory file to be ranked before clean file: %s", text)
 	}
 }

@@ -235,6 +235,10 @@ func TestRgSummary_NoTrigger_UnderLimit(t *testing.T) {
 
 // 11. TestRgSummary_ExplicitLimitRespected
 func TestRgSummary_ExplicitLimitRespected(t *testing.T) {
+	origSummary := rgSummaryEnabled
+	rgSummaryEnabled = true
+	defer func() { rgSummaryEnabled = origSummary }()
+
 	repoDir := t.TempDir()
 	initTestRepo(t, repoDir)
 	st := newTestStore(t)
@@ -426,6 +430,10 @@ func TestRgSummary_SensitiveFallback(t *testing.T) {
 
 // 15. TestRgSummary_NoStoreFallback
 func TestRgSummary_NoStoreFallback(t *testing.T) {
+	origSummary := rgSummaryEnabled
+	rgSummaryEnabled = true
+	defer func() { rgSummaryEnabled = origSummary }()
+
 	repoDir := t.TempDir()
 	initTestRepo(t, repoDir)
 	s := &server{
@@ -458,6 +466,10 @@ func TestRgSummary_NoStoreFallback(t *testing.T) {
 
 // 16. TestRgOffset_Paging
 func TestRgOffset_Paging(t *testing.T) {
+	origSummary := rgSummaryEnabled
+	rgSummaryEnabled = true
+	defer func() { rgSummaryEnabled = origSummary }()
+
 	repoDir := t.TempDir()
 	initTestRepo(t, repoDir)
 	s := &server{
@@ -650,7 +662,7 @@ func TestRgSummary_EnvSwitchOff(t *testing.T) {
 	}
 
 	var f1 strings.Builder
-	for i := 0; i < 30; i++ {
+	for i := 0; i < 60; i++ {
 		f1.WriteString("SWITCH_OFF_TOKEN line\n")
 	}
 	commitFile(t, repoDir, "f1.txt", f1.String(), "commit f1")
@@ -672,5 +684,411 @@ func TestRgSummary_EnvSwitchOff(t *testing.T) {
 	}
 	if !strings.Contains(text, "truncated=true") {
 		t.Errorf("expected truncated=true on raw fallback: %s", text)
+	}
+}
+
+// 20. TestRg_ColonInFilename (Attack 1: Colon in filename)
+func TestRg_ColonInFilename(t *testing.T) {
+	origSummary := rgSummaryEnabled
+	rgSummaryEnabled = true
+	defer func() { rgSummaryEnabled = origSummary }()
+
+	// Unit checks
+	colonLine := "pkg/a:b.go:10:func Hello() {}"
+	if !isRgMatchLine(colonLine) {
+		t.Errorf("isRgMatchLine returned false for %q", colonLine)
+	}
+	p, num, ok := splitRgMatchLine(colonLine)
+	if !ok || p != "pkg/a:b.go" || num != "10" {
+		t.Errorf("splitRgMatchLine failed for %q, got path=%q num=%q ok=%v", colonLine, p, num, ok)
+	}
+
+	groups := groupRgLines([]string{colonLine})
+	if len(groups) != 1 || groups[0].file != "pkg/a:b.go" || groups[0].hits != 1 {
+		t.Errorf("groupRgLines failed for colon line: %+v", groups)
+	}
+
+	// Integration check with toolRg
+	repoDir := t.TempDir()
+	initTestRepo(t, repoDir)
+	s := &server{
+		workdirs:      []string{repoDir},
+		gitDirtyCache: make(map[string]gitDirtyEntry),
+	}
+	mustWrite(t, filepath.Join(repoDir, "log:2026.txt"), "ERROR: connection lost\n")
+
+	res, _, err := s.toolRg(context.Background(), nil, rgArgs{
+		Pattern: "connection",
+		Path:    repoDir,
+	})
+	if err != nil {
+		t.Fatalf("toolRg failed: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "matches=1") || strings.Contains(text, "matches=0") {
+		t.Errorf("expected matches=1, got:\n%s", text)
+	}
+	if !strings.Contains(text, "log:2026.txt:1:") {
+		t.Errorf("expected log:2026.txt:1: in output, got:\n%s", text)
+	}
+}
+
+// 21. TestRg_HashInFilename (Attack 1: # in filename not ignored)
+func TestRg_HashInFilename(t *testing.T) {
+	origSummary := rgSummaryEnabled
+	rgSummaryEnabled = true
+	defer func() { rgSummaryEnabled = origSummary }()
+
+	hashLine := "#main.go:5:package main"
+	if !isRgMatchLine(hashLine) {
+		t.Errorf("isRgMatchLine returned false for %q", hashLine)
+	}
+	p, num, ok := splitRgMatchLine(hashLine)
+	if !ok || p != "#main.go" || num != "5" {
+		t.Errorf("splitRgMatchLine failed for %q, got path=%q num=%q ok=%v", hashLine, p, num, ok)
+	}
+
+	repoDir := t.TempDir()
+	initTestRepo(t, repoDir)
+	s := &server{
+		workdirs:      []string{repoDir},
+		gitDirtyCache: make(map[string]gitDirtyEntry),
+	}
+	mustWrite(t, filepath.Join(repoDir, "#main.go"), "package main\n// TARGET_HASH_TOKEN\n")
+
+	res, _, err := s.toolRg(context.Background(), nil, rgArgs{
+		Pattern: "TARGET_HASH_TOKEN",
+		Path:    repoDir,
+	})
+	if err != nil {
+		t.Fatalf("toolRg failed: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "matches=1") || !strings.Contains(text, "#main.go:2:") {
+		t.Errorf("expected #main.go match, got:\n%s", text)
+	}
+}
+
+// 22. TestRg_CaptureTruncation (Attack 7: 200KB capture truncation)
+func TestRg_CaptureTruncation(t *testing.T) {
+	origSummary := rgSummaryEnabled
+	rgSummaryEnabled = true
+	defer func() { rgSummaryEnabled = origSummary }()
+
+	repoDir := t.TempDir()
+	initTestRepo(t, repoDir)
+	st := newTestStore(t)
+	s := &server{
+		workdirs:        []string{repoDir},
+		store:           st,
+		sessionID:       "sess-atk7",
+		gitDirtyCache:   make(map[string]gitDirtyEntry),
+		rgIndexDedupMap: make(map[string]rgIndexEntry),
+	}
+
+	// Generate ~300KB of match content across multiple files
+	for f := 0; f < 5; f++ {
+		var b strings.Builder
+		for i := 0; i < 600; i++ {
+			b.WriteString(fmt.Sprintf("// HIT_LARGE_TOKEN %s line %d\n", strings.Repeat("A", 150), i))
+		}
+		commitFile(t, repoDir, fmt.Sprintf("large_%d.txt", f), b.String(), "commit")
+	}
+
+	res, _, err := s.toolRg(context.Background(), nil, rgArgs{
+		Pattern: "HIT_LARGE_TOKEN",
+		Path:    repoDir,
+	})
+	if err != nil {
+		t.Fatalf("toolRg failed: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if strings.Contains(text, "full set indexed") {
+		t.Errorf("truncated capture must NOT say 'full set indexed', got:\n%s", text)
+	}
+	if !strings.Contains(text, "capture truncated at 200KB / 500-match cap") {
+		t.Errorf("expected 'capture truncated at 200KB / 500-match cap' in summary, got:\n%s", text)
+	}
+	if !strings.Contains(text, "truncated=true") {
+		t.Errorf("expected truncated=true in header, got:\n%s", text)
+	}
+}
+
+// 23. TestRg_SensitiveFallback_ContextPreserved (Attack 6: sensitive fallback with context)
+func TestRg_SensitiveFallback_ContextPreserved(t *testing.T) {
+	origSummary := rgSummaryEnabled
+	rgSummaryEnabled = true
+	defer func() { rgSummaryEnabled = origSummary }()
+
+	repoDir := t.TempDir()
+	initTestRepo(t, repoDir)
+	st := newTestStore(t)
+	s := &server{
+		workdirs:        []string{repoDir},
+		store:           st,
+		sessionID:       "sess-sensitive",
+		gitDirtyCache:   make(map[string]gitDirtyEntry),
+		rgIndexDedupMap: make(map[string]rgIndexEntry),
+	}
+
+	fakeKey := "AKIA" + "IOSFODNN7EXAMPLE"
+	var content strings.Builder
+	for i := 1; i <= 30; i++ {
+		content.WriteString(fmt.Sprintf("// SENSITIVE_MATCH %s line %d\n// context after %d\n", fakeKey, i, i))
+	}
+	commitFile(t, repoDir, "keys.txt", content.String(), "commit keys")
+
+	res, _, err := s.toolRg(context.Background(), nil, rgArgs{
+		Pattern: "SENSITIVE_MATCH",
+		Path:    repoDir,
+		Context: 1,
+	})
+	if err != nil {
+		t.Fatalf("toolRg failed: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "sensitive content detected") {
+		t.Errorf("expected sensitive content notice, got:\n%s", text)
+	}
+	if !strings.Contains(text, "keys.txt-2-// context after 1") {
+		t.Errorf("expected context lines to be preserved in sensitive fallback, got:\n%s", text)
+	}
+}
+
+// 24. TestRg_OffsetPaging_Consistency33 (Offset paging consistency: 20 + 13 = 33)
+func TestRg_OffsetPaging_Consistency33(t *testing.T) {
+	origSummary := rgSummaryEnabled
+	rgSummaryEnabled = true
+	defer func() { rgSummaryEnabled = origSummary }()
+
+	origGit := rgGitRankEnabled
+	rgGitRankEnabled = true
+	defer func() { rgGitRankEnabled = origGit }()
+
+	repoDir := t.TempDir()
+	initTestRepo(t, repoDir)
+	st := newTestStore(t)
+	s := &server{
+		workdirs:        []string{repoDir},
+		store:           st,
+		sessionID:       "sess-p33",
+		gitDirtyCache:   make(map[string]gitDirtyEntry),
+		rgIndexDedupMap: make(map[string]rgIndexEntry),
+	}
+
+	// 3 files: dirty (app.ts 2), untracked (utils.ts 1), clean (noise.ts 30) -> total 33 matches
+	var noiseContent strings.Builder
+	for i := 1; i <= 30; i++ {
+		noiseContent.WriteString(fmt.Sprintf("// TODO: noise item %d\n", i))
+	}
+	commitFile(t, repoDir, "noise.ts", noiseContent.String(), "commit noise")
+
+	commitFile(t, repoDir, "app.ts", "// TODO: initial app todo\n", "commit app")
+	mustWrite(t, filepath.Join(repoDir, "app.ts"), "// TODO: refactor auth flow\n// line\n// TODO: handle token expiry\n")
+	mustWrite(t, filepath.Join(repoDir, "utils.ts"), "// TODO: dedupe helper functions\n")
+
+	// Page 1: Offset=0, Limit=20
+	resPage1, _, err := s.toolRg(context.Background(), nil, rgArgs{
+		Pattern: "TODO",
+		Path:    repoDir,
+		Limit:   20,
+		Offset:  0,
+	})
+	if err != nil {
+		t.Fatalf("page 1 failed: %v", err)
+	}
+	text1 := mcpResultText(t, resPage1)
+
+	// Page 2: Offset=20, Limit=20
+	resPage2, _, err := s.toolRg(context.Background(), nil, rgArgs{
+		Pattern: "TODO",
+		Path:    repoDir,
+		Limit:   20,
+		Offset:  20,
+	})
+	if err != nil {
+		t.Fatalf("page 2 failed: %v", err)
+	}
+	text2 := mcpResultText(t, resPage2)
+
+	// Extract indexed label from page 1 summary
+	var label string
+	for _, part := range strings.Split(strings.Split(text1, "\n")[0], " ") {
+		if strings.HasPrefix(part, "indexed=") {
+			label = strings.TrimPrefix(part, "indexed=")
+			break
+		}
+	}
+	if label == "" {
+		t.Fatalf("no indexed label in page 1: %s", text1)
+	}
+	doc, err := st.Get(label)
+	if err != nil || doc == nil {
+		t.Fatalf("failed to get indexed document: %v", err)
+	}
+
+	// Collect full 33 lines from store document
+	var fullDocLines []string
+	for _, line := range strings.Split(doc.Content, "\n") {
+		if isRgMatchLine(line) {
+			fullDocLines = append(fullDocLines, line)
+		}
+	}
+	if len(fullDocLines) != 33 {
+		t.Fatalf("expected 33 lines in doc, got %d", len(fullDocLines))
+	}
+
+	// Page 2 lines
+	var page2Lines []string
+	for _, line := range strings.Split(text2, "\n")[1:] { // skip header
+		if strings.TrimSpace(line) != "" && isRgMatchLine(line) {
+			page2Lines = append(page2Lines, line)
+		}
+	}
+	if len(page2Lines) != 13 {
+		t.Fatalf("expected 13 lines in page 2 (33 - 20 = 13), got %d", len(page2Lines))
+	}
+
+	// Assert page 2 matches exactly lines 20..32 (0-indexed) of full doc
+	for i := 0; i < 13; i++ {
+		if page2Lines[i] != fullDocLines[20+i] {
+			t.Errorf("mismatch at paged line %d: got %q, want %q", i, page2Lines[i], fullDocLines[20+i])
+		}
+	}
+}
+
+// 25. TestRg_EmptySessionID_Prefix (Item 9: sessionID=="" returns rg: prefix)
+func TestRg_EmptySessionID_Prefix(t *testing.T) {
+	origSummary := rgSummaryEnabled
+	rgSummaryEnabled = true
+	defer func() { rgSummaryEnabled = origSummary }()
+
+	repoDir := t.TempDir()
+	initTestRepo(t, repoDir)
+	st := newTestStore(t)
+	fg := NewFloodGuard(60*time.Second, 64)
+	sp := NewSearchPipeline(st, fg)
+	s := &server{
+		workdirs:        []string{repoDir},
+		store:           st,
+		sessionID:       "", // Empty session ID
+		floodGuard:      fg,
+		searchPipeline:  sp,
+		gitDirtyCache:   make(map[string]gitDirtyEntry),
+		rgIndexDedupMap: make(map[string]rgIndexEntry),
+	}
+
+	if prefix := s.rgIndexPrefix(); prefix != "rg:" {
+		t.Fatalf("expected rgIndexPrefix to be 'rg:', got %q", prefix)
+	}
+
+	var f1 strings.Builder
+	for i := 0; i < 25; i++ {
+		f1.WriteString("EMPTY_SESS_TOKEN line\n")
+	}
+	commitFile(t, repoDir, "f1.txt", f1.String(), "commit f1")
+
+	res, _, err := s.toolRg(context.Background(), nil, rgArgs{
+		Pattern: "EMPTY_SESS_TOKEN",
+		Path:    repoDir,
+	})
+	if err != nil {
+		t.Fatalf("toolRg failed: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "indexed=rg:EMPTY_SESS_TOKEN:") {
+		t.Errorf("expected indexed label starting with rg:EMPTY_SESS_TOKEN:, got:\n%s", text)
+	}
+
+	// Test SearchRgScoped with s.rgIndexPrefix()
+	sres, _, err := s.toolSearch(context.Background(), nil, searchArgs{
+		Query: "EMPTY_SESS_TOKEN",
+		Scope: "rg",
+	})
+	if err != nil {
+		t.Fatalf("toolSearch scope=rg failed: %v", err)
+	}
+	stext := mcpResultText(t, sres)
+	if !strings.Contains(stext, "EMPTY_SESS_TOKEN") {
+		t.Errorf("expected search result to find indexed content, got:\n%s", stext)
+	}
+}
+
+// 26. TestRg_Ed5a2e5_ByteForByteEquivalence (Item 10: Golden comparison with ed5a2e5 when switches off)
+func TestRg_Ed5a2e5_ByteForByteEquivalence(t *testing.T) {
+	origSummary := rgSummaryEnabled
+	rgSummaryEnabled = false
+	defer func() { rgSummaryEnabled = origSummary }()
+
+	origGit := rgGitRankEnabled
+	rgGitRankEnabled = false
+	defer func() { rgGitRankEnabled = origGit }()
+
+	repoDir := t.TempDir()
+	initTestRepo(t, repoDir)
+	st := newTestStore(t)
+	s := &server{
+		workdirs:        []string{repoDir},
+		store:           st,
+		sessionID:       "sess-ed5a2e5",
+		gitDirtyCache:   make(map[string]gitDirtyEntry),
+		rgIndexDedupMap: make(map[string]rgIndexEntry),
+	}
+
+	// 1. Normal matches under limit
+	var f1 strings.Builder
+	for i := 1; i <= 5; i++ {
+		f1.WriteString(fmt.Sprintf("// EQUIV_TOKEN line %d\n", i))
+	}
+	commitFile(t, repoDir, "f1.go", f1.String(), "commit f1")
+
+	res1, _, err := s.toolRg(context.Background(), nil, rgArgs{
+		Pattern: "EQUIV_TOKEN",
+		Path:    repoDir,
+	})
+	if err != nil {
+		t.Fatalf("query 1 failed: %v", err)
+	}
+	text1 := mcpResultText(t, res1)
+	expected1 := "engine=rg matches=5\nf1.go:1:// EQUIV_TOKEN line 1\nf1.go:2:// EQUIV_TOKEN line 2\nf1.go:3:// EQUIV_TOKEN line 3\nf1.go:4:// EQUIV_TOKEN line 4\nf1.go:5:// EQUIV_TOKEN line 5"
+	if text1 != expected1 {
+		t.Errorf("query 1 mismatch.\nGot:\n%s\nWant:\n%s", text1, expected1)
+	}
+
+	// 2. No matches
+	res2, _, err := s.toolRg(context.Background(), nil, rgArgs{
+		Pattern: "NON_EXISTENT_PATTERN_XYZ",
+		Path:    repoDir,
+	})
+	if err != nil {
+		t.Fatalf("query 2 failed: %v", err)
+	}
+	text2 := mcpResultText(t, res2)
+	expected2 := "engine=rg matches=0\n(no matches)"
+	if text2 != expected2 {
+		t.Errorf("query 2 mismatch.\nGot:\n%s\nWant:\n%s", text2, expected2)
+	}
+
+	// 3. Over default limit (50 matches) with truncation
+	var f2 strings.Builder
+	for i := 1; i <= 60; i++ {
+		f2.WriteString(fmt.Sprintf("// TRUNC_TOKEN %02d\n", i))
+	}
+	commitFile(t, repoDir, "f2.go", f2.String(), "commit f2")
+
+	res3, _, err := s.toolRg(context.Background(), nil, rgArgs{
+		Pattern: "TRUNC_TOKEN",
+		Path:    repoDir,
+	})
+	if err != nil {
+		t.Fatalf("query 3 failed: %v", err)
+	}
+	text3 := mcpResultText(t, res3)
+	if !strings.HasPrefix(text3, "engine=rg matches=50 truncated=true\n") {
+		t.Errorf("query 3 header mismatch: %s", text3)
+	}
+	lines3 := strings.Split(text3, "\n")
+	if len(lines3) != 51 { // header + 50 lines
+		t.Errorf("expected 51 lines (header + 50 matches), got %d", len(lines3))
 	}
 }
