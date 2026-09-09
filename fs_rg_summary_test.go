@@ -3,11 +3,22 @@ package main
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// skipIfNoSystemRg skips tests whose assertions only hold when the system
+// ripgrep binary is on PATH. toolRg otherwise falls back to the Go engine
+// and reports engine=go, which is not byte-for-byte equivalent to engine=rg.
+func skipIfNoSystemRg(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Skip("system rg not available; byte-for-byte equivalence vs engine=rg is only meaningful when rg is present")
+	}
+}
 
 func TestGroupRgLines_ContextAttached(t *testing.T) {
 	input := []string{
@@ -1016,6 +1027,7 @@ func TestRg_EmptySessionID_Prefix(t *testing.T) {
 
 // 26. TestRg_Ed5a2e5_ByteForByteEquivalence (Item 10: Golden comparison with ed5a2e5 when switches off)
 func TestRg_Ed5a2e5_ByteForByteEquivalence(t *testing.T) {
+	skipIfNoSystemRg(t)
 	origSummary := rgSummaryEnabled
 	rgSummaryEnabled = false
 	defer func() { rgSummaryEnabled = origSummary }()

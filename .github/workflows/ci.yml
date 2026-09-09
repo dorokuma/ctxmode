@@ -15,6 +15,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: go test -race ./...
       - run: go vet ./...
       - run: go build .
