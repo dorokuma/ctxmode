@@ -85,6 +85,10 @@ func main() {
 	var configPath string
 	flag.StringVar(&workdir, "workdir", "", "workspace root (default: cwd)")
 	flag.StringVar(&configPath, "config", "", "path to config file")
+	flag.Usage = func() {
+		fmt.Fprint(os.Stderr, cliUsage())
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	// Load workdirs from config file (or fall back to cwd).
@@ -154,20 +158,27 @@ func main() {
 	sessionID := newSessionID()
 	log.Printf("ctxmode: session %s", sessionID)
 	s := &server{
-		workdirs:       workdirs,
-		dbPath:         dbPath,
-		sessionID:      sessionID,
-		store:          store,
-		floodGuard:     floodGuard,
-		searchPipeline: searchPipeline,
-		httpClient:     newHTTPClient(),
-		gitDirtyCache:  make(map[string]gitDirtyEntry),
+		workdirs:        workdirs,
+		dbPath:          dbPath,
+		sessionID:       sessionID,
+		store:           store,
+		floodGuard:      floodGuard,
+		searchPipeline:  searchPipeline,
+		httpClient:      newHTTPClient(),
+		gitDirtyCache:   make(map[string]gitDirtyEntry),
 		rgIndexDedupMap: make(map[string]rgIndexEntry),
 	}
 	if err := s.migrateFromJSON(); err != nil {
 		fatal(store, "failed to migrate database: %v", err)
 	}
 	s.excludeFromGit()
+
+	if len(flag.Args()) > 0 {
+		if err := runCLI(s, flag.Args(), os.Stdout); err != nil {
+			fatal(store, "%v", err)
+		}
+		return
+	}
 
 	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: Version}, &mcp.ServerOptions{Instructions: serverInstructions})
 	s.registerCategoryTools(srv)
@@ -396,6 +407,9 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		outputText += "[WARNING: output truncated at 10MB — indexed content may be incomplete]"
 	}
 
+	errorClass := errorClassForExit(result.ExitCode, outputText)
+	indexContent := prefixErrorClass(outputText, errorClass)
+
 	// Auto-indexing logic.
 	const (
 		autoIndexThreshold = 100 * 1024 // 100KB
@@ -409,22 +423,14 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		if err := checkSensitiveContent(outputText); err != nil {
 			indexErr = err
 		} else {
-			indexErr = s.storeIndexLocked(label, outputText)
+			indexErr = s.storeIndexLocked(label, indexContent)
 		}
 		if indexErr != nil {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{
-					Text: formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, indexErr),
-				}},
-			}, nil, nil
+			return textResult(formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, indexErr), errorClass), nil, nil
 		}
 		result.Indexed = true
 		result.IndexLabel = label
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{
-				Text: formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, nil),
-			}},
-		}, nil, nil
+		return textResult(formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, nil), errorClass), nil, nil
 	}
 
 	if len(outputText) > intentThreshold && args.Intent != "" {
@@ -434,28 +440,18 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		if err := checkSensitiveContent(outputText); err != nil {
 			indexErr = err
 		} else {
-			indexErr = s.storeIndexLocked(label, outputText)
+			indexErr = s.storeIndexLocked(label, indexContent)
 		}
 		if indexErr != nil {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{
-					Text: formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, indexErr),
-				}},
-			}, nil, nil
+			return textResult(formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, indexErr), errorClass), nil, nil
 		}
 		result.Indexed = true
 		result.IndexLabel = label
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{
-				Text: formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, nil),
-			}},
-		}, nil, nil
+		return textResult(formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, nil), errorClass), nil, nil
 	}
 
 	// Normal return.
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: outputText}},
-	}, nil, nil
+	return textResult(outputText, errorClass), nil, nil
 }
 
 type indexArgs struct {
@@ -934,6 +930,9 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		outputText += "[WARNING: output truncated at 10MB — indexed content may be incomplete]"
 	}
 
+	errorClass := errorClassForExit(result.ExitCode, outputText)
+	indexContent := prefixErrorClass(outputText, errorClass)
+
 	// Auto-indexing logic (same as toolExecute).
 	const (
 		autoIndexThreshold = 100 * 1024 // 100KB
@@ -952,22 +951,14 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		} else if err := checkSensitiveContent(outputText); err != nil {
 			indexErr = err
 		} else {
-			indexErr = s.storeIndexLocked(label, outputText)
+			indexErr = s.storeIndexLocked(label, indexContent)
 		}
 		if indexErr != nil {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{
-					Text: formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, indexErr),
-				}},
-			}, nil, nil
+			return textResult(formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, indexErr), errorClass), nil, nil
 		}
 		result.Indexed = true
 		result.IndexLabel = label
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{
-				Text: formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, nil),
-			}},
-		}, nil, nil
+		return textResult(formatLargeIndexed(result.ExitCode, len(outputText), label, outputText, nil), errorClass), nil, nil
 	}
 
 	if len(outputText) > intentThreshold && args.Intent != "" {
@@ -978,27 +969,17 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		} else if err := checkSensitiveContent(outputText); err != nil {
 			indexErr = err
 		} else {
-			indexErr = s.storeIndexLocked(label, outputText)
+			indexErr = s.storeIndexLocked(label, indexContent)
 		}
 		if indexErr != nil {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{
-					Text: formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, indexErr),
-				}},
-			}, nil, nil
+			return textResult(formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, indexErr), errorClass), nil, nil
 		}
 		result.Indexed = true
 		result.IndexLabel = label
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{
-				Text: formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, nil),
-			}},
-		}, nil, nil
+		return textResult(formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, nil), errorClass), nil, nil
 	}
 
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: outputText}},
-	}, nil, nil
+	return textResult(outputText, errorClass), nil, nil
 }
 
 // ---------- db helpers ----------

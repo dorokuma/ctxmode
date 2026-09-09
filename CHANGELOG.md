@@ -5,6 +5,11 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Added
+- **MCP tool annotations**: each of the five public tools now advertises MCP `ToolAnnotations` on `tools/list` — `ctx_fs`/`ctx_git`: `readOnlyHint=true`, `destructiveHint=false`; `ctx_run`: `readOnlyHint=false`, `destructiveHint=true`, `openWorldHint=true`; `ctx_kb`/`ctx_bg`: `readOnlyHint=false`, `destructiveHint=true`.
+- **Error auto-classification**: failed `execute`, `execute_file`, `batch`, and `run_task` results set `_meta.error_class` (10-bucket ABI) and prefix indexed KB content with `error_class: <class>`.
+- **CLI `index`/`search` subcommands**: `ctxmode index <path>` indexes a file or directory into the knowledge base; `ctxmode search <query>` prints matching snippets without starting the MCP server.
+
 ## [3.2.0] - 2026-08-28
 
 ### Added

@@ -242,33 +242,56 @@ const ctxRunDescription = "PRIMARY for commands/tests/builds. action=execute (sh
 	"execute_file (code over FILE_CONTENT), batch (many commands + optional queries), " +
 	"run_task (go_test|go_build|go_vet|npm_test|npm_run_build|cargo_test|cargo_build|make|custom; fixed argv). Large output auto-indexed."
 
+// boolPtr returns a distinct *bool so ToolAnnotations hints are not aliased.
+func boolPtr(v bool) *bool { return &v }
+
+// categoryToolAnnotations returns MCP ToolAnnotations for the five public tools.
+// Pointer hints are set explicitly so false values appear in tools/list JSON.
+// Each tool gets its own *bool so mutating one annotation cannot leak to another.
+func categoryToolAnnotations() map[string]*mcp.ToolAnnotations {
+	return map[string]*mcp.ToolAnnotations{
+		"ctx_fs":  {ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
+		"ctx_git": {ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
+		"ctx_run": {ReadOnlyHint: false, DestructiveHint: boolPtr(true), OpenWorldHint: boolPtr(true)},
+		"ctx_kb":  {ReadOnlyHint: false, DestructiveHint: boolPtr(true)},
+		"ctx_bg":  {ReadOnlyHint: false, DestructiveHint: boolPtr(true)},
+	}
+}
+
 // registerCategoryTools wires the v2.0 multi-category MCP surface (end state).
 func (s *server) registerCategoryTools(srv *mcp.Server) {
+	ann := categoryToolAnnotations()
+
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_run",
 		Description: ctxRunDescription,
+		Annotations: ann["ctx_run"],
 	}, s.toolCtxRun)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctx_fs",
 		Description: "Workspace filesystem (sandboxed). action=ls (list), glob (pattern), " +
 			"stat (metadata), rg (content search; default limit=20; matches > limit auto-indexed to ctx_kb with summary returned; use offset for linear paging). Prefer over ad-hoc shell find/ls/rg when possible.",
+		Annotations: ann["ctx_fs"],
 	}, s.toolCtxFs)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctx_git",
 		Description: "Read-only git. action=status (porcelain -b), diff (optional path/stat/staged), " +
 			"log (n, path, oneline). No commit/push/reset.",
+		Annotations: ann["ctx_git"],
 	}, s.toolCtxGit)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctx_kb",
 		Description: "Local knowledge base / context virtualization. action=index (path), search (query), " +
 			"fetch (URL→markdown→index), stats, purge (confirm:true), doctor (install check).",
+		Annotations: ann["ctx_kb"],
 	}, s.toolCtxKb)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_bg",
 		Description: "Background processes from ctx_run action=execute background:true. Starts return immediately and never proactively push notifications. action=wait (preferred once after launch; blocking, default 60000ms, max 1h, timeout does not kill), list (snapshot), log (tail output), kill (terminate). Identify with either id or pid; do not poll list/log.",
+		Annotations: ann["ctx_bg"],
 	}, s.toolCtxBg)
 }

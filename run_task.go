@@ -284,6 +284,8 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 	if intent != "" {
 		labelBase = intent
 	}
+	errorClass := errorClassForExit(exitCode, outputText)
+	indexContent := prefixErrorClass(outputText, errorClass)
 
 	if len(outputText) > runTaskAutoIndexBytes {
 		// Unique label per index: a fixed "run_task:<kind>" label would let a
@@ -293,24 +295,18 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 		if err := checkSensitiveContent(outputText); err != nil {
 			indexErr = err
 		} else {
-			indexErr = s.storeIndexLocked(label, outputText)
+			indexErr = s.storeIndexLocked(label, indexContent)
 		}
 		if indexErr != nil {
 			preview := tailUTF8(outputText, runTaskTailBytes)
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{
-					Text: fmt.Sprintf("exit_code: %d\nOutput is too large (%d bytes). Indexing failed: %v. Content was NOT indexed.\n\n--- Tail preview ---\n%s",
-						exitCode, len(outputText), indexErr, preview),
-				}},
-			}, nil, nil
+			return textResult(fmt.Sprintf("exit_code: %d\nOutput is too large (%d bytes). Indexing failed: %v. Content was NOT indexed.\n\n--- Tail preview ---\n%s",
+				exitCode, len(outputText), indexErr, preview), errorClass), nil, nil
 		}
 		preview := tailUTF8(outputText, runTaskTailBytes)
 		// Search hint must use the index label (not empty intent).
 		msg := fmt.Sprintf("exit_code: %d\nOutput is too large (%d bytes). Indexed as %q. Use ctx_kb action=search query=%q to search the indexed content.\n\n--- Tail preview ---\n%s",
 			exitCode, len(outputText), label, label, preview)
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: msg}},
-		}, nil, nil
+		return textResult(msg, errorClass), nil, nil
 	}
 
 	if len(outputText) > runTaskIntentIndexBytes && intent != "" {
@@ -319,30 +315,20 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 		if err := checkSensitiveContent(outputText); err != nil {
 			indexErr = err
 		} else {
-			indexErr = s.storeIndexLocked(label, outputText)
+			indexErr = s.storeIndexLocked(label, indexContent)
 		}
 		if indexErr != nil {
 			preview := tailUTF8(outputText, runTaskPreviewBytes)
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{
-					Text: fmt.Sprintf("exit_code: %d\nOutput (%d bytes) was NOT indexed (error: %v).\n\n--- Tail preview ---\n%s",
-						exitCode, len(outputText), indexErr, preview),
-				}},
-			}, nil, nil
+			return textResult(fmt.Sprintf("exit_code: %d\nOutput (%d bytes) was NOT indexed (error: %v).\n\n--- Tail preview ---\n%s",
+				exitCode, len(outputText), indexErr, preview), errorClass), nil, nil
 		}
 		preview := tailUTF8(outputText, runTaskPreviewBytes)
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{
-				Text: fmt.Sprintf("exit_code: %d\nOutput (%d bytes) indexed as %q. Use ctx_kb action=search query=%q to search.\n\n--- Tail preview ---\n%s",
-					exitCode, len(outputText), label, label, preview),
-			}},
-		}, nil, nil
+		return textResult(fmt.Sprintf("exit_code: %d\nOutput (%d bytes) indexed as %q. Use ctx_kb action=search query=%q to search.\n\n--- Tail preview ---\n%s",
+			exitCode, len(outputText), label, label, preview), errorClass), nil, nil
 	}
 
 	// Normal return (includes exit_code in the structured body).
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: outputText}},
-	}, nil, nil
+	return textResult(outputText, errorClass), nil, nil
 }
 
 // tailUTF8 returns the last maxBytes of s at a valid UTF-8 boundary, with a marker if truncated.

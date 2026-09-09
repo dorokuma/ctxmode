@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestCtxRunUnknownAction(t *testing.T) {
@@ -102,6 +104,119 @@ func TestRegisterCategoryToolsDoesNotPanic(t *testing.T) {
 		t.Fatal(names)
 	}
 	_ = s
+}
+
+func boolVal(p *bool) (bool, bool) {
+	if p == nil {
+		return false, false
+	}
+	return *p, true
+}
+
+func TestCategoryToolAnnotations(t *testing.T) {
+	ann := categoryToolAnnotations()
+	check := func(name string, readOnly bool, destructive bool, openWorld *bool) {
+		t.Helper()
+		a, ok := ann[name]
+		if !ok || a == nil {
+			t.Fatalf("missing annotations for %s", name)
+		}
+		if a.ReadOnlyHint != readOnly {
+			t.Fatalf("%s readOnlyHint=%v want %v", name, a.ReadOnlyHint, readOnly)
+		}
+		gotD, hasD := boolVal(a.DestructiveHint)
+		if !hasD || gotD != destructive {
+			t.Fatalf("%s destructiveHint=%v present=%v want %v", name, gotD, hasD, destructive)
+		}
+		if openWorld != nil {
+			gotO, hasO := boolVal(a.OpenWorldHint)
+			if !hasO || gotO != *openWorld {
+				t.Fatalf("%s openWorldHint=%v present=%v want %v", name, gotO, hasO, *openWorld)
+			}
+		}
+	}
+	check("ctx_fs", true, false, nil)
+	check("ctx_git", true, false, nil)
+	ow := true
+	check("ctx_run", false, true, &ow)
+	check("ctx_kb", false, true, nil)
+	check("ctx_bg", false, true, nil)
+}
+
+func TestCategoryToolAnnotationsIndependentPointers(t *testing.T) {
+	ann := categoryToolAnnotations()
+	run := ann["ctx_run"]
+	fs := ann["ctx_fs"]
+	kb := ann["ctx_kb"]
+	if run == nil || run.DestructiveHint == nil || fs == nil || fs.DestructiveHint == nil || kb == nil || kb.DestructiveHint == nil {
+		t.Fatal("missing DestructiveHint pointers")
+	}
+	if run.DestructiveHint == fs.DestructiveHint || run.DestructiveHint == kb.DestructiveHint || fs.DestructiveHint == kb.DestructiveHint {
+		t.Fatal("tools must not share DestructiveHint pointers")
+	}
+	origFS, origKB := *fs.DestructiveHint, *kb.DestructiveHint
+	*run.DestructiveHint = !*run.DestructiveHint
+	if *fs.DestructiveHint != origFS {
+		t.Fatal("mutating ctx_run DestructiveHint must not affect ctx_fs")
+	}
+	if *kb.DestructiveHint != origKB {
+		t.Fatal("mutating ctx_run DestructiveHint must not affect ctx_kb")
+	}
+}
+
+func TestCategoryToolAnnotationsInToolsList(t *testing.T) {
+	ctx := context.Background()
+	s := &server{workdirs: []string{t.TempDir()}}
+	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: Version}, nil)
+	s.registerCategoryTools(srv)
+
+	t1, t2 := mcp.NewInMemoryTransports()
+	if _, err := srv.Connect(ctx, t1, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "v0"}, nil)
+	cs, err := client.Connect(ctx, t2, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+
+	listed, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	want := categoryToolAnnotations()
+	seen := map[string]bool{}
+	for _, tool := range listed.Tools {
+		seen[tool.Name] = true
+		exp, ok := want[tool.Name]
+		if !ok {
+			continue
+		}
+		if tool.Annotations == nil {
+			t.Fatalf("tools/list %s missing annotations", tool.Name)
+		}
+		if tool.Annotations.ReadOnlyHint != exp.ReadOnlyHint {
+			t.Fatalf("tools/list %s readOnlyHint=%v want %v", tool.Name, tool.Annotations.ReadOnlyHint, exp.ReadOnlyHint)
+		}
+		gotD, hasD := boolVal(tool.Annotations.DestructiveHint)
+		wantD, _ := boolVal(exp.DestructiveHint)
+		if !hasD || gotD != wantD {
+			t.Fatalf("tools/list %s destructiveHint=%v present=%v want %v", tool.Name, gotD, hasD, wantD)
+		}
+		if exp.OpenWorldHint != nil {
+			gotO, hasO := boolVal(tool.Annotations.OpenWorldHint)
+			wantO, _ := boolVal(exp.OpenWorldHint)
+			if !hasO || gotO != wantO {
+				t.Fatalf("tools/list %s openWorldHint=%v present=%v want %v", tool.Name, gotO, hasO, wantO)
+			}
+		}
+	}
+	for name := range want {
+		if !seen[name] {
+			t.Fatalf("tools/list missing %s", name)
+		}
+	}
 }
 
 func TestCtxKbFetchAndIndexAliasRejected(t *testing.T) {

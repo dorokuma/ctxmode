@@ -41,6 +41,7 @@ type batchResult struct {
 	Size       int    `json:"size"`
 	Error      string `json:"error,omitempty"`
 	IndexError string `json:"index_error,omitempty"`
+	ErrorClass string `json:"error_class,omitempty"`
 }
 
 type batchResponse struct {
@@ -324,9 +325,14 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 	if len(searchErrors) > 0 {
 		text += "\n\nSearch errors:\n- " + strings.Join(searchErrors, "\n- ")
 	}
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: text}},
-	}, nil, nil
+	errorClass := ""
+	for _, r := range results {
+		if r.ErrorClass != "" {
+			errorClass = r.ErrorClass
+			break
+		}
+	}
+	return textResult(text, errorClass), nil, nil
 }
 
 // ---------- execution strategies ----------
@@ -347,12 +353,14 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 	for i, cmd := range commands {
 		// Check if the shared context has expired.
 		if err := cmdCtx.Err(); err != nil {
+			skipErr := fmt.Sprintf("skipped: shared timeout exceeded (%v)", err)
 			results[i] = batchResult{
-				Label:    cmd.Label,
-				Command:  cmd.Command,
-				Success:  false,
-				ExitCode: -1,
-				Error:    fmt.Sprintf("skipped: shared timeout exceeded (%v)", err),
+				Label:      cmd.Label,
+				Command:    cmd.Command,
+				Success:    false,
+				ExitCode:   -1,
+				Error:      skipErr,
+				ErrorClass: classifyError(skipErr),
 			}
 			continue
 		}
@@ -366,34 +374,11 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 			Size:      len(out),
 			Truncated: truncated,
 		}
-
+		execErrStr := ""
 		if execErr != nil {
-			r.Success = false
-			r.Error = execErr.Error()
-		} else {
-			r.Success = exitCode == 0
+			execErrStr = execErr.Error()
 		}
-
-		// Auto-index only large output (same 100KB threshold as the execute path);
-		// small output is not persisted. Each index gets a unique label so a
-		// repeated command label cannot silently overwrite an earlier document
-		// (INSERT OR REPLACE); the actual label is returned in the response.
-		if len(out) > maxOutputSize {
-			label := s.indexLabel("batch", runID+":"+cmd.Label)
-			if err := checkSensitiveContent(out); err != nil {
-				r.IndexError = err.Error()
-			} else {
-				s.mu.Lock()
-				if err := s.store.Index(label, out); err != nil {
-					r.IndexError = err.Error()
-				} else {
-					r.Indexed = true
-					r.IndexLabel = label
-				}
-				s.mu.Unlock()
-			}
-		}
-
+		s.completeBatchResult(&r, runID, out, execErrStr)
 		results[i] = r
 	}
 }
@@ -431,36 +416,61 @@ func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCom
 				Size:      len(out),
 				Truncated: truncated,
 			}
-
+			execErrStr := ""
 			if execErr != nil {
-				r.Success = false
-				r.Error = execErr.Error()
-			} else {
-				r.Success = exitCode == 0
+				execErrStr = execErr.Error()
 			}
-
-			// Auto-index only large output (same 100KB threshold as the execute path);
-			// small output is not persisted. Mutex serializes SQLite single-writer.
-			// Unique label per index (see executeBatchSerial).
-			if len(out) > maxOutputSize {
-				label := s.indexLabel("batch", runID+":"+c.Label)
-				if err := checkSensitiveContent(out); err != nil {
-					r.IndexError = err.Error()
-				} else {
-					s.mu.Lock()
-					if err := s.store.Index(label, out); err != nil {
-						r.IndexError = err.Error()
-					} else {
-						r.Indexed = true
-						r.IndexLabel = label
-					}
-					s.mu.Unlock()
-				}
-			}
-
+			s.completeBatchResult(&r, runID, out, execErrStr)
 			results[idx] = r
 		}(i, cmd)
 	}
 
 	wg.Wait()
+}
+
+// completeBatchResult fills success/error_class and auto-indexes large output.
+func (s *server) completeBatchResult(r *batchResult, runID, out, execErr string) {
+	if execErr != "" {
+		r.Success = false
+		r.Error = execErr
+	} else {
+		r.Success = r.ExitCode == 0
+	}
+	if r.ExitCode != 0 || execErr != "" {
+		msg := out
+		if execErr != "" {
+			if msg != "" {
+				msg += "\n"
+			}
+			msg += execErr
+		}
+		// Align with execute: fold the exit-code suffix into the classifier
+		// input so empty output with POSIX 127 is command_not_found, not unknown.
+		if r.ExitCode != 0 {
+			if msg != "" {
+				msg += "\n"
+			}
+			msg += fmt.Sprintf("(exited with code %d)", r.ExitCode)
+		}
+		r.ErrorClass = classifyError(msg)
+	}
+	// Auto-index only large output (same 100KB threshold as the execute path);
+	// small output is not persisted. Unique label per index so a repeated
+	// command label cannot silently overwrite an earlier document.
+	if len(out) > maxOutputSize {
+		label := s.indexLabel("batch", runID+":"+r.Label)
+		storeOut := prefixErrorClass(out, r.ErrorClass)
+		if err := checkSensitiveContent(out); err != nil {
+			r.IndexError = err.Error()
+		} else {
+			s.mu.Lock()
+			if err := s.store.Index(label, storeOut); err != nil {
+				r.IndexError = err.Error()
+			} else {
+				r.Indexed = true
+				r.IndexLabel = label
+			}
+			s.mu.Unlock()
+		}
+	}
 }
