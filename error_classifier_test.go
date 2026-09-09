@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestClassifyError_EachBucket(t *testing.T) {
@@ -79,6 +81,10 @@ func TestClassifyError_PriorityAndFallbacks(t *testing.T) {
 	}
 	if got := errorClassForExit(1, "permission denied"); got != errorClassPermissionDenied {
 		t.Fatalf("exit 1 = %q", got)
+	}
+	// Empty output + POSIX 127 folds the suffix at errorClassForExit.
+	if got := errorClassForExit(127, ""); got != errorClassCommandNotFound {
+		t.Fatalf("empty output exit 127 = %q, want command_not_found", got)
 	}
 }
 
@@ -292,6 +298,86 @@ func TestErrorClass_RunTaskCustom(t *testing.T) {
 	}
 	if got, _ := res.Meta["error_class"].(string); got != errorClassSyntaxError {
 		t.Fatalf("run_task error_class = %q, text=%s", got, mcpResultText(t, res))
+	}
+}
+
+func TestErrorClass_RunTaskCustomEmptyOutputExit127(t *testing.T) {
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: newTestStore(t)}
+	// argv/stdout/stderr must not themselves trip classifyError (reExit127 /
+	// "exited with code 127" / "not found"). "exit 127" in argv would still
+	// classify as command_not_found even if errorClassForExit stopped folding
+	// the suffix — so this uses a shell function `return 127` instead.
+	res, _, err := s.toolRunTask(context.Background(), nil, runTaskArgs{
+		Kind:      "custom",
+		Args:      []string{"sh", "-c", "f() { return 127; }; f"},
+		TimeoutMs: 10000,
+		CWD:       wd,
+	})
+	if err != nil {
+		t.Fatalf("toolRunTask: %v", err)
+	}
+	if res == nil || res.Meta == nil {
+		t.Fatal("expected Meta.error_class for empty-output exit 127")
+	}
+	text := mcpResultText(t, res)
+	for _, leak := range []string{"exit 127", "exited with code 127", "not found"} {
+		if strings.Contains(strings.ToLower(text), leak) {
+			t.Fatalf("result text must not contain %q (would not lock errorClassForExit fold): %s", leak, text)
+		}
+	}
+	if classifyError(text) == errorClassCommandNotFound {
+		t.Fatalf("result text itself must not classify as command_not_found (would not lock fold); text=%s", text)
+	}
+	if got, _ := res.Meta["error_class"].(string); got != errorClassCommandNotFound {
+		t.Fatalf("run_task empty output exit 127 error_class = %q, want command_not_found (text=%s)", got, text)
+	}
+}
+
+func TestErrorClass_WireMetaJSON(t *testing.T) {
+	ctx := context.Background()
+	s := &server{workdirs: []string{t.TempDir()}, store: newTestStore(t)}
+	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: Version}, nil)
+	s.registerCategoryTools(srv)
+
+	t1, t2 := mcp.NewInMemoryTransports()
+	if _, err := srv.Connect(ctx, t1, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "v0"}, nil)
+	cs, err := client.Connect(ctx, t2, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "ctx_run",
+		Arguments: map[string]any{
+			"action":   "execute",
+			"command":  "echo permission denied; exit 1",
+			"language": "shell",
+			"timeout":  10000,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal CallTool result: %v", err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("unmarshal wire JSON: %v\n%s", err, raw)
+	}
+	meta, _ := wire["_meta"].(map[string]any)
+	if meta == nil {
+		t.Fatalf("tools/call JSON missing _meta; wire=%s", raw)
+	}
+	got, _ := meta["error_class"].(string)
+	if got != errorClassPermissionDenied {
+		t.Fatalf("_meta.error_class = %q, want %s; wire JSON: %s", got, errorClassPermissionDenied, raw)
 	}
 }
 

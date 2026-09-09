@@ -986,7 +986,9 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		}
 
 		slug := slugifyRgPattern(args.Pattern, args.Glob)
-		label, reused := s.rgIndexDedup(dedupKey, textToStore, slug)
+		// Hash match body only: indexHeader embeds a wall-clock timestamp, so
+		// hashing textToStore made identical searches miss the reuse window.
+		label, reused := s.rgIndexDedup(dedupKey, rawText, slug)
 		if !reused {
 			if ierr := s.storeIndexLocked(label, textToStore); ierr != nil {
 				// Fallback on index failure: return raw match lines with context preserved

@@ -353,6 +353,10 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 	for i, cmd := range commands {
 		// Check if the shared context has expired.
 		if err := cmdCtx.Err(); err != nil {
+			// Skipped commands never ran, so there is no real exit code to
+			// fold through errorClassForExit. The synthetic skipErr already
+			// includes "deadline exceeded" (from ctx.Err()); classifyError
+			// maps that to timeout, equivalent to the folding path.
 			skipErr := fmt.Sprintf("skipped: shared timeout exceeded (%v)", err)
 			results[i] = batchResult{
 				Label:      cmd.Label,
@@ -444,15 +448,7 @@ func (s *server) completeBatchResult(r *batchResult, runID, out, execErr string)
 			}
 			msg += execErr
 		}
-		// Align with execute: fold the exit-code suffix into the classifier
-		// input so empty output with POSIX 127 is command_not_found, not unknown.
-		if r.ExitCode != 0 {
-			if msg != "" {
-				msg += "\n"
-			}
-			msg += fmt.Sprintf("(exited with code %d)", r.ExitCode)
-		}
-		r.ErrorClass = classifyError(msg)
+		r.ErrorClass = errorClassForExit(r.ExitCode, msg)
 	}
 	// Auto-index only large output (same 100KB threshold as the execute path);
 	// small output is not persisted. Unique label per index so a repeated

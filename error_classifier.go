@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -8,7 +9,8 @@ import (
 )
 
 // 10-bucket error_class ABI. Matching rules follow
-// /tmp/context-mode/src/session/error-classifier.ts (most-specific first).
+// github.com/mksglu/context-mode src/session/error-classifier.ts
+// (most-specific first).
 const (
 	errorClassFileNotFound     = "file_not_found"
 	errorClassCommandNotFound  = "command_not_found"
@@ -118,11 +120,22 @@ func classifyError(message string) string {
 }
 
 // errorClassForExit classifies failed runs (exit != 0). Success returns "".
+// Always folds "(exited with code N)" into the classifier input so empty
+// output with POSIX 127 is command_not_found across execute/batch/run_task.
+// The execute path may already append "(exited with code N)" to outputText
+// before calling this; folding then duplicates the suffix. Classification
+// uses existence matches (strings.Contains / regexp), so a repeated suffix
+// is idempotent and harmless.
 func errorClassForExit(exitCode int, output string) string {
 	if exitCode == 0 {
 		return ""
 	}
-	return classifyError(output)
+	msg := output
+	if msg != "" {
+		msg += "\n"
+	}
+	msg += fmt.Sprintf("(exited with code %d)", exitCode)
+	return classifyError(msg)
 }
 
 // prefixErrorClass annotates indexed KB content. No-op when class is empty.
