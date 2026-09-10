@@ -5,10 +5,17 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-09-09
+
 ### Added
 - **MCP tool annotations**: each of the five public tools now advertises MCP `ToolAnnotations` on `tools/list` — `ctx_fs`/`ctx_git`: `readOnlyHint=true`, `destructiveHint=false`; `ctx_run`: `readOnlyHint=false`, `destructiveHint=true`, `openWorldHint=true`; `ctx_kb`/`ctx_bg`: `readOnlyHint=false`, `destructiveHint=true`.
 - **Error auto-classification**: failed `execute`, `execute_file`, `batch`, and `run_task` results set `_meta.error_class` (10-bucket ABI) and prefix indexed KB content with `error_class: <class>`.
 - **CLI `index`/`search` subcommands**: `ctxmode index <path>` indexes a file or directory into the knowledge base; `ctxmode search <query>` prints matching snippets without starting the MCP server.
+
+### Fixed
+- **Error-class exit-code fold**: `(exited with code N)` folding is unified into `errorClassForExit` so `execute`/`batch`/`run_task` classify empty-output exit 127 as `command_not_found`.
+- **`ctx_fs` rg summary dedup hash**: hash on raw match text (drop timestamp) to fix intermittent flake and unbounded KB entry proliferation.
+- **CI ripgrep**: install ripgrep on the runner; skip the byte-for-byte equivalence test when system `rg` is absent (CI had been red since v3.2.0).
 
 ## [3.2.0] - 2026-08-28
 
