@@ -285,7 +285,8 @@ func isNotGitRepoMessage(msg string) bool {
 // ensureGitToplevelInside runs `git rev-parse --show-toplevel` in cwd and
 // requires the repository root to lie inside configured workdirs. This blocks
 // the case where workdir is a plain subdirectory of a parent git repo.
-func (s *server) ensureGitToplevelInside(ctx context.Context, cwd string) error {
+// On success it returns the cleaned absolute toplevel path.
+func (s *server) ensureGitToplevelInside(ctx context.Context, cwd string) (string, error) {
 	gctx, cancel := context.WithTimeout(ctx, gitTimeout)
 	defer cancel()
 
@@ -304,31 +305,31 @@ func (s *server) ensureGitToplevelInside(ctx context.Context, cwd string) error 
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			if gctx.Err() != nil {
-				return fmt.Errorf("git timed out after %s", gitTimeout)
+				return "", fmt.Errorf("git timed out after %s", gitTimeout)
 			}
 			msg = err.Error()
 		}
 		if isNotGitRepoMessage(msg) {
-			return fmt.Errorf("not a git repository (cwd=%s): %s", cwd, msg)
+			return "", fmt.Errorf("not a git repository (cwd=%s): %s", cwd, msg)
 		}
-		return fmt.Errorf("git rev-parse --show-toplevel failed: %s", msg)
+		return "", fmt.Errorf("git rev-parse --show-toplevel failed: %s", msg)
 	}
 
 	toplevel := filepath.Clean(strings.TrimSpace(stdout.String()))
 	if toplevel == "" || toplevel == "." {
-		return fmt.Errorf("git rev-parse --show-toplevel returned empty")
+		return "", fmt.Errorf("git rev-parse --show-toplevel returned empty")
 	}
 	if !filepath.IsAbs(toplevel) {
 		toplevel = filepath.Clean(filepath.Join(cwd, toplevel))
 	}
 
 	if !s.lexicallyInside(toplevel) {
-		return fmt.Errorf("git repository root %q is outside workdir (parent repo outside workdir)", toplevel)
+		return "", fmt.Errorf("git repository root %q is outside workdir (parent repo outside workdir)", toplevel)
 	}
 	if _, err := s.ensureInsideWorkspaces(toplevel); err != nil {
-		return fmt.Errorf("git repository root outside workdir: %w", err)
+		return "", fmt.Errorf("git repository root outside workdir: %w", err)
 	}
-	return nil
+	return toplevel, nil
 }
 
 // runGit executes a git subcommand in cwd with a short timeout.
@@ -340,7 +341,7 @@ func (s *server) runGit(ctx context.Context, cwd string, args ...string) (string
 	}
 
 	// H1: refuse when git would operate on a parent repo outside workdirs.
-	if err := s.ensureGitToplevelInside(ctx, cwd); err != nil {
+	if _, err := s.ensureGitToplevelInside(ctx, cwd); err != nil {
 		return "", err
 	}
 

@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 var rgSummaryEnabled = envFlagDefaultOn("CTXMODE_RG_SUMMARY")
@@ -16,10 +19,11 @@ type rgIndexEntry struct {
 }
 
 type rgFileGroup struct {
-	file  string
-	lines []string
-	hits  int
-	dirty bool
+	file   string
+	lines  []string
+	hits   int
+	dirty  bool
+	gitTag string // porcelain short tag: M, A, ?? (empty = clean)
 }
 
 func fnv64a(s string) uint64 {
@@ -270,22 +274,36 @@ func sliceMatchLines(groups []rgFileGroup, offset, limit int) string {
 	return strings.Join(matchLines[offset:end], "\n")
 }
 
-func indexHeader(pattern, root, glob string, totalHits int) string {
+func indexHeader(pattern, root, glob string, totalHits int, partial bool) string {
 	ts := time.Now().UTC().Format(time.RFC3339)
-	return fmt.Sprintf("# rg pattern=%q root=%q glob=%q matches=%d timestamp=%s\n# indexed for ctx_fs action=rg\n---\n", pattern, root, glob, totalHits, ts)
+	var b strings.Builder
+	fmt.Fprintf(&b, "# rg pattern=%q root=%q glob=%q matches=%d timestamp=%s\n", pattern, root, glob, totalHits, ts)
+	if partial {
+		b.WriteString("# partial=true\n")
+	}
+	b.WriteString("# indexed for ctx_fs action=rg\n---\n")
+	return b.String()
 }
 
-func renderRgSummary(groups []rgFileGroup, totalHits, limit int, label, pattern string, reused, truncated bool) string {
+func renderRgSummary(groups []rgFileGroup, totalHits, limit int, label, pattern string, reused, truncated, budgetHit bool, root string) string {
 	var b strings.Builder
 
 	indexedTag := "full set indexed"
-	if truncated {
+	switch {
+	case budgetHit:
+		indexedTag = "partial set indexed (budget exceeded)"
+		if reused {
+			indexedTag = "partial set indexed (budget exceeded) (reused)"
+		}
+	case truncated:
 		indexedTag = "capture truncated at 200KB / 500-match cap"
 		if reused {
 			indexedTag = "capture truncated at 200KB / 500-match cap (reused)"
 		}
-	} else if reused {
-		indexedTag = "full set indexed (reused)"
+	default:
+		if reused {
+			indexedTag = "full set indexed (reused)"
+		}
 	}
 
 	var summaryGroups []rgFileGroup
@@ -294,10 +312,6 @@ func renderRgSummary(groups []rgFileGroup, totalHits, limit int, label, pattern 
 			summaryGroups = append(summaryGroups, g)
 		}
 	}
-
-	fmt.Fprintf(&b, "%d matches in %d files (%s, > first-screen limit %d). Retrieve details: ctx_kb action=search query=%q scope=rg or page raw lines: ctx_fs action=rg pattern=%q offset=%d\n",
-		totalHits, len(summaryGroups), indexedTag, limit, label, pattern, limit)
-	b.WriteString("Files (* = git modified/staged/untracked, then by match count):\n")
 
 	sort.SliceStable(summaryGroups, func(i, j int) bool {
 		if summaryGroups[i].dirty != summaryGroups[j].dirty {
@@ -308,6 +322,20 @@ func renderRgSummary(groups []rgFileGroup, totalHits, limit int, label, pattern 
 		}
 		return false
 	})
+
+	if p, isDef, ok := rgReadHint(summaryGroups); ok {
+		b.WriteString(formatReadHint(p, isDef, root))
+		b.WriteByte('\n')
+	}
+
+	if budgetHit {
+		fmt.Fprintf(&b, "%d matches in %d files (%s, > first-screen limit %d). Retrieve details: ctx_kb action=search query=%q scope=rg\n",
+			totalHits, len(summaryGroups), indexedTag, limit, label)
+	} else {
+		fmt.Fprintf(&b, "%d matches in %d files (%s, > first-screen limit %d). Retrieve details: ctx_kb action=search query=%q scope=rg or page raw lines: ctx_fs action=rg pattern=%q offset=%d\n",
+			totalHits, len(summaryGroups), indexedTag, limit, label, pattern, limit)
+	}
+	b.WriteString("Files (M=modified, A=added, ??=untracked; then by match count):\n")
 
 	maxFiles := 25
 	shownCount := len(summaryGroups)
@@ -322,10 +350,12 @@ func renderRgSummary(groups []rgFileGroup, totalHits, limit int, label, pattern 
 			matchStr = "match"
 		}
 		prefix := ""
-		if g.dirty {
+		if g.gitTag != "" {
+			prefix = g.gitTag + " "
+		} else if g.dirty {
 			prefix = "* "
 		}
-		fmt.Fprintf(&b, "%s%s %d %s\n", prefix, g.file, g.hits, matchStr)
+		fmt.Fprintf(&b, "%s%s %d %s%s\n", prefix, g.file, g.hits, matchStr, rgFileSizeTag(root, g.file))
 
 		var matchPreviews []string
 		for _, line := range g.lines {
@@ -360,4 +390,206 @@ func renderRgSummary(groups []rgFileGroup, totalHits, limit int, label, pattern 
 		res = truncateUTF8(res, 4096)
 	}
 	return res
+}
+
+// ---------- definition-line heuristic, match-line truncation, Read hint ----------
+
+// rgMaxLineRunes caps match-line content (UTF-8 runes) on the toolRg path.
+// Default 500; CTXMODE_RG_MAX_LINE_RUNES overrides; <=0 disables truncation.
+var rgMaxLineRunes = envIntDefault("CTXMODE_RG_MAX_LINE_RUNES", 500)
+
+// rgLargeFileBytes is the summary size-tag threshold: 20KiB = 20*1024 bytes.
+const rgLargeFileBytes = 20 * 1024
+
+var rgDefModifiers = []string{
+	"pub", "export", "default", "async", "abstract", "unsafe",
+	"static", "protected", "private", "public",
+}
+
+var rgDefKeywords = []string{
+	"struct", "fn", "enum", "trait", "impl", "class", "interface",
+	"function", "def", "func", "type", "module", "object",
+}
+
+func isIdentStart(s string) bool {
+	if s == "" {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(s)
+	return r == '_' || r == '$' || unicode.IsLetter(r)
+}
+
+func skipDefModifiers(s string) string {
+	for {
+		s = strings.TrimLeft(s, " \t")
+		if strings.HasPrefix(s, "pub(") {
+			end := strings.IndexByte(s, ')')
+			if end < 0 {
+				return s
+			}
+			s = s[end+1:]
+			continue
+		}
+		matched := false
+		for _, kw := range rgDefModifiers {
+			if strings.HasPrefix(s, kw) {
+				rest := s[len(kw):]
+				if rest != "" && (rest[0] == ' ' || rest[0] == '\t') {
+					s = rest
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			return s
+		}
+	}
+}
+
+// isDefinitionLine reports whether a matched line looks like a code definition.
+// Tightened vs the pi-fff POC: the definition keyword must be followed by
+// whitespace and then an identifier-class character, so `type(x)`, `object.foo`,
+// and `interface{}` are not tagged (prefer miss over false positive).
+func isDefinitionLine(line string) bool {
+	s := skipDefModifiers(strings.TrimLeft(line, " \t"))
+	s = strings.TrimLeft(s, " \t")
+	for _, kw := range rgDefKeywords {
+		if !strings.HasPrefix(s, kw) {
+			continue
+		}
+		rest := s[len(kw):]
+		if rest == "" || (rest[0] != ' ' && rest[0] != '\t') {
+			continue
+		}
+		rest = strings.TrimLeft(rest, " \t")
+		if isIdentStart(rest) {
+			return true
+		}
+		// Go methods: `func (s *T) M(...)` — only on this line-start keyword
+		// path, and only for `func`, so `type (x)` stays untagged.
+		if kw == "func" && strings.HasPrefix(rest, "(") {
+			return true
+		}
+	}
+	return false
+}
+
+// truncateRgMatchLine caps match-line content at rgMaxLineRunes (UTF-8 safe)
+// with a "..." marker, mirroring pi-fff GREP_MAX_LINE_LENGTH. No-op when the
+// cap is <=0 (disabled via CTXMODE_RG_MAX_LINE_RUNES).
+func truncateRgMatchLine(content string) string {
+	if rgMaxLineRunes <= 0 || utf8.RuneCountInString(content) <= rgMaxLineRunes {
+		return content
+	}
+	var b strings.Builder
+	n := 0
+	for _, r := range content {
+		if n == rgMaxLineRunes {
+			break
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return b.String() + "..."
+}
+
+// prepareRgGroups optionally truncates match-line content (CTXMODE_RG_MAX_LINE_RUNES,
+// default 500, <=0 disables) and, when the rg summary feature is on, prefixes
+// definition lines with "[def] ". Applied before indexing so tags/truncation
+// flow into ctx_kb.
+func prepareRgGroups(groups []rgFileGroup) {
+	for i := range groups {
+		for j, line := range groups[i].lines {
+			path, lineNo, ok := splitRgMatchLine(line)
+			if !ok {
+				continue
+			}
+			prefixLen := len(path) + 1 + len(lineNo) + 1
+			if len(line) < prefixLen {
+				continue
+			}
+			content := line[prefixLen:]
+			tagged := rgSummaryEnabled && isDefinitionLine(content)
+			if rgMaxLineRunes > 0 {
+				content = truncateRgMatchLine(content)
+			}
+			if tagged {
+				content = "[def] " + content
+			}
+			groups[i].lines[j] = line[:prefixLen] + content
+		}
+	}
+}
+
+func groupHasDef(g rgFileGroup) bool {
+	for _, line := range g.lines {
+		path, lineNo, ok := splitRgMatchLine(line)
+		if !ok {
+			continue
+		}
+		prefixLen := len(path) + 1 + len(lineNo) + 1
+		if len(line) >= prefixLen && strings.HasPrefix(line[prefixLen:], "[def] ") {
+			return true
+		}
+	}
+	return false
+}
+
+// rgReadHint picks the first group (in the existing order) that contains a
+// definition line, else the first group with matches. Does not reorder lines.
+func rgReadHint(groups []rgFileGroup) (path string, isDef bool, ok bool) {
+	var first string
+	for _, g := range groups {
+		if g.hits == 0 || g.file == "" {
+			continue
+		}
+		if first == "" {
+			first = g.file
+		}
+		if groupHasDef(g) {
+			return g.file, true, true
+		}
+	}
+	if first == "" {
+		return "", false, false
+	}
+	return first, false, true
+}
+
+func rgFileSizeTag(root, file string) string {
+	if file == "" {
+		return ""
+	}
+	abs := rgGroupAbsPath(root, file)
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return ""
+	}
+	if fi.Size() < rgLargeFileBytes {
+		return ""
+	}
+	kb := (fi.Size() + 512) / 1024
+	return fmt.Sprintf(" (%dKB - use offset to read relevant section)", kb)
+}
+
+func formatReadHint(path string, isDef bool, root string) string {
+	s := "→ Read " + path
+	if isDef {
+		s += " [def]"
+	}
+	s += rgFileSizeTag(root, path)
+	return s
+}
+
+func prependReadHint(body string, groups []rgFileGroup, root string) string {
+	p, isDef, ok := rgReadHint(groups)
+	if !ok {
+		return body
+	}
+	hint := formatReadHint(p, isDef, root)
+	if body == "" {
+		return hint
+	}
+	return hint + "\n" + body
 }

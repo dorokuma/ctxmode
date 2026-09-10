@@ -694,7 +694,12 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
     label: "CTX FS",
     description: "工作区文件（沙箱）。action=ls|glob|stat|rg（rg 默认 limit=20，超限自动落库并返回摘要，支持 offset 线性翻页）。",
     promptSnippet: "List, glob, stat, or search files under workdirs",
-    promptGuidelines: ["Prefer ctx_fs over shell find/ls/rg when listing or searching workspace files."],
+    promptGuidelines: [
+      "Prefer ctx_fs over shell find/ls/rg when listing or searching workspace files.",
+      "rg: grep for a concrete identifier (e.g. MyFunc), never '.*' — grep is not a file reader.",
+      "rg: after 1-2 greps, Read the top-hit file instead of grepping again.",
+      "rg: for huge result sets use ctx_kb action=search or ctx_fs rg offset paging.",
+    ],
     parameters: Type.Object({
       action: Type.String({ description: "ls|glob|stat|rg", enum: ["ls", "glob", "stat", "rg"] }),
       path: Type.Optional(Type.String()),

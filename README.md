@@ -4,7 +4,7 @@ A 100% NPM/NodeJS-free, Go implementation of Mert Koseoglu's [context-mode](http
 
 Local-first Model Context Protocol (MCP) server that virtualizes tool outputs, allowing AI coding agents to execute heavy tasks and save up to 98% in token usage.
 
-Current version: **3.3.0**.
+Current version: **3.4.0**.
 
 Supported platform: **Linux**. Background process identity verification reads `/proc/<pid>/stat`; on other platforms ctxmode still runs, but `ctx_bg` termination is not promised (see [ctx_bg](#ctx_bg--background-process-supervision-from-ctx_run-actionexecute-backgroundtrue)).
 
@@ -63,6 +63,8 @@ Environment variables:
 - `CTXMODE_DB` — absolute path to the SQLite database file; takes priority over the per-workdir default (see Database).
 - `CTXMODE_CONFIG` — path to the YAML config file.
 - `CTXMODE_ENV_PASSTHROUGH=1` — disable the default stripping of sensitive variables from subprocess environments (see [Subprocess environment isolation](#subprocess-environment-isolation)).
+- `CTXMODE_RG_BUDGET_MS` — `ctx_fs` rg wall-clock budget in milliseconds (default `10000`; `<=0` disables).
+- `CTXMODE_RG_MAX_LINE_RUNES` — `ctx_fs` rg match-line truncation in UTF-8 runes (default `500`; `<=0` disables). The wildcard-only pattern guard is always-on and has no env switch; pass `literal:true` to search metacharacters as a literal string.
 
 ## Security model — NOT a sandbox
 
@@ -109,7 +111,7 @@ Side effects to be aware of:
 - `ls` — list directory: `path` (omitted, `.`, or `./` is the primary workdir, even when several `workdirs` are configured), `depth` (1-5, default 1; >5 is an error), `include_hidden`, `limit` (default 200, max 2000; >2000 is an error).
 - `glob` — `pattern` (`**` supported), `path` (same default as `ls`), `limit` (default 200, max 2000; >2000 is an error); skips `.git`/`node_modules`/`vendor` and applies basic `.gitignore` rules.
 - `stat` — `path`: size/mode/mtime/symlink/workdir metadata (symlink-aware).
-- `rg` — content search: `pattern` (or `literal`), `path` (same default as `ls`), `glob`, `ignore_case`, `context` (0-5), `limit` (default 50, max 500; >500 is an error); system `rg` with `--no-config` (ignores `RIPGREP_CONFIG_PATH` / `~/.ripgreprc`) and a pure-Go fallback; skips binaries.
+- `rg` — content search: `pattern` (or `literal`), `path` (same default as `ls`), `glob`, `ignore_case`, `context` (0-5), `limit` (default 20 with summary on, max 500; >500 is an error); system `rg` with `--no-config` (ignores `RIPGREP_CONFIG_PATH` / `~/.ripgreprc`) and a pure-Go fallback; skips binaries. Wildcard-only patterns (`.*`, `*`, `.+`, `.`) are rejected (always-on; pass `literal:true` to search those characters). Match lines longer than 500 runes are truncated (`CTXMODE_RG_MAX_LINE_RUNES`; `<=0` disables). Files over 20KiB (`20*1024` bytes) get a size tag in the summary.
 
 ### ctx_git — read-only git (no commit/push/reset)
 

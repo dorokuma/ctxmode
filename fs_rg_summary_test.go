@@ -124,14 +124,14 @@ func TestRgAB_Golden_BeforeAfter(t *testing.T) {
 	}
 
 	// Assert ordering: app.ts (dirty) appears before noise.ts (clean)
-	appIdx := strings.Index(text, "* app.ts")
+	appIdx := strings.Index(text, "M app.ts")
 	noiseIdx := strings.Index(text, "noise.ts")
-	utilsIdx := strings.Index(text, "* utils.ts")
+	utilsIdx := strings.Index(text, "?? utils.ts")
 	if appIdx < 0 || noiseIdx < 0 || utilsIdx < 0 {
-		t.Fatalf("expected * app.ts, * utils.ts and noise.ts in summary, got: %s", text)
+		t.Fatalf("expected M app.ts, ?? utils.ts and noise.ts in summary, got: %s", text)
 	}
 	if appIdx > noiseIdx || utilsIdx > noiseIdx {
-		t.Errorf("expected dirty files (* app.ts, * utils.ts) before noise.ts in summary")
+		t.Errorf("expected dirty files (M app.ts, ?? utils.ts) before noise.ts in summary")
 	}
 
 	// Extract indexed label from header

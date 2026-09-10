@@ -24,6 +24,9 @@ action argument.
 ## Usage policy
 
 - Prefer argv over shell command strings; prefer ctx_fs over shell find/ls/rg.
+- rg: search with a concrete identifier (e.g. MyFunc), never '.*' — grep is not a file reader.
+- rg: after 1-2 greps, Read the top-hit file instead of grepping again.
+- rg: for huge result sets use ctx_kb action=search or ctx_fs rg offset paging.
 - Big outputs are auto-indexed: search ctx_kb instead of re-running.
 - Mutating: ctx_run (executes code/commands), ctx_kb index/fetch/purge (writes
   the local KB), ctx_bg kill. Everything else is read-only.

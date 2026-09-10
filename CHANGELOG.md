@@ -5,6 +5,19 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [3.4.0] - 2026-09-10
+
+### Added
+- **Wildcard-only rg guard** (behavior change, always-on): `ctx_fs` rg rejects patterns that contain no literal characters after stripping regex metacharacters (`.*`, `*`, `.+`, `.`, `.*.*`), returning a short tool error that steers the caller to a concrete identifier. Mixed patterns (`foo.*`, `Get.*Name`) still run. This guard cannot be disabled; pass `literal:true` to search those metacharacters as a literal string. Previously these patterns scanned every line.
+- **rg wall-clock budget**: `ctx_fs` rg searches stop after 10s by default (override with `CTXMODE_RG_BUDGET_MS`; `<=0` disables). Unlike pi-fff, the budget applies to zero-match scans too. Timeout returns partial results with `truncated=true` and a hint to narrow path/glob or use `ctx_kb` search (not rg offset). Partial results still go through auto-index/summary, tagged `partial set indexed (budget exceeded)` with `# partial=true` in the KB document.
+- **Definition-line `[def]` tags and `→ Read` hint**: rg summary and first-screen output (when `CTXMODE_RG_SUMMARY` is on) annotate definition lines (tightened heuristic: keyword then identifier, including Go methods `func (s *T) M(...)`) and suggest `→ Read <path>` (first file with a definition, else the first ranked file). Match-line order is not rearranged.
+- **Match-line truncation and large-file hints**: match lines longer than 500 runes are UTF-8-truncated with `...` (override with `CTXMODE_RG_MAX_LINE_RUNES`; `<=0` disables). Files over 20KiB (`20*1024` bytes) shown in the summary get `(NN KB - use offset to read relevant section)`. Dedup hash is computed on the truncated (and tagged) match text. The wildcard-only guard stays always-on even when this truncation switch is off.
+- **Git porcelain short tags on rg summary**: dirty-file `*` prefix becomes `M` (modified), `A` (added), or `??` (untracked); one tag per file, priority modified > added > untracked.
+
+### Changed
+- **`ctx_fs` glob dirty-first ordering**: glob results reuse the rg git dirty set (3s TTL) to list dirty files first; remaining entries keep their previous relative (lexicographic) order.
+- **Tool guidance**: `instructions.go` and the pi `ctx_fs` promptGuidelines now tell agents to grep with concrete identifiers, Read after 1-2 greps, and page huge result sets via `ctx_kb` search or rg offset.
+
 ## [3.3.0] - 2026-09-09
 
 ### Added

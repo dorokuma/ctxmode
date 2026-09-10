@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -34,6 +36,47 @@ const (
 	fsRgMaxOutputBytes      = 100 * 1024 // 100 KB
 	fsRgProcessCaptureBytes = 2 * fsRgMaxOutputBytes
 )
+
+// rgBudgetMs is the wall-clock search budget for ctx_fs rg, in milliseconds.
+// Default 10s; CTXMODE_RG_BUDGET_MS overrides; <=0 disables.
+var rgBudgetMs = envIntDefault("CTXMODE_RG_BUDGET_MS", 10_000)
+
+// errRgBudget is returned by rgSystem/rgGo when the wall-clock budget is hit.
+// Partial results are in the text return; toolRg turns this into truncated=true
+// plus a narrow-path/glob hint rather than an MCP error.
+var errRgBudget = errors.New("rg wall-clock budget exceeded")
+
+func envIntDefault(name string, def int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// isWildcardOnlyPattern reports whether a regex pattern contains no literal
+// characters after stripping regex metacharacters and whitespace. Such patterns
+// (".*", "*", ".+", ".", ".*.*") match (nearly) every line and are almost
+// always grep misused as a file reader. Mixed patterns ("foo.*", "Get.*Name")
+// always pass. Metacharacter-free strings are never wildcard-only.
+func isWildcardOnlyPattern(pattern string) bool {
+	hasMeta := false
+	for _, r := range pattern {
+		switch r {
+		case '.', '*', '+', '?', '^', '$', '(', ')', '[', ']', '{', '}', '|', '\\':
+			hasMeta = true
+		default:
+			if !unicode.IsSpace(r) {
+				return false
+			}
+		}
+	}
+	return hasMeta
+}
 
 // skipWalkDirs are well-known bulk/VCS directories always skipped by glob/rg walks.
 var skipWalkDirs = map[string]bool{
@@ -231,6 +274,30 @@ func (s *server) toolLs(ctx context.Context, _ *mcp.CallToolRequest, args lsArgs
 	}, nil, nil
 }
 
+// displayPathBase returns the workdir that displayPath would relativize abs against.
+// Used to invert workdir-relative rg match paths back to absolute dirty keys.
+func (s *server) displayPathBase(abs string) string {
+	if s == nil {
+		return abs
+	}
+	for _, wd := range s.workdirs {
+		realWd := wd
+		if rw, err := filepath.EvalSymlinks(wd); err == nil {
+			realWd = rw
+		}
+		cleanWd := strings.TrimSuffix(realWd, string(filepath.Separator))
+		for _, base := range []string{cleanWd, strings.TrimSuffix(wd, string(filepath.Separator))} {
+			if abs == base {
+				return base
+			}
+			if strings.HasPrefix(abs, base+string(filepath.Separator)) {
+				return base
+			}
+		}
+	}
+	return abs
+}
+
 // displayPath returns a path relative to the first matching workdir, else absolute.
 func (s *server) displayPath(abs string) string {
 	for _, wd := range s.workdirs {
@@ -294,7 +361,7 @@ func (s *server) toolGlob(ctx context.Context, _ *mcp.CallToolRequest, args glob
 	// Root + nested .gitignore (last match wins, including !).
 	gitignore := newGitignoreStack(root)
 
-	var matches []string
+	var absMatches []string
 	truncated := false
 	pattern := filepath.ToSlash(args.Pattern)
 
@@ -346,14 +413,14 @@ func (s *server) toolGlob(ctx context.Context, _ *mcp.CallToolRequest, args glob
 
 		// Match files and dirs against pattern (both useful).
 		if matchGlobPattern(pattern, relSlash) {
-			if len(matches) >= limit {
+			if len(absMatches) >= limit {
 				truncated = true
 				if fi.IsDir() {
 					return filepath.SkipDir
 				}
 				return nil
 			}
-			matches = append(matches, s.displayPath(p))
+			absMatches = append(absMatches, p)
 		}
 		return nil
 	})
@@ -361,7 +428,7 @@ func (s *server) toolGlob(ctx context.Context, _ *mcp.CallToolRequest, args glob
 		return nil, nil, err
 	}
 
-	sort.Strings(matches)
+	matches := s.globOrderMatches(ctx, absMatches, root)
 
 	type globResult struct {
 		Pattern   string   `json:"pattern"`
@@ -381,6 +448,37 @@ func (s *server) toolGlob(ctx context.Context, _ *mcp.CallToolRequest, args glob
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: string(js)}},
 	}, nil, nil
+}
+
+// globOrderMatches converts abs paths to display paths, sorts lexicographically,
+// then stably partitions dirty files first using the rg git dirty set (3s TTL).
+// Remaining entries keep their previous relative (lex) order.
+func (s *server) globOrderMatches(ctx context.Context, absMatches []string, root string) []string {
+	type item struct{ display, abs string }
+	items := make([]item, len(absMatches))
+	for i, p := range absMatches {
+		items[i] = item{display: s.displayPath(p), abs: filepath.Clean(p)}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].display < items[j].display })
+	dirty, _ := s.gitDirtyFiles(ctx, root)
+	out := make([]string, 0, len(items))
+	if len(dirty) == 0 {
+		for _, it := range items {
+			out = append(out, it.display)
+		}
+		return out
+	}
+	for _, it := range items {
+		if _, ok := dirty[it.abs]; ok {
+			out = append(out, it.display)
+		}
+	}
+	for _, it := range items {
+		if _, ok := dirty[it.abs]; !ok {
+			out = append(out, it.display)
+		}
+	}
+	return out
 }
 
 // matchGlobPattern supports *, ?, and ** against slash-separated relative paths.
@@ -745,6 +843,7 @@ type rgHeader struct {
 	GitDirty  int
 	GitStatus string
 	Indexed   string
+	BudgetHit bool
 }
 
 func defaultRgLimit() int {
@@ -785,17 +884,31 @@ func formatRgHeader(hdr rgHeader) string {
 			parts = append(parts, fmt.Sprintf("git_dirty=%d", hdr.GitDirty))
 		}
 	}
+	if hdr.BudgetHit {
+		parts = append(parts, "budget_exceeded=true")
+	}
 	if hdr.Indexed != "" {
 		parts = append(parts, fmt.Sprintf("indexed=%s", hdr.Indexed))
 	}
 	return strings.Join(parts, " ")
 }
 
+func rgBudgetLabel() string {
+	if rgBudgetMs >= 1000 && rgBudgetMs%1000 == 0 {
+		return fmt.Sprintf("%ds", rgBudgetMs/1000)
+	}
+	return fmt.Sprintf("%dms", rgBudgetMs)
+}
+
 func (s *server) rgRenderResult(hdr rgHeader, text string) *mcp.CallToolResult {
+	budgetHint := ""
+	if hdr.BudgetHit {
+		budgetHint = fmt.Sprintf("\n(search stopped at %s wall-clock budget — results may be incomplete; narrow path/glob or use ctx_kb action=search)", rgBudgetLabel())
+	}
 	if text == "" {
 		header := formatRgHeader(hdr)
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: header + "\n(no matches)"}},
+			Content: []mcp.Content{&mcp.TextContent{Text: header + "\n(no matches)" + budgetHint}},
 		}
 	}
 	// Cap total response size.
@@ -805,7 +918,7 @@ func (s *server) rgRenderResult(hdr rgHeader, text string) *mcp.CallToolResult {
 	}
 	header := formatRgHeader(hdr)
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: header + "\n" + text}},
+		Content: []mcp.Content{&mcp.TextContent{Text: header + "\n" + text + budgetHint}},
 	}
 }
 
@@ -820,6 +933,9 @@ func (s *server) rgResult(text string, count int, truncated bool, engine string)
 func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs) (*mcp.CallToolResult, any, error) {
 	if args.Pattern == "" {
 		return nil, nil, fmt.Errorf("pattern is required")
+	}
+	if !args.Literal && isWildcardOnlyPattern(args.Pattern) {
+		return nil, nil, fmt.Errorf("pattern %q matches everything — grep needs a concrete substring or identifier (e.g. 'MyClass' or 'export function'); pass literal:true to search metacharacters as a literal string", args.Pattern)
 	}
 	pathArg := args.Path
 	if pathArg == "" {
@@ -851,7 +967,8 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		return nil, nil, err
 	}
 
-	dirty, gitStatus := s.gitDirtyFiles(ctx, root)
+	dirty, tags, gitStatus := s.gitDirtyState(ctx, root)
+	matchRoot := s.displayPathBase(root)
 
 	indexingPossible := s.store != nil && rgSummaryEnabled && args.Offset == 0
 	var fetchLimit, fetchBytes int
@@ -861,14 +978,34 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		fetchLimit, fetchBytes = fsRgHardLimit, fsRgProcessCaptureBytes
 	}
 
+	budgetCtx := ctx
+	var cancelBudget context.CancelFunc
+	if rgBudgetMs > 0 {
+		budgetCtx, cancelBudget = context.WithTimeout(ctx, time.Duration(rgBudgetMs)*time.Millisecond)
+		defer cancelBudget()
+	}
+
 	var text string
 	var truncated bool
+	var budgetHit bool
 	engine := "rg"
+
+	fillHdr := func(hdr rgHeader) rgHeader {
+		if budgetHit {
+			hdr.BudgetHit = true
+			hdr.Truncated = true
+		}
+		return hdr
+	}
 
 	// Prefer system rg when available.
 	if rgPath, lookErr := exec.LookPath("rg"); lookErr == nil {
 		var sysErr error
-		text, truncated, _, sysErr = s.rgSystem(ctx, rgPath, root, args, fetchLimit, contextLines, fetchBytes)
+		text, truncated, _, sysErr = s.rgSystem(budgetCtx, rgPath, root, args, fetchLimit, contextLines, fetchBytes)
+		if errors.Is(sysErr, errRgBudget) {
+			budgetHit = true
+			sysErr = nil
+		}
 		if sysErr != nil {
 			if ee, ok := sysErr.(*exec.ExitError); ok && ee.ExitCode() == 1 {
 				hdr := rgHeader{
@@ -880,7 +1017,7 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 					GitDirty:  0,
 					GitStatus: gitStatus,
 				}
-				return s.rgRenderResult(hdr, ""), nil, nil
+				return s.rgRenderResult(fillHdr(hdr), ""), nil, nil
 			}
 			// Other errors: fallback to pure-Go.
 			text, truncated, _, err = s.rgGo(ctx, root, args, fetchLimit, contextLines, fetchBytes)
@@ -891,6 +1028,10 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		engine = "go"
 	}
 
+	if errors.Is(err, errRgBudget) {
+		budgetHit = true
+		err = nil
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -899,7 +1040,9 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 	if text != "" {
 		lines := strings.Split(text, "\n")
 		groups = groupRgLines(lines)
-		rankGroups(groups, dirty, root)
+		prepareRgGroups(groups)
+		rankGroups(groups, dirty, matchRoot)
+		tagGroups(groups, tags, matchRoot)
 	}
 
 	totalHits := 0
@@ -938,9 +1081,13 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 			GitStatus: gitStatus,
 			Indexed:   s.getRgIndexLabel(dedupKey),
 		}
-		return s.rgRenderResult(hdr, slicedText), nil, nil
+		return s.rgRenderResult(fillHdr(hdr), slicedText), nil, nil
 
 	case totalHits <= limit:
+		body := renderGroups(groups)
+		if rgSummaryEnabled {
+			body = prependReadHint(body, groups, matchRoot)
+		}
 		hdr := rgHeader{
 			Engine:    engine,
 			Matches:   totalHits,
@@ -950,7 +1097,7 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 			GitDirty:  gitDirtyCount,
 			GitStatus: gitStatus,
 		}
-		return s.rgRenderResult(hdr, renderGroups(groups)), nil, nil
+		return s.rgRenderResult(fillHdr(hdr), body), nil, nil
 
 	case !indexingPossible:
 		// Fallback: old behavior (first limit match lines with context preserved and truncated=true)
@@ -964,12 +1111,12 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 			GitDirty:  gitDirtyCount,
 			GitStatus: gitStatus,
 		}
-		return s.rgRenderResult(hdr, slicedText), nil, nil
+		return s.rgRenderResult(fillHdr(hdr), slicedText), nil, nil
 
 	default:
 		// Exceeds limit: index to ctx_kb and return summary
 		rawText := renderGroups(groups)
-		textToStore := indexHeader(args.Pattern, root, args.Glob, totalHits) + rawText
+		textToStore := indexHeader(args.Pattern, root, args.Glob, totalHits, budgetHit) + rawText
 		if serr := checkSensitiveContent(textToStore); serr != nil {
 			// Sensitive content fallback: return raw match lines up to limit with context preserved
 			slicedText := sliceGroupsWithContext(groups, limit)
@@ -982,12 +1129,13 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 				GitDirty:  gitDirtyCount,
 				GitStatus: gitStatus,
 			}
-			return s.rgRenderResult(hdr, fmt.Sprintf("%s\n(sensitive content detected: indexing skipped, returning first %d matches)", slicedText, limit)), nil, nil
+			return s.rgRenderResult(fillHdr(hdr), fmt.Sprintf("%s\n(sensitive content detected: indexing skipped, returning first %d matches)", slicedText, limit)), nil, nil
 		}
 
 		slug := slugifyRgPattern(args.Pattern, args.Glob)
 		// Hash match body only: indexHeader embeds a wall-clock timestamp, so
 		// hashing textToStore made identical searches miss the reuse window.
+		// Hash is over truncated+tagged match text (the stored body).
 		label, reused := s.rgIndexDedup(dedupKey, rawText, slug)
 		if !reused {
 			if ierr := s.storeIndexLocked(label, textToStore); ierr != nil {
@@ -1002,11 +1150,11 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 					GitDirty:  gitDirtyCount,
 					GitStatus: gitStatus,
 				}
-				return s.rgRenderResult(hdr, fmt.Sprintf("%s\n(indexing failed: %v, returning first %d matches)", slicedText, ierr, limit)), nil, nil
+				return s.rgRenderResult(fillHdr(hdr), fmt.Sprintf("%s\n(indexing failed: %v, returning first %d matches)", slicedText, ierr, limit)), nil, nil
 			}
 		}
 
-		summary := renderRgSummary(groups, totalHits, limit, label, args.Pattern, reused, truncated)
+		summary := renderRgSummary(groups, totalHits, limit, label, args.Pattern, reused, truncated, budgetHit, matchRoot)
 		hdr := rgHeader{
 			Engine:    engine,
 			Matches:   totalHits,
@@ -1017,7 +1165,7 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 			GitStatus: gitStatus,
 			Indexed:   label,
 		}
-		return s.rgRenderResult(hdr, summary), nil, nil
+		return s.rgRenderResult(fillHdr(hdr), summary), nil, nil
 	}
 }
 
@@ -1028,6 +1176,13 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 		"--with-filename",
 		"--line-number",
 		"--color", "never",
+	}
+	// Line-buffer stdout when a wall-clock budget may SIGKILL rg, so partial
+	// hits are flushed instead of sitting in a pipe buffer and looking empty.
+	if rgBudgetMs > 0 {
+		cmdArgs = append(cmdArgs, "--line-buffered")
+	}
+	cmdArgs = append(cmdArgs,
 		"--hidden",
 		"--glob", "!.git/**",
 		"--glob", "!.git/*",
@@ -1052,7 +1207,7 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 		"--glob", "!.gnupg/**",
 		"--glob", "!.kube/**",
 		"-m", strconv.Itoa(fetchLimit),
-	}
+	)
 	if args.IgnoreCase {
 		cmdArgs = append(cmdArgs, "-i")
 	}
@@ -1078,8 +1233,11 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	killedByBudget := errors.Is(ctx.Err(), context.DeadlineExceeded)
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
+		if killedByBudget {
+			// SIGKILLed at the wall-clock budget: keep partial stdout below.
+		} else if ee, ok := err.(*exec.ExitError); ok {
 			// Exit 0 = matches, 1 = no match, 2 = error.
 			if ee.ExitCode() == 1 {
 				return "", false, 0, nil
@@ -1129,7 +1287,11 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 	if matchCount >= fetchLimit || stdout.truncated {
 		truncated = true
 	}
-	return strings.TrimRight(b.String(), "\n"), truncated, matchCount, nil
+	out := strings.TrimRight(b.String(), "\n")
+	if killedByBudget {
+		return out, true, matchCount, errRgBudget
+	}
+	return out, truncated, matchCount, nil
 }
 
 func isRgMatchLine(line string) bool {
@@ -1245,6 +1407,13 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, fetchLimit,
 	matchCount := 0
 	truncated := false
 	stopped := false // walk halted by match limit / output cap (NOT by skipped lines)
+	budgetStopped := false
+	fileCount := 0
+	start := time.Now()
+	var budget time.Duration
+	if rgBudgetMs > 0 {
+		budget = time.Duration(rgBudgetMs) * time.Millisecond
+	}
 	gitignore := newGitignoreStack(root)
 
 	walkErr := filepath.Walk(root, func(p string, fi os.FileInfo, err error) error {
@@ -1310,6 +1479,15 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, fetchLimit,
 
 		if isSensitiveFilePath(p) {
 			return nil
+		}
+		// Wall-clock budget: check every 8th scanned file (fff-style throttle).
+		// Unlike pi-fff, there is no "must have matched first" gate — zero-match
+		// searches stop too.
+		fileCount++
+		if budget > 0 && fileCount%8 == 0 && time.Since(start) > budget {
+			truncated = true
+			budgetStopped = true
+			return io.EOF
 		}
 		f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
@@ -1399,5 +1577,15 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, fetchLimit,
 	if walkErr != nil && walkErr != io.EOF {
 		return "", false, 0, walkErr
 	}
-	return strings.TrimRight(b.String(), "\n"), truncated, matchCount, nil
+	// Repos with fewer than 8 files never trip the %8 throttle; check once
+	// more after the walk so a small tree is still wall-clock bounded.
+	if budget > 0 && !budgetStopped && time.Since(start) > budget {
+		truncated = true
+		budgetStopped = true
+	}
+	out := strings.TrimRight(b.String(), "\n")
+	if budgetStopped {
+		return out, true, matchCount, errRgBudget
+	}
+	return out, truncated, matchCount, nil
 }
