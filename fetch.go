@@ -67,7 +67,8 @@ type fetchArgs struct {
 	Force     bool     `json:"force,omitempty" jsonschema:"Skip cache and re-fetch"`
 	MaxBytes  int      `json:"maxBytes,omitempty" jsonschema:"Max bytes to return (default 50KB)"`
 	TimeoutMs int      `json:"timeoutMs,omitempty" jsonschema:"Timeout in ms (default 150000)"`
-	TTL       *int     `json:"ttl,omitempty" jsonschema:"Cache TTL in ms (0 = skip cache, omit = 24h default)"`
+	TTLMs     *int     `json:"ttl_ms,omitempty" jsonschema:"Cache TTL in ms (0 = skip cache, omit = 24h default)"`
+	TTL       *int     `json:"ttl,omitempty" jsonschema:"DEPRECATED: use ttl_ms. Cache TTL in ms (0 = skip cache, omit = 24h default)"`
 }
 
 // ---------- SSRF validation ----------
@@ -997,8 +998,11 @@ func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, 
 	}
 
 	// Resolve TTL: nil means use default (24h), 0 means skip cache.
+	// ttl_ms is the canonical field; deprecated ttl kept as alias.
 	ttl := -1 // sentinel: use default 24h TTL
-	if args.TTL != nil {
+	if args.TTLMs != nil {
+		ttl = *args.TTLMs // may be 0 (skip cache) or positive (custom ms)
+	} else if args.TTL != nil {
 		ttl = *args.TTL // may be 0 (skip cache) or positive (custom ms)
 	}
 

@@ -35,7 +35,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "3.4.0"
+const Version = "3.5.0"
 
 // toolIndex walk / size limits.
 const (
@@ -304,7 +304,8 @@ func ensureDBDir(dbPath string) error {
 type executeArgs struct {
 	Command    string            `json:"command,omitempty" jsonschema:"Command or code to execute (ignored when argv is non-empty)"`
 	Language   string            `json:"language,omitempty" jsonschema:"Runtime language (javascript/python/shell/go/...). Ignored in argv mode"`
-	Timeout    int               `json:"timeout,omitempty" jsonschema:"Max execution time in ms"`
+	Timeout    int               `json:"timeout,omitempty" jsonschema:"DEPRECATED: use timeout_ms. Max execution time in ms"`
+	TimeoutMs  int               `json:"timeout_ms,omitempty" jsonschema:"Max execution time in ms (default 60000, max 3600000)"`
 	Background bool              `json:"background,omitempty" jsonschema:"Run asynchronously in background (terminated on timeout if specified, default max 1h). Manage via ctx_bg"`
 	Intent     string            `json:"intent,omitempty" jsonschema:"What you're looking for in the output (for auto-indexing)"`
 	CWD        string            `json:"cwd,omitempty" jsonschema:"Working directory"`
@@ -325,13 +326,18 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		language = "shell"
 	}
 
-	// Parse timeout (capped at 1 hour).
+	// Parse timeout (capped at 1 hour). timeout_ms takes precedence over the
+	// deprecated timeout field; both are in milliseconds.
 	var timeout time.Duration
-	if args.Timeout > 0 {
-		if args.Timeout > 3600000 {
-			return nil, nil, fmt.Errorf("timeout %dms exceeds maximum allowed (1 hour)", args.Timeout)
+	timeoutMs := args.TimeoutMs
+	if timeoutMs <= 0 {
+		timeoutMs = args.Timeout
+	}
+	if timeoutMs > 0 {
+		if timeoutMs > 3600000 {
+			return nil, nil, fmt.Errorf("timeout_ms %dms exceeds maximum allowed (1 hour)", timeoutMs)
 		}
-		timeout = time.Duration(args.Timeout) * time.Millisecond
+		timeout = time.Duration(timeoutMs) * time.Millisecond
 	}
 
 	// Resolve working directory.
@@ -776,12 +782,13 @@ func (s *server) toolStats(ctx context.Context, _ *mcp.CallToolRequest, _ statsA
 // ---------- ctx_run action=execute_file ----------
 
 type executeFileArgs struct {
-	Path     string `json:"path" jsonschema:"File path to read into FILE_CONTENT variable"`
-	Language string `json:"language,omitempty" jsonschema:"Runtime language (javascript/python/shell/go/...)"`
-	Code     string `json:"code" jsonschema:"Code that processes FILE_CONTENT variable"`
-	Timeout  int    `json:"timeout,omitempty" jsonschema:"Max execution time in ms"`
-	Intent   string `json:"intent,omitempty" jsonschema:"What you're looking for in the output"`
-	CWD      string `json:"cwd,omitempty" jsonschema:"Working directory"`
+	Path      string `json:"path" jsonschema:"File path to read into FILE_CONTENT variable"`
+	Language  string `json:"language,omitempty" jsonschema:"Runtime language (javascript/python/shell/go/...)"`
+	Code      string `json:"code" jsonschema:"Code that processes FILE_CONTENT variable"`
+	Timeout   int    `json:"timeout,omitempty" jsonschema:"DEPRECATED: use timeout_ms. Max execution time in ms"`
+	TimeoutMs int    `json:"timeout_ms,omitempty" jsonschema:"Max execution time in ms (default 60000, max 3600000)"`
+	Intent    string `json:"intent,omitempty" jsonschema:"What you're looking for in the output"`
+	CWD       string `json:"cwd,omitempty" jsonschema:"Working directory"`
 }
 
 func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, args executeFileArgs) (*mcp.CallToolResult, any, error) {
@@ -875,13 +882,18 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		language = "javascript"
 	}
 
-	// Parse timeout (capped at 1 hour).
+	// Parse timeout (capped at 1 hour). timeout_ms takes precedence over the
+	// deprecated timeout field; both are in milliseconds.
 	var timeout time.Duration
-	if args.Timeout > 0 {
-		if args.Timeout > 3600000 {
-			return nil, nil, fmt.Errorf("timeout %dms exceeds maximum allowed (1 hour)", args.Timeout)
+	timeoutMs := args.TimeoutMs
+	if timeoutMs <= 0 {
+		timeoutMs = args.Timeout
+	}
+	if timeoutMs > 0 {
+		if timeoutMs > 3600000 {
+			return nil, nil, fmt.Errorf("timeout_ms %dms exceeds maximum allowed (1 hour)", timeoutMs)
 		}
-		timeout = time.Duration(args.Timeout) * time.Millisecond
+		timeout = time.Duration(timeoutMs) * time.Millisecond
 	}
 
 	// Resolve working directory.

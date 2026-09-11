@@ -354,10 +354,10 @@ func TestErrorClass_WireMetaJSON(t *testing.T) {
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
 		Name: "ctx_run",
 		Arguments: map[string]any{
-			"action":   "execute",
-			"command":  "echo permission denied; exit 1",
-			"language": "shell",
-			"timeout":  10000,
+			"action":     "execute",
+			"command":    "echo permission denied; exit 1",
+			"language":   "shell",
+			"timeout_ms": 10000,
 		},
 	})
 	if err != nil {

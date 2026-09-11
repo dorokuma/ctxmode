@@ -5,6 +5,15 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-09-11
+
+### Added
+- **`timeout_ms` on execute / execute_file / batch**: canonical millisecond timeout (same unit as the old `timeout` field). `timeout` remains as a deprecated alias; `timeout_ms` wins when both are set. Previously only `run_task` and `ctx_bg` wait honored `timeout_ms`.
+- **`ttl_ms` on ctx_kb fetch**: canonical cache TTL in milliseconds. `ttl` remains as a deprecated alias.
+
+### Changed
+- Pi adapter schemas advertise `timeout_ms` / `ttl_ms` as canonical and mark `timeout` / `ttl` deprecated.
+
 ## [3.4.0] - 2026-09-10
 
 ### Added

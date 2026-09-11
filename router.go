@@ -17,8 +17,10 @@ type ctxRunArgs struct {
 	Action string `json:"action" jsonschema:"execute|execute_file|batch|run_task"`
 
 	// execute
-	Command    string            `json:"command,omitempty"`
-	Language   string            `json:"language,omitempty"`
+	Command  string `json:"command,omitempty"`
+	Language string `json:"language,omitempty"`
+	// TimeoutMs is canonical (ms); Timeout is the deprecated alias, also ms.
+	TimeoutMs  int               `json:"timeout_ms,omitempty"`
 	Timeout    int               `json:"timeout,omitempty"`
 	Background bool              `json:"background,omitempty" jsonschema:"Only for action=execute: start and return immediately; no proactive push. Configured execution timeout terminates on timeout; ctx_bg wait timeout does not kill. After receiving id, call ctx_bg action=wait once (default 60000ms, max 3600000ms); not supported by other actions. (terminated on timeout)"`
 	Intent     string            `json:"intent,omitempty"`
@@ -38,10 +40,9 @@ type ctxRunArgs struct {
 	QueryScope  string         `json:"query_scope,omitempty"`
 
 	// run_task
-	Kind      string   `json:"kind,omitempty"`
-	Target    string   `json:"target,omitempty"`
-	Args      []string `json:"args,omitempty"`
-	TimeoutMs int      `json:"timeout_ms,omitempty"`
+	Kind   string   `json:"kind,omitempty"`
+	Target string   `json:"target,omitempty"`
+	Args   []string `json:"args,omitempty"`
 }
 
 func (s *server) toolCtxRun(ctx context.Context, req *mcp.CallToolRequest, args ctxRunArgs) (*mcp.CallToolResult, any, error) {
@@ -51,24 +52,24 @@ func (s *server) toolCtxRun(ctx context.Context, req *mcp.CallToolRequest, args 
 	switch strings.ToLower(strings.TrimSpace(args.Action)) {
 	case "execute":
 		return s.toolExecute(ctx, req, executeArgs{
-			Command: args.Command, Language: args.Language, Timeout: args.Timeout,
+			Command: args.Command, Language: args.Language, TimeoutMs: args.TimeoutMs, Timeout: args.Timeout,
 			Background: args.Background, Intent: args.Intent, CWD: args.CWD,
 			Argv: args.Argv, Env: args.Env, Stdin: args.Stdin,
 		})
 	case "execute_file":
 		return s.toolExecuteFile(ctx, req, executeFileArgs{
 			Path: args.Path, Language: args.Language, Code: args.Code,
-			Timeout: args.Timeout, Intent: args.Intent, CWD: args.CWD,
+			TimeoutMs: args.TimeoutMs, Timeout: args.Timeout, Intent: args.Intent, CWD: args.CWD,
 		})
 	case "batch":
 		return s.toolBatchExecute(ctx, req, batchArgs{
 			Commands: args.Commands, Queries: args.Queries, Concurrency: args.Concurrency,
-			CWD: args.CWD, Timeout: args.Timeout, QueryScope: args.QueryScope,
+			CWD: args.CWD, TimeoutMs: args.TimeoutMs, Timeout: args.Timeout, QueryScope: args.QueryScope,
 		})
 	case "run_task":
 		return s.toolRunTask(ctx, req, runTaskArgs{
 			Kind: args.Kind, Target: args.Target, Args: args.Args,
-			CWD: args.CWD, TimeoutMs: args.TimeoutMs, Intent: args.Intent, Env: args.Env,
+			CWD: args.CWD, TimeoutMs: args.TimeoutMs, Intent: args.Intent, Env: args.Env, // shared TimeoutMs field serves run_task too
 		})
 	case "":
 		return nil, nil, fmt.Errorf("action is required (execute|execute_file|batch|run_task)")
@@ -165,6 +166,7 @@ type ctxKbArgs struct {
 	Force     bool     `json:"force,omitempty"`
 	MaxBytes  int      `json:"maxBytes,omitempty"`
 	TimeoutMs int      `json:"timeoutMs,omitempty"`
+	TTLMs     *int     `json:"ttl_ms,omitempty"`
 	TTL       *int     `json:"ttl,omitempty"`
 	Confirm   bool     `json:"confirm,omitempty"`
 	Scope     string   `json:"scope,omitempty"`
@@ -181,7 +183,7 @@ func (s *server) toolCtxKb(ctx context.Context, req *mcp.CallToolRequest, args c
 	case "fetch":
 		return s.toolFetchAndIndex(ctx, req, fetchArgs{
 			URL: args.URL, URLs: args.URLs, Source: args.Source, Format: args.Format,
-			Force: args.Force, MaxBytes: args.MaxBytes, TimeoutMs: args.TimeoutMs, TTL: args.TTL,
+			Force: args.Force, MaxBytes: args.MaxBytes, TimeoutMs: args.TimeoutMs, TTLMs: args.TTLMs, TTL: args.TTL,
 		})
 	case "stats":
 		return s.toolStats(ctx, req, statsArgs{})

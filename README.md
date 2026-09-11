@@ -4,7 +4,7 @@ A 100% NPM/NodeJS-free, Go implementation of Mert Koseoglu's [context-mode](http
 
 Local-first Model Context Protocol (MCP) server that virtualizes tool outputs, allowing AI coding agents to execute heavy tasks and save up to 98% in token usage.
 
-Current version: **3.4.0**.
+Current version: **3.5.0**.
 
 Supported platform: **Linux**. Background process identity verification reads `/proc/<pid>/stat`; on other platforms ctxmode still runs, but `ctx_bg` termination is not promised (see [ctx_bg](#ctx_bg--background-process-supervision-from-ctx_run-actionexecute-backgroundtrue)).
 
@@ -14,10 +14,10 @@ Five real tools (not skills). Each takes **`action=`** plus capability-specific 
 
 | Tool | Actions | Key parameters |
 |------|---------|----------------|
-| **ctx_run** | `execute`, `execute_file`, `batch`, `run_task` | `command`/`language`/`timeout`/`background`/`intent`/`cwd`/`argv`/`env`/`stdin`; `path`+`code`; `commands`/`queries`/`concurrency`/`query_scope`; `kind`/`target`/`args`/`timeout_ms` |
+| **ctx_run** | `execute`, `execute_file`, `batch`, `run_task` | `command`/`language`/`timeout_ms`/`background`/`intent`/`cwd`/`argv`/`env`/`stdin`; `path`+`code`; `commands`/`queries`/`concurrency`/`query_scope`; `kind`/`target`/`args`/`timeout_ms` |
 | **ctx_fs** | `ls`, `glob`, `stat`, `rg` | `path`/`depth`/`include_hidden`/`limit`; `pattern`/`path`/`limit`; `path`; `pattern`/`glob`/`ignore_case`/`context`/`literal` |
 | **ctx_git** | `status`, `diff`, `log` | `cwd`; `path`/`stat`/`unified`/`staged`; `n`/`path`/`oneline` |
-| **ctx_kb** | `index`, `search`, `fetch`, `stats`, `purge`, `doctor` | `path`; `query`; `url`/`urls`/`source`/`format`/`force`/`maxBytes`/`timeoutMs`/`ttl`; —; `confirm`/`scope`/`sessionId`/`dryRun`; — |
+| **ctx_kb** | `index`, `search`, `fetch`, `stats`, `purge`, `doctor` | `path`; `query`; `url`/`urls`/`source`/`format`/`force`/`maxBytes`/`timeoutMs`/`ttl_ms`; —; `confirm`/`scope`/`sessionId`/`dryRun`; — |
 | **ctx_bg** | `list`, `kill`, `log`, `wait` | —; `id`/`pid`; `id`/`pid`/`tail_lines`/`tail_bytes`; `id`/`pid`/`timeout_ms` |
 
 Any MCP host (Grok, Pi, …) uses this surface. Grok prefixes the server name (e.g. `ctxmode__ctx_run`).
@@ -101,9 +101,9 @@ Side effects to be aware of:
 
 ### ctx_run — PRIMARY for commands/tests/builds
 
-- `execute` — 12-language subprocess execution (`javascript`, `typescript`, `python`, `shell`, `go`, `rust`, `php`, `perl`, `ruby`, `r`, `elixir`, `csharp`). `command` runs via shell (default language); `argv` execs directly without a shell (preferred). `env` (allowlist-validated), `stdin` (≤1MB), `timeout` (ms, max 1h), `background` (supervise via ctx_bg), `intent`, `cwd` (workdir-resolved). Output >100KB is auto-indexed (with `intent`, >5KB too). Auto-indexed replies include `exit_code` and a tail preview (same contract as `run_task`).
+- `execute` — 12-language subprocess execution (`javascript`, `typescript`, `python`, `shell`, `go`, `rust`, `php`, `perl`, `ruby`, `r`, `elixir`, `csharp`). `command` runs via shell (default language); `argv` execs directly without a shell (preferred). `env` (allowlist-validated), `stdin` (≤1MB), `timeout_ms` (ms, max 1h; deprecated alias `timeout`), `background` (supervise via ctx_bg), `intent`, `cwd` (workdir-resolved). Output >100KB is auto-indexed (with `intent`, >5KB too). Auto-indexed replies include `exit_code` and a tail preview (same contract as `run_task`).
 - `execute_file` — `path` + `code`: file content is injected as `FILE_CONTENT` and the code processes it. Files ≤10MB; binary files refused. Whole-file Go sources use `var FILE_CONTENT` (legal at package scope); PHP does not add a second `<?php` when the source already has one. Auto-indexed replies match `execute` (`exit_code` + tail preview).
-- `batch` — `commands` (≤50, non-empty unique labels), `queries` (≤20), `concurrency` (1-8, default 1; out-of-range is an error), `query_scope` (`batch`|`global`, default `batch`; invalid is an error), `cwd`, `timeout` (default 30s, max 1h; serial: shared budget, concurrent: per-command). Only output >100KB is indexed (same threshold as `execute`); small output is not persisted. `query_scope=batch` searches only this run's indexed command output.
+- `batch` — `commands` (≤50, non-empty unique labels), `queries` (≤20), `concurrency` (1-8, default 1; out-of-range is an error), `query_scope` (`batch`|`global`, default `batch`; invalid is an error), `cwd`, `timeout_ms` (default 30s, max 1h; serial: shared budget, concurrent: per-command; deprecated alias `timeout`). Only output >100KB is indexed (same threshold as `execute`); small output is not persisted. `query_scope=batch` searches only this run's indexed command output.
 - `run_task` — structured test/build with fixed argv (no shell): `kind` ∈ `go_test`|`go_build`|`go_vet`|`npm_test`|`npm_run_build`|`cargo_test`|`cargo_build`|`make`|`custom`, `target`, `args`, `timeout_ms` (default 300000, max 3600000), `cwd`, `intent`, `env`. Go kinds accept package targets only (no flag arguments); `custom` requires `args[0]` as the executable.
 
 ### ctx_fs — workspace filesystem (paths limited to workdirs)
@@ -123,7 +123,7 @@ Side effects to be aware of:
 
 - `index` — `path` (file or directory) into SQLite FTS5; skips `.git`/`node_modules`, sensitive/secret files, binaries and >1MB files; capped at 5000 files / 100MB total.
 - `search` — `query`: BM25 + Porter + Trigram + RRF + proximity rerank; flood-guarded (default 60-second window; 4 successful queries in the same window start throttling with half results; 9 attempts hard-reject). If one FTS index errors and the other returns no hits, the error is returned (not a silent "no matches"). `ctx_run` batch `query_scope=batch` searches only that batch run's indexed documents and bypasses the guard; it does not search `execute`/`run_task`/fetch output.
-- `fetch` — `url`/`urls` (≤10) → markdown → index; `source`, `format` (markdown/html/json), `force`, `maxBytes` (default 50KB), `timeoutMs` (default 150000), `ttl` (default 24h, 0 = skip cache); SSRF protection as above. URL fragments (`#…`) are stripped before indexing so a user fragment cannot collide with internal `#chunk-` keys. Bodies cut at the 10MB fetch cap are still indexed, and the summary reports `body truncated at 10MB`. Indexed documents are isolated per `format`: the KB path embeds the format (`source:format:url`), so the same URL can coexist as markdown/html/json without overwriting, and re-fetching in one format never touches the others. Re-fetching a short URL does not delete a longer sibling URL. The Pi adapter default request timeout for `fetch` is 150s plus a 30s buffer (and honors `timeoutMs`).
+- `fetch` — `url`/`urls` (≤10) → markdown → index; `source`, `format` (markdown/html/json), `force`, `maxBytes` (default 50KB), `timeoutMs` (default 150000), `ttl_ms` (default 24h, 0 = skip cache; deprecated alias `ttl`); SSRF protection as above. URL fragments (`#…`) are stripped before indexing so a user fragment cannot collide with internal `#chunk-` keys. Bodies cut at the 10MB fetch cap are still indexed, and the summary reports `body truncated at 10MB`. Indexed documents are isolated per `format`: the KB path embeds the format (`source:format:url`), so the same URL can coexist as markdown/html/json without overwriting, and re-fetching in one format never touches the others. Re-fetching a short URL does not delete a longer sibling URL. The Pi adapter default request timeout for `fetch` is 150s plus a 30s buffer (and honors `timeoutMs`).
 - `stats` — document/cache/DB statistics, token-savings estimate, and `session_id` for this server process.
 - `purge` — `confirm:true` is mandatory: missing or `false` returns an error (not a silent no-op). `scope=project` wipes the whole KB. `scope=session` deletes documents tagged with `sessionId` (the id from `stats`/`doctor`); execute/batch/run_task/fetch writes from this process are tagged automatically.
 - `doctor` — runtime availability (missing runtimes are listed under `warnings`), FTS5 self-test, storage info, `session_id`.

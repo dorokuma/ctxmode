@@ -1117,7 +1117,7 @@ func TestToolFetchAndIndex_ReportsBodyTruncated(t *testing.T) {
 		URL:    "http://1.1.1.1/huge",
 		Format: "html",
 		Force:  true,
-		TTL:    &ttl,
+		TTLMs:  &ttl,
 	})
 	if err != nil {
 		t.Fatalf("toolFetchAndIndex: %v", err)
