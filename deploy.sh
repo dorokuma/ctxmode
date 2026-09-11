@@ -82,5 +82,16 @@ if [ -z "${VERSION:-}" ]; then
 fi
 echo "ctxmode v${VERSION} 部署成功"
 
+echo "=== Pi extension ==="
+EXT_SRC="$ROOT/integrations/pi/ctxmode.ts"
+EXT_DST="${PI_CTXMODE_EXT:-$HOME/.pi/agent/extensions/ctxmode.ts}"
+if [ ! -f "$EXT_SRC" ]; then
+  echo "missing Pi extension $EXT_SRC" >&2
+  exit 1
+fi
+mkdir -p -- "$(dirname "$EXT_DST")"
+install -m 644 "$EXT_SRC" "$EXT_DST"
+echo "Pi extension → $EXT_DST"
+
 echo "=== 完成 ==="
-echo "在 pi 里敲 /reload 让扩展重新扫码新的二进制。"
+echo "Pi 无 MCP：工具来自扩展。在 Pi 里 /reload 重载扩展（会再 spawn 新二进制）。"

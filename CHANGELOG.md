@@ -5,6 +5,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Changed
+- **`deploy.sh` installs the Pi extension** (`integrations/pi/ctxmode.ts` → `~/.pi/agent/extensions/ctxmode.ts`). Pi has no MCP client; tools come from that file. Binary-only deploys left Pi on a stale schema.
+
 ## [4.0.1] - 2026-09-11
 
 ### Changed

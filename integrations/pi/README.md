@@ -1,6 +1,7 @@
 # Pi integration
 
-Thin bridge: spawn `ctxmode`, register the **same five MCP tools** on Pi
+Thin bridge: Pi has **no MCP client**. This extension spawns the `ctxmode`
+binary (MCP over stdio, internal only) and registers five **native Pi tools**
 (`ctx_run`, `ctx_fs`, `ctx_git`, `ctx_kb`, `ctx_bg`). Requires **ctxmode ≥ 2.0.0**.
 
 ```bash
