@@ -103,9 +103,9 @@ func TestErrorClass_ExecuteMetaEvenWhenNotIndexed(t *testing.T) {
 	wd := t.TempDir()
 	s := &server{workdirs: []string{wd}, store: st}
 	res, _, err := s.toolExecute(context.Background(), nil, executeArgs{
-		Command:  "echo permission denied; exit 1",
-		Language: "shell",
-		Timeout:  10000,
+		Command:   "echo permission denied; exit 1",
+		Language:  "shell",
+		TimeoutMs: 10000,
 	})
 	if err != nil {
 		t.Fatalf("toolExecute: %v", err)
@@ -129,9 +129,9 @@ func TestErrorClass_ExecuteSuccessHasNoMeta(t *testing.T) {
 	wd := t.TempDir()
 	s := &server{workdirs: []string{wd}, store: st}
 	res, _, err := s.toolExecute(context.Background(), nil, executeArgs{
-		Command:  "echo ok_success",
-		Language: "shell",
-		Timeout:  10000,
+		Command:   "echo ok_success",
+		Language:  "shell",
+		TimeoutMs: 10000,
 	})
 	if err != nil {
 		t.Fatalf("toolExecute: %v", err)
@@ -149,10 +149,10 @@ func TestErrorClass_IndexedContentHeader(t *testing.T) {
 	s := &server{workdirs: []string{wd}, store: st}
 	// >5KB + intent triggers index; non-zero exit triggers classification.
 	res, _, err := s.toolExecute(context.Background(), nil, executeArgs{
-		Command:  "printf 'no such file or directory\\n'; head -c 6000 /dev/zero | tr '\\0' x; exit 1",
-		Language: "shell",
-		Intent:   "errcls",
-		Timeout:  15000,
+		Command:   "printf 'no such file or directory\\n'; head -c 6000 /dev/zero | tr '\\0' x; exit 1",
+		Language:  "shell",
+		Intent:    "errcls",
+		TimeoutMs: 15000,
 	})
 	if err != nil {
 		t.Fatalf("toolExecute: %v", err)
@@ -390,10 +390,10 @@ func TestErrorClass_ExecuteFileMeta(t *testing.T) {
 	mustWrite(t, filepath.Join(wd, "data.txt"), "hello")
 	s := &server{workdirs: []string{wd}, store: st}
 	res, _, err := s.toolExecuteFile(context.Background(), nil, executeFileArgs{
-		Path:     "data.txt",
-		Code:     "import sys; print('Traceback (most recent call last):'); sys.exit(1)",
-		Language: "python",
-		Timeout:  15000,
+		Path:      "data.txt",
+		Code:      "import sys; print('Traceback (most recent call last):'); sys.exit(1)",
+		Language:  "python",
+		TimeoutMs: 15000,
 	})
 	if err != nil {
 		t.Fatalf("toolExecuteFile: %v", err)

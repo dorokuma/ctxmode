@@ -470,10 +470,10 @@ func TestExecuteFile_GoCompilesWithoutSpuriousImports(t *testing.T) {
 	mustWrite(t, filepath.Join(wd, "data.txt"), content)
 
 	res, _, err := s.toolExecuteFile(ctx, nil, executeFileArgs{
-		Path:     "data.txt",
-		Code:     "fmt.Println(strings.Count(FILE_CONTENT, \"\\n\"))",
-		Language: "go",
-		Timeout:  60000,
+		Path:      "data.txt",
+		Code:      "fmt.Println(strings.Count(FILE_CONTENT, \"\\n\"))",
+		Language:  "go",
+		TimeoutMs: 60000,
 	})
 	if err != nil {
 		t.Fatalf("toolExecuteFile (go): %v", err)
@@ -642,8 +642,8 @@ func TestValidateURL_AllowsIfAnyIPSafe(t *testing.T) {
 
 func TestVersionAligned(t *testing.T) {
 	// Keep in sync with CHANGELOG release label.
-	if Version != "3.5.0" {
-		t.Fatalf("Version=%q, want 3.5.0 (CHANGELOG)", Version)
+	if Version != "4.0.0" {
+		t.Fatalf("Version=%q, want 4.0.0 (CHANGELOG)", Version)
 	}
 }
 
@@ -722,9 +722,9 @@ func TestAutoIndex_FailureHasPreviewNotIndexedAs(t *testing.T) {
 	// Pure shell, no external runtime dependency: 110000 null bytes -> 'X'.
 	code := `head -c 110000 /dev/zero | tr '\0' X`
 	res, _, err := s.toolExecute(context.Background(), nil, executeArgs{
-		Command:  code,
-		Language: "shell",
-		Timeout:  15000,
+		Command:   code,
+		Language:  "shell",
+		TimeoutMs: 15000,
 	})
 	if err != nil {
 		t.Fatalf("toolExecute: %v", err)

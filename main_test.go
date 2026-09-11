@@ -426,10 +426,10 @@ func TestExecute_IndexedHintUsesCtxKbAndUniqueLabels(t *testing.T) {
 	run := func(b byte) string {
 		t.Helper()
 		res, _, err := s.toolExecute(ctx, nil, executeArgs{
-			Command:  fmt.Sprintf("head -c 6000 /dev/zero | tr '\\0' %c", b),
-			Language: "shell",
-			Intent:   "build-log",
-			Timeout:  15000,
+			Command:   fmt.Sprintf("head -c 6000 /dev/zero | tr '\\0' %c", b),
+			Language:  "shell",
+			Intent:    "build-log",
+			TimeoutMs: 15000,
 		})
 		if err != nil {
 			t.Fatalf("toolExecute: %v", err)
@@ -478,9 +478,9 @@ func TestExecute_IndexedHintUsesCtxKbAndUniqueLabels(t *testing.T) {
 
 	// Auto-index branch (>100KB) message format.
 	res, _, err := s.toolExecute(ctx, nil, executeArgs{
-		Command:  "head -c 110000 /dev/zero | tr '\\0' X",
-		Language: "shell",
-		Timeout:  15000,
+		Command:   "head -c 110000 /dev/zero | tr '\\0' X",
+		Language:  "shell",
+		TimeoutMs: 15000,
 	})
 	if err != nil {
 		t.Fatalf("toolExecute (110KB): %v", err)
@@ -510,11 +510,11 @@ func TestExecuteFile_IndexedHintUsesCtxKb(t *testing.T) {
 	// Intent branch (5KB-100KB): python prints FILE_CONTENT (6000 bytes).
 	mustWrite(t, filepath.Join(wd, "data.txt"), strings.Repeat("z", 6000))
 	res, _, err := s.toolExecuteFile(ctx, nil, executeFileArgs{
-		Path:     "data.txt",
-		Code:     "print(FILE_CONTENT)",
-		Language: "python",
-		Intent:   "ef-intent",
-		Timeout:  15000,
+		Path:      "data.txt",
+		Code:      "print(FILE_CONTENT)",
+		Language:  "python",
+		Intent:    "ef-intent",
+		TimeoutMs: 15000,
 	})
 	if err != nil {
 		t.Fatalf("toolExecuteFile: %v", err)
@@ -541,10 +541,10 @@ func TestExecuteFile_IndexedHintUsesCtxKb(t *testing.T) {
 	// Auto-index branch (>100KB).
 	mustWrite(t, filepath.Join(wd, "big.txt"), strings.Repeat("w", 110000))
 	res, _, err = s.toolExecuteFile(ctx, nil, executeFileArgs{
-		Path:     "big.txt",
-		Code:     "print(FILE_CONTENT)",
-		Language: "python",
-		Timeout:  15000,
+		Path:      "big.txt",
+		Code:      "print(FILE_CONTENT)",
+		Language:  "python",
+		TimeoutMs: 15000,
 	})
 	if err != nil {
 		t.Fatalf("toolExecuteFile (110KB): %v", err)
@@ -567,10 +567,10 @@ func TestExecuteFile_ReportsExitCode(t *testing.T) {
 	s := &server{workdirs: []string{wd}, store: st}
 	mustWrite(t, filepath.Join(wd, "n.txt"), "x")
 	res, _, err := s.toolExecuteFile(context.Background(), nil, executeFileArgs{
-		Path:     "n.txt",
-		Language: "python",
-		Code:     "import sys; sys.exit(1)",
-		Timeout:  15000,
+		Path:      "n.txt",
+		Language:  "python",
+		Code:      "import sys; sys.exit(1)",
+		TimeoutMs: 15000,
 	})
 	if err != nil {
 		t.Fatalf("toolExecuteFile: %v", err)
@@ -585,8 +585,8 @@ func TestExecute_LargeOutputKeepsExitAndTail(t *testing.T) {
 	st := newTestStore(t)
 	s := &server{workdirs: []string{t.TempDir()}, store: st}
 	res, _, err := s.toolExecute(context.Background(), nil, executeArgs{
-		Argv:    []string{"python3", "-c", "import sys; sys.stdout.write('X'*110000); sys.exit(3)"},
-		Timeout: 20000,
+		Argv:      []string{"python3", "-c", "import sys; sys.stdout.write('X'*110000); sys.exit(3)"},
+		TimeoutMs: 20000,
 	})
 	if err != nil {
 		t.Fatalf("toolExecute: %v", err)
@@ -604,9 +604,9 @@ func TestExecute_IntentMidSizeKeepsExitAndTail(t *testing.T) {
 	st := newTestStore(t)
 	s := &server{workdirs: []string{t.TempDir()}, store: st}
 	res, _, err := s.toolExecute(context.Background(), nil, executeArgs{
-		Argv:    []string{"python3", "-c", "import sys; sys.stdout.write('H'*6000); sys.exit(7)"},
-		Intent:  "recheck-mid",
-		Timeout: 20000,
+		Argv:      []string{"python3", "-c", "import sys; sys.stdout.write('H'*6000); sys.exit(7)"},
+		Intent:    "recheck-mid",
+		TimeoutMs: 20000,
 	})
 	if err != nil {
 		t.Fatalf("toolExecute: %v", err)
@@ -776,10 +776,10 @@ func TestToolExecuteFile_FIFODoesNotHang(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		_, _, err := s.toolExecuteFile(context.Background(), nil, executeFileArgs{
-			Path:     fifo,
-			Language: "python",
-			Code:     "print(FILE_CONTENT)",
-			Timeout:  2000,
+			Path:      fifo,
+			Language:  "python",
+			Code:      "print(FILE_CONTENT)",
+			TimeoutMs: 2000,
 		})
 		if err == nil {
 			done <- fmt.Errorf("expected execute_file on FIFO to fail")

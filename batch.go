@@ -26,7 +26,6 @@ type batchArgs struct {
 	Queries     []string       `json:"queries,omitempty" jsonschema:"Search queries over indexed output (max 20)"`
 	Concurrency int            `json:"concurrency,omitempty" jsonschema:"Max parallel commands (1-8, default 1)"`
 	CWD         string         `json:"cwd,omitempty" jsonschema:"Working directory"`
-	Timeout     int            `json:"timeout,omitempty" jsonschema:"DEPRECATED: use timeout_ms. Max execution time in ms (serial: total budget; concurrent: per-command budget)"`
 	TimeoutMs   int            `json:"timeout_ms,omitempty" jsonschema:"Max execution time in ms (serial: total budget; concurrent: per-command budget)"`
 	QueryScope  string         `json:"query_scope,omitempty" jsonschema:"Search scope (batch or global, default batch)"`
 }
@@ -225,18 +224,13 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 		return nil, nil, fmt.Errorf("too many queries: %d (max 20)", len(args.Queries))
 	}
 
-	// Parse timeout (capped at 1 hour). timeout_ms takes precedence over the
-	// deprecated timeout field; both are in milliseconds.
+	// Parse timeout_ms (capped at 1 hour).
 	var timeout time.Duration
-	timeoutMs := args.TimeoutMs
-	if timeoutMs <= 0 {
-		timeoutMs = args.Timeout
-	}
-	if timeoutMs > 0 {
-		if timeoutMs > 3600000 {
-			return nil, nil, fmt.Errorf("timeout_ms %dms exceeds maximum allowed (1 hour)", timeoutMs)
+	if args.TimeoutMs > 0 {
+		if args.TimeoutMs > 3600000 {
+			return nil, nil, fmt.Errorf("timeout_ms %dms exceeds maximum allowed (1 hour)", args.TimeoutMs)
 		}
-		timeout = time.Duration(timeoutMs) * time.Millisecond
+		timeout = time.Duration(args.TimeoutMs) * time.Millisecond
 	}
 	if timeout <= 0 {
 		timeout = 30 * time.Second

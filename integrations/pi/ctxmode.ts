@@ -435,13 +435,7 @@ export class CtxmodeClient {
   /** Per-tool client timeout. Long tasks (run_task/execute/batch) need ≥ server budget. */
   private timeoutForTool(name: string, args: Record<string, unknown>): number {
     const fromArgs =
-      typeof args.timeout_ms === "number" && args.timeout_ms > 0
-        ? args.timeout_ms
-        : typeof args.timeoutMs === "number" && args.timeoutMs > 0
-          ? args.timeoutMs
-          : typeof args.timeout === "number" && args.timeout > 0
-            ? args.timeout
-            : 0
+      typeof args.timeout_ms === "number" && args.timeout_ms > 0 ? args.timeout_ms : 0
     // Server defaults: run_task 300s, fetch 150s, execute often 30s–hours; keep buffer for MCP overhead.
     let base = REQUEST_TIMEOUT_MS
     if (name === "ctx_run") {
@@ -666,7 +660,6 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       action: Type.String({ description: "execute|execute_file|batch|run_task", enum: ["execute", "execute_file", "batch", "run_task"] }),
       command: Type.Optional(Type.String()),
       language: Type.Optional(Type.String()),
-      timeout: Type.Optional(Type.Number({ description: "DEPRECATED: use timeout_ms. Max execution time in ms" })),
       timeout_ms: Type.Optional(Type.Number({ description: "Max execution time in ms (default 60000, max 3600000)" })),
       background: Type.Optional(Type.Boolean({ description: "Only with action=execute. Starts and returns immediately; no proactive push. Then call ctx_bg action=wait once with id or pid (default 60000ms, max 1h); timeout does not kill. Do not poll list/log." })),
       intent: Type.Optional(Type.String()),
@@ -683,7 +676,6 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       kind: Type.Optional(Type.String()),
       target: Type.Optional(Type.String()),
       args: Type.Optional(Type.Array(Type.String())),
-      timeout_ms: Type.Optional(Type.Number()),
     }),
     async execute(_id, params) {
       return run("ctx_run", params as Record<string, unknown>)
@@ -759,9 +751,8 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       format: Type.Optional(Type.String()),
       force: Type.Optional(Type.Boolean()),
       maxBytes: Type.Optional(Type.Number()),
-      timeoutMs: Type.Optional(Type.Number()),
+      timeout_ms: Type.Optional(Type.Number({ description: "Timeout in ms (default 150000, max 3600000)" })),
       ttl_ms: Type.Optional(Type.Number({ description: "Cache TTL in ms (0 = skip cache, omit = 24h default)" })),
-      ttl: Type.Optional(Type.Number({ description: "DEPRECATED: use ttl_ms. Cache TTL in ms" })),
       confirm: Type.Optional(Type.Boolean()),
       scope: Type.Optional(Type.String()),
       sessionId: Type.Optional(Type.String()),

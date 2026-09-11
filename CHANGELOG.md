@@ -5,6 +5,15 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-09-11
+
+### Breaking changes
+- **One timeout field: `timeout_ms`**. `ctx_run` execute / execute_file / batch no longer accept `timeout`. `ctx_kb` fetch no longer accepts camelCase `timeoutMs`. Unknown JSON keys are dropped silently, so a leftover `timeout`/`timeoutMs` becomes the action default instead of an error.
+- **One fetch TTL field: `ttl_ms`**. `ctx_kb` fetch no longer accepts `ttl`.
+
+### Changed
+- Pi adapter schemas expose only `timeout_ms` and `ttl_ms`. Client request timeout reads only `timeout_ms`.
+
 ## [3.5.0] - 2026-09-11
 
 ### Added

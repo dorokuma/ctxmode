@@ -66,9 +66,8 @@ type fetchArgs struct {
 	Format    string   `json:"format,omitempty" jsonschema:"Output format (markdown/html/json, default markdown)"`
 	Force     bool     `json:"force,omitempty" jsonschema:"Skip cache and re-fetch"`
 	MaxBytes  int      `json:"maxBytes,omitempty" jsonschema:"Max bytes to return (default 50KB)"`
-	TimeoutMs int      `json:"timeoutMs,omitempty" jsonschema:"Timeout in ms (default 150000)"`
+	TimeoutMs int      `json:"timeout_ms,omitempty" jsonschema:"Timeout in ms (default 150000)"`
 	TTLMs     *int     `json:"ttl_ms,omitempty" jsonschema:"Cache TTL in ms (0 = skip cache, omit = 24h default)"`
-	TTL       *int     `json:"ttl,omitempty" jsonschema:"DEPRECATED: use ttl_ms. Cache TTL in ms (0 = skip cache, omit = 24h default)"`
 }
 
 // ---------- SSRF validation ----------
@@ -991,19 +990,16 @@ func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, 
 	// Default timeout.
 	timeout := defaultFetchTimeout
 	if args.TimeoutMs > 3600000 {
-		return nil, nil, fmt.Errorf("timeoutMs %d exceeds maximum allowed (3600000)", args.TimeoutMs)
+		return nil, nil, fmt.Errorf("timeout_ms %d exceeds maximum allowed (3600000)", args.TimeoutMs)
 	}
 	if args.TimeoutMs > 0 {
 		timeout = time.Duration(args.TimeoutMs) * time.Millisecond
 	}
 
-	// Resolve TTL: nil means use default (24h), 0 means skip cache.
-	// ttl_ms is the canonical field; deprecated ttl kept as alias.
+	// Resolve ttl_ms: nil means use default (24h), 0 means skip cache.
 	ttl := -1 // sentinel: use default 24h TTL
 	if args.TTLMs != nil {
 		ttl = *args.TTLMs // may be 0 (skip cache) or positive (custom ms)
-	} else if args.TTL != nil {
-		ttl = *args.TTL // may be 0 (skip cache) or positive (custom ms)
 	}
 
 	// Batch fetch.
