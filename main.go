@@ -35,7 +35,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "4.0.0"
+const Version = "4.0.1"
 
 // toolIndex walk / size limits.
 const (
@@ -304,7 +304,7 @@ func ensureDBDir(dbPath string) error {
 type executeArgs struct {
 	Command    string            `json:"command,omitempty" jsonschema:"Command or code to execute (ignored when argv is non-empty)"`
 	Language   string            `json:"language,omitempty" jsonschema:"Runtime language (javascript/python/shell/go/...). Ignored in argv mode"`
-	TimeoutMs  int               `json:"timeout_ms,omitempty" jsonschema:"Max execution time in ms (default 60000, max 3600000)"`
+	TimeoutMs  int               `json:"timeout_ms,omitempty" jsonschema:"ms (default 30000, max 3600000)"`
 	Background bool              `json:"background,omitempty" jsonschema:"Run asynchronously in background (terminated on timeout if specified, default max 1h). Manage via ctx_bg"`
 	Intent     string            `json:"intent,omitempty" jsonschema:"What you're looking for in the output (for auto-indexing)"`
 	CWD        string            `json:"cwd,omitempty" jsonschema:"Working directory"`
@@ -779,7 +779,7 @@ type executeFileArgs struct {
 	Path      string `json:"path" jsonschema:"File path to read into FILE_CONTENT variable"`
 	Language  string `json:"language,omitempty" jsonschema:"Runtime language (javascript/python/shell/go/...)"`
 	Code      string `json:"code" jsonschema:"Code that processes FILE_CONTENT variable"`
-	TimeoutMs int    `json:"timeout_ms,omitempty" jsonschema:"Max execution time in ms (default 60000, max 3600000)"`
+	TimeoutMs int    `json:"timeout_ms,omitempty" jsonschema:"ms (default 30000, max 3600000)"`
 	Intent    string `json:"intent,omitempty" jsonschema:"What you're looking for in the output"`
 	CWD       string `json:"cwd,omitempty" jsonschema:"Working directory"`
 }

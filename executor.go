@@ -1175,7 +1175,7 @@ func (s *server) toolBackgroundLog(ctx context.Context, _ *mcp.CallToolRequest, 
 type backgroundWaitArgs struct {
 	ID        string `json:"id,omitempty" jsonschema:"Background process id (use either id or pid, not both)"`
 	PID       int    `json:"pid,omitempty" jsonschema:"Process PID (use either pid or id, not both)"`
-	TimeoutMs int    `json:"timeout_ms,omitempty" jsonschema:"Max blocking wait in ms (default: 60000, maximum: 3600000). Does not kill on timeout."`
+	TimeoutMs int    `json:"timeout_ms,omitempty" jsonschema:"ms (default 60000, max 3600000; does not kill)"`
 }
 
 func (s *server) toolBackgroundWait(ctx context.Context, _ *mcp.CallToolRequest, args backgroundWaitArgs) (*mcp.CallToolResult, any, error) {

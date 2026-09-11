@@ -42,7 +42,7 @@ type runTaskArgs struct {
 	Target    string            `json:"target,omitempty" jsonschema:"go: package path (default ./...); make: target name; custom unused"`
 	Args      []string          `json:"args,omitempty" jsonschema:"Extra argv appended as independent args (no shell). custom: full argv with args[0]=executable"`
 	CWD       string            `json:"cwd,omitempty" jsonschema:"Working directory (sandboxed via resolvePath)"`
-	TimeoutMs int               `json:"timeout_ms,omitempty" jsonschema:"Timeout in ms (default 300000, hard max 3600000)"`
+	TimeoutMs int               `json:"timeout_ms,omitempty" jsonschema:"ms (default 300000, max 3600000)"`
 	Intent    string            `json:"intent,omitempty" jsonschema:"Label hint for large-output auto-index"`
 	Env       map[string]string `json:"env,omitempty" jsonschema:"Extra env (same allowlist as ctx_run action=execute; never PATH/HOME/LD_*)"`
 }

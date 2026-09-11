@@ -26,7 +26,7 @@ type batchArgs struct {
 	Queries     []string       `json:"queries,omitempty" jsonschema:"Search queries over indexed output (max 20)"`
 	Concurrency int            `json:"concurrency,omitempty" jsonschema:"Max parallel commands (1-8, default 1)"`
 	CWD         string         `json:"cwd,omitempty" jsonschema:"Working directory"`
-	TimeoutMs   int            `json:"timeout_ms,omitempty" jsonschema:"Max execution time in ms (serial: total budget; concurrent: per-command budget)"`
+	TimeoutMs   int            `json:"timeout_ms,omitempty" jsonschema:"ms (default 30000, max 3600000; serial: total, concurrent: per-command)"`
 	QueryScope  string         `json:"query_scope,omitempty" jsonschema:"Search scope (batch or global, default batch)"`
 }
 

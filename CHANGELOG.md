@@ -5,6 +5,11 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [4.0.1] - 2026-09-11
+
+### Changed
+- **Timeout/TTL schema copy is ms-only**: MCP `jsonschema` and Pi descriptions for `timeout_ms` / `ttl_ms` now state unit, default, and max in milliseconds (no `1h`/`24h`). Execute/batch default documented as 30000 (was wrongly 60000). Router structs that MCP `tools/list` actually uses now carry the descriptions.
+
 ## [4.0.0] - 2026-09-11
 
 ### Breaking changes

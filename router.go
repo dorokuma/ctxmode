@@ -19,7 +19,7 @@ type ctxRunArgs struct {
 	// execute
 	Command    string            `json:"command,omitempty"`
 	Language   string            `json:"language,omitempty"`
-	TimeoutMs  int               `json:"timeout_ms,omitempty"`
+	TimeoutMs  int               `json:"timeout_ms,omitempty" jsonschema:"ms (execute/execute_file/batch default 30000, run_task default 300000, max 3600000)"`
 	Background bool              `json:"background,omitempty" jsonschema:"Only for action=execute: start and return immediately; no proactive push. Configured execution timeout terminates on timeout; ctx_bg wait timeout does not kill. After receiving id, call ctx_bg action=wait once (default 60000ms, max 3600000ms); not supported by other actions. (terminated on timeout)"`
 	Intent     string            `json:"intent,omitempty"`
 	CWD        string            `json:"cwd,omitempty"`
@@ -163,8 +163,8 @@ type ctxKbArgs struct {
 	Format    string   `json:"format,omitempty"`
 	Force     bool     `json:"force,omitempty"`
 	MaxBytes  int      `json:"maxBytes,omitempty"`
-	TimeoutMs int      `json:"timeout_ms,omitempty"`
-	TTLMs     *int     `json:"ttl_ms,omitempty"`
+	TimeoutMs int      `json:"timeout_ms,omitempty" jsonschema:"ms (default 150000, max 3600000)"`
+	TTLMs     *int     `json:"ttl_ms,omitempty" jsonschema:"ms (0=skip cache, omit=86400000)"`
 	Confirm   bool     `json:"confirm,omitempty"`
 	Scope     string   `json:"scope,omitempty"`
 	SessionID string   `json:"sessionId,omitempty"`
@@ -208,7 +208,7 @@ type ctxBgArgs struct {
 	PID       int    `json:"pid,omitempty"`
 	TailLines int    `json:"tail_lines,omitempty"`
 	TailBytes int    `json:"tail_bytes,omitempty"`
-	TimeoutMs int    `json:"timeout_ms,omitempty"`
+	TimeoutMs int    `json:"timeout_ms,omitempty" jsonschema:"ms (default 60000, max 3600000; does not kill)"`
 }
 
 func (s *server) toolCtxBg(ctx context.Context, req *mcp.CallToolRequest, args ctxBgArgs) (*mcp.CallToolResult, any, error) {
@@ -290,7 +290,7 @@ func (s *server) registerCategoryTools(srv *mcp.Server) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_bg",
-		Description: "Background processes from ctx_run action=execute background:true. Starts return immediately and never proactively push notifications. action=wait (preferred once after launch; blocking, default 60000ms, max 1h, timeout does not kill), list (snapshot), log (tail output), kill (terminate). Identify with either id or pid; do not poll list/log.",
+		Description: "Background processes from ctx_run action=execute background:true. Starts return immediately and never proactively push notifications. action=wait (preferred once after launch; blocking, default 60000ms, max 3600000ms, timeout does not kill), list (snapshot), log (tail output), kill (terminate). Identify with either id or pid; do not poll list/log.",
 		Annotations: ann["ctx_bg"],
 	}, s.toolCtxBg)
 }

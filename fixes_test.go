@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -642,8 +643,33 @@ func TestValidateURL_AllowsIfAnyIPSafe(t *testing.T) {
 
 func TestVersionAligned(t *testing.T) {
 	// Keep in sync with CHANGELOG release label.
-	if Version != "4.0.0" {
-		t.Fatalf("Version=%q, want 4.0.0 (CHANGELOG)", Version)
+	if Version != "4.0.1" {
+		t.Fatalf("Version=%q, want 4.0.1 (CHANGELOG)", Version)
+	}
+}
+
+func TestTimeoutFields_SchemaIsMs(t *testing.T) {
+	checks := []struct {
+		typ   reflect.Type
+		field string
+	}{
+		{reflect.TypeOf(ctxRunArgs{}), "TimeoutMs"},
+		{reflect.TypeOf(ctxKbArgs{}), "TimeoutMs"},
+		{reflect.TypeOf(ctxKbArgs{}), "TTLMs"},
+		{reflect.TypeOf(ctxBgArgs{}), "TimeoutMs"},
+	}
+	for _, c := range checks {
+		f, ok := c.typ.FieldByName(c.field)
+		if !ok {
+			t.Fatalf("%s.%s missing", c.typ.Name(), c.field)
+		}
+		tag := f.Tag.Get("jsonschema")
+		if !strings.HasPrefix(tag, "ms ") && tag != "ms" {
+			t.Fatalf("%s.%s jsonschema must start with ms, got %q", c.typ.Name(), c.field, tag)
+		}
+		if strings.Contains(tag, "1h") || strings.Contains(tag, "24h") || strings.Contains(tag, " second") {
+			t.Fatalf("%s.%s jsonschema mixes non-ms units: %q", c.typ.Name(), c.field, tag)
+		}
 	}
 }
 

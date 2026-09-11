@@ -660,7 +660,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       action: Type.String({ description: "execute|execute_file|batch|run_task", enum: ["execute", "execute_file", "batch", "run_task"] }),
       command: Type.Optional(Type.String()),
       language: Type.Optional(Type.String()),
-      timeout_ms: Type.Optional(Type.Number({ description: "Max execution time in ms (default 60000, max 3600000)" })),
+      timeout_ms: Type.Optional(Type.Number({ description: "ms (execute/execute_file/batch default 30000, run_task default 300000, max 3600000)" })),
       background: Type.Optional(Type.Boolean({ description: "Only with action=execute. Starts and returns immediately; no proactive push. Then call ctx_bg action=wait once with id or pid (default 60000ms, max 1h); timeout does not kill. Do not poll list/log." })),
       intent: Type.Optional(Type.String()),
       cwd: Type.Optional(Type.String()),
@@ -751,8 +751,8 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       format: Type.Optional(Type.String()),
       force: Type.Optional(Type.Boolean()),
       maxBytes: Type.Optional(Type.Number()),
-      timeout_ms: Type.Optional(Type.Number({ description: "Timeout in ms (default 150000, max 3600000)" })),
-      ttl_ms: Type.Optional(Type.Number({ description: "Cache TTL in ms (0 = skip cache, omit = 24h default)" })),
+      timeout_ms: Type.Optional(Type.Number({ description: "ms (default 150000, max 3600000)" })),
+      ttl_ms: Type.Optional(Type.Number({ description: "ms (0=skip cache, omit=86400000)" })),
       confirm: Type.Optional(Type.Boolean()),
       scope: Type.Optional(Type.String()),
       sessionId: Type.Optional(Type.String()),
@@ -775,7 +775,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       pid: Type.Optional(Type.Number()),
       tail_lines: Type.Optional(Type.Number()),
       tail_bytes: Type.Optional(Type.Number()),
-      timeout_ms: Type.Optional(Type.Number()),
+      timeout_ms: Type.Optional(Type.Number({ description: "ms (default 60000, max 3600000; does not kill)" })),
     }),
     async execute(_id, params) {
       return run("ctx_bg", params as Record<string, unknown>)

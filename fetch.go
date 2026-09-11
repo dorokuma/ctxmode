@@ -66,8 +66,8 @@ type fetchArgs struct {
 	Format    string   `json:"format,omitempty" jsonschema:"Output format (markdown/html/json, default markdown)"`
 	Force     bool     `json:"force,omitempty" jsonschema:"Skip cache and re-fetch"`
 	MaxBytes  int      `json:"maxBytes,omitempty" jsonschema:"Max bytes to return (default 50KB)"`
-	TimeoutMs int      `json:"timeout_ms,omitempty" jsonschema:"Timeout in ms (default 150000)"`
-	TTLMs     *int     `json:"ttl_ms,omitempty" jsonschema:"Cache TTL in ms (0 = skip cache, omit = 24h default)"`
+	TimeoutMs int      `json:"timeout_ms,omitempty" jsonschema:"ms (default 150000, max 3600000)"`
+	TTLMs     *int     `json:"ttl_ms,omitempty" jsonschema:"ms (0=skip cache, omit=86400000)"`
 }
 
 // ---------- SSRF validation ----------
