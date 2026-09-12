@@ -3,6 +3,14 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [4.0.3] - 2026-09-12
+
+### Security
+- **All command-output return paths are gated**: `ctx_run` execute / execute_file / run_task normal returns and the bg log / bg wait paths now run returned output through the sensitive-content fence — small outputs were previously returned raw, so a single `cat` could exfiltrate credential files the rg fence had just been hardened against. Indexing-refused outputs no longer include a tail preview (the preview echoed the very secret that was refused).
+- **Sensitive-path deny list extended** (`isSensitiveFilePath` + rg deny-globs, same-name-same-set): `.git-credentials`, `.bash_history`, `.zsh_history`, `.pgpass`, `.htpasswd`, `*.tfvars`, `*.tfstate`, `*.kdbx`, `service-account*.json`.
+- **Secret-value regexes extended**: refresh/session/id token, aws_secret_access_key, db_password, db_pass; word boundaries rebuilt without `\b` so underscore-prefixed keys (`_db_password`) match; value charset accepts `/` for real AWS secrets.
+- **rg output fence ambiguity fixed**: match and context lines are resolved with candidate-path stat disambiguation — paths containing `:<digits>:` or `-<digits>-` segments (e.g. `x:12:y/.docker/config.json`, `v1-2-id_rsa`) can no longer bypass the sensitive-path filter; genuine ambiguity fails closed.
+
 ## [4.0.2] - 2026-09-12
 
 ### Security
