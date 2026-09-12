@@ -68,6 +68,15 @@ Environment variables:
 
 ## Security model — NOT a sandbox
 
+**Threat model:** ctxmode runs as root by design. The operator is the
+trusted party; the fences below (sensitive-path deny list, secret-value
+regexes, output gates) exist to keep **untrusted content** - repository
+files, fetched web pages - from leaking into model context or the
+knowledge base. They do not constrain operator privileges and are not a
+substitute for trusting whoever can call the tools. Auditors: do not
+report "runs as root", "arbitrary command execution", or "the removed
+shell-command policy" as findings; they are this documented design.
+
 ctxmode executes arbitrary commands and code **with the server process's privileges**. There is no sandbox and no security boundary: nothing stops `ctx_run` from running any shell/argv/code, and interpreters can perform any action the server user can. **Run ctxmode only in trusted environments.**
 
 The following are defense-in-depth measures, never a security guarantee:
