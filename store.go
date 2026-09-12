@@ -756,6 +756,19 @@ func (s *Store) SetCache(url, source, content string) error {
 	return nil
 }
 
+// DeleteCached removes a single fetch_cache entry by url and source. It is
+// used when indexing of fetched content is refused (e.g. the
+// sensitive-content fence): a row written before that fence existed (or by
+// an older version) must not linger for the whole cache TTL, and must not be
+// re-served through the cache-hit re-index path.
+func (s *Store) DeleteCached(url, source string) error {
+	_, err := s.db.Exec(`DELETE FROM fetch_cache WHERE url = ? AND source = ?`, url, source)
+	if err != nil {
+		return fmt.Errorf("delete cached: %w", err)
+	}
+	return nil
+}
+
 // PruneCache deletes cache entries older than the given duration.
 func (s *Store) PruneCache(maxAge time.Duration) error {
 	cutoff := time.Now().Add(-maxAge).Unix()

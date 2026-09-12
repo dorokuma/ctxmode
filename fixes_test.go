@@ -643,8 +643,8 @@ func TestValidateURL_AllowsIfAnyIPSafe(t *testing.T) {
 
 func TestVersionAligned(t *testing.T) {
 	// Keep in sync with CHANGELOG release label.
-	if Version != "4.0.6" {
-		t.Fatalf("Version=%q, want 4.0.6 (CHANGELOG)", Version)
+	if Version != "4.0.7" {
+		t.Fatalf("Version=%q, want 4.0.7 (CHANGELOG)", Version)
 	}
 }
 
@@ -1055,12 +1055,18 @@ func TestMigrateFromJSON_OversizedSymlinkAndValid(t *testing.T) {
 	})
 
 	// 3. Valid small JSON DB: documents migrated and renamed to .bak.
+	// Legacy KB paths are absolute (resolvePath/Walk products) and must be
+	// backed by an existing file; they migrate under their workspace-
+	// relative display path.
 	t.Run("valid small JSON DB migrated", func(t *testing.T) {
 		wd := t.TempDir()
 		st := newTestStore(t)
 		s := &server{workdirs: []string{wd}, store: st}
+		if err := os.WriteFile(filepath.Join(wd, "doc1.txt"), []byte("on disk"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		jsonPath := filepath.Join(wd, ".context_mode_db.json")
-		validJSON := `{"doc1": {"path": "doc1.txt", "content": "migrated content alpha"}}`
+		validJSON := `{"doc1": {"path": "` + filepath.Join(wd, "doc1.txt") + `", "content": "migrated content alpha"}}`
 		if err := os.WriteFile(jsonPath, []byte(validJSON), 0o600); err != nil {
 			t.Fatal(err)
 		}

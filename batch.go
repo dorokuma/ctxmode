@@ -148,7 +148,7 @@ func (s *server) executeCommand(ctx context.Context, command, cwd string) (outpu
 			}
 			output += stderr
 		}
-		return output, -1, fmt.Errorf("command cancelled: %w", ctx.Err()), stdoutBuf.truncated || stderrBuf.truncated
+		return output, -1, fmt.Errorf("command cancelled: %w", ctx.Err()), stdoutBuf.truncatedFlag() || stderrBuf.truncatedFlag()
 
 	case err := <-done:
 		stdout := stdoutBuf.String()
@@ -169,7 +169,7 @@ func (s *server) executeCommand(ctx context.Context, command, cwd string) (outpu
 				}
 				output += stderr
 			}
-			return output, exitCode, nil, stdoutBuf.truncated || stderrBuf.truncated
+			return output, exitCode, nil, stdoutBuf.truncatedFlag() || stderrBuf.truncatedFlag()
 		}
 
 		// Success.
@@ -180,7 +180,7 @@ func (s *server) executeCommand(ctx context.Context, command, cwd string) (outpu
 			}
 			output += stderr
 		}
-		return output, cmd.ProcessState.ExitCode(), nil, stdoutBuf.truncated || stderrBuf.truncated
+		return output, cmd.ProcessState.ExitCode(), nil, stdoutBuf.truncatedFlag() || stderrBuf.truncatedFlag()
 	}
 }
 

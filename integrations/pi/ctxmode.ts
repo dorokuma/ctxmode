@@ -134,12 +134,22 @@ function clampUtf16Index(s: string, i: number, towardStart: boolean): number {
 // compressToolText: line overflow keeps ~75% head + remaining tail.
 // Char overflow uses the same 75%/25% split so a trailing
 // "(exited with code N)" survives. Surrogate pairs are not split.
-function stripANSI(s: string): string {
-  // OSC (ESC ] ... BEL or ST), CSI (ESC [ params intermediate final), two-byte ESC X.
+export function stripANSI(s: string): string {
+  // 顺序敏感：字符串型序列必须先于两/三字节兜底规则（否则兜底规则只吃掉
+  // "ESC ]"/"ESC P" 前缀、把载荷当正文残留；且会把 DCS 的 "ESC \" 终止器吃掉）。
+  // 1. OSC (ESC ] ... BEL | ST)
+  // 2. DCS/SOS/PM/APC (ESC P/X/^/_ ... BEL | ST)：载荷整体剥离；未终止则
+  //    吞掉剩余全部，避免残缺序列把日志尾部污染成乱码。
+  // 3. CSI (ESC [ 参数字节 中间字节 final)
+  // 4. 两/三字节 ESC 形式：ESC [0x20-0x2F]* final(0x30-0x7E) —— 覆盖 ESC c
+  //    (RIS)、ESC # 8 (DECALN)、ESC ( B、ESC % G、ESC 7/8 等。旧的
+  //    \x1b[@-Z\\-_] 只认 0x40-0x5F 的 final，中间字节区 0x20-0x2F 完全不
+  //    处理，还会把 "ESC ( B" 的 "B" 当正文残留。
   return s
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b[PX^_](?:[\s\S]*?(?:\x07|\x1b\\)|[\s\S]*)/g, "")
     .replace(/\x1b\[[0-9:;<=>?]*[ -/]*[@-~]/g, "")
-    .replace(/\x1b[@-Z\\-_]/g, "")
+    .replace(/\x1b[\x20-\x2f]*[\x30-\x7e]/g, "")
 }
 
 export function compressToolText(text: string): string {

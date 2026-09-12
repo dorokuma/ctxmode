@@ -786,6 +786,15 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 					if _, err := s.indexContentLocked(docPath, cached.Content); err != nil {
 						result.IndexError = fmt.Sprintf("cache hit re-index failed: %v", err)
 						fmt.Fprintf(os.Stderr, "cache hit re-index failed for %q: %v\n", docPath, err)
+						// The cached plaintext was refused by the index fence (it holds secrets,
+						// or the row was written before the fence existed). Drop the row so the
+						// rejected plaintext cannot linger for the full cache TTL or be served
+						// again through the cache later.
+						s.mu.Lock()
+						if derr := s.store.DeleteCached(rawURL, cacheSource); derr != nil {
+							fmt.Fprintf(os.Stderr, "cache delete failed: %v\n", derr)
+						}
+						s.mu.Unlock()
 					}
 				}
 				return result, nil
@@ -873,14 +882,21 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 		// caching rejected plaintext would persist it for the whole cache TTL
 		// and let it resurrect into the KB through the cache-hit re-index
 		// path. indexErrString still travels to the caller unchanged.
+		// When indexing was rejected, also drop any existing cache row for
+		// this URL: skipping SetCache only stops new writes, while a row
+		// written before the fence existed (or by an older version) would
+		// otherwise linger until the 7-day TTL and resurrect through the
+		// cache-hit re-index path.
+		s.mu.Lock()
 		if indexErr == nil {
-			s.mu.Lock()
 			if err := s.store.SetCache(rawURL, cacheSource, content); err != nil {
 				fmt.Fprintf(os.Stderr, "cache write failed: %v\n", err)
 			}
 			_ = s.store.PruneCache(7 * 24 * time.Hour)
-			s.mu.Unlock()
+		} else if derr := s.store.DeleteCached(rawURL, cacheSource); derr != nil {
+			fmt.Fprintf(os.Stderr, "cache delete failed: %v\n", derr)
 		}
+		s.mu.Unlock()
 
 		return &fetchResultData{content: content, chunkCount: chunkCount, truncated: truncated, indexError: indexErrString}, nil
 	})

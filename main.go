@@ -35,7 +35,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "4.0.6"
+const Version = "4.0.7"
 
 // toolIndex walk / size limits.
 const (
@@ -1087,57 +1087,83 @@ func (s *server) migrateFromJSONOrWarn() {
 const maxMigratedPathBytes = 512
 
 // migratedDocPathValid reports whether a document path from the legacy JSON
-// database has a shape this server could have produced. The JSON file is
-// untrusted input (crafted or corrupted), so paths that could forge another
-// session's namespace, carry ANSI/OSC escape sequences, or inject arbitrary
-// labels are rejected and the document is skipped.
+// database has a shape this server could have produced, and returns the
+// normalized display path (relative to the containing workdir) the document
+// should be indexed under.
 //
-// Accepted shapes mirror the KB paths the server itself writes:
-//   - "session:<current sessionID>:<label>" -- a path claiming any other
-//     session id is cross-session forgery and is always rejected (it would
-//     also survive session-scoped purge);
-//   - "rg:" / "batch:" structured labels;
-//   - fetch document paths, which always embed an http(s) URL
-//     ("<source>[:<format>]:http(s)://...");
-//   - plain relative file paths (no colon, not absolute, no ".." segment).
-func migratedDocPathValid(sessionID, path string) bool {
-	if path == "" || len(path) > maxMigratedPathBytes {
-		return false
+// The JSON file is untrusted input (crafted or corrupted). The JSON-era
+// server only ever wrote absolute file paths to the KB (the product of
+// resolvePath and the workspace walk), so the other shapes the old whitelist
+// accepted -- "rg:"/"batch:" labels, "session:<id>:..." namespaces and paths
+// embedding http(s) URLs -- exist only in crafted or corrupted files and are
+// rejected outright; a path claiming any session namespace can never be
+// produced by the random session ids in use.
+//
+// A path is accepted only when it:
+//   - is non-empty, at most maxMigratedPathBytes bytes, valid UTF-8, and
+//     free of C0/C1 control characters and DEL (no ANSI/OSC smuggling);
+//   - is absolute with no ".." segment left after filepath.Clean;
+//   - resolves via filepath.EvalSymlinks (a dangling path -- deleted file or
+//     broken symlink -- is rejected, not re-joined onto a resolved prefix)
+//     and lands inside one of the workdirs, the same containment fence
+//     ensureInsideWorkspaces applies to live paths; and
+//   - does not name a sensitive file: isSensitiveFilePath is re-run on both
+//     the resolved real path and the normalized display path.
+func migratedDocPathValid(workdirs []string, path string) (string, bool) {
+	if path == "" || len(path) > maxMigratedPathBytes || !utf8.ValidString(path) {
+		return "", false
 	}
 	for _, r := range path {
 		// C0 controls (incl. ESC, CR, LF), DEL, and C1 controls would let a
 		// crafted path smuggle ANSI/OSC escape sequences into MCP output.
 		if r <= 0x1F || r == 0x7F || (r >= 0x80 && r <= 0x9F) {
-			return false
+			return "", false
 		}
 	}
-	if strings.HasPrefix(path, "session:") {
-		// Only the CURRENT session namespace is acceptable.
-		rest := strings.TrimPrefix(path, "session:")
-		id := rest
-		if i := strings.Index(rest, ":"); i >= 0 {
-			id = rest[:i]
-		}
-		return sessionID != "" && id == sessionID
+	// Real legacy data only ever held absolute file paths.
+	if !filepath.IsAbs(path) {
+		return "", false
 	}
-	if strings.HasPrefix(path, "rg:") || strings.HasPrefix(path, "batch:") {
-		return true
-	}
-	if strings.Contains(path, "http://") || strings.Contains(path, "https://") {
-		// Fetch document paths embed an absolute http(s) URL.
-		return true
-	}
-	// Plain relative file path: no scheme-like colon, not absolute, and no
-	// parent-directory traversal segment.
-	if strings.ContainsRune(path, ':') || filepath.IsAbs(path) {
-		return false
-	}
-	for _, seg := range strings.Split(path, "/") {
+	cleaned := filepath.Clean(path)
+	for _, seg := range strings.Split(cleaned, string(filepath.Separator)) {
 		if seg == ".." {
-			return false
+			return "", false
 		}
 	}
-	return true
+	// Strict symlink resolution: a dangling final component is rejected
+	// rather than silently accepted.
+	real, err := filepath.EvalSymlinks(cleaned)
+	if err != nil {
+		return "", false
+	}
+	// Same containment fence as ensureInsideWorkspaces, applied to the
+	// strictly resolved path and each symlink-resolved workdir.
+	for _, wd := range workdirs {
+		if wd == "" {
+			continue
+		}
+		realWd := wd
+		if rw, werr := filepath.EvalSymlinks(wd); werr == nil {
+			realWd = rw
+		}
+		cleanWd := strings.TrimSuffix(realWd, string(filepath.Separator))
+		if real != realWd && real != cleanWd && !strings.HasPrefix(real, cleanWd+string(filepath.Separator)) {
+			continue
+		}
+		// Normalize to the workspace-relative display path. Rel cannot fail
+		// for the containment shapes above with a sane workdir; fail closed
+		// on the pathological remainder (e.g. workdir == filesystem root).
+		display, rerr := filepath.Rel(cleanWd, real)
+		if rerr != nil {
+			return "", false
+		}
+		// Sensitive files never migrate, under either name.
+		if isSensitiveFilePath(real) || isSensitiveFilePath(display) {
+			return "", false
+		}
+		return display, true
+	}
+	return "", false
 }
 
 var (
@@ -1211,12 +1237,14 @@ func (s *server) migrateFromJSON() error {
 			continue
 		}
 		// The legacy JSON file is untrusted input (crafted or corrupted):
-		// validate every path before it enters the KB.
-		if !migratedDocPathValid(s.sessionID, doc.Path) {
+		// validate every path before it enters the KB and index the document
+		// under the normalized workspace-relative display path.
+		display, ok := migratedDocPathValid(s.workdirs, doc.Path)
+		if !ok {
 			log.Printf("ctxmode: warning: skipping legacy document %q with invalid path %q during migration", key, truncateUTF8(doc.Path, 128))
 			continue
 		}
-		if err := s.storeIndexLocked(doc.Path, doc.Content); err != nil {
+		if err := s.storeIndexLocked(display, doc.Content); err != nil {
 			// One rejected document (e.g. sensitive content refused by the
 			// store gate) must not abort the rest of the migration.
 			log.Printf("ctxmode: warning: skipping legacy document %q (path %q) during migration: %v", key, truncateUTF8(doc.Path, 128), err)
@@ -1320,16 +1348,43 @@ func pathHasExcludedSegment(path string, excluded ...string) bool {
 // sensitiveBackupSuffixes are trailing markers that hide a credential
 // file's real identity: backup copies (.bak, .old, .orig, .backup, ~,
 // .save, .tmp), encrypted exports (.gpg) and plain-text dumps (.txt).
+// Purely numeric tails (".1", ".20240901") are additionally treated as
+// copy markers; see stripOneSensitiveBackupSuffix.
 var sensitiveBackupSuffixes = []string{
 	".bak", ".old", ".orig", ".backup", "~", ".gpg", ".txt", ".tmp", ".save",
 }
 
+// maxSensitiveBackupPeels bounds the backup-suffix stripping loop in
+// isSensitiveFilePath. Every peel removes at least two bytes (the "." plus
+// the marker), so the loop always terminates on its own; the cap is defense
+// in depth against a pathological name stacking more markers than a sane
+// backup chain would have.
+const maxSensitiveBackupPeels = 8
+
 // stripOneSensitiveBackupSuffix peels a single trailing backup marker off a
-// base name; returns the input unchanged when no marker is present.
+// base name; returns the input unchanged when no marker is present. Besides
+// the fixed markers, a trailing ".<digits>" component (logrotate-style ".1",
+// datestamped ".20240901") is peeled: a purely numeric tail marks a numbered
+// or dated copy. Alphabetic tails (".go", ".md", ".sh", ...) are deliberately
+// NOT peeled: they are real file extensions (netrc.go is Go source, not a
+// netrc backup), and peeling them would re-create the pgpass.md / netrc.go
+// false positives that the exact-name credential rules removed.
 func stripOneSensitiveBackupSuffix(base string) string {
 	for _, suf := range sensitiveBackupSuffixes {
 		if strings.HasSuffix(base, suf) && len(base) > len(suf) {
 			return base[:len(base)-len(suf)]
+		}
+	}
+	if i := strings.LastIndexByte(base, '.'); i > 0 && i+1 < len(base) {
+		numeric := true
+		for _, c := range []byte(base[i+1:]) {
+			if c < '0' || c > '9' {
+				numeric = false
+				break
+			}
+		}
+		if numeric {
+			return base[:i]
 		}
 	}
 	return base
@@ -1349,30 +1404,45 @@ func isSensitiveCredentialBase(base string) bool {
 		return true
 	}
 	for _, key := range []string{"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"} {
-		// Prefix match covers key variants such as id_rsa_primary and
-		// id_ed25519_sk (FIDO); the original suffix match is kept so
-		// established hits (e.g. "..._id_rsa") do not regress.
-		if strings.HasPrefix(base, key) || strings.HasSuffix(base, key) {
+		// The original suffix match is kept so established hits
+		// (e.g. "..._id_rsa") do not regress.
+		if strings.HasSuffix(base, key) {
 			return true
+		}
+		// The prefix match covers key variants such as id_rsa_primary and
+		// id_ed25519_sk (FIDO), bounded so the prefix must end at a name
+		// boundary -- end of base or a non-alphanumeric character. An
+		// unrelated word merely starting with the same letters (id_rsafoo)
+		// no longer matches, while extension tails keep hitting
+		// (id_rsa.go stays blocked -- a conservative direction).
+		if strings.HasPrefix(base, key) {
+			rest := base[len(key):]
+			if rest == "" || !isASCIIAlnum(rest[0]) {
+				return true
+			}
 		}
 	}
 	if strings.HasPrefix(base, "service-account") && strings.HasSuffix(base, ".json") {
 		return true
 	}
+	// Credential stores match by EXACT name only (dot-less pgpass, netrc and
+	// git-credentials alongside their dotted forms). The previous dot-less
+	// prefix match also caught unrelated files (netrc.go, pgpass.md,
+	// git-credentials-helper.sh); real backup copies are covered by the
+	// backup-suffix stripping (netrc.bak -> netrc), so the loose prefix is
+	// not needed.
 	switch base {
-	case "credentials.json", "credentials", ".npmrc", ".netrc",
-		".git-credentials", ".bash_history", ".zsh_history", ".pgpass", ".htpasswd":
+	case "credentials.json", "credentials", ".npmrc", ".netrc", "netrc",
+		".git-credentials", "git-credentials", ".bash_history", ".zsh_history",
+		".pgpass", "pgpass", ".htpasswd":
 		return true
 	}
-	// Dot-less variants of credential stores (pgpass, netrc, git-credentials,
-	// and labeled derivatives like pgpass.example.com): prefix match, never a
-	// Contains sweep, so unrelated names cannot be caught by accident.
-	for _, pre := range []string{"pgpass", "netrc", "git-credentials"} {
-		if strings.HasPrefix(base, pre) {
-			return true
-		}
-	}
 	return false
+}
+
+// isASCIIAlnum reports whether b is an ASCII letter or digit.
+func isASCIIAlnum(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }
 
 func isSensitiveFilePath(path string) bool {
@@ -1391,7 +1461,7 @@ func isSensitiveFilePath(path string) bool {
 	// the credential-identity rules, so prod.pem.txt, .htpasswd.old,
 	// key.pem.orig or .env~ cannot smuggle secrets past the fence.
 	stripped := base
-	for {
+	for peel := 0; peel < maxSensitiveBackupPeels; peel++ {
 		next := stripOneSensitiveBackupSuffix(stripped)
 		if next == stripped {
 			break

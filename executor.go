@@ -2461,7 +2461,7 @@ func runCompiledOpts(ctx context.Context, language string, rt runtimeConfig, tmp
 				Stdout:    compileOutBuf.String(),
 				Stderr:    fmt.Sprintf("compilation failed: %v", err),
 				ExitCode:  -1,
-				Truncated: compileOutBuf.truncated,
+				Truncated: compileOutBuf.truncatedFlag(),
 			}, nil
 		}
 		compileDone := make(chan error, 1)
@@ -2491,7 +2491,7 @@ func runCompiledOpts(ctx context.Context, language string, rt runtimeConfig, tmp
 				Stdout:    compileOutBuf.String(),
 				Stderr:    fmt.Sprintf("compilation failed: %v", compileErr),
 				ExitCode:  -1,
-				Truncated: compileOutBuf.truncated,
+				Truncated: compileOutBuf.truncatedFlag(),
 			}, nil
 		}
 		cmd = exec.Command(outPath)
@@ -2540,13 +2540,23 @@ const maxCmdOutput = 10 * 1024 * 1024 // 10 MB
 // limitedBuffer is an io.Writer that keeps the newest `limit` bytes (same
 // "keep latest" policy as limitedFileWriter). Write always returns len(p).
 // String() drops incomplete UTF-8 runes at either end.
+//
+// All access is mutex-guarded: when a reap path gives up on cmd.Wait
+// (reapWaitBound), the os/exec pipe-copy goroutine may still be Writing into
+// the buffer while the main flow reads the captured output. Write racing
+// String()/truncatedFlag on the underlying bytes.Buffer would be an undefined
+// concurrent read/write; the lock's cost is negligible (few large writes per
+// process).
 type limitedBuffer struct {
+	mu        sync.Mutex
 	buf       bytes.Buffer
 	limit     int
 	truncated bool
 }
 
 func (lb *limitedBuffer) Write(p []byte) (int, error) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
 	n := len(p)
 	if n == 0 {
 		return 0, nil
@@ -2574,9 +2584,23 @@ func (lb *limitedBuffer) Write(p []byte) (int, error) {
 }
 
 func (lb *limitedBuffer) String() string {
-	b := dropLeadingPartialRune(lb.buf.Bytes())
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	// Copy before rune-trimming: buf.Bytes() aliases the internal storage,
+	// which a concurrent post-give-up Write may still mutate.
+	b := append([]byte(nil), lb.buf.Bytes()...)
+	b = dropLeadingPartialRune(b)
 	b = trimTrailingPartialRune(b)
 	return string(b)
+}
+
+// truncatedFlag reports whether bytes had to be dropped to honor the limit.
+// Guarded like Write/String: after a reapWaitBound give-up the pipe-copy
+// goroutine may still be running while the caller reads the flag.
+func (lb *limitedBuffer) truncatedFlag() bool {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	return lb.truncated
 }
 
 // runCmd is the shared execution loop for all languages.
@@ -2736,7 +2760,16 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 				// keeps cmd.Wait (and this call) blocked until it exits by
 				// itself.
 				killTimeoutEscapedDescendants(escaped)
-				<-done
+				// Mirror the ctx.Done branch: wait for the drain with a bound. A
+				// setsid escapee spawned in the microsecond window between the
+				// descendant snapshot and the group kill (or a D-state process)
+				// can hold the output pipe forever; give up after reapWaitBound
+				// and let the runtime reclaim the residual cmd.Wait goroutine.
+				select {
+				case <-done:
+				case <-time.After(reapWaitBound):
+					log.Printf("ctxmode: WARNING: timed-out process (pgid %d): cmd.Wait did not return within %v after group kill; continuing (residual Wait is reclaimed by the runtime)", cmd.Process.Pid, reapWaitBound)
+				}
 			}
 			// Final sweep: descendants normally died with the group above;
 			// SIGKILL any setsid escapee that closed its output handles and
@@ -2748,7 +2781,7 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 		if stderr == "" {
 			stderr = fmt.Sprintf("Process timed out after %v", timeout)
 		}
-		truncated = stdoutBuf.truncated || stderrBuf.truncated
+		truncated = stdoutBuf.truncatedFlag() || stderrBuf.truncatedFlag()
 		return &executeResult{
 			Stdout:    stdout,
 			Stderr:    stderr,
@@ -2792,7 +2825,7 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 		if stderr == "" {
 			stderr = fmt.Sprintf("process cancelled: %v", ctx.Err())
 		}
-		truncated = stdoutBuf.truncated || stderrBuf.truncated
+		truncated = stdoutBuf.truncatedFlag() || stderrBuf.truncatedFlag()
 		return &executeResult{
 			Stdout:    stdout,
 			Stderr:    stderr,
@@ -2813,7 +2846,7 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 			}
 		}
 
-		truncated = stdoutBuf.truncated || stderrBuf.truncated
+		truncated = stdoutBuf.truncatedFlag() || stderrBuf.truncatedFlag()
 		return &executeResult{
 			Stdout:    stdout,
 			Stderr:    stderr,

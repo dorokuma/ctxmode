@@ -3,6 +3,17 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [4.0.7] - 2026-09-13
+
+### Fixed
+- **migrateFromJSON rewritten**: the v4.0.6 whitelist rejected every real legacy document (the JSON era stored absolute workdir paths, and old session ids can never match the per-process random id). Legacy paths are now accepted only as absolute paths that resolve inside a workdir (EvalSymlinks + `..`-segment rejection + valid-UTF-8 + control-character checks), normalized to workdir-relative display paths, and re-checked by `isSensitiveFilePath`; the rg:/batch:/URL accept branches that only existed for hostile JSON are gone.
+- **timeout branch of runCmd now bounds its final wait** (reapWaitBound, mirroring the ctx-cancel and batch branches), and `limitedBuffer` is mutex-protected, removing a data race when an abandoned Wait's copy goroutine is still writing.
+- **fetch**: a fence-refused URL now deletes any pre-existing stale `fetch_cache` row (new `DeleteCached`) instead of leaving plaintext until the 7-day TTL.
+- **isSensitiveFilePath false positives narrowed**: pgpass/netrc/git-credentials match exact names only (netrc.go / pgpass.md no longer flagged), private-key prefixes require a name boundary, and pure-numeric secondary suffixes are stripped (`prod.key.1`, `server.pem.20240901` now match).
+
+### Changed
+- Pi adapter stripANSI covers two/three-byte ESC forms with intermediate bytes and DCS/SOS/PM/APC sequences (verified by new TS tests).
+
 ## [4.0.6] - 2026-09-12
 
 ### Fixed

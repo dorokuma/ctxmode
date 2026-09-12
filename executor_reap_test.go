@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -148,4 +149,54 @@ func TestReap_KillBackgroundStarttimeZeroFallback(t *testing.T) {
 		t.Fatalf("process group %d survived the fallback group kill", pgid)
 	}
 	waitForNoProc(t, "sleep 120")
+}
+
+// TestReap_LimitedBufferConcurrentReadWrite (t-reap-buf): after a reap path
+// gives up on cmd.Wait (reapWaitBound), the os/exec pipe-copy goroutine may
+// still Write into the limitedBuffer while the main flow reads String() and
+// the truncation flag. Without the internal mutex that is a concurrent
+// bytes.Buffer read/write data race — run with -race to surface it. Without
+// -race the test still asserts the keep-newest policy holds under
+// concurrency.
+func TestReap_LimitedBufferConcurrentReadWrite(t *testing.T) {
+	var lb limitedBuffer
+	lb.limit = 64
+	payload := []byte(strings.Repeat("ab", 32)) // exactly the limit
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := lb.Write(payload); err != nil {
+				t.Errorf("limitedBuffer.Write: %v", err)
+				return
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if out := lb.String(); len(out) > lb.limit {
+			t.Fatalf("String() returned %d bytes, limit is %d", len(out), lb.limit)
+		}
+		_ = lb.truncatedFlag()
+	}
+	close(stop)
+	wg.Wait()
+
+	// Every write is exactly limit-sized: the newest payload must survive
+	// intact and the buffer must report truncation (older bytes dropped).
+	if got := lb.String(); got != string(payload) {
+		t.Fatalf("keep-newest policy broken: got %d bytes, want %d identical", len(got), len(payload))
+	}
+	if !lb.truncatedFlag() {
+		t.Fatal("expected truncated=true after overflow writes")
+	}
 }
