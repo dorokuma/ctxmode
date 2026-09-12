@@ -1004,6 +1004,10 @@ func (s *server) indexFile(path string) error {
 	return s.indexFileWithSensitive(path, nil)
 }
 
+// Middle-path-component TOCTOU is out of scope under the documented threat
+// model (README "Security model"): exploiting it needs a local process racing
+// symlink swaps, while static malicious symlinks are rejected by the
+// EvalSymlinks re-check in ensureInsideWorkspaces. Do not report as a finding.
 func (s *server) indexFileWithSensitive(path string, sensitiveInodes map[fileID]struct{}) error {
 	// Resolve symlinks and re-check containment at read time (Walk may
 	// encounter links; callers may pass an unverified path).

@@ -953,6 +953,47 @@ func (s *server) batchFetchAndIndex(ctx context.Context, urls []string, source, 
 	return results
 }
 
+// ---------- fetch flood guard ----------
+
+// ctx_kb fetch performs outbound HTTP GETs (SSRF-gated but previously
+// unlimited), so it gets its own flood bucket, independent from the search
+// buckets. One tool call — even one carrying up to 10 URLs — consumes a
+// single slot: the per-call guard bounds how often an agent can trigger
+// outbound fetch bursts, while singleflight still merges concurrent
+// identical fetches and the TTL cache still absorbs repeats.
+const (
+	fetchFloodOKLimit    = 8  // full-speed fetch calls per 60s sliding window
+	fetchFloodBlockLimit = 16 // total attempts per 60s window before hard block
+)
+
+// fetchFloodGuardEnabled is the fetch-guard switch: when false (or when the
+// per-session bucket is nil) fetch behaves exactly as it did before the
+// guard existed.
+var fetchFloodGuardEnabled = true
+
+var (
+	fetchGuardsMu sync.Mutex
+	fetchGuards   = map[*server]*FloodGuard{}
+)
+
+// fetchFloodGuard returns the per-session fetch rate-limit bucket. A server
+// lives for one MCP session, so keying by *server gives every session (and
+// every test, which builds fresh servers) an independent bucket without
+// touching the server struct. Returns nil when the guard is disabled.
+func (s *server) fetchFloodGuard() *FloodGuard {
+	if !fetchFloodGuardEnabled {
+		return nil
+	}
+	fetchGuardsMu.Lock()
+	defer fetchGuardsMu.Unlock()
+	if fg, ok := fetchGuards[s]; ok {
+		return fg
+	}
+	fg := NewFloodGuardWithThresholds(60*time.Second, 64, fetchFloodOKLimit, fetchFloodBlockLimit)
+	fetchGuards[s] = fg
+	return fg
+}
+
 // ---------- MCP tool handler ----------
 
 // maxFetchTTLms caps ttl_ms at 30 days: past this point time.Duration(ttl) *
@@ -977,6 +1018,19 @@ func validateFetchTTLms(ttl int64) error {
 }
 
 func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, args fetchArgs) (*mcp.CallToolResult, any, error) {
+	// Flood guard: every attempt (including ones that later fail parameter
+	// validation) consumes one slot in the dedicated fetch bucket. A nil
+	// bucket (guard disabled) means no limiting, matching pre-guard behavior.
+	fetchThrottled := false
+	if fg := s.fetchFloodGuard(); fg != nil {
+		switch fg.Allow() {
+		case StatusBlocked:
+			return nil, nil, fmt.Errorf("fetch blocked: too many requests in a short time. Wait a moment and retry.")
+		case StatusThrottled:
+			fetchThrottled = true
+		}
+	}
+
 	// Collect and deduplicate URLs.
 	seen := make(map[string]bool)
 	var urls []string
@@ -1084,6 +1138,9 @@ func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, 
 	var builder strings.Builder
 	builder.WriteString(fmt.Sprintf("Fetched %d URL(s): %d successful, %d cache hits, %d total chunks\n\n",
 		len(results), successCount, cacheHitCount, totalChunks))
+	if fetchThrottled {
+		builder.WriteString("Fetch volume is high: requests are being throttled. Wait a moment before fetching more pages.\n\n")
+	}
 	builder.WriteString(strings.Join(summaryLines, "\n"))
 	builder.WriteString(searchHint)
 

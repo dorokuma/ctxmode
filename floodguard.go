@@ -35,13 +35,17 @@ type FloodGuard struct {
 	attSize     int           // current entries within the window (≤ capacity)
 	capacity    int           // max entries in each buffer
 	windowDur   time.Duration // e.g., 60 seconds
+	okLimit     int           // OK calls in window that trigger StatusThrottled (0 = default 4)
+	totalLimit  int           // total attempts in window that trigger StatusBlocked (0 = default 9)
 }
 
-// NewFloodGuard creates a FloodGuard with the given window duration and ring
-// buffer capacity. capacity controls how many recent timestamps are tracked in
-// each of the two internal ring buffers; it is clamped to a minimum of 64 so
-// that the rate-limit thresholds (block at 9, throttle at 4) are always
-// correctly measurable.
+// NewFloodGuard creates a FloodGuard with the given window duration, ring
+// buffer capacity, and the historical thresholds (throttle at 4 OK calls,
+// block at 9 total attempts). capacity controls how many recent timestamps
+// are tracked in each of the two internal ring buffers; it is clamped to a
+// minimum of 64 so that the rate-limit thresholds are always correctly
+// measurable. Use NewFloodGuardWithThresholds for buckets that need
+// different (typically more generous) limits.
 func NewFloodGuard(windowDur time.Duration, capacity int) *FloodGuard {
 	if capacity < 64 {
 		capacity = 64
@@ -51,7 +55,30 @@ func NewFloodGuard(windowDur time.Duration, capacity int) *FloodGuard {
 		attemptsBuf: make([]time.Time, capacity),
 		capacity:    capacity,
 		windowDur:   windowDur,
+		okLimit:     4, // throttle when OK calls in the window reach 4
+		totalLimit:  9, // hard block when total attempts in the window reach 9
 	}
+}
+
+// NewFloodGuardWithThresholds creates a FloodGuard with explicit throttle and
+// block thresholds so additional buckets (rg-scoped search, fetch) can share
+// the sliding-window mechanics with limits appropriate to their traffic.
+// capacity is clamped to at least 64 and to at least totalLimit so the block
+// threshold stays measurable.
+func NewFloodGuardWithThresholds(windowDur time.Duration, capacity, okLimit, totalLimit int) *FloodGuard {
+	if okLimit < 1 {
+		okLimit = 1
+	}
+	if totalLimit <= okLimit {
+		totalLimit = okLimit + 1
+	}
+	if capacity < totalLimit {
+		capacity = totalLimit
+	}
+	fg := NewFloodGuard(windowDur, capacity)
+	fg.okLimit = okLimit
+	fg.totalLimit = totalLimit
+	return fg
 }
 
 // WindowCount returns the number of OK calls recorded in the current sliding
@@ -81,10 +108,12 @@ func (fg *FloodGuard) WindowCount() int {
 //   - attemptsBuf records every call (OK, throttled, blocked).
 //   - okBuf records only StatusOK calls.
 //
-// Thresholds (evaluated after pruning expired entries):
-//   - total attempts >= 9 → StatusBlocked (hard deny — sustained abuse)
-//   - OK count       >= 4 → StatusThrottled (reduced results — temporary load)
-//   - otherwise            → StatusOK (full results)
+// Thresholds (evaluated after pruning expired entries; defaults 9/4 unless
+// overridden via NewFloodGuardWithThresholds, and zero-value guards fall back
+// to the same defaults):
+//   - total attempts >= totalLimit → StatusBlocked (hard deny — sustained abuse)
+//   - OK count       >= okLimit    → StatusThrottled (reduced results — temporary load)
+//   - otherwise                    → StatusOK (full results)
 //
 // The dual-counter design guarantees that a sustained burst of requests
 // eventually triggers a hard block (total reaches 9), while a legitimate
@@ -111,13 +140,23 @@ func (fg *FloodGuard) Allow() FloodStatus {
 	okCount := fg.okSize
 
 	// Determine status based on window counts.
-	// Block takes priority: once total reaches 9, deny outright.
-	// Throttle applies when the OK count alone reaches 4.
+	// Block takes priority: once total reaches totalLimit, deny outright.
+	// Throttle applies when the OK count alone reaches okLimit.
+	// Zero-value guards (limits unset) fall back to the historical defaults
+	// so the original semantics are preserved unchanged.
+	totalLimit := fg.totalLimit
+	if totalLimit <= 0 {
+		totalLimit = 9
+	}
+	okLimit := fg.okLimit
+	if okLimit <= 0 {
+		okLimit = 4
+	}
 	var status FloodStatus
 	switch {
-	case total >= 9:
+	case total >= totalLimit:
 		status = StatusBlocked
-	case okCount >= 4:
+	case okCount >= okLimit:
 		status = StatusThrottled
 	default:
 		status = StatusOK

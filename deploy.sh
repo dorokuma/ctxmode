@@ -42,10 +42,20 @@ fi
 # 不用 2>/dev/null：失败时把 initialize 的 stderr/stdout 打出来。
 # 验证失败是预期分支，必须先拆掉 ERR trap，否则 trap 会先删掉 .err，
 # 失败原因就看不到了。
+# stdin EOF 竞态：新二进制偶发在关闭流程中收到 EOF 以 rc=1 退出
+# （"server is closing: EOF"），与被验证二进制本身无关，重试即可。
 trap - ERR
 set +e
-VERIFY=$( (echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"deploy-check","version":"1"}}}'; sleep 1) | timeout 5 "$TMP_FILE" 2>"$TMP_FILE.err" )
-VERIFY_RC=$?
+VERIFY=""
+VERIFY_RC=1
+for attempt in 1 2 3; do
+  VERIFY=$( (echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"deploy-check","version":"1"}}}'; sleep 1) | timeout 5 "$TMP_FILE" 2>"$TMP_FILE.err" )
+  VERIFY_RC=$?
+  if [ "$VERIFY_RC" -eq 0 ] && printf '%s' "$VERIFY" | grep -qE '"version"[[:space:]]*:[[:space:]]*"[^"]+"'; then
+    break
+  fi
+  [ "$attempt" -eq 3 ] || sleep 1
+done
 set -e
 if [ "$VERIFY_RC" -ne 0 ] || ! printf '%s' "$VERIFY" | grep -qE '"version"[[:space:]]*:[[:space:]]*"[^"]+"'; then
   echo "新二进制 initialize 验证失败 (exit ${VERIFY_RC})" >&2

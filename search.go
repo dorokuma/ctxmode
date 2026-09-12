@@ -135,24 +135,57 @@ type SearchMeta struct {
 
 // ---------- SearchPipeline ----------
 
+// Flood-guard modes for the shared search implementation. Each externally
+// reachable path uses its own bucket so that a compromised agent spamming
+// one path cannot exhaust another path's quota:
+//
+//	floodNone   — internal/batch-scoped queries: no guard. Batch queries are
+//	              not agent-spammable and keep their historical bypass.
+//	floodGlobal — unscoped ctx_kb action=search: the original global bucket.
+//	floodRg     — ctx_kb action=search scope=rg: dedicated rg bucket, more
+//	              generous than global because legitimate rg-summary reuse
+//	              (searching back output indexed by ctx_fs rg) can produce
+//	              several lookups per rg run during iterative agent work.
+type floodMode int
+
+const (
+	floodNone floodMode = iota
+	floodGlobal
+	floodRg
+)
+
+// rg-scope bucket thresholds (same 60s sliding window as the global bucket):
+// 20 full-result searches per minute before throttling, hard block at 40
+// total attempts — 5x the global search quota (4/9). rg-scoped searches only
+// hit this session's rg index, and the legitimate reuse path (ctx_fs rg
+// indexes oversized output, then the agent searches it back with scope=rg)
+// is not throttled at normal interactive rates, while sustained abuse still
+// trips the hard block and caps the double-FTS query rate.
+const (
+	rgFloodOKLimit    = 20
+	rgFloodBlockLimit = 40
+)
+
 // SearchPipeline orchestrates the complete search pipeline:
 // flood guard → dual-table search → RRF merge → fuzzy fallback → proximity rerank.
 type SearchPipeline struct {
-	store      *Store
-	floodGuard *FloodGuard
+	store        *Store
+	floodGuard   *FloodGuard // global bucket for unscoped search (unchanged semantics)
+	rgFloodGuard *FloodGuard // dedicated bucket for scope=rg (nil = disabled, no limiting)
 }
 
 // NewSearchPipeline creates a new search pipeline.
 func NewSearchPipeline(store *Store, floodGuard *FloodGuard) *SearchPipeline {
 	return &SearchPipeline{
-		store:      store,
-		floodGuard: floodGuard,
+		store:        store,
+		floodGuard:   floodGuard,
+		rgFloodGuard: NewFloodGuardWithThresholds(60*time.Second, 64, rgFloodOKLimit, rgFloodBlockLimit),
 	}
 }
 
 // Search runs the complete enhanced search pipeline (with flood guard).
 func (sp *SearchPipeline) Search(query string, limit int) ([]SearchResult, *SearchMeta, error) {
-	return sp.search(query, "", limit, true)
+	return sp.search(query, "", limit, floodGlobal)
 }
 
 // SearchBatchScoped searches only documents under the batch: path prefix and
@@ -161,28 +194,38 @@ func (sp *SearchPipeline) SearchBatchScoped(query string, limit int) ([]SearchRe
 	return sp.SearchPrefixScoped(query, "batch:", limit)
 }
 
-// SearchRgScoped searches only documents under rgSessionPrefix and
-// does NOT consume flood-guard quota.
+// SearchRgScoped searches only documents under rgSessionPrefix. It consumes
+// the dedicated rg-scope flood bucket — independent from the global search
+// bucket and more generous — so rg-scoped searches no longer bypass rate
+// limiting entirely while legitimate rg-summary reuse keeps ample headroom.
 func (sp *SearchPipeline) SearchRgScoped(query, rgSessionPrefix string, limit int) ([]SearchResult, *SearchMeta, error) {
-	return sp.SearchPrefixScoped(query, rgSessionPrefix, limit)
+	return sp.search(query, rgSessionPrefix, limit, floodRg)
 }
 
-// SearchPrefixScoped searches documents under pathPrefix and skips the flood guard.
+// SearchPrefixScoped searches documents under pathPrefix and skips the flood
+// guard (used by ctx_run action=batch query_scope=batch, which is internal
+// and must keep its historical bypass).
 func (sp *SearchPipeline) SearchPrefixScoped(query, pathPrefix string, limit int) ([]SearchResult, *SearchMeta, error) {
-	return sp.search(query, pathPrefix, limit, false)
+	return sp.search(query, pathPrefix, limit, floodNone)
 }
 
 // search is the shared implementation.
-// pathPrefix filters at the store layer; applyFlood enables the flood guard.
-func (sp *SearchPipeline) search(query, pathPrefix string, limit int, applyFlood bool) ([]SearchResult, *SearchMeta, error) {
+// pathPrefix filters at the store layer; mode selects the flood-guard bucket
+// (floodNone skips the guard, floodGlobal uses the original global bucket
+// unchanged, floodRg uses the dedicated rg-scope bucket).
+func (sp *SearchPipeline) search(query, pathPrefix string, limit int, mode floodMode) ([]SearchResult, *SearchMeta, error) {
 	if limit < 0 {
 		limit = 0
 	}
 	start := time.Now()
 	meta := &SearchMeta{}
 
-	// 1. Flood guard check (optional — skipped for batch-scoped queries).
-	if applyFlood {
+	// 1. Flood guard check: floodNone skips it entirely (batch-scoped
+	// queries), floodGlobal keeps the original semantics unchanged, floodRg
+	// uses the dedicated rg-scope bucket. A nil bucket means the guard is
+	// disabled and everything behaves exactly as before.
+	switch mode {
+	case floodGlobal:
 		status := sp.floodGuard.Allow()
 		switch status {
 		case StatusBlocked:
@@ -198,7 +241,27 @@ func (sp *SearchPipeline) search(query, pathPrefix string, limit int, applyFlood
 		default:
 			meta.FloodStatus = "ok"
 		}
-	} else {
+	case floodRg:
+		if sp.rgFloodGuard != nil {
+			status := sp.rgFloodGuard.Allow()
+			switch status {
+			case StatusBlocked:
+				meta.FloodStatus = "blocked"
+				meta.TimeMs = time.Since(start).Milliseconds()
+				return nil, meta, fmt.Errorf("rg-scoped search blocked: too many requests in a short time. Wait a moment and retry.")
+			case StatusThrottled:
+				meta.FloodStatus = "throttled"
+				meta.ThrottleMsg = "Search volume is high: showing limited results. Wait before retrying rg-scoped search."
+				if limit > 1 {
+					limit = max(1, limit/2)
+				}
+			default:
+				meta.FloodStatus = "ok"
+			}
+		} else {
+			meta.FloodStatus = "ok"
+		}
+	default:
 		meta.FloodStatus = "ok"
 	}
 

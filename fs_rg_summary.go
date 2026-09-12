@@ -312,6 +312,13 @@ func renderRgSummary(groups []rgFileGroup, totalHits, limit int, label, pattern 
 			summaryGroups = append(summaryGroups, g)
 		}
 	}
+	// Cosmetic, label-layer fix only: a path containing ":<digits>:"
+	// (e.g. directory "x:12:y" holding notes.md) parses as its first
+	// colon-split prefix, so a group label can read "x" where rg really
+	// matched "x:12:y/notes.md". Resolve those labels the same way the
+	// fs_tools.go output fence does (stat-verified candidates); unambiguous
+	// labels are untouched.
+	disambiguateRgGroupLabels(summaryGroups, root)
 
 	sort.SliceStable(summaryGroups, func(i, j int) bool {
 		if summaryGroups[i].dirty != summaryGroups[j].dirty {
@@ -556,6 +563,56 @@ func groupHasDef(g rgFileGroup) bool {
 	return false
 }
 
+// rgGroupLabelCandidates returns the candidate paths for a group label:
+// the candidates of its first match line, i.e. the line whose
+// splitRgMatchLine parse produced the label. Context-only groups (no
+// match line) return nil and keep their label.
+func rgGroupLabelCandidates(g *rgFileGroup) []string {
+	for _, line := range g.lines {
+		if isRgMatchLine(line) {
+			return rgCandidatePaths(line)
+		}
+	}
+	return nil
+}
+
+// disambiguateRgGroupLabels rewrites ambiguous group labels in place. A path
+// containing ":<digits>:" (a directory "x:12:y" holding notes.md) parses as
+// its first colon-split prefix, so a group label can read "x" where rg
+// really matched "x:12:y/notes.md" and the summary file list plus the Read
+// hint name a nonexistent path. Resolution mirrors the raw-line output fence
+// (rgRawLineSensitive): candidates are enumerated with rgCandidatePaths and
+// the first one that stats to an existing regular file (root-joined via
+// rgGroupAbsPath, deduped through rgStatCache so each unique path costs one
+// stat) becomes the label. When the parse is unambiguous (a single
+// candidate, the common case) no stat is made at all, and when no candidate
+// exists the original label is kept, so normal-path output stays
+// byte-identical. Sensitive-path filtering is not done here: it stays in
+// the fs_tools.go fence, which has already dropped sensitive lines before
+// grouping runs.
+func disambiguateRgGroupLabels(groups []rgFileGroup, root string) {
+	var cache *rgStatCache
+	for i := range groups {
+		g := &groups[i]
+		if g.file == "" {
+			continue
+		}
+		cands := rgGroupLabelCandidates(g)
+		if len(cands) < 2 {
+			continue
+		}
+		if cache == nil {
+			cache = newRgStatCache()
+		}
+		for _, c := range cands {
+			if fi, ok := cache.stat(rgGroupAbsPath(root, c)); ok && fi.Mode().IsRegular() {
+				g.file = c
+				break
+			}
+		}
+	}
+}
+
 // rgReadHint picks the first group (in the existing order) that contains a
 // definition line, else the first group with matches. Does not reorder lines.
 func rgReadHint(groups []rgFileGroup) (path string, isDef bool, ok bool) {
@@ -603,7 +660,12 @@ func formatReadHint(path string, isDef bool, root string) string {
 }
 
 func prependReadHint(body string, groups []rgFileGroup, root string) string {
-	p, isDef, ok := rgReadHint(groups)
+	// Work on a copy: groups belongs to the caller, and the label layer must
+	// not mutate it after rank/tag have run.
+	hintGroups := make([]rgFileGroup, len(groups))
+	copy(hintGroups, groups)
+	disambiguateRgGroupLabels(hintGroups, root)
+	p, isDef, ok := rgReadHint(hintGroups)
 	if !ok {
 		return body
 	}

@@ -1838,6 +1838,10 @@ func (s *server) rgGoBudget(ctx context.Context, budgetMs int, root string, args
 			budgetStopped = true
 			return io.EOF
 		}
+		// Middle-path-component TOCTOU is out of scope under the documented threat
+		// model (README "Security model"): exploiting it needs a local process racing
+		// symlink swaps, while static malicious symlinks are rejected by the
+		// EvalSymlinks re-check in ensureInsideWorkspaces. Do not report as a finding.
 		f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
 			return nil

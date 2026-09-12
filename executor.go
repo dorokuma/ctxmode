@@ -72,6 +72,11 @@ type bgEntry struct {
 	done         chan struct{}
 	doneSignaled bool
 	finishedAt   time.Time
+	// maxAgeTimer is the per-job AfterFunc that kills the job at maxAge.
+	// Kept on the entry so the Done-marking paths can Stop() it: a job that
+	// finishes (or is killed) early must not leave the timer alive until
+	// maxAge, firing a redundant kill into killBackground.
+	maxAgeTimer *time.Timer
 }
 
 // bgTombstone contains only the bounded terminal result needed for wait.
@@ -370,6 +375,7 @@ func finishBackground(id string, exitCode int) {
 			ent.Done = true
 			ent.ExitCode = exitCode
 			ent.finishedAt = time.Now()
+			stopMaxAgeTimerLocked(ent)
 		} else if exitCode >= 0 {
 			// Prefer real Wait exit code over kill's placeholder (-1) when available.
 			ent.ExitCode = exitCode
@@ -394,6 +400,19 @@ func finishBackground(id string, exitCode int) {
 	}
 }
 
+// stopMaxAgeTimerLocked stops the per-job max-age kill timer once the entry
+// reached a terminal state, so a job that finished (or was killed) early does
+// not keep the AfterFunc alive until maxAge firing a redundant kill into
+// killBackground. Caller holds bgMu: Done transitions and the handle store in
+// runCmd are serialized under it, so the timer is stopped exactly once.
+// Safe on a timer that already fired (Stop just reports false).
+func stopMaxAgeTimerLocked(e *bgEntry) {
+	if e.maxAgeTimer != nil {
+		e.maxAgeTimer.Stop()
+		e.maxAgeTimer = nil
+	}
+}
+
 // markBackgroundKilled marks the entry Done without closing the log FD.
 // The Wait goroutine must still call finishBackground to close the log and
 // reap temps — closing early can drop the final flush of stdout/stderr.
@@ -406,6 +425,7 @@ func markBackgroundKilled(id string) {
 	}
 	e.Done = true
 	e.ExitCode = -1
+	stopMaxAgeTimerLocked(e)
 	if e.done == nil {
 		e.done = make(chan struct{})
 	}
@@ -720,6 +740,94 @@ func findProcessGroupPIDs(pgid int, minStartTime uint64) []int {
 		pids = append(pids, pid)
 	}
 	return pids
+}
+
+// collectDescendantPIDs scans /proc once and returns the descendant PIDs of
+// root (transitive children) keyed by their /proc starttime, for use
+// immediately before a timeout kill. A child that called setsid(2) lives in
+// a new session/process group and escapes the pgid-wide signal, so the
+// timeout path snapshots the PPID tree before any signal is sent and reaps
+// escapees individually afterwards (killTimeoutEscapedDescendants). The
+// comm field of /proc/<pid>/stat may contain spaces and parentheses, so
+// fields are parsed after the last ')' (field 4 is then ppid, field 22
+// starttime; 0-indexed 1 and 19 in the remainder). Returns nil on read
+// errors or when root has no descendants.
+func collectDescendantPIDs(root int) map[int]uint64 {
+	if root <= 0 {
+		return nil
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	ppid := make(map[int]int)
+	starttime := make(map[int]uint64)
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil {
+			continue // vanished mid-scan
+		}
+		i := bytes.LastIndexByte(data, ')')
+		if i < 0 || i+2 >= len(data) {
+			continue
+		}
+		fields := strings.Fields(string(data[i+2:]))
+		if len(fields) < 20 {
+			continue
+		}
+		parent, err := strconv.Atoi(fields[1]) // field 4 is ppid (0-indexed 1 after comm)
+		if err != nil {
+			continue
+		}
+		st, err := strconv.ParseUint(fields[19], 10, 64) // field 22 is starttime (0-indexed 19 after comm)
+		if err != nil {
+			continue
+		}
+		ppid[pid] = parent
+		starttime[pid] = st
+	}
+	children := make(map[int][]int)
+	for pid, parent := range ppid {
+		children[parent] = append(children[parent], pid)
+	}
+	descendants := make(map[int]uint64)
+	stack := []int{root}
+	seen := map[int]bool{root: true}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, child := range children[cur] {
+			if seen[child] {
+				continue
+			}
+			seen[child] = true
+			descendants[child] = starttime[child]
+			stack = append(stack, child)
+		}
+	}
+	if len(descendants) == 0 {
+		return nil
+	}
+	return descendants
+}
+
+// killTimeoutEscapedDescendants SIGKILLs collected descendants that are still
+// alive after the process-group kill, re-checking /proc starttime so a PID
+// recycled between the scan and the kill is never signalled. Most entries are
+// already dead with their group and are skipped; in practice only setsid
+// escapees get signalled. Called only from the timeout kill path in runCmd.
+func killTimeoutEscapedDescendants(descendants map[int]uint64) {
+	for pid, starttime := range descendants {
+		current, err := procStartTimeErr(pid)
+		if err != nil || current != starttime {
+			continue // gone, or PID recycled since the scan
+		}
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
 }
 
 // killBackground kills by id or by PID string. Returns a status message.
@@ -2479,10 +2587,23 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 		if maxAge <= 0 {
 			maxAge = defaultBackgroundMaxAge
 		}
-		time.AfterFunc(maxAge, func() {
+		// Keep the timer handle on the entry so the Done-marking paths
+		// (finishBackground/markBackgroundKilled) can Stop() it when the
+		// job ends early; otherwise the timer stays alive until maxAge and
+		// fires a redundant kill into killBackground.
+		maxAgeTimer := time.AfterFunc(maxAge, func() {
 			// Entry may already be Done or reaped — nothing to do then.
 			_, _ = killBackground(entry.ID)
 		})
+		bgMu.Lock()
+		if entry.Done {
+			// Finished between AfterFunc and this lock: the Done path saw a
+			// nil handle, so stop the timer here instead of storing it.
+			maxAgeTimer.Stop()
+		} else {
+			entry.maxAgeTimer = maxAgeTimer
+		}
+		bgMu.Unlock()
 		return &executeResult{
 			Stdout: fmt.Sprintf("Process started in background (id: %s, PID: %d). Next: call ctx_bg action=wait with id %s (default timeout 60000ms; timeout does not kill). No proactive push; do not poll list/log. ctx_bg action=list|kill|log|wait remains available for snapshots, logs, and termination. Max age %s.",
 				entry.ID, cmd.Process.Pid, entry.ID, maxAge),
@@ -2513,6 +2634,10 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 	case <-timerC:
 		// Timeout: send SIGTERM first for graceful shutdown, then SIGKILL.
 		if cmd.Process != nil {
+			// Snapshot the descendant tree before any signal is sent: a
+			// setsid(2) grandchild gets a new session/pgid and escapes the
+			// group-wide kills below, so it is reaped individually after.
+			escaped := collectDescendantPIDs(cmd.Process.Pid)
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 			select {
 			case <-done:
@@ -2520,8 +2645,17 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 			case <-time.After(3 * time.Second):
 				// Force-kill and drain to release pipe resources.
 				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				// Escapees sit outside the group: SIGKILL them before the
+				// drain, or an escapee still holding the stdout/stderr pipe
+				// keeps cmd.Wait (and this call) blocked until it exits by
+				// itself.
+				killTimeoutEscapedDescendants(escaped)
 				<-done
 			}
+			// Final sweep: descendants normally died with the group above;
+			// SIGKILL any setsid escapee that closed its output handles and
+			// survived (identity re-checked via /proc starttime).
+			killTimeoutEscapedDescendants(escaped)
 		}
 		stdout := stdoutBuf.String()
 		stderr := stderrBuf.String()
