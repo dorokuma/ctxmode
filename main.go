@@ -35,7 +35,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "4.0.5"
+const Version = "4.0.6"
 
 // toolIndex walk / size limits.
 const (
@@ -168,9 +168,7 @@ func main() {
 		gitDirtyCache:   make(map[string]gitDirtyEntry),
 		rgIndexDedupMap: make(map[string]rgIndexEntry),
 	}
-	if err := s.migrateFromJSON(); err != nil {
-		fatal(store, "failed to migrate database: %v", err)
-	}
+	s.migrateFromJSONOrWarn()
 	s.excludeFromGit()
 
 	if len(flag.Args()) > 0 {
@@ -1074,6 +1072,74 @@ func (s *server) indexFileWithSensitive(path string, sensitiveInodes map[fileID]
 	return s.storeIndexLocked(real, neutralizeDefMarker(string(data)))
 }
 
+// migrateFromJSONOrWarn runs the legacy JSON migration without letting a
+// damaged or hostile file abort startup: a corrupt .context_mode_db.json
+// used to fatal() the whole server at this call site. Instead we warn and
+// keep the file in place, so the next start can retry the migration.
+func (s *server) migrateFromJSONOrWarn() {
+	if err := s.migrateFromJSON(); err != nil {
+		log.Printf("ctxmode: warning: legacy JSON migration skipped (%v); the old file is left in place and migration will be retried on the next start", err)
+	}
+}
+
+// maxMigratedPathBytes bounds the length of a document path accepted from
+// the legacy JSON database.
+const maxMigratedPathBytes = 512
+
+// migratedDocPathValid reports whether a document path from the legacy JSON
+// database has a shape this server could have produced. The JSON file is
+// untrusted input (crafted or corrupted), so paths that could forge another
+// session's namespace, carry ANSI/OSC escape sequences, or inject arbitrary
+// labels are rejected and the document is skipped.
+//
+// Accepted shapes mirror the KB paths the server itself writes:
+//   - "session:<current sessionID>:<label>" -- a path claiming any other
+//     session id is cross-session forgery and is always rejected (it would
+//     also survive session-scoped purge);
+//   - "rg:" / "batch:" structured labels;
+//   - fetch document paths, which always embed an http(s) URL
+//     ("<source>[:<format>]:http(s)://...");
+//   - plain relative file paths (no colon, not absolute, no ".." segment).
+func migratedDocPathValid(sessionID, path string) bool {
+	if path == "" || len(path) > maxMigratedPathBytes {
+		return false
+	}
+	for _, r := range path {
+		// C0 controls (incl. ESC, CR, LF), DEL, and C1 controls would let a
+		// crafted path smuggle ANSI/OSC escape sequences into MCP output.
+		if r <= 0x1F || r == 0x7F || (r >= 0x80 && r <= 0x9F) {
+			return false
+		}
+	}
+	if strings.HasPrefix(path, "session:") {
+		// Only the CURRENT session namespace is acceptable.
+		rest := strings.TrimPrefix(path, "session:")
+		id := rest
+		if i := strings.Index(rest, ":"); i >= 0 {
+			id = rest[:i]
+		}
+		return sessionID != "" && id == sessionID
+	}
+	if strings.HasPrefix(path, "rg:") || strings.HasPrefix(path, "batch:") {
+		return true
+	}
+	if strings.Contains(path, "http://") || strings.Contains(path, "https://") {
+		// Fetch document paths embed an absolute http(s) URL.
+		return true
+	}
+	// Plain relative file path: no scheme-like colon, not absolute, and no
+	// parent-directory traversal segment.
+	if strings.ContainsRune(path, ':') || filepath.IsAbs(path) {
+		return false
+	}
+	for _, seg := range strings.Split(path, "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 var (
 	maxJSONMigrationBytes int64 = 50 * 1024 * 1024 // 50 MB
 	jsonMigrationStatHook func(path string) (os.FileInfo, error)
@@ -1131,15 +1197,30 @@ func (s *server) migrateFromJSON() error {
 		return nil
 	}
 
-	// Parse old JSON format: map[string]Document
-	var oldDocs map[string]Document
+	// Parse old JSON format: raw per-document objects, so one damaged entry
+	// only skips that document instead of aborting the whole migration.
+	var oldDocs map[string]json.RawMessage
 	if err := json.Unmarshal(data, &oldDocs); err != nil {
 		return fmt.Errorf("parse old JSON: %w", err)
 	}
 
-	for _, doc := range oldDocs {
+	for key, raw := range oldDocs {
+		var doc Document
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			log.Printf("ctxmode: warning: skipping damaged legacy document %q during migration: %v", key, err)
+			continue
+		}
+		// The legacy JSON file is untrusted input (crafted or corrupted):
+		// validate every path before it enters the KB.
+		if !migratedDocPathValid(s.sessionID, doc.Path) {
+			log.Printf("ctxmode: warning: skipping legacy document %q with invalid path %q during migration", key, truncateUTF8(doc.Path, 128))
+			continue
+		}
 		if err := s.storeIndexLocked(doc.Path, doc.Content); err != nil {
-			return fmt.Errorf("migrate document %q: %w", doc.Path, err)
+			// One rejected document (e.g. sensitive content refused by the
+			// store gate) must not abort the rest of the migration.
+			log.Printf("ctxmode: warning: skipping legacy document %q (path %q) during migration: %v", key, truncateUTF8(doc.Path, 128), err)
+			continue
 		}
 	}
 
@@ -1236,20 +1317,42 @@ func pathHasExcludedSegment(path string, excluded ...string) bool {
 // (*.tfstate, *.tfvars), password vaults (*.kdbx), GCP service-account keys
 // (service-account*.json), and anything under a dot-secret directory (.aws,
 // .ssh, .gnupg, .kube). Matches are case-insensitive.
-func isSensitiveFilePath(path string) bool {
-	lower := strings.ToLower(path)
-	base := filepath.Base(lower)
+// sensitiveBackupSuffixes are trailing markers that hide a credential
+// file's real identity: backup copies (.bak, .old, .orig, .backup, ~,
+// .save, .tmp), encrypted exports (.gpg) and plain-text dumps (.txt).
+var sensitiveBackupSuffixes = []string{
+	".bak", ".old", ".orig", ".backup", "~", ".gpg", ".txt", ".tmp", ".save",
+}
+
+// stripOneSensitiveBackupSuffix peels a single trailing backup marker off a
+// base name; returns the input unchanged when no marker is present.
+func stripOneSensitiveBackupSuffix(base string) string {
+	for _, suf := range sensitiveBackupSuffixes {
+		if strings.HasSuffix(base, suf) && len(base) > len(suf) {
+			return base[:len(base)-len(suf)]
+		}
+	}
+	return base
+}
+
+// isSensitiveCredentialBase matches the credential-identity rules (exact
+// names, credential-bearing extensions, private-key name shapes) against a
+// base name. It runs on the raw base and again after repeatedly stripping
+// backup suffixes, so id_rsa.bak, prod.pem.txt or .pgpass.bak are caught
+// without loosening the rules themselves.
+func isSensitiveCredentialBase(base string) bool {
 	if base == ".env" || base == ".envrc" || strings.HasPrefix(base, ".env.") {
 		return true
 	}
 	if strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key") ||
-		strings.HasSuffix(base, ".p12") || strings.HasSuffix(base, ".pfx") ||
-		strings.HasSuffix(base, ".tfvars") || strings.HasSuffix(base, ".tfstate") ||
-		strings.HasSuffix(base, ".kdbx") {
+		strings.HasSuffix(base, ".p12") || strings.HasSuffix(base, ".pfx") {
 		return true
 	}
 	for _, key := range []string{"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"} {
-		if strings.HasSuffix(base, key) {
+		// Prefix match covers key variants such as id_rsa_primary and
+		// id_ed25519_sk (FIDO); the original suffix match is kept so
+		// established hits (e.g. "..._id_rsa") do not regress.
+		if strings.HasPrefix(base, key) || strings.HasSuffix(base, key) {
 			return true
 		}
 	}
@@ -1260,6 +1363,43 @@ func isSensitiveFilePath(path string) bool {
 	case "credentials.json", "credentials", ".npmrc", ".netrc",
 		".git-credentials", ".bash_history", ".zsh_history", ".pgpass", ".htpasswd":
 		return true
+	}
+	// Dot-less variants of credential stores (pgpass, netrc, git-credentials,
+	// and labeled derivatives like pgpass.example.com): prefix match, never a
+	// Contains sweep, so unrelated names cannot be caught by accident.
+	for _, pre := range []string{"pgpass", "netrc", "git-credentials"} {
+		if strings.HasPrefix(base, pre) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSensitiveFilePath(path string) bool {
+	lower := strings.ToLower(path)
+	base := filepath.Base(lower)
+	if isSensitiveCredentialBase(base) {
+		return true
+	}
+	// State/vault formats keep the exact-suffix rule only (no backup-stripping
+	// recheck): terraform.tfvars.bak stays non-sensitive by design.
+	if strings.HasSuffix(base, ".tfvars") || strings.HasSuffix(base, ".tfstate") ||
+		strings.HasSuffix(base, ".kdbx") {
+		return true
+	}
+	// Backup-suffix stripping: repeatedly peel one trailing marker and re-run
+	// the credential-identity rules, so prod.pem.txt, .htpasswd.old,
+	// key.pem.orig or .env~ cannot smuggle secrets past the fence.
+	stripped := base
+	for {
+		next := stripOneSensitiveBackupSuffix(stripped)
+		if next == stripped {
+			break
+		}
+		stripped = next
+		if isSensitiveCredentialBase(stripped) {
+			return true
+		}
 	}
 	if base == "config.json" {
 		for _, seg := range strings.Split(lower, string(filepath.Separator)) {

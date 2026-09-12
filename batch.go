@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -112,6 +113,11 @@ func (s *server) executeCommand(ctx context.Context, command, cwd string) (outpu
 	case <-ctx.Done():
 		// Context was cancelled (timeout or parent cancellation).
 		// Two-stage kill: SIGTERM first for graceful shutdown, then SIGKILL after 3s.
+		// Snapshot the descendant tree before any signal is sent: a setsid(2)
+		// grandchild gets a new session/pgid and escapes the group-wide kills
+		// below, so it is reaped individually after (same escapee sweep as the
+		// timeout path in runCmd).
+		escaped := collectDescendantPIDs(cmd.Process.Pid)
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 		select {
 		case <-done:
@@ -119,8 +125,20 @@ func (s *server) executeCommand(ctx context.Context, command, cwd string) (outpu
 		case <-time.After(3 * time.Second):
 			// Force-kill and drain to release pipe resources.
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			<-done
+			// Escapees sit outside the group: SIGKILL them before the drain,
+			// or an escapee still holding the stdout/stderr pipe keeps
+			// cmd.Wait (and this call) blocked until it exits by itself.
+			killTimeoutEscapedDescendants(escaped)
+			select {
+			case <-done:
+			case <-time.After(reapWaitBound):
+				log.Printf("ctxmode: WARNING: batch command (pgid %d): cmd.Wait did not return within %v after group kill; continuing (residual Wait is reclaimed by the runtime)", cmd.Process.Pid, reapWaitBound)
+			}
 		}
+		// Final sweep: descendants normally died with the group above;
+		// SIGKILL any setsid escapee that closed its output handles and
+		// survived (identity re-checked via /proc starttime).
+		killTimeoutEscapedDescendants(escaped)
 		stdout := stdoutBuf.String()
 		stderr := stderrBuf.String()
 		output := stdout

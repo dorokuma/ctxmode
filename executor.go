@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,6 +40,14 @@ const (
 	// Bounded result-only handoff records let wait consume an id returned just
 	// before pruning without retaining process handles or log files.
 	maxBackgroundTombstones = 64
+	// reapWaitBound bounds the final drain wait after a group SIGKILL in the
+	// ctx-cancel kill paths (runCmd and batch executeCommand). The escapee
+	// sweep has already SIGKILLed every pipe holder at that point, so
+	// cmd.Wait normally returns within milliseconds; the bound exists so a
+	// pathological straggler can never hang the tool call unboundedly. The
+	// abandoned Wait goroutine finishes on its own once the process dies and
+	// is then reclaimed by the runtime.
+	reapWaitBound = 5 * time.Second
 )
 
 // ---------- background process registry ----------
@@ -830,6 +839,32 @@ func killTimeoutEscapedDescendants(descendants map[int]uint64) {
 	}
 }
 
+// procProcessGroupID reads field 5 (pgrp) from /proc/<pid>/stat, reusing the
+// same parse-after-last-')' scheme as findProcessGroupPIDs (field 5 is
+// 0-indexed 2 in the remainder after the comm field). Used by the
+// killBackground starttime==0 fallback to confirm the leader still owns its
+// own process group before an unverifiable group SIGKILL. Returns an error
+// when the process does not exist or the stat file cannot be parsed.
+func procProcessGroupID(pid int) (int, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+	i := bytes.LastIndexByte(data, ')')
+	if i < 0 || i+2 >= len(data) {
+		return 0, fmt.Errorf("malformed /proc/%d/stat", pid)
+	}
+	fields := strings.Fields(string(data[i+2:]))
+	if len(fields) < 4 {
+		return 0, fmt.Errorf("malformed /proc/%d/stat: insufficient fields", pid)
+	}
+	v, err := strconv.Atoi(fields[2]) // field 5 is pgrp (0-indexed 2 after comm)
+	if err != nil {
+		return 0, fmt.Errorf("parse pgrp for PID %d: %w", pid, err)
+	}
+	return v, nil
+}
+
 // killBackground kills by id or by PID string. Returns a status message.
 // On success the entry is marked Done promptly so list no longer shows it as live.
 // Kill errors (other than ESRCH / already gone) are returned to the caller.
@@ -857,10 +892,61 @@ func killBackground(idOrPID string) (string, error) {
 	done := target.Done
 	bgMu.Unlock()
 
-	// If registered starttime is 0, process identity is unknown/unverifiable.
-	// Fail closed: must return error, do not signal, do not mark Done, do not release slot.
+	// If registered starttime is 0, process identity could not be captured at
+	// registration (procfs read failed). A strict fail-closed refusal here
+	// would leave the entry unkillable forever: the maxAge timer and the 30s
+	// reaper both funnel through killBackground, so the entry would pin one of
+	// the 16 background slots until restart. Fall back to a conservative
+	// group kill instead: signal only when /proc/<pid> still exists AND its
+	// process group id (stat field 5, pgrp) equals pid — i.e. the leader is
+	// still alive in exactly the group this entry owns (Setpgid makes pgid ==
+	// pid), so the group SIGKILL cannot reach an unrelated recycled PID. Any
+	// other observation (leader gone, or PID now in another group) is treated
+	// as "already dead": mark Done and release the slot without signalling.
 	if starttime == 0 {
-		return "", fmt.Errorf("refusing to kill %s (PID %d): process identity unknown (unable to read proc starttime)", id, pid)
+		if pgid <= 0 {
+			// No recorded process group to corroborate the identity against
+			// (registerBackground always sets pgid == pid for real entries).
+			// With neither starttime nor pgid the entry is unidentifiable:
+			// fail closed exactly as before — do not signal, do not mark Done.
+			return "", fmt.Errorf("refusing to kill %s (PID %d): process identity unknown (no starttime and no corroborating pgid)", id, pid)
+		}
+		log.Printf("ctxmode: WARNING: killBackground %s (PID %d): proc starttime unknown, using conservative pgid fallback instead of failing closed", id, pid)
+		if done {
+			// The Wait goroutine already reaped the direct child, so a live
+			// /proc/<pid> here could only be a recycled PID: release the slot
+			// without signalling (same behavior as the verified leaderAlive
+			// path below).
+			return fmt.Sprintf("process %s already exited", id), nil
+		}
+		pgrp, pgrpErr := procProcessGroupID(pid)
+		if pgrpErr == nil && pgrp == pid {
+			// Leader alive in its own process group: SIGKILL the whole group
+			// immediately (no graceful stage — identity was never verified,
+			// so do not wait on it), then mark Done via the normal path.
+			log.Printf("ctxmode: WARNING: killBackground %s (PID %d): identity unverified but leader still owns pgrp %d; SIGKILLing process group as fallback", id, pid, pgrp)
+			if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+				return "", fmt.Errorf("kill background process %s (PID %d): fallback process-group kill: %w", id, pid, err)
+			}
+			_ = syscall.Kill(pid, syscall.SIGKILL) // belt and braces if the pgrp read raced the exit
+			markBackgroundKilled(id)
+			return fmt.Sprintf("killed background process %s (PID %d) via conservative process-group kill (starttime unknown)", id, pid), nil
+		}
+		// Leader is gone (or /proc/<pid> now belongs to another group): treat
+		// as already dead, mark Done and release the slot without signalling.
+		reason := "process gone"
+		if pgrpErr != nil {
+			if os.IsNotExist(pgrpErr) || errors.Is(pgrpErr, os.ErrNotExist) {
+				reason = "/proc entry gone"
+			} else {
+				reason = fmt.Sprintf("proc stat unreadable: %v", pgrpErr)
+			}
+		} else {
+			reason = fmt.Sprintf("PID now belongs to pgrp %d (recycled or reparented)", pgrp)
+		}
+		log.Printf("ctxmode: WARNING: killBackground %s (PID %d): identity unverified, %s; treating as dead and releasing the slot", id, pid, reason)
+		markBackgroundKilled(id)
+		return fmt.Sprintf("process %s (PID %d) already exited (identity unverified: %s)", id, pid, reason), nil
 	}
 
 	// Two-stage kill of the process group; surface real failures (ignore ESRCH).
@@ -2673,13 +2759,33 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 	case <-ctx.Done():
 		// Context cancelled: same two-stage kill as timeout.
 		if cmd.Process != nil {
+			// Snapshot the descendant tree before any signal is sent: a
+			// setsid(2) grandchild gets a new session/pgid and escapes the
+			// group-wide kills below, so it is reaped individually after
+			// (same escapee sweep as the timeout branch above).
+			escaped := collectDescendantPIDs(cmd.Process.Pid)
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 			select {
 			case <-done:
+				// Process exited gracefully after SIGTERM.
 			case <-time.After(3 * time.Second):
+				// Force-kill and drain to release pipe resources.
 				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				<-done
+				// Escapees sit outside the group: SIGKILL them before the
+				// drain, or an escapee still holding the stdout/stderr pipe
+				// keeps cmd.Wait (and this call) blocked until it exits by
+				// itself.
+				killTimeoutEscapedDescendants(escaped)
+				select {
+				case <-done:
+				case <-time.After(reapWaitBound):
+					log.Printf("ctxmode: WARNING: cancelled process (pgid %d): cmd.Wait did not return within %v after group kill; continuing (residual Wait is reclaimed by the runtime)", cmd.Process.Pid, reapWaitBound)
+				}
 			}
+			// Final sweep: descendants normally died with the group above;
+			// SIGKILL any setsid escapee that closed its output handles and
+			// survived (identity re-checked via /proc starttime).
+			killTimeoutEscapedDescendants(escaped)
 		}
 		stdout := stdoutBuf.String()
 		stderr := stderrBuf.String()

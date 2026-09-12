@@ -3,6 +3,19 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [4.0.6] - 2026-09-12
+
+### Fixed
+- **fetch persistence no longer bypasses the sensitive fence**: when indexing is refused, the page content is not written to `fetch_cache` (previously refused content persisted in plaintext for 7 days and could revive purged documents via cache hits).
+- **migrateFromJSON hardening**: legacy JSON document paths are validated against a whitelist (session-namespace, rg/batch prefixes, fetch URL shapes, plain relative paths; no control characters, length-capped); malformed documents are skipped with a warning instead of aborting, and a corrupt migration file no longer fatals the server at startup.
+- **setsid escapee reaping extended to the ctx-cancel and batch branches** (previously timeout-only): descendants are snapshotted and SIGKILLed before draining, and the final wait is bounded (5s) - a single `setsid` child can no longer hang an MCP call indefinitely.
+- **killBackground fallback for unknown process start time**: entries whose /proc starttime could not be read are conservatively group-killed when the recorded pgid matches, instead of expiring never and occupying a background slot.
+- **Sensitive-file name variants**: backup/secondary suffixes (`id_rsa.bak`, `prod.pem.txt`, `.pgpass.bak`, `netrc.bak`, `.htpasswd.old`, `.env~`, `pgpass`, `git-credentials.txt`) and private-key prefixes (`id_rsa_primary`, `id_ed25519_sk`) now match `isSensitiveFilePath`.
+- **Pi adapter**: ctx_kb schema gains `confirm_phrase` (project purge was unusable from Pi), tool text is stripped of ANSI/OSC/CSI sequences before TUI rendering.
+
+### Changed
+- Shell execution is documented as `$SHELL -c` (not `sh -c`).
+
 ## [4.0.5] - 2026-09-12
 
 ### Fixed

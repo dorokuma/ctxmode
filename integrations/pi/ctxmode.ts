@@ -134,9 +134,17 @@ function clampUtf16Index(s: string, i: number, towardStart: boolean): number {
 // compressToolText: line overflow keeps ~75% head + remaining tail.
 // Char overflow uses the same 75%/25% split so a trailing
 // "(exited with code N)" survives. Surrogate pairs are not split.
+function stripANSI(s: string): string {
+  // OSC (ESC ] ... BEL or ST), CSI (ESC [ params intermediate final), two-byte ESC X.
+  return s
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-9:;<=>?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b[@-Z\\-_]/g, "")
+}
+
 export function compressToolText(text: string): string {
   if (!text) return text
-  let t = text.replace(/\r\n/g, "\n").replace(/[ \t]+$/gm, "")
+  let t = stripANSI(text).replace(/\r\n/g, "\n").replace(/[ \t]+$/gm, "")
   t = t.replace(/\n{4,}/g, "\n\n\n")
 
   const lines = t.split("\n")
@@ -739,7 +747,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
     promptSnippet: "Index/search knowledge base, fetch URLs, doctor, purge",
     promptGuidelines: [
       "Use ctx_kb action=search after large ctx_run outputs were auto-indexed.",
-      "purge requires confirm:true.",
+      "purge requires confirm:true plus confirm_phrase (the knowledge base name echoed in the error).",
     ],
     parameters: Type.Object({
       action: Type.String({ description: "index|search|fetch|stats|purge|doctor", enum: ["index", "search", "fetch", "stats", "purge", "doctor"] }),
@@ -754,6 +762,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       timeout_ms: Type.Optional(Type.Number({ description: "ms (default 150000, max 3600000)" })),
       ttl_ms: Type.Optional(Type.Number({ description: "ms (0=skip cache, omit=86400000)" })),
       confirm: Type.Optional(Type.Boolean()),
+      confirm_phrase: Type.Optional(Type.String()),
       scope: Type.Optional(Type.String()),
       sessionId: Type.Optional(Type.String()),
       dryRun: Type.Optional(Type.Boolean()),

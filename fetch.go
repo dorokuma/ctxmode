@@ -868,13 +868,19 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 			fmt.Fprintf(os.Stderr, "index %q failed: %v\n", docPath, indexErr)
 		}
 
-		// Write to cache (with mutex protection).
-		s.mu.Lock()
-		if err := s.store.SetCache(rawURL, cacheSource, content); err != nil {
-			fmt.Fprintf(os.Stderr, "cache write failed: %v\n", err)
+		// Write to cache (with mutex protection) -- but never when indexing
+		// was rejected (indexErr != nil, e.g. the sensitive-content fence):
+		// caching rejected plaintext would persist it for the whole cache TTL
+		// and let it resurrect into the KB through the cache-hit re-index
+		// path. indexErrString still travels to the caller unchanged.
+		if indexErr == nil {
+			s.mu.Lock()
+			if err := s.store.SetCache(rawURL, cacheSource, content); err != nil {
+				fmt.Fprintf(os.Stderr, "cache write failed: %v\n", err)
+			}
+			_ = s.store.PruneCache(7 * 24 * time.Hour)
+			s.mu.Unlock()
 		}
-		_ = s.store.PruneCache(7 * 24 * time.Hour)
-		s.mu.Unlock()
 
 		return &fetchResultData{content: content, chunkCount: chunkCount, truncated: truncated, indexError: indexErrString}, nil
 	})
