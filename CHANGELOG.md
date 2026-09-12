@@ -3,6 +3,18 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [4.0.5] - 2026-09-12
+
+### Fixed
+- **Timeout kill reaps setsid escapees**: descendants are snapshotted from /proc (PPID tree, comm-safe parsing, starttime recheck against PID reuse) and SIGKILLed in the hard-kill branch plus a post-drain sweep; a `setsid ... &` child can no longer survive the timeout as an orphan.
+- **Background maxAge safety timers stop on early finish**: a completed/killed background job no longer leaves its 1-hour safety timer around to fire a no-op.
+- **rg summary labels disambiguate ambiguous paths**: group labels and Read hints resolve `x:12:y/notes.md`-style paths with the same candidate-path stat strategy as the output fence; normal paths are byte-identical.
+
+### Changed
+- **FloodGuard covers rg-scoped search and fetch**: rg-scoped KB search gets its own bucket (throttle 20 / block 40, five times the global search limits) and ctx_kb fetch a per-server bucket (throttle 8 / block 16); unscoped search and the batch bypass are unchanged.
+- **deploy.sh initialize verification retries up to three times**, absorbing the transient stdin-EOF shutdown race during first-run initialize.
+- Middle-path-component TOCTOU is documented as out of scope in fs_tools.go / main.go under the README threat model.
+
 ## [4.0.4] - 2026-09-12
 
 ### Security
