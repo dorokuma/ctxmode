@@ -712,7 +712,13 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		if rel == "" {
 			rel = r.Path
 		}
-		lines = append(lines, fmt.Sprintf("Matches in file %s:\n  Snippet: %s", rel, r.Snippet))
+		// The snippet is excerpted from KB content that originates from
+		// untrusted sources (indexed files, rg match lines). Strip ANSI/OSC
+		// escape sequences at the MCP boundary: the CLI path already strips
+		// in writeCLIText, so MCP must not return raw sequences either
+		// (stripANSI is idempotent). rel/path are structural fields resolved
+		// inside the workspaces and stay untouched.
+		lines = append(lines, fmt.Sprintf("Matches in file %s:\n  Snippet: %s", rel, stripANSI(r.Snippet)))
 	}
 
 	text := strings.Join(lines, "\n\n")
@@ -1057,7 +1063,11 @@ func (s *server) indexFileWithSensitive(path string, sensitiveInodes map[fileID]
 	if looksLikePrivateKey(data) {
 		return fmt.Errorf("refusing to index private key material")
 	}
-	return s.storeIndexLocked(real, string(data))
+	// Neutralize a literal "[def] " prefix (see neutralizeDefMarker) before
+	// untrusted file content enters the KB, so it cannot spoof the marker
+	// ctxmode generates for rg definition lines. Both toolIndex entry points
+	// (single file and directory walk) converge here.
+	return s.storeIndexLocked(real, neutralizeDefMarker(string(data)))
 }
 
 var (

@@ -99,8 +99,9 @@ func TestPurgeProject_Vacuum_Restores0600(t *testing.T) {
 
 	// Call purgeProject via toolPurge
 	res, _, err := srv.toolPurge(context.Background(), nil, purgeArgs{
-		Scope:   "project",
-		Confirm: true,
+		Scope:         "project",
+		Confirm:       true,
+		ConfirmPhrase: filepath.Base(dir),
 	})
 	if err != nil {
 		t.Fatalf("toolPurge project: %v", err)

@@ -78,8 +78,9 @@ func (s *server) toolGitDiff(ctx context.Context, _ *mcp.CallToolRequest, args g
 	if args.Unified > 0 {
 		gitArgs = append(gitArgs, "-U"+strconv.Itoa(args.Unified))
 	}
+	var pathspec string
 	if args.Path != "" {
-		pathspec, err := s.resolveGitPathspec(cwd, args.Path)
+		pathspec, err = s.resolveGitPathspec(cwd, args.Path)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -89,6 +90,15 @@ func (s *server) toolGitDiff(ctx context.Context, _ *mcp.CallToolRequest, args g
 	out, err := s.runGit(ctx, cwd, gitArgs...)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// P2: git diff echoes tracked file content back to the client. Gate the
+	// output with checkSensitiveContent like the execute/rg return paths; on
+	// a hit no raw output is echoed, only a metadata-only notice.
+	if gated, hit := gitSensitiveGate("diff", pathspec, out); hit {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: gated}},
+		}, nil, nil
 	}
 
 	text, truncated := truncateGitOutput(out, gitDiffMaxBytes, gitDiffMaxLines)
@@ -134,8 +144,9 @@ func (s *server) toolGitLog(ctx context.Context, _ *mcp.CallToolRequest, args gi
 	} else {
 		gitArgs = append(gitArgs, "--format=%H %an %ad %s", "--date=short")
 	}
+	var pathspec string
 	if args.Path != "" {
-		pathspec, err := s.resolveGitPathspec(cwd, args.Path)
+		pathspec, err = s.resolveGitPathspec(cwd, args.Path)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -145,6 +156,13 @@ func (s *server) toolGitLog(ctx context.Context, _ *mcp.CallToolRequest, args gi
 	out, err := s.runGit(ctx, cwd, gitArgs...)
 	if err != nil {
 		return nil, nil, err
+	}
+	// P2: git log echoes commit metadata and subjects; gate it with the same
+	// sensitive-content fence before anything is echoed back.
+	if gated, hit := gitSensitiveGate("log", pathspec, out); hit {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: gated}},
+		}, nil, nil
 	}
 	text, truncated := truncateGitOutput(out, gitDiffMaxBytes, gitDiffMaxLines)
 	if truncated {
@@ -383,6 +401,25 @@ func (s *server) runGitIn(ctx context.Context, cwd string, args ...string) (stri
 		return "", fmt.Errorf("git failed: %s", msg)
 	}
 	return stdout.String(), nil
+}
+
+// gitSensitiveGate gates git subcommand output that can echo tracked file
+// content (diff hunks, log commit subjects/bodies) through
+// checkSensitiveContent, matching the fence on the execute/rg return paths.
+// On a hit the raw output is never echoed; the replacement keeps only
+// operational metadata (git subcommand, resolved pathspec, output byte
+// count, rejection reason) in the style of sensitiveWithheldNotice.
+func gitSensitiveGate(cmd, pathspec, out string) (string, bool) {
+	if err := checkSensitiveContent(out); err != nil {
+		var b strings.Builder
+		fmt.Fprintf(&b, "git %s", cmd)
+		if pathspec != "" {
+			fmt.Fprintf(&b, " (pathspec %q)", pathspec)
+		}
+		fmt.Fprintf(&b, "\nOutput (%d bytes) withheld: sensitive content detected (%v). Raw output is not shown.", len(out), err)
+		return b.String(), true
+	}
+	return out, false
 }
 
 // truncateGitOutput caps by line count then byte size; returns truncated flag.

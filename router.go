@@ -154,21 +154,22 @@ func (s *server) toolCtxGit(ctx context.Context, req *mcp.CallToolRequest, args 
 // ---------- ctx_kb ----------
 
 type ctxKbArgs struct {
-	Action    string   `json:"action" jsonschema:"index|search|fetch|stats|purge|doctor"`
-	Path      string   `json:"path,omitempty"`
-	Query     string   `json:"query,omitempty"`
-	URL       string   `json:"url,omitempty"`
-	URLs      []string `json:"urls,omitempty"`
-	Source    string   `json:"source,omitempty"`
-	Format    string   `json:"format,omitempty"`
-	Force     bool     `json:"force,omitempty"`
-	MaxBytes  int      `json:"maxBytes,omitempty"`
-	TimeoutMs int      `json:"timeout_ms,omitempty" jsonschema:"ms (default 150000, max 3600000)"`
-	TTLMs     *int     `json:"ttl_ms,omitempty" jsonschema:"ms (0=skip cache, omit=86400000)"`
-	Confirm   bool     `json:"confirm,omitempty"`
-	Scope     string   `json:"scope,omitempty"`
-	SessionID string   `json:"sessionId,omitempty"`
-	DryRun    bool     `json:"dryRun,omitempty"`
+	Action        string   `json:"action" jsonschema:"index|search|fetch|stats|purge|doctor"`
+	Path          string   `json:"path,omitempty"`
+	Query         string   `json:"query,omitempty"`
+	URL           string   `json:"url,omitempty"`
+	URLs          []string `json:"urls,omitempty"`
+	Source        string   `json:"source,omitempty"`
+	Format        string   `json:"format,omitempty"`
+	Force         bool     `json:"force,omitempty"`
+	MaxBytes      int      `json:"maxBytes,omitempty"`
+	TimeoutMs     int      `json:"timeout_ms,omitempty" jsonschema:"ms (default 150000, max 3600000)"`
+	TTLMs         *int     `json:"ttl_ms,omitempty" jsonschema:"ms (0=skip cache, omit=86400000)"`
+	Confirm       bool     `json:"confirm,omitempty"`
+	ConfirmPhrase string   `json:"confirm_phrase,omitempty"`
+	Scope         string   `json:"scope,omitempty"`
+	SessionID     string   `json:"sessionId,omitempty"`
+	DryRun        bool     `json:"dryRun,omitempty"`
 }
 
 func (s *server) toolCtxKb(ctx context.Context, req *mcp.CallToolRequest, args ctxKbArgs) (*mcp.CallToolResult, any, error) {
@@ -186,7 +187,7 @@ func (s *server) toolCtxKb(ctx context.Context, req *mcp.CallToolRequest, args c
 		return s.toolStats(ctx, req, statsArgs{})
 	case "purge":
 		return s.toolPurge(ctx, req, purgeArgs{
-			Confirm: args.Confirm, Scope: args.Scope, SessionID: args.SessionID, DryRun: args.DryRun,
+			Confirm: args.Confirm, ConfirmPhrase: args.ConfirmPhrase, Scope: args.Scope, SessionID: args.SessionID, DryRun: args.DryRun,
 		})
 	case "doctor":
 		return s.toolDoctor(ctx, req, doctorArgs{})

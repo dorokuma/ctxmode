@@ -257,6 +257,14 @@ func (s *Store) Index(path, content string) error {
 	if err := checkSensitiveContent(content); err != nil {
 		return err
 	}
+	// Defense in depth, same rationale as the checkSensitiveContent gate
+	// above: not every KB write path flows through the toolIndex gate in
+	// main.go (batch.go writes output via Store.Index directly, JSON
+	// migration re-indexes old docs), so neutralize a literal "[def] "
+	// prefix at content position 0 here as well. Idempotent, and a no-op
+	// unless the document starts with the marker; the rest of the content
+	// is preserved byte-for-byte.
+	content = neutralizeDefMarker(content)
 	var mtimeNS, size int64
 	if info, statErr := os.Stat(path); statErr == nil {
 		mtimeNS = info.ModTime().UnixNano()
@@ -850,10 +858,14 @@ func (s *Store) PurgeExactAndChunks(docPath string) (deleted int, err error) {
 // and inserts the provided chunks within a single transaction. If any check or step fails,
 // the transaction is rolled back and existing entries are preserved.
 func (s *Store) ReplaceExactAndChunks(docPath string, chunks []string) error {
-	for _, chunk := range chunks {
+	for i, chunk := range chunks {
 		if err := checkSensitiveContent(chunk); err != nil {
 			return err
 		}
+		// Each chunk is stored as its own KB document row, so a literal
+		// "[def] " prefix at a chunk start spoofs the ctxmode marker the
+		// same way a doc-level prefix does (see neutralizeDefMarker).
+		chunks[i] = neutralizeDefMarker(chunk)
 	}
 	tx, err := s.db.BeginTx(context.Background(), nil)
 	if err != nil {

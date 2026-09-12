@@ -5,16 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // purgeArgs is the JSON schema for ctx_kb action=purge.
 type purgeArgs struct {
-	Confirm   bool   `json:"confirm" jsonschema:"MUST be true. Destructive operation; requires confirm:true. dryRun:true previews without confirm."`
-	Scope     string `json:"scope,omitempty" jsonschema:"'session' or 'project'"`
-	SessionID string `json:"sessionId,omitempty" jsonschema:"UUID of session to purge (for scope='session')"`
-	DryRun    bool   `json:"dryRun,omitempty" jsonschema:"If true, preview what would be deleted without actually deleting"`
+	Confirm       bool   `json:"confirm" jsonschema:"MUST be true. Destructive operation; requires confirm:true. dryRun:true previews without confirm."`
+	ConfirmPhrase string `json:"confirm_phrase,omitempty" jsonschema:"Second confirmation for scope=project: must be exactly the knowledge base name (echo the name shown in the purge error message)"`
+	Scope         string `json:"scope,omitempty" jsonschema:"'session' or 'project'"`
+	SessionID     string `json:"sessionId,omitempty" jsonschema:"UUID of session to purge (for scope='session')"`
+	DryRun        bool   `json:"dryRun,omitempty" jsonschema:"If true, preview what would be deleted without actually deleting"`
 }
 
 // purgeResult holds the result of a purge operation.
@@ -45,12 +47,48 @@ func (s *server) toolPurge(ctx context.Context, _ *mcp.CallToolRequest, args pur
 
 	switch args.Scope {
 	case "project":
+		// S7 second confirmation: wiping the whole project knowledge base
+		// requires echoing the knowledge base name, not just confirm:true.
+		// A bare confirm:true (the pre-S7 call shape) is rejected here.
+		if err := s.checkPurgeProjectPhrase(args.ConfirmPhrase); err != nil {
+			return nil, nil, err
+		}
 		return s.purgeProject()
 	case "session":
 		return s.purgeSession(args.SessionID)
 	default:
 		return nil, nil, fmt.Errorf("invalid scope %q: must be 'session' or 'project'", args.Scope)
 	}
+}
+
+// purgeKBName returns the explicit name a caller must echo in confirm_phrase
+// to wipe the whole project knowledge base: the primary workspace directory
+// name (the project), or the database directory name when no workspace is
+// configured (tests and embedded servers). If a scope=all is ever introduced,
+// it should require the literal "ALL" instead.
+func (s *server) purgeKBName() string {
+	if len(s.workdirs) > 0 {
+		if wd := filepath.Clean(s.workdirs[0]); wd != "" && wd != "." {
+			return filepath.Base(wd)
+		}
+	}
+	return filepath.Base(filepath.Dir(s.store.DBPath()))
+}
+
+// checkPurgeProjectPhrase enforces the second confirmation for scope=project
+// (S7): a project purge deletes every document in the knowledge base, so a
+// bare confirm:true boolean is not enough — the caller must repeat the
+// knowledge base name byte-for-byte in confirm_phrase. Any mismatch, including
+// the old confirm-only call shape, is rejected before anything is deleted.
+func (s *server) checkPurgeProjectPhrase(phrase string) error {
+	want := s.purgeKBName()
+	if phrase == "" {
+		return fmt.Errorf("confirm_phrase is required for scope=project: purge deletes the ENTIRE project knowledge base, not a single session; resend with confirm:true AND confirm_phrase:%q (the knowledge base name shown here) to proceed, or dryRun:true to preview first", want)
+	}
+	if phrase != want {
+		return fmt.Errorf("confirm_phrase %q does not match the knowledge base name %q: scope=project requires confirm_phrase to be exactly the knowledge base name to confirm deleting all documents; nothing was deleted", phrase, want)
+	}
+	return nil
 }
 
 func (s *server) purgeProject() (*mcp.CallToolResult, any, error) {
