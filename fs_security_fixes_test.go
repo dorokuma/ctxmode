@@ -500,3 +500,195 @@ func TestSecurityFixes_NonIndexingSensitiveWithheld(t *testing.T) {
 		t.Errorf("expected truncated=true in header, got:\n%s", text)
 	}
 }
+
+// ---------- P1-7 / P2-1: stat-disambiguated output fence on raw rg lines ----------
+
+// TestSecurityFixes_RgCandidatePathDisambiguation covers candidate
+// enumeration and the fence decision directly: a directory named "x:12:y"
+// and a file named "v1-2-id_rsa" must resolve to their real paths instead of
+// the first colon/hyphen split, ambiguity must fail closed, and normal
+// match/context lines must stay unfenced.
+func TestSecurityFixes_RgCandidatePathDisambiguation(t *testing.T) {
+	dir := t.TempDir()
+	dockerCfg := filepath.Join(dir, "x:12:y", ".docker", "config.json")
+	cfg := `{"auths":{"registry.example.com":{"auth":"dXNlcjpwYXNzd29yZA=="}}}`
+	mustWrite(t, dockerCfg, cfg+"\n")
+	mustWrite(t, filepath.Join(dir, "v1-2-id_rsa"), "SSH_PASSPHRASE_ZEBRA_42\n")
+	mustWrite(t, filepath.Join(dir, "v1-2-notes.txt"), "harmless\n")
+	mustWrite(t, filepath.Join(dir, "ok.go"), "package main\n")
+	mustWrite(t, filepath.Join(dir, "plain.log"), "hello\n")
+
+	// P1-7: the first colon split reads path "<dir>/x"; the stat-verified
+	// real path must win and fence the line.
+	colonLine := dockerCfg + ":1:" + cfg
+	cands := rgCandidatePaths(colonLine)
+	if len(cands) < 2 || cands[0] != filepath.Join(dir, "x") || cands[len(cands)-1] != dockerCfg {
+		t.Fatalf("colon candidates = %q, want first %q then %q", cands, filepath.Join(dir, "x"), dockerCfg)
+	}
+	if !rgRawLineSensitive(colonLine, newRgStatCache()) {
+		t.Fatalf("colon-ambiguous line must be fenced via the real path, not path=%q", filepath.Join(dir, "x"))
+	}
+	// Fail-closed: with a harmless file "x" also present, both candidates
+	// exist and the sensitive one must still drop the line.
+	mustWrite(t, filepath.Join(dir, "x"), "harmless\n")
+	if !rgRawLineSensitive(colonLine, newRgStatCache()) {
+		t.Fatal("ambiguous colon line must stay fenced when the first-split prefix also exists")
+	}
+
+	// P2-1: the first hyphen split reads path "<dir>/v1".
+	hyphenLine := filepath.Join(dir, "v1-2-id_rsa") + "-3-SSH_PASSPHRASE_ZEBRA_42"
+	if !rgRawLineSensitive(hyphenLine, newRgStatCache()) {
+		t.Fatalf("hyphen-ambiguous context line must be fenced via the real path, not path=%q", filepath.Join(dir, "v1"))
+	}
+
+	// Normal lines (match and context, plain and hyphenated names) pass.
+	for _, keep := range []string{
+		filepath.Join(dir, "ok.go") + ":1:package main",
+		filepath.Join(dir, "plain.log") + "-4-hello",
+		filepath.Join(dir, "v1-2-notes.txt") + "-1-harmless",
+	} {
+		if rgRawLineSensitive(keep, newRgStatCache()) {
+			t.Fatalf("normal line %q must not be fenced", keep)
+		}
+	}
+}
+
+// TestSecurityFixes_AmbiguousPathOutputFence: fake rg emitting the red-team
+// lines over a real fixture tree, so the fence sees the same bytes system rg
+// would produce. The docker-config payload trips no content-based gate, so
+// only the path fence can stop it.
+func TestSecurityFixes_AmbiguousPathOutputFence(t *testing.T) {
+	dir := t.TempDir()
+	cfg := `{"auths":{"registry.example.com":{"auth":"dXNlcjpwYXNzd29yZA=="}}}`
+	mustWrite(t, filepath.Join(dir, "x:12:y", ".docker", "config.json"), cfg+"\n")
+	mustWrite(t, filepath.Join(dir, "v1-2-id_rsa"), "before\nSSH_PASSPHRASE_ZEBRA_42\nafter\n")
+	mustWrite(t, filepath.Join(dir, "v1-2-readme.md"), "readme-Alpha-here\n")
+	mustWrite(t, filepath.Join(dir, "plain.log"), "PLAIN_CONTEXT_OK\n")
+
+	script := "#!/bin/sh\nroot=\"\"\nfor a; do root=\"$a\"; done\n" +
+		"echo \"${root}/x:12:y/.docker/config.json:1:" + cfg + "\"\n" +
+		"echo \"${root}/x:12:y/.docker/config.json-2-context-of-config\"\n" +
+		"echo \"${root}/v1-2-id_rsa-2-SSH_PASSPHRASE_ZEBRA_42\"\n" +
+		"echo \"${root}/v1-2-id_rsa-1-before\"\n" +
+		"echo \"${root}/v1-2-readme.md-1-readme-Alpha-here\"\n" +
+		"echo \"${root}/plain.log:1:PLAIN_CONTEXT_OK\"\n"
+	fake := filepath.Join(dir, "rg")
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := testServerWithWorkdir(t, dir)
+	out, _, _, err := s.rgSystem(context.Background(), fake, dir, rgArgs{Pattern: "x", Limit: 50}, 50, 0, fsRgMaxOutputBytes)
+	if err != nil {
+		t.Fatalf("rgSystem: %v", err)
+	}
+	if !strings.Contains(out, "PLAIN_CONTEXT_OK") || !strings.Contains(out, "v1-2-readme.md-1-readme-Alpha-here") {
+		t.Fatalf("non-sensitive result lines must survive: %q", out)
+	}
+	for _, leak := range []string{"dXNlcjpwYXNzd29yZA", "config.json", "SSH_PASSPHRASE_ZEBRA_42", "v1-2-id_rsa", "x:12:"} {
+		if strings.Contains(out, leak) {
+			t.Fatalf("ambiguous sensitive line leaked into output (%s): %q", leak, out)
+		}
+	}
+}
+
+// TestSecurityFixes_AmbiguousPathRealRg: end-to-end with system rg against a
+// real tree, covering both ambiguities plus the normal-path regression in
+// one pass.
+func TestSecurityFixes_AmbiguousPathRealRg(t *testing.T) {
+	skipIfNoSystemRg(t)
+	wd := t.TempDir()
+	cfg := `{"auths":{"registry.example.com":{"auth":"dXNlcjpwYXNzd29yZA=="}}}`
+	mustWrite(t, filepath.Join(wd, "x:12:y", ".docker", "config.json"), cfg+"\n")
+	mustWrite(t, filepath.Join(wd, "v1-2-id_rsa"), "before\nSSH_PASSPHRASE_ZEBRA_42\nafter\n")
+	mustWrite(t, filepath.Join(wd, "v1-2-notes.txt"), "notes-Alpha-line\n")
+	mustWrite(t, filepath.Join(wd, "main.go"), "package main\nfunc Alpha() {}\n")
+	mustWrite(t, filepath.Join(wd, "foo-bar.txt"), "alpha one\nbeta two\n")
+	s := testServerWithWorkdir(t, wd)
+
+	// P1-7: the docker config must be fenced through its real path even
+	// though the first colon split reads "x".
+	res, _, err := s.toolRg(context.Background(), nil, rgArgs{Pattern: "dXNlcjpwYXNzd29yZA"})
+	if err != nil {
+		t.Fatalf("toolRg (docker config): %v", err)
+	}
+	text := mcpResultText(t, res)
+	for _, leak := range []string{"dXNlcjpwYXNzd29yZA", "config.json", "x:12:"} {
+		if strings.Contains(text, leak) {
+			t.Fatalf("colon-ambiguous sensitive file leaked (%s): %s", leak, text)
+		}
+	}
+
+	// P2-1: id_rsa-suffixed file with a hyphenated name; with context lines
+	// the legacy parse reads path "v1" and used to slip past the fence.
+	res, _, err = s.toolRg(context.Background(), nil, rgArgs{Pattern: "SSH_PASSPHRASE_ZEBRA_42", Context: 1})
+	if err != nil {
+		t.Fatalf("toolRg (id_rsa context): %v", err)
+	}
+	text = mcpResultText(t, res)
+	for _, leak := range []string{"SSH_PASSPHRASE_ZEBRA_42", "v1-2-id_rsa", "before", "after"} {
+		if strings.Contains(text, leak) {
+			t.Fatalf("hyphen-ambiguous sensitive file leaked (%s): %s", leak, text)
+		}
+	}
+
+	// Regression: normal match lines, hyphenated non-sensitive names, and
+	// plain context lines must come back unchanged.
+	res, _, err = s.toolRg(context.Background(), nil, rgArgs{Pattern: "Alpha"})
+	if err != nil {
+		t.Fatalf("toolRg (Alpha): %v", err)
+	}
+	text = mcpResultText(t, res)
+	// prepareRgGroups may add the "[def] " marker to definition lines; the
+	// path:line prefix and the content itself must stay byte-for-byte.
+	if !strings.Contains(text, "main.go:2:") || !strings.Contains(text, "func Alpha() {}") ||
+		!strings.Contains(text, "v1-2-notes.txt:1:notes-Alpha-line") {
+		t.Fatalf("normal match lines must be unchanged: %s", text)
+	}
+	res, _, err = s.toolRg(context.Background(), nil, rgArgs{Pattern: "beta", Context: 1})
+	if err != nil {
+		t.Fatalf("toolRg (beta context): %v", err)
+	}
+	text = mcpResultText(t, res)
+	if !strings.Contains(text, "foo-bar.txt-1-alpha one") || !strings.Contains(text, "foo-bar.txt:2:beta two") {
+		t.Fatalf("normal context lines must be unchanged: %s", text)
+	}
+}
+
+// ---------- P1: extended rg deny-glob list ----------
+
+// TestSecurityFixes_DenyGlobExtendedSet: the new credential deny globs must
+// exclude the files at the rg layer itself. None of these names were covered
+// by the previous deny block, so rg-level exclusion is what is exercised
+// here (output-side fencing may additionally apply once isSensitiveFilePath
+// learns the same set).
+func TestSecurityFixes_DenyGlobExtendedSet(t *testing.T) {
+	skipIfNoSystemRg(t)
+	wd := t.TempDir()
+	mustWrite(t, filepath.Join(wd, "ok.txt"), "NEEDLE control file\n")
+	mustWrite(t, filepath.Join(wd, ".git-credentials"), "NEEDLE https://user:pass@example.com\n")
+	mustWrite(t, filepath.Join(wd, ".bash_history"), "NEEDLE curl -u user:pass\n")
+	mustWrite(t, filepath.Join(wd, ".zsh_history"), "NEEDLE history\n")
+	mustWrite(t, filepath.Join(wd, ".pgpass"), "dbhost:5432:db:user:NEEDLE\n")
+	mustWrite(t, filepath.Join(wd, ".htpasswd"), "user:$apr1$NEEDLE\n")
+	mustWrite(t, filepath.Join(wd, "env.tfvars"), "NEEDLE = 42\n")
+	mustWrite(t, filepath.Join(wd, "state.tfstate"), "{\"key\": \"NEEDLE\"}\n")
+	mustWrite(t, filepath.Join(wd, "vault.kdbx"), "NEEDLE\n")
+	mustWrite(t, filepath.Join(wd, "service-account-prod.json"), "\"token\": \"NEEDLE\"\n")
+	s := testServerWithWorkdir(t, wd)
+	res, _, err := s.toolRg(context.Background(), nil, rgArgs{Pattern: "NEEDLE"})
+	if err != nil {
+		t.Fatalf("toolRg: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "ok.txt:1:NEEDLE control file") {
+		t.Fatalf("non-deny-listed control file must still match: %s", text)
+	}
+	for _, denied := range []string{
+		".git-credentials", ".bash_history", ".zsh_history", ".pgpass",
+		".htpasswd", ".tfvars", ".tfstate", ".kdbx", "service-account",
+	} {
+		if strings.Contains(text, denied) {
+			t.Fatalf("deny-glob file %q leaked into output: %s", denied, text)
+		}
+	}
+}

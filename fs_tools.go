@@ -1374,6 +1374,19 @@ func (s *server) rgSystemBounded(ctx, parentCtx context.Context, rgPath, root st
 		"--glob", "!.ssh/**",
 		"--glob", "!.gnupg/**",
 		"--glob", "!.kube/**",
+		// Extended deny list for credential/secret material, the same name
+		// set as the isSensitiveFilePath extension in main.go. Appended after
+		// the established deny block (and still after any client glob) so
+		// the deny globs keep winning over re-includes.
+		"--glob", "!.git-credentials",
+		"--glob", "!.bash_history",
+		"--glob", "!.zsh_history",
+		"--glob", "!.pgpass",
+		"--glob", "!.htpasswd",
+		"--glob", "!*.tfvars",
+		"--glob", "!*.tfstate",
+		"--glob", "!*.kdbx",
+		"--glob", "!service-account*.json",
 		"-m", strconv.Itoa(fetchLimit),
 	)
 	if args.IgnoreCase {
@@ -1433,6 +1446,7 @@ func (s *server) rgSystemBounded(ctx, parentCtx context.Context, rgPath, root st
 
 	var b strings.Builder
 	matchCount := 0
+	statCache := newRgStatCache()
 	for _, line := range lines {
 		if line == "" {
 			continue
@@ -1442,9 +1456,21 @@ func (s *server) rgSystemBounded(ctx, parentCtx context.Context, rgPath, root st
 		if strings.HasPrefix(rewritten, ".git/") || strings.HasPrefix(rewritten, "./.git/") || strings.Contains(rewritten, "/.git/") {
 			continue
 		}
-		// Output-side fence: drop any result line whose file path is on the
-		// sensitive-path deny list (defense in depth alongside the deny
-		// globs and the explicit-path check; mirrors rgGo's per-file gate).
+		// Output-side fence, stage 1: the raw rg line, before the display
+		// rewrite. The path prefix here is still root-anchored and
+		// stat-verifiable, which disambiguates paths containing ":<digits>:"
+		// (a directory "x:12:y" made ".docker/config.json" parse as path "x",
+		// leaking its content) and "-<digits>-" ("v1-2-id_rsa" parsed as
+		// "v1"): every plausible candidate is checked, and any stat-verified
+		// sensitive candidate drops the line, fail-closed when several
+		// splits name real files.
+		if rgRawLineSensitive(line, statCache) {
+			continue
+		}
+		// Output-side fence, stage 2: legacy display-path check, kept as
+		// defense in depth (mirrors rgGo's per-file gate) and as the
+		// fallback for lines whose raw path no longer stats (the file was
+		// removed between the rg scan and this fence).
 		if linePath, ok := rgLineFilePath(rewritten); ok && isSensitiveFilePath(linePath) {
 			continue
 		}
@@ -1500,6 +1526,117 @@ func rgLineFilePath(line string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// rgStatCache dedupes os.Stat and filepath.EvalSymlinks lookups made by the
+// raw-line output fence: the same candidate path recurs across output lines
+// (rg output is capped at 500 matches), and the fence must not turn into one
+// uncached filesystem round-trip per line. Single-goroutine use, which is
+// how rgSystemBounded consumes it.
+type rgStatCache struct {
+	fi   map[string]os.FileInfo // path -> stat result; a nil entry caches a failed stat
+	real map[string]string      // path -> EvalSymlinks result; "" caches a failed lookup
+}
+
+func newRgStatCache() *rgStatCache {
+	return &rgStatCache{fi: make(map[string]os.FileInfo), real: make(map[string]string)}
+}
+
+func (c *rgStatCache) stat(p string) (os.FileInfo, bool) {
+	if fi, ok := c.fi[p]; ok {
+		return fi, fi != nil
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		c.fi[p] = nil
+		return nil, false
+	}
+	c.fi[p] = fi
+	return fi, true
+}
+
+func (c *rgStatCache) evalSymlinks(p string) (string, bool) {
+	if r, ok := c.real[p]; ok {
+		return r, r != ""
+	}
+	r, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		c.real[p] = ""
+		return "", false
+	}
+	c.real[p] = r
+	return r, true
+}
+
+// rgCandidatePaths lists every file path a raw rg output line may refer to.
+// System rg emits "path:line:content" (match) or "path-line-content"
+// (context) with the path anchored at the (absolute) search root, but the
+// split point is not self-evident: a path containing ":<digits>:" (directory
+// "x:12:y" holding ".docker/config.json") or "-<digits>-" (file
+// "v1-2-id_rsa") yields several plausible prefixes, and trusting the first
+// parse made the sensitive-path fence inspect the wrong file (red-team
+// P1-7/P2-1). Every all-digit colon pair and every -<digits>- run is
+// returned in order; callers disambiguate by stat instead of guessing.
+func rgCandidatePaths(line string) []string {
+	var cands []string
+	seen := make(map[string]bool)
+	add := func(p string) {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			cands = append(cands, p)
+		}
+	}
+	// Match form: every colon pair bounding an all-digit segment.
+	c1 := -1
+	for {
+		next := strings.IndexByte(line[c1+1:], ':')
+		if next < 0 {
+			break
+		}
+		c := c1 + 1 + next
+		if c1 >= 0 && isAllDigits(line[c1+1:c]) {
+			add(line[:c1])
+		}
+		c1 = c
+	}
+	// Context form: every -<digits>- run.
+	for i := 0; i < len(line); i++ {
+		if line[i] != '-' {
+			continue
+		}
+		j := i + 1
+		for j < len(line) && line[j] >= '0' && line[j] <= '9' {
+			j++
+		}
+		if j > i+1 && j < len(line) && line[j] == '-' {
+			add(line[:i])
+		}
+	}
+	return cands
+}
+
+// rgRawLineSensitive reports whether a raw rg output line refers to a file
+// on the sensitive-path deny list. Candidates are disambiguated by stat:
+// only prefixes naming an existing regular file are checked, together with
+// their symlink-resolved targets (mirroring the explicit-path fence), and
+// any sensitive candidate drops the line, which fails closed for genuinely
+// ambiguous names. Lines whose candidates all fail to stat (the file was
+// removed between the rg scan and the fence) fall through to the legacy
+// display-path fence at the call site.
+func rgRawLineSensitive(line string, cache *rgStatCache) bool {
+	for _, p := range rgCandidatePaths(line) {
+		fi, ok := cache.stat(p)
+		if !ok || !fi.Mode().IsRegular() {
+			continue
+		}
+		if isSensitiveFilePath(p) {
+			return true
+		}
+		if real, ok := cache.evalSymlinks(p); ok && real != p && isSensitiveFilePath(real) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *server) rewriteRgLine(root, line string) string {

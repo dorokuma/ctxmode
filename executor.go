@@ -1148,6 +1148,11 @@ func (s *server) toolBackgroundLog(ctx context.Context, _ *mcp.CallToolRequest, 
 	if err != nil {
 		return nil, nil, err
 	}
+	if serr := checkSensitiveContent(logText); serr != nil {
+		// Same sensitive-content gate as the synchronous execute paths:
+		// background log output comes from arbitrary commands.
+		logText = sensitiveWithheldNotice(entry.ExitCode, len(logText), serr)
+	}
 	type logResult struct {
 		ID           string `json:"id"`
 		PID          int    `json:"pid"`
@@ -1231,6 +1236,11 @@ func (s *server) toolBackgroundWait(ctx context.Context, _ *mcp.CallToolRequest,
 	}
 
 	logText, logErr := readBackgroundLogTail(entry.LogPath, 100, 0)
+	if serr := checkSensitiveContent(logText); serr != nil {
+		// Same sensitive-content gate as the synchronous execute paths:
+		// background log output comes from arbitrary commands.
+		logText = sensitiveWithheldNotice(entry.ExitCode, len(logText), serr)
+	}
 	type waitResult struct {
 		ID           string `json:"id"`
 		PID          int    `json:"pid"`

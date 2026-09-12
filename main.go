@@ -450,7 +450,12 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		return textResult(formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, nil), errorClass), nil, nil
 	}
 
-	// Normal return.
+	// Normal return. Gate the small-output path on sensitive content too so
+	// every execute return path is fenced, not just the auto-indexed ones:
+	// on a hit the raw output is never echoed and errorClass is preserved.
+	if err := checkSensitiveContent(outputText); err != nil {
+		return textResult(sensitiveWithheldNotice(result.ExitCode, len(outputText), err), errorClass), nil, nil
+	}
 	return textResult(outputText, errorClass), nil, nil
 }
 
@@ -979,6 +984,11 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		return textResult(formatIntentIndexed(result.ExitCode, len(outputText), label, outputText, nil), errorClass), nil, nil
 	}
 
+	// Same sensitive-content gate as toolExecute: fence the small-output
+	// return path (user code may echo FILE_CONTENT of a non-listed file).
+	if err := checkSensitiveContent(outputText); err != nil {
+		return textResult(sensitiveWithheldNotice(result.ExitCode, len(outputText), err), errorClass), nil, nil
+	}
 	return textResult(outputText, errorClass), nil, nil
 }
 
@@ -1207,8 +1217,11 @@ func pathHasExcludedSegment(path string, excluded ...string) bool {
 // variants (.env.local, .env.production, ...), .envrc, private keys (*.pem,
 // *.key, *.p12, *.pfx, id_rsa/id_ed25519/...), cloud/registry auth files
 // (credentials.json, .npmrc, .netrc, .docker/config.json — not the whole
-// .docker directory), and anything under a dot-secret directory (.aws, .ssh,
-// .gnupg, .kube). Matches are case-insensitive.
+// .docker directory), shell/db credential stores (.git-credentials,
+// .bash_history, .zsh_history, .pgpass, .htpasswd), terraform state/var files
+// (*.tfstate, *.tfvars), password vaults (*.kdbx), GCP service-account keys
+// (service-account*.json), and anything under a dot-secret directory (.aws,
+// .ssh, .gnupg, .kube). Matches are case-insensitive.
 func isSensitiveFilePath(path string) bool {
 	lower := strings.ToLower(path)
 	base := filepath.Base(lower)
@@ -1216,7 +1229,9 @@ func isSensitiveFilePath(path string) bool {
 		return true
 	}
 	if strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key") ||
-		strings.HasSuffix(base, ".p12") || strings.HasSuffix(base, ".pfx") {
+		strings.HasSuffix(base, ".p12") || strings.HasSuffix(base, ".pfx") ||
+		strings.HasSuffix(base, ".tfvars") || strings.HasSuffix(base, ".tfstate") ||
+		strings.HasSuffix(base, ".kdbx") {
 		return true
 	}
 	for _, key := range []string{"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"} {
@@ -1224,8 +1239,12 @@ func isSensitiveFilePath(path string) bool {
 			return true
 		}
 	}
+	if strings.HasPrefix(base, "service-account") && strings.HasSuffix(base, ".json") {
+		return true
+	}
 	switch base {
-	case "credentials.json", "credentials", ".npmrc", ".netrc":
+	case "credentials.json", "credentials", ".npmrc", ".netrc",
+		".git-credentials", ".bash_history", ".zsh_history", ".pgpass", ".htpasswd":
 		return true
 	}
 	if base == "config.json" {
@@ -1308,8 +1327,13 @@ var (
 	// Slack token: xox[baprs]-...
 	slackTokenRe = regexp.MustCompile(`\bxox[baprs]-[0-9A-Za-z]{10,}\b`)
 	// Generic credential assignment pattern: key/secret/password/token = "..." (high confidence).
-	genericSecretRe  = regexp.MustCompile(`(?i)\b(?:api[_-]?key|access[_-]?token|secret[_-]?key|auth[_-]?token|client[_-]?secret|private[_-]?key)\s*[:=]\s*['"][a-zA-Z0-9_\-.~!@#$%^&*+=]{16,}['"]`)
-	passwordAssignRe = regexp.MustCompile(`(?i)\b(?:password|passwd)\s*[:=]\s*['"][^'"\r\n]{8,}['"]`)
+	// Keys are fenced with an explicit "(?:^|[^_A-Za-z0-9])" instead of "\b":
+	// "\b" never fires before a key embedded after an underscore (e.g. the
+	// "db_" prefix of db_password), because "_" is a word character. The fence
+	// keeps the same non-identifier boundary semantics while matching such
+	// underscore-prefixed key names.
+	genericSecretRe  = regexp.MustCompile(`(?i)(?:^|[^_A-Za-z0-9])(?:aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|api[_-]?key|access[_-]?token|secret[_-]?key|auth[_-]?token|client[_-]?secret|private[_-]?key|refresh[_-]?token|session[_-]?token|id[_-]?token|db[_-]?pass(?:word)?)\s*[:=]\s*['"][a-zA-Z0-9_\-.~/!@#$%^&*+=]{16,}['"]`)
+	passwordAssignRe = regexp.MustCompile(`(?i)(?:^|[^_A-Za-z0-9])(?:password|passwd)\s*[:=]\s*['"][^'"\r\n]{8,}['"]`)
 	// JWT bearer token.
 	jwtTokenRe = regexp.MustCompile(`\beyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_.+/=]+\b`)
 )
@@ -1432,7 +1456,32 @@ func (s *server) rgIndexPrefix() string {
 	return "rg:"
 }
 
+// sensitiveWithheldNotice builds the message returned in place of raw command
+// output when checkSensitiveContent flags it. It keeps operational metadata
+// (exit code, output size, rejection reason) but never echoes any fragment of
+// the output, mirroring the rg side's withheld-warning style.
+func sensitiveWithheldNotice(exitCode, n int, reason error) string {
+	return fmt.Sprintf("exit_code: %d\nOutput (%d bytes) withheld: sensitive content detected (%v). Raw output is not shown.",
+		exitCode, n, reason)
+}
+
+// sensitiveIndexErr reports whether indexing was refused because the content
+// itself trips checkSensitiveContent (as opposed to a store/backend failure).
+// Callers run the sensitive check before handing content to the store, so a
+// store error can only surface for content that passed the fence; re-checking
+// the content is authoritative and needs no error-type plumbing.
+func sensitiveIndexErr(outputText string) bool {
+	return checkSensitiveContent(outputText) != nil
+}
+
 func formatLargeIndexed(exitCode, n int, label, outputText string, indexErr error) string {
+	if indexErr != nil && sensitiveIndexErr(outputText) {
+		// The index was refused because the output trips the sensitive-content
+		// fence; the tail preview would be the very secret we refused to
+		// index, so it must not be echoed.
+		return fmt.Sprintf("exit_code: %d\nOutput is too large (%d bytes). Indexing failed: %v. Content was NOT indexed. Tail preview withheld (sensitive content).",
+			exitCode, n, indexErr)
+	}
 	preview := tailUTF8(outputText, 2000)
 	if indexErr != nil {
 		return fmt.Sprintf("exit_code: %d\nOutput is too large (%d bytes). Indexing failed: %v. Content was NOT indexed.\n\n--- Tail preview ---\n%s",
@@ -1443,6 +1492,10 @@ func formatLargeIndexed(exitCode, n int, label, outputText string, indexErr erro
 }
 
 func formatIntentIndexed(exitCode, n int, label, outputText string, indexErr error) string {
+	if indexErr != nil && sensitiveIndexErr(outputText) {
+		return fmt.Sprintf("exit_code: %d\nOutput (%d bytes) was NOT indexed (error: %v). Tail preview withheld (sensitive content).",
+			exitCode, n, indexErr)
+	}
 	preview := tailUTF8(outputText, 2000)
 	if indexErr != nil {
 		return fmt.Sprintf("exit_code: %d\nOutput (%d bytes) was NOT indexed (error: %v).\n\n--- Tail preview ---\n%s",

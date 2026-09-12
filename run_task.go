@@ -298,6 +298,12 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 			indexErr = s.storeIndexLocked(label, indexContent)
 		}
 		if indexErr != nil {
+			if sensitiveIndexErr(outputText) {
+				// Sensitive rejection: the tail preview would be the very
+				// secret we refused to index; withhold it entirely.
+				return textResult(fmt.Sprintf("exit_code: %d\nOutput is too large (%d bytes). Indexing failed: %v. Content was NOT indexed. Tail preview withheld (sensitive content).",
+					exitCode, len(outputText), indexErr), errorClass), nil, nil
+			}
 			preview := tailUTF8(outputText, runTaskTailBytes)
 			return textResult(fmt.Sprintf("exit_code: %d\nOutput is too large (%d bytes). Indexing failed: %v. Content was NOT indexed.\n\n--- Tail preview ---\n%s",
 				exitCode, len(outputText), indexErr, preview), errorClass), nil, nil
@@ -318,6 +324,11 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 			indexErr = s.storeIndexLocked(label, indexContent)
 		}
 		if indexErr != nil {
+			if sensitiveIndexErr(outputText) {
+				// Sensitive rejection: withhold the tail preview entirely.
+				return textResult(fmt.Sprintf("exit_code: %d\nOutput (%d bytes) was NOT indexed (error: %v). Tail preview withheld (sensitive content).",
+					exitCode, len(outputText), indexErr), errorClass), nil, nil
+			}
 			preview := tailUTF8(outputText, runTaskPreviewBytes)
 			return textResult(fmt.Sprintf("exit_code: %d\nOutput (%d bytes) was NOT indexed (error: %v).\n\n--- Tail preview ---\n%s",
 				exitCode, len(outputText), indexErr, preview), errorClass), nil, nil
@@ -327,7 +338,11 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 			exitCode, len(outputText), label, label, preview), errorClass), nil, nil
 	}
 
-	// Normal return (includes exit_code in the structured body).
+	// Normal return (includes exit_code in the structured body). Gate the
+	// small-output path on sensitive content like every other return path.
+	if err := checkSensitiveContent(outputText); err != nil {
+		return textResult(sensitiveWithheldNotice(exitCode, len(outputText), err), errorClass), nil, nil
+	}
 	return textResult(outputText, errorClass), nil, nil
 }
 
