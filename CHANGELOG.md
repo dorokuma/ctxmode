@@ -3,6 +3,14 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [4.0.4] - 2026-09-12
+
+### Security
+- **ctx_git diff/log outputs are gated**: outputs from git diff and git log now pass the sensitive-content fence; credential-bearing diffs or commit messages are withheld with a metadata-only notice (previously returned raw). status remains ungated: it is pure metadata.
+- **KB search snippets are escape-sanitized on the MCP path**: toolSearch applies the same ANSI/OSC stripping as the CLI, so untrusted indexed content cannot carry terminal escape sequences or injection payloads back into model context.
+- **KB writes neutralize forged [def] markers at every path**: toolIndex (file and directory walk) and the store layer (Store.Index, ReplaceExactAndChunks, covering batch and JSON-migration writes) neutralize a literal `[def] ` prefix at content position 0, matching the rg-path behavior; mid-content markers stay byte-identical.
+- **purge scope=project requires an explicit confirmation phrase**: confirm:true alone no longer wipes the knowledge base; confirm_phrase must byte-equal the knowledge base name (surfaced in the error message). session scope and dryRun semantics unchanged; the MCP schema carries confirm_phrase.
+
 ## [4.0.3] - 2026-09-12
 
 ### Security
