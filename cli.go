@@ -50,10 +50,77 @@ func runCLI(s *server, args []string, stdout io.Writer) error {
 	}
 }
 
+// stripANSI removes ANSI escape sequences from text so content indexed from
+// untrusted sources (web fetches, repository files) cannot inject terminal
+// control codes when the CLI prints KB content to stdout. Handles OSC
+// (ESC ] ... BEL or ESC \), CSI (ESC [ parameter bytes, intermediate bytes,
+// final byte), and remaining ESC forms (intermediate bytes 0x20-0x2F plus
+// one final byte: the two-byte ESC X form and e.g. ESC ( B). An unterminated
+// OSC swallows the rest of the text, mirroring terminal behavior.
+func stripANSI(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] != '\x1b' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		if i+1 >= len(s) {
+			break // dangling trailing ESC: drop
+		}
+		switch s[i+1] {
+		case ']':
+			// OSC: terminated by BEL (0x07) or ST (ESC \)
+			end := -1
+			for j := i + 2; j < len(s); j++ {
+				if s[j] == '\x07' {
+					end = j
+					break
+				}
+				if s[j] == '\x1b' && j+1 < len(s) && s[j+1] == '\\' {
+					end = j + 1
+					break
+				}
+			}
+			if end < 0 {
+				i = len(s) // unterminated OSC: drop the remainder
+			} else {
+				i = end + 1
+			}
+		case '[':
+			// CSI: parameter bytes 0x30-0x3F, intermediates 0x20-0x2F, final 0x40-0x7E
+			j := i + 2
+			for j < len(s) && s[j] >= 0x20 && s[j] <= 0x3f {
+				j++
+			}
+			if j < len(s) && s[j] >= 0x40 && s[j] <= 0x7e {
+				i = j + 1
+			} else {
+				i = j // malformed CSI: drop what was scanned
+			}
+		default:
+			// Other ESC sequences: intermediate bytes 0x20-0x2F then one final byte
+			// 0x30-0x7E (two-byte ESC X, or three-byte e.g. ESC ( B).
+			j := i + 1
+			for j < len(s) && s[j] >= 0x20 && s[j] <= 0x2f {
+				j++
+			}
+			if j < len(s) && s[j] >= 0x30 && s[j] <= 0x7e {
+				i = j + 1
+			} else {
+				i = j // dangling ESC or intermediates: drop them
+			}
+		}
+	}
+	return b.String()
+}
+
 func writeCLIText(w io.Writer, text string) error {
 	if text == "" {
 		return nil
 	}
+	text = stripANSI(text)
 	if !strings.HasSuffix(text, "\n") {
 		text += "\n"
 	}

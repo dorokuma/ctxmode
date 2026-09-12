@@ -3,7 +3,18 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [4.0.2] - 2026-09-12
+
+### Security
+- **rg sensitive-file fence hardened** (`ctx_fs`): the client-supplied `glob` is now appended *before* the built-in deny-globs, so built-in excludes always win (a trailing user glob could previously re-include `.env*`, `*.pem`, `.ssh/**`, ...); an explicit `path` that resolves to a deny-listed sensitive file is refused; rg output lines whose file path is sensitive are dropped; on the direct-return path (hits <= limit) content matching secret patterns is withheld and replaced by a warning listing the file names.
+- **Sensitive-content withholding extended to every `ctx_fs` rg return path**: with more hits than the limit (indexed fallback), on offset-paginated pages, and in the non-indexing fallback (store or summary disabled), raw match lines used to be echoed without the sensitive-content gate; all paths now return the withheld warning listing the file names.
+- **rg dedup key now carries `truncated`/budget state**: a truncated or budget-partial result set can no longer be cached and later served as the complete result for the same query.
+- **`[def]` marker spoofing neutralized** (`fs_rg_summary`): a literal `[def] ` prefix at the start of untrusted file content can no longer forge definition hints or poison KB summaries; only ctxmode-generated markers are recognized.
+- **`ctx_fs` MCP annotation `readOnlyHint` corrected to `false`**: over-limit rg hits write the KB store, so the tool is not read-only.
+- **CLI output is escape-sanitized**: untrusted KB content written by `ctxmode index`/`search` is stripped of ANSI CSI/OSC sequences before hitting the terminal.
+- **`ttl_ms` validation**: negative values are rejected with an explicit error and a 30-day cap prevents `time.Duration` overflow (previously silently fell back to the default or wrapped negative).
+- **`maxFetchTTLms` is an explicitly typed `int64`** so the 30-day TTL cap compiles on 32-bit platforms (64-bit behavior unchanged).
+- **rg budget bookkeeping fixes**: a parent-request timeout is no longer mislabeled as `budget_exceeded` and a clean finish is not flagged truncated; the Go fallback engine now consumes only the remaining rg budget instead of a fresh one; the wildcard-only-pattern guard now rejects zero-width-assertion-only patterns such as `\b\b` while keeping `\bword\b` working.
 
 ### Changed
 - **`deploy.sh` installs the Pi extension** (`integrations/pi/ctxmode.ts` → `~/.pi/agent/extensions/ctxmode.ts`). Pi has no MCP client; tools come from that file. Binary-only deploys left Pi on a stale schema.

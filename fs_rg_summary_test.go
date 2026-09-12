@@ -825,8 +825,8 @@ func TestRg_CaptureTruncation(t *testing.T) {
 	}
 }
 
-// 23. TestRg_SensitiveFallback_ContextPreserved (Attack 6: sensitive fallback with context)
-func TestRg_SensitiveFallback_ContextPreserved(t *testing.T) {
+// 23. TestRg_SensitiveFallback_ContextWithheld (Attack 6: sensitive fallback with context)
+func TestRg_SensitiveFallback_ContextWithheld(t *testing.T) {
 	origSummary := rgSummaryEnabled
 	rgSummaryEnabled = true
 	defer func() { rgSummaryEnabled = origSummary }()
@@ -861,8 +861,11 @@ func TestRg_SensitiveFallback_ContextPreserved(t *testing.T) {
 	if !strings.Contains(text, "sensitive content detected") {
 		t.Errorf("expected sensitive content notice, got:\n%s", text)
 	}
-	if !strings.Contains(text, "keys.txt-2-// context after 1") {
-		t.Errorf("expected context lines to be preserved in sensitive fallback, got:\n%s", text)
+	if strings.Contains(text, "keys.txt-") {
+		t.Errorf("sensitive fallback must not echo raw match lines, got:\n%s", text)
+	}
+	if !strings.Contains(text, "files: keys.txt") {
+		t.Errorf("expected withheld warning to list the sensitive file, got:\n%s", text)
 	}
 }
 

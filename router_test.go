@@ -135,7 +135,7 @@ func TestCategoryToolAnnotations(t *testing.T) {
 			}
 		}
 	}
-	check("ctx_fs", true, false, nil)
+	check("ctx_fs", false, false, nil) // F4c: rg indexes oversized hits into ctx_kb
 	check("ctx_git", true, false, nil)
 	ow := true
 	check("ctx_run", false, true, &ow)

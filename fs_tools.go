@@ -63,19 +63,47 @@ func envIntDefault(name string, def int) int {
 // (".*", "*", ".+", ".", ".*.*") match (nearly) every line and are almost
 // always grep misused as a file reader. Mixed patterns ("foo.*", "Get.*Name")
 // always pass. Metacharacter-free strings are never wildcard-only.
+//
+// Zero-width assertions (\b \B \A \z \Z) are stripped from the copy used for
+// the literal scan (while still marking the pattern regex-bearing): they
+// match position only, so `\b\b`/`\B\B` cannot smuggle b/B past the guard,
+// while `\bfoo\b` keeps its real literal and passes.
 func isWildcardOnlyPattern(pattern string) bool {
-	hasMeta := false
-	for _, r := range pattern {
+	var stripped strings.Builder
+	stripped.Grow(len(pattern))
+	assertion := false
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		if c == '\\' && i+1 < len(pattern) {
+			switch pattern[i+1] {
+			case 'b', 'B', 'A', 'z', 'Z':
+				assertion = true
+				i++
+				continue
+			case '\\':
+				// Escaped backslash: keep both bytes so a following b/B is
+				// not misread as an assertion escape (`\\b` = literal "\b").
+				stripped.WriteByte(c)
+				stripped.WriteByte(pattern[i+1])
+				i++
+				continue
+			}
+		}
+		stripped.WriteByte(c)
+	}
+	hasMeta := assertion
+	onlyMetaOrSpace := true
+	for _, r := range stripped.String() {
 		switch r {
 		case '.', '*', '+', '?', '^', '$', '(', ')', '[', ']', '{', '}', '|', '\\':
 			hasMeta = true
 		default:
 			if !unicode.IsSpace(r) {
-				return false
+				onlyMetaOrSpace = false
 			}
 		}
 	}
-	return hasMeta
+	return hasMeta && onlyMetaOrSpace
 }
 
 // skipWalkDirs are well-known bulk/VCS directories always skipped by glob/rg walks.
@@ -900,6 +928,21 @@ func rgBudgetLabel() string {
 	return fmt.Sprintf("%dms", rgBudgetMs)
 }
 
+// rgFallbackBudget returns the wall-clock budget (ms) still available for an
+// rgGo fallback after rgSystem ran since rgStart. ok is false when the budget
+// is already spent, so the fallback is refused instead of restarting with a
+// fresh full budget (2x spend).
+func rgFallbackBudget(rgStart, now time.Time) (budgetMs int, ok bool) {
+	if rgBudgetMs <= 0 {
+		return 0, true // budget disabled: fallback unrestricted
+	}
+	left := rgBudgetMs - int(now.Sub(rgStart).Milliseconds())
+	if left <= 0 {
+		return 0, false
+	}
+	return left, true
+}
+
 func (s *server) rgRenderResult(hdr rgHeader, text string) *mcp.CallToolResult {
 	budgetHint := ""
 	if hdr.BudgetHit {
@@ -928,6 +971,14 @@ func (s *server) rgResult(text string, count int, truncated bool, engine string)
 		Matches:   count,
 		Truncated: truncated,
 	}, text)
+}
+
+// rgDedupKey builds the rg result-index dedup key. The truncated/budget
+// state is part of the key: a truncated or budget-cut result set must never
+// be reused as (or replace) the complete set within the reuse window, or
+// "(reused)" would present an incomplete corpus as a stable conclusion.
+func rgDedupKey(root string, args rgArgs, contextLines int, truncated, budgetHit bool) string {
+	return fmt.Sprintf("%s|%s|%s|%v|%v|%d|trunc=%v|budget=%v", root, args.Pattern, args.Glob, args.IgnoreCase, args.Literal, contextLines, truncated, budgetHit)
 }
 
 func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs) (*mcp.CallToolResult, any, error) {
@@ -966,6 +1017,13 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 	if err != nil {
 		return nil, nil, err
 	}
+	// Explicit-path fence: ripgrep applies glob filters only to walked files,
+	// never to an explicit file argument, so {"path": ".env"} would read a
+	// credential file straight past the deny-glob fence. Refuse file targets
+	// on the sensitive-path deny list.
+	if st, statErr := os.Stat(root); statErr == nil && !st.IsDir() && isSensitiveFilePath(root) {
+		return nil, nil, fmt.Errorf("refusing to search %q: explicit path is a sensitive file (credentials / secret material, deny-listed)", pathArg)
+	}
 
 	dirty, tags, gitStatus := s.gitDirtyState(ctx, root)
 	matchRoot := s.displayPathBase(root)
@@ -1001,7 +1059,8 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 	// Prefer system rg when available.
 	if rgPath, lookErr := exec.LookPath("rg"); lookErr == nil {
 		var sysErr error
-		text, truncated, _, sysErr = s.rgSystem(budgetCtx, rgPath, root, args, fetchLimit, contextLines, fetchBytes)
+		rgStart := time.Now()
+		text, truncated, _, sysErr = s.rgSystemBounded(budgetCtx, ctx, rgPath, root, args, fetchLimit, contextLines, fetchBytes)
 		if errors.Is(sysErr, errRgBudget) {
 			budgetHit = true
 			sysErr = nil
@@ -1019,9 +1078,23 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 				}
 				return s.rgRenderResult(fillHdr(hdr), ""), nil, nil
 			}
-			// Other errors: fallback to pure-Go.
-			text, truncated, _, err = s.rgGo(ctx, root, args, fetchLimit, contextLines, fetchBytes)
-			engine = "go"
+			// Parent request already canceled or timed out: falling back to
+			// the Go engine cannot succeed; surface the real cause.
+			if perr := ctx.Err(); perr != nil {
+				return nil, nil, perr
+			}
+			// Other errors: fall back to pure-Go, charged only the rg budget
+			// REMAINING since rgSystem started, so a single tool call can
+			// never spend 2x CTXMODE_RG_BUDGET_MS.
+			budgetLeft, fallbackOK := rgFallbackBudget(rgStart, time.Now())
+			if !fallbackOK {
+				// Budget exhausted inside rgSystem: no fallback; surface the
+				// original rg error.
+				err = sysErr
+			} else {
+				text, truncated, _, err = s.rgGoBudget(ctx, budgetLeft, root, args, fetchLimit, contextLines, fetchBytes)
+				engine = "go"
+			}
 		}
 	} else {
 		text, truncated, _, err = s.rgGo(ctx, root, args, fetchLimit, contextLines, fetchBytes)
@@ -1065,7 +1138,10 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		}
 	}
 
-	dedupKey := fmt.Sprintf("%s|%s|%s|%v|%v|%d", root, args.Pattern, args.Glob, args.IgnoreCase, args.Literal, contextLines)
+	// truncated/budget state is part of the key: a truncated or budget-cut
+	// result set must never be reused as (or replace) the complete set
+	// within the reuse window (see rgDedupKey).
+	dedupKey := rgDedupKey(root, args, contextLines, truncated, budgetHit)
 
 	switch {
 	case args.Offset > 0:
@@ -1081,10 +1157,33 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 			GitStatus: gitStatus,
 			Indexed:   s.getRgIndexLabel(dedupKey),
 		}
+		// Paged output is a direct return too: gate the page exactly
+		// like the <=limit path, or content withheld on the first page
+		// could be read back one offset at a time.
+		if serr := checkSensitiveContent(slicedText); serr != nil {
+			hdr.Truncated = true
+			return s.rgRenderResult(fillHdr(hdr), rgSensitiveWithheldWarning(groups)), nil, nil
+		}
 		return s.rgRenderResult(fillHdr(hdr), slicedText), nil, nil
 
 	case totalHits <= limit:
 		body := renderGroups(groups)
+		if serr := checkSensitiveContent(body); serr != nil {
+			// Directly-returned results get the same sensitive-content gate
+			// as the index-to-store path. Most conservative handling: never
+			// echo the raw matched lines back; return a warning plus the
+			// offending file names only.
+			hdr := rgHeader{
+				Engine:    engine,
+				Matches:   totalHits,
+				Files:     len(validGroups),
+				Limit:     limit,
+				Truncated: true,
+				GitDirty:  gitDirtyCount,
+				GitStatus: gitStatus,
+			}
+			return s.rgRenderResult(fillHdr(hdr), rgSensitiveWithheldWarning(groups)), nil, nil
+		}
 		if rgSummaryEnabled {
 			body = prependReadHint(body, groups, matchRoot)
 		}
@@ -1111,6 +1210,11 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 			GitDirty:  gitDirtyCount,
 			GitStatus: gitStatus,
 		}
+		if serr := checkSensitiveContent(slicedText); serr != nil {
+			// Same withholding gate as the indexed fallback below: with the
+			// store or summary disabled this path echoed raw lines, no gate.
+			return s.rgRenderResult(fillHdr(hdr), rgSensitiveWithheldWarning(groups)), nil, nil
+		}
 		return s.rgRenderResult(fillHdr(hdr), slicedText), nil, nil
 
 	default:
@@ -1118,8 +1222,10 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 		rawText := renderGroups(groups)
 		textToStore := indexHeader(args.Pattern, root, args.Glob, totalHits, budgetHit) + rawText
 		if serr := checkSensitiveContent(textToStore); serr != nil {
-			// Sensitive content fallback: return raw match lines up to limit with context preserved
-			slicedText := sliceGroupsWithContext(groups, limit)
+			// Indexing stays skipped, and the raw-match fallback is withheld
+			// exactly like the <=limit direct-return gate above: echoing the
+			// first N raw lines here would hand the secret to any search whose
+			// hit count exceeds the limit.
 			hdr := rgHeader{
 				Engine:    engine,
 				Matches:   totalHits,
@@ -1129,7 +1235,7 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 				GitDirty:  gitDirtyCount,
 				GitStatus: gitStatus,
 			}
-			return s.rgRenderResult(fillHdr(hdr), fmt.Sprintf("%s\n(sensitive content detected: indexing skipped, returning first %d matches)", slicedText, limit)), nil, nil
+			return s.rgRenderResult(fillHdr(hdr), rgSensitiveWithheldWarning(groups)), nil, nil
 		}
 
 		slug := slugifyRgPattern(args.Pattern, args.Glob)
@@ -1169,7 +1275,63 @@ func (s *server) toolRg(ctx context.Context, _ *mcp.CallToolRequest, args rgArgs
 	}
 }
 
+// rgSensitiveWithheldWarning builds the warning returned in place of raw
+// matched lines on every direct-return path of toolRg (<=limit results,
+// offset pages, and >limit fallbacks). It names the files whose own lines
+// trip checkSensitiveContent, so the caller can inspect those files
+// through the gated read paths without ever seeing the matched lines.
+func rgSensitiveWithheldWarning(groups []rgFileGroup) string {
+	var hitFiles []string
+	for _, g := range groups {
+		if g.file == "" {
+			continue
+		}
+		if gerr := checkSensitiveContent(strings.Join(g.lines, "\n")); gerr != nil {
+			hitFiles = append(hitFiles, g.file)
+		}
+	}
+	warning := "(sensitive content detected: matched lines withheld"
+	if len(hitFiles) > 0 {
+		warning += "; files: " + strings.Join(hitFiles, ", ")
+	}
+	warning += ")"
+	return warning
+}
+
+// rgSystem keeps its historical single-context signature (tests call it
+// directly): with no separate parent context, a DeadlineExceeded on ctx is
+// attributed to the rg wall-clock budget exactly as before.
 func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs, fetchLimit, contextLines, fetchCapBytes int) (string, bool, int, error) {
+	return s.rgSystemBounded(ctx, nil, rgPath, root, args, fetchLimit, contextLines, fetchCapBytes)
+}
+
+// rgBudgetKilled reports whether runErr means rg was SIGKILLed by this
+// search's own wall-clock budget. A clean exit (rg finished, matched or not)
+// is never a budget kill, and neither is a kill caused by the parent request
+// being canceled or timed out. parentCtx == nil (legacy single-context
+// callers) means the budget context is authoritative.
+func rgBudgetKilled(budgetCtx, parentCtx context.Context, runErr error) bool {
+	if runErr == nil {
+		return false // rg completed on its own
+	}
+	var ee *exec.ExitError
+	if !errors.As(runErr, &ee) || ee.ExitCode() != -1 {
+		return false // exited with a real status, not killed by a signal
+	}
+	berr := budgetCtx.Err()
+	if berr == nil || berr != context.DeadlineExceeded {
+		return false
+	}
+	if parentCtx != nil && parentCtx.Err() != nil {
+		return false // parent canceled/timed out: real cause is upstream
+	}
+	return true
+}
+
+// rgSystemBounded is rgSystem with the parent request context passed
+// separately from the budget context, so a parent cancel/timeout is never
+// mislabeled as an rg wall-clock budget hit (budget_exceeded).
+func (s *server) rgSystemBounded(ctx, parentCtx context.Context, rgPath, root string, args rgArgs, fetchLimit, contextLines, fetchCapBytes int) (string, bool, int, error) {
 	cmdArgs := []string{
 		"--no-config",
 		"--no-heading",
@@ -1181,6 +1343,12 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 	// hits are flushed instead of sitting in a pipe buffer and looking empty.
 	if rgBudgetMs > 0 {
 		cmdArgs = append(cmdArgs, "--line-buffered")
+	}
+	// Client glob goes BEFORE the built-in deny globs: ripgrep gives
+	// precedence to the last --glob, so appending a client glob like
+	// ".env*" after the deny block would re-include deny-listed files.
+	if args.Glob != "" {
+		cmdArgs = append(cmdArgs, "--glob", args.Glob)
 	}
 	cmdArgs = append(cmdArgs,
 		"--hidden",
@@ -1217,9 +1385,6 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 	if contextLines > 0 {
 		cmdArgs = append(cmdArgs, "-C", strconv.Itoa(contextLines))
 	}
-	if args.Glob != "" {
-		cmdArgs = append(cmdArgs, "--glob", args.Glob)
-	}
 	// Pattern and path last.
 	cmdArgs = append(cmdArgs, "--", args.Pattern, root)
 
@@ -1233,10 +1398,18 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
-	killedByBudget := errors.Is(ctx.Err(), context.DeadlineExceeded)
+	// Classify the exit before deciding what to keep: only a kill caused by
+	// this search's own budget deadline marks budget_exceeded; a parent
+	// cancel/timeout surfaces as the real error instead.
+	budgetKilled := rgBudgetKilled(ctx, parentCtx, err)
+	parentDone := parentCtx != nil && parentCtx.Err() != nil
 	if err != nil {
-		if killedByBudget {
+		if budgetKilled {
 			// SIGKILLed at the wall-clock budget: keep partial stdout below.
+		} else if parentDone {
+			// Parent request canceled or timed out mid-search: propagate the
+			// real cause instead of mislabeling it as a budget hit.
+			return "", false, 0, parentCtx.Err()
 		} else if ee, ok := err.(*exec.ExitError); ok {
 			// Exit 0 = matches, 1 = no match, 2 = error.
 			if ee.ExitCode() == 1 {
@@ -1269,6 +1442,12 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 		if strings.HasPrefix(rewritten, ".git/") || strings.HasPrefix(rewritten, "./.git/") || strings.Contains(rewritten, "/.git/") {
 			continue
 		}
+		// Output-side fence: drop any result line whose file path is on the
+		// sensitive-path deny list (defense in depth alongside the deny
+		// globs and the explicit-path check; mirrors rgGo's per-file gate).
+		if linePath, ok := rgLineFilePath(rewritten); ok && isSensitiveFilePath(linePath) {
+			continue
+		}
 		// Count real matches (colon form with line number), not context separators.
 		if isRgMatchLine(rewritten) {
 			if matchCount >= fetchLimit {
@@ -1288,7 +1467,7 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 		truncated = true
 	}
 	out := strings.TrimRight(b.String(), "\n")
-	if killedByBudget {
+	if budgetKilled {
 		return out, true, matchCount, errRgBudget
 	}
 	return out, truncated, matchCount, nil
@@ -1297,6 +1476,30 @@ func (s *server) rgSystem(ctx context.Context, rgPath, root string, args rgArgs,
 func isRgMatchLine(line string) bool {
 	_, _, ok := splitRgMatchLine(line)
 	return ok
+}
+
+// rgLineFilePath extracts the file path from an rg output line, either the
+// match form "path:line:content" or the context form "path-line-content".
+// ok is false for separator lines like "--" that carry no path.
+func rgLineFilePath(line string) (string, bool) {
+	if p, _, ok := splitRgMatchLine(line); ok {
+		return p, true
+	}
+	// Context form: find the first "-<digits>-" run so paths containing '-'
+	// (e.g. "foo-bar.pem-12-x") still split correctly.
+	for i := 0; i < len(line); i++ {
+		if line[i] != '-' {
+			continue
+		}
+		j := i + 1
+		for j < len(line) && line[j] >= '0' && line[j] <= '9' {
+			j++
+		}
+		if j > i+1 && j < len(line) && line[j] == '-' {
+			return line[:i], true
+		}
+	}
+	return "", false
 }
 
 func (s *server) rewriteRgLine(root, line string) string {
@@ -1384,7 +1587,16 @@ func trimRgLineEnd(buf []byte) []byte {
 	return buf
 }
 
+// rgGo keeps its historical signature (tests call it directly) and runs with
+// the default CTXMODE_RG_BUDGET_MS wall-clock budget.
 func (s *server) rgGo(ctx context.Context, root string, args rgArgs, fetchLimit, contextLines, fetchCapBytes int) (string, bool, int, error) {
+	return s.rgGoBudget(ctx, rgBudgetMs, root, args, fetchLimit, contextLines, fetchCapBytes)
+}
+
+// rgGoBudget is rgGo with an explicit wall-clock budget in milliseconds
+// (<= 0 disables), so a fallback after rgSystem can be charged only the
+// remaining budget instead of a fresh full one.
+func (s *server) rgGoBudget(ctx context.Context, budgetMs int, root string, args rgArgs, fetchLimit, contextLines, fetchCapBytes int) (string, bool, int, error) {
 	pattern := args.Pattern
 	if args.Literal {
 		pattern = regexp.QuoteMeta(pattern)
@@ -1411,8 +1623,8 @@ func (s *server) rgGo(ctx context.Context, root string, args rgArgs, fetchLimit,
 	fileCount := 0
 	start := time.Now()
 	var budget time.Duration
-	if rgBudgetMs > 0 {
-		budget = time.Duration(rgBudgetMs) * time.Millisecond
+	if budgetMs > 0 {
+		budget = time.Duration(budgetMs) * time.Millisecond
 	}
 	gitignore := newGitignoreStack(root)
 

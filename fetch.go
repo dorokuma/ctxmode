@@ -955,6 +955,27 @@ func (s *server) batchFetchAndIndex(ctx context.Context, urls []string, source, 
 
 // ---------- MCP tool handler ----------
 
+// maxFetchTTLms caps ttl_ms at 30 days: past this point time.Duration(ttl) *
+// time.Millisecond grows toward int64 overflow, and a wrapped-negative TTL
+// would make every cache lookup miss. 2,592,000,000 ms is ~2.59e15 ns,
+// safely below math.MaxInt64. Explicitly typed int64: the value exceeds int32,
+// so an untyped constant would overflow int (and fail to compile) on 32-bit
+// platforms where int is 32 bits.
+const maxFetchTTLms int64 = 30 * 24 * 60 * 60 * 1000
+
+// validateFetchTTLms rejects negative ttl_ms values (previously silently
+// mapped to the 24h default) and values above maxFetchTTLms, mirroring the
+// timeout_ms validation in toolFetchAndIndex.
+func validateFetchTTLms(ttl int64) error {
+	if ttl < 0 {
+		return fmt.Errorf("ttl_ms %d must not be negative", ttl)
+	}
+	if ttl > maxFetchTTLms {
+		return fmt.Errorf("ttl_ms %d exceeds maximum allowed (%d)", ttl, maxFetchTTLms)
+	}
+	return nil
+}
+
 func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, args fetchArgs) (*mcp.CallToolResult, any, error) {
 	// Collect and deduplicate URLs.
 	seen := make(map[string]bool)
@@ -1000,6 +1021,9 @@ func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, 
 	ttl := -1 // sentinel: use default 24h TTL
 	if args.TTLMs != nil {
 		ttl = *args.TTLMs // may be 0 (skip cache) or positive (custom ms)
+		if err := validateFetchTTLms(int64(ttl)); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	// Batch fetch.

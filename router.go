@@ -249,7 +249,9 @@ func boolPtr(v bool) *bool { return &v }
 // Each tool gets its own *bool so mutating one annotation cannot leak to another.
 func categoryToolAnnotations() map[string]*mcp.ToolAnnotations {
 	return map[string]*mcp.ToolAnnotations{
-		"ctx_fs":  {ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
+		// ctx_fs is not read-only: action=rg indexes oversized hit sets into the
+		// ctx_kb SQLite store (KB write, git status, cache update).
+		"ctx_fs":  {ReadOnlyHint: false, DestructiveHint: boolPtr(false)},
 		"ctx_git": {ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
 		"ctx_run": {ReadOnlyHint: false, DestructiveHint: boolPtr(true), OpenWorldHint: boolPtr(true)},
 		"ctx_kb":  {ReadOnlyHint: false, DestructiveHint: boolPtr(true)},

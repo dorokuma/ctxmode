@@ -494,10 +494,30 @@ func truncateRgMatchLine(content string) string {
 	return b.String() + "..."
 }
 
+// defMarker is the prefix ctxmode prepends to definition lines in rg match
+// content. Untrusted file content that literally starts with this marker is
+// neutralized before tagging/storing (see neutralizeDefMarker), so a stored
+// match line whose content starts with defMarker was tagged by ctxmode.
+const defMarker = "[def] "
+
+// neutralizeDefMarker stops untrusted file content from spoofing defMarker:
+// a match line whose content literally starts with "[def] " would otherwise
+// be recognized by groupHasDef as a genuine ctxmode tag and hijack the
+// Read hint (and poison the ctx_kb index). Prepending a single space breaks
+// the HasPrefix check while preserving the original bytes.
+func neutralizeDefMarker(content string) string {
+	if strings.HasPrefix(content, defMarker) {
+		return " " + content
+	}
+	return content
+}
+
 // prepareRgGroups optionally truncates match-line content (CTXMODE_RG_MAX_LINE_RUNES,
 // default 500, <=0 disables) and, when the rg summary feature is on, prefixes
-// definition lines with "[def] ". Applied before indexing so tags/truncation
-// flow into ctx_kb.
+// definition lines with defMarker ("[def] "). Applied before indexing so
+// tags/truncation flow into ctx_kb. Literal defMarker prefixes coming from
+// untrusted file content are neutralized first, so only ctxmode-generated
+// tags are ever recognized or stored.
 func prepareRgGroups(groups []rgFileGroup) {
 	for i := range groups {
 		for j, line := range groups[i].lines {
@@ -509,13 +529,13 @@ func prepareRgGroups(groups []rgFileGroup) {
 			if len(line) < prefixLen {
 				continue
 			}
-			content := line[prefixLen:]
+			content := neutralizeDefMarker(line[prefixLen:])
 			tagged := rgSummaryEnabled && isDefinitionLine(content)
 			if rgMaxLineRunes > 0 {
 				content = truncateRgMatchLine(content)
 			}
 			if tagged {
-				content = "[def] " + content
+				content = defMarker + content
 			}
 			groups[i].lines[j] = line[:prefixLen] + content
 		}
@@ -529,7 +549,7 @@ func groupHasDef(g rgFileGroup) bool {
 			continue
 		}
 		prefixLen := len(path) + 1 + len(lineNo) + 1
-		if len(line) >= prefixLen && strings.HasPrefix(line[prefixLen:], "[def] ") {
+		if len(line) >= prefixLen && strings.HasPrefix(line[prefixLen:], defMarker) {
 			return true
 		}
 	}

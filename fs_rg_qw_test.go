@@ -870,8 +870,8 @@ func TestPrepareRgGroups_TruncationDisabled(t *testing.T) {
 	tail := "TAIL_UNIQUE_KEEP_ZZZ"
 	long := "HEAD_TOKEN " + strings.Repeat("x", 600) + " " + tail
 	groups := []rgFileGroup{{
-		file: "long.txt",
-		hits: 1,
+		file:  "long.txt",
+		hits:  1,
 		lines: []string{"long.txt:1:" + long},
 	}}
 	prepareRgGroups(groups)
