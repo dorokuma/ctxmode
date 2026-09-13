@@ -74,9 +74,8 @@ type bgEntry struct {
 	// logFile is the open handle that background stdout/stderr write to;
 	// closed on process exit (Wait → finishBackground). kill must not close it
 	// early or log tail is lost.
-	logFile       *os.File
-	logWriter     *limitedFileWriter
-	reapScheduled bool // grace-period removal already started
+	logFile   *os.File
+	logWriter *limitedFileWriter
 	// done is closed once the job reaches a terminal state; wait callers block on it.
 	done         chan struct{}
 	doneSignaled bool
@@ -1019,9 +1018,9 @@ func killBackground(idOrPID string) (string, error) {
 
 	var lastErr error
 	if pgid != 0 {
-		if err := killErr(syscall.Kill(-pgid, syscall.SIGTERM)); err != nil {
-			lastErr = err
-		}
+		// SIGTERM is best-effort: the procStartTime re-check below re-derives
+		// the outcome, so its error is deliberately not tracked in lastErr.
+		_ = killErr(syscall.Kill(-pgid, syscall.SIGTERM))
 		time.Sleep(500 * time.Millisecond)
 		current, err = procStartTimeErr(pid)
 		if err != nil || current != starttime {
@@ -1041,9 +1040,7 @@ func killBackground(idOrPID string) (string, error) {
 			lastErr = nil
 		}
 	} else {
-		if err := killErr(syscall.Kill(pid, syscall.SIGTERM)); err != nil {
-			lastErr = err
-		}
+		_ = killErr(syscall.Kill(pid, syscall.SIGTERM)) // best-effort; see note above
 		time.Sleep(500 * time.Millisecond)
 		current, err = procStartTimeErr(pid)
 		if err != nil || current != starttime {
@@ -1824,7 +1821,7 @@ func tsNodeForCwd(cwd string) string {
 // checkRuntime checks if the runtime executable for the given language is
 // available on the system PATH. Shell is always available.
 // cwd is used only for TypeScript (local ts-node). Empty cwd means LookPath
-// plus the empty cache key (doctor / availableLanguages).
+// plus the empty cache key (doctor).
 // When useCache is true, TypeScript detection is reused per cwd. When false,
 // that cwd key is refreshed (doctor).
 func checkRuntime(language string, useCache bool, cwd string) bool {
@@ -2409,12 +2406,8 @@ func rustBackgroundArgv(outPath, srcPath string) []string {
 	return []string{"sh", "-c", `rustc -o "$1" "$2" && exec "$1"`, "_", outPath, srcPath}
 }
 
-// runCompiled executes a language that uses a temp source file.
-func runCompiled(ctx context.Context, language string, rt runtimeConfig, tmpPath, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
-	return runCompiledOpts(ctx, language, rt, tmpPath, cwd, timeout, background, nil)
-}
-
-// runCompiledOpts is runCompiled with optional env/stdin.
+// runCompiledOpts executes a language that uses a temp source file, with
+// optional env/stdin overrides.
 func runCompiledOpts(ctx context.Context, language string, rt runtimeConfig, tmpPath, cwd string, timeout time.Duration, background bool, opts *runOptions) (*executeResult, error) {
 	var cmd *exec.Cmd
 	var cleanups []string
@@ -2853,48 +2846,5 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 			ExitCode:  exitCode,
 			Truncated: truncated,
 		}, nil
-	}
-}
-
-// ---------- runtime listing ----------
-
-// availableLanguages returns a list of languages whose runtimes are installed.
-func availableLanguages() []string {
-	var langs []string
-	for name := range runtimes {
-		if checkRuntime(name, false, "") {
-			langs = append(langs, name)
-		}
-	}
-	return langs
-}
-
-// ---------- FILE_CONTENT injection for ctx_run: execute_file (base64 fallback) ----------
-
-// injectFileContentBase64 uses base64 encoding to safely inject arbitrary file
-// content into any language. The user code must decode the variable.
-func injectFileContentBase64(language, code, fileContent string) string {
-	encoded := base64.StdEncoding.EncodeToString([]byte(fileContent))
-	switch language {
-	case "shell":
-		return fmt.Sprintf(`FILE_CONTENT_B64='%s'
-FILE_CONTENT=$(echo "$FILE_CONTENT_B64" | base64 -d)
-%s`, encoded, code)
-	case "javascript", "typescript":
-		return fmt.Sprintf(`const FILE_CONTENT = Buffer.from("%s", "base64").toString();
-%s`, encoded, code)
-	case "python":
-		return fmt.Sprintf(`import base64
-FILE_CONTENT = base64.b64decode("%s").decode()
-%s`, encoded, code)
-	case "go":
-		return fmt.Sprintf(`import "encoding/base64"
-var FILE_CONTENT_BYTES, _ = base64.StdEncoding.DecodeString("%s")
-var FILE_CONTENT = string(FILE_CONTENT_BYTES)
-%s`, encoded, code)
-	default:
-		// For languages that don't have a native decode, inject the raw content
-		// via string literal (limited to text content).
-		return injectFileContent(language, code, fileContent)
 	}
 }

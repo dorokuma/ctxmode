@@ -3,6 +3,16 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [4.0.8] - 2026-09-13
+
+### Fixed
+- All 20 staticcheck findings resolved: dead assignments in the kill/drain and rg-line-drain paths removed, dead functions (superseded purges, unused runCompiled/isProbablyBinary wrappers) deleted, error strings normalized. No behavioural changes.
+
+### Added
+- **deploy.sh rollback subcommand**: the previous binary is kept as `.prev` on every deploy, and `deploy.sh rollback` verifies it through the same initialize check before atomically swapping it back.
+- **KB backups**: every `context_mode.db` under the data directory is snapshotted weekly (Sunday 06:00 UTC) via `sqlite3 .backup` with per-database integrity checks, gzip, and 4-week retention into `/root/backups/ctxmode/`; restore documented in README.
+- **CI quality gates**: staticcheck (pinned 2025.1.1) and the Pi-adapter TypeScript tests (`node --test`, Node 24 via setup-node) now run on every push; coverage baseline measured at 78.3% with new table-driven tests for the weakest newly-covered paths.
+
 ## [4.0.7] - 2026-09-13
 
 ### Fixed

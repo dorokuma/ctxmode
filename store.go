@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -33,9 +32,8 @@ type SearchResult struct {
 
 // Store wraps a SQLite database with FTS5 full-text search.
 type Store struct {
-	db      *sql.DB
-	dbPath  string
-	secured atomic.Bool
+	db     *sql.DB
+	dbPath string
 }
 
 // sqliteDSN builds a file: URI DSN so paths containing space, %, ?, or #

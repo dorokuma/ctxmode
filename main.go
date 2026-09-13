@@ -35,7 +35,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "4.0.7"
+const Version = "4.0.8"
 
 // toolIndex walk / size limits.
 const (
@@ -1313,11 +1313,6 @@ func isProbablyBinaryName(name string) bool {
 		}
 	}
 	return false
-}
-
-// isProbablyBinary is kept as an alias for extension-only checks used by older call sites.
-func isProbablyBinary(name string) bool {
-	return isProbablyBinaryName(name)
 }
 
 // pathHasExcludedSegment reports whether any path segment equals one of the

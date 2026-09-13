@@ -183,8 +183,8 @@ func TestPrePushHook(t *testing.T) {
 	t.Run("clean commits pass on new branch", func(t *testing.T) {
 		repo := t.TempDir()
 		initTestRepo(t, repo)
-		head := commitFile(t, repo, "a.txt", "hello\n", "feat: add a")
-		head = commitFile(t, repo, "b.txt", "world\n", "feat: add b")
+		commitFile(t, repo, "a.txt", "hello\n", "feat: add a")
+		head := commitFile(t, repo, "b.txt", "world\n", "feat: add b")
 		out, code := runHook(t, repo, script,
 			"refs/heads/main "+head+" refs/heads/main "+zeroSHA+"\n")
 		if code != 0 {

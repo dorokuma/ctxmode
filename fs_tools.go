@@ -659,11 +659,6 @@ func (g basicGitignore) match(rel string, isDir bool) (matched, neg bool) {
 	return matched, neg
 }
 
-func (g basicGitignore) ignores(rel string, isDir bool) bool {
-	matched, neg := g.match(rel, isDir)
-	return matched && !neg
-}
-
 // gitignoreStack applies root-to-current .gitignore layers (last match wins).
 type gitignoreStack struct {
 	layers []struct {
@@ -1695,7 +1690,7 @@ func readRgLine(br *bufio.Reader, maxBytes int) (line []byte, tooLong bool, err 
 			tooLong = true
 			// Drain the remainder of the oversized line without accumulating it.
 			for rerr == bufio.ErrBufferFull {
-				chunk, rerr = br.ReadSlice('\n')
+				_, rerr = br.ReadSlice('\n') // drain, chunk intentionally discarded
 			}
 			return nil, true, nil
 		}

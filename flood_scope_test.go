@@ -59,7 +59,7 @@ func TestSearchRgScoped_FloodGuardThresholds(t *testing.T) {
 	if meta == nil || meta.FloodStatus != "blocked" {
 		t.Fatalf("expected FloodStatus blocked, got %+v", meta)
 	}
-	if !strings.Contains(err.Error(), "too many requests in a short time. Wait a moment and retry.") {
+	if !strings.Contains(err.Error(), "too many requests in a short time. Wait a moment and retry") {
 		t.Fatalf("blocked copy must align with the FloodGuard wording, got: %s", err.Error())
 	}
 }
@@ -228,7 +228,7 @@ func TestToolFetchAndIndex_FloodGuardThresholds(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected fetch to be blocked after sustained abuse")
 	}
-	if !strings.Contains(err.Error(), "too many requests in a short time. Wait a moment and retry.") {
+	if !strings.Contains(err.Error(), "too many requests in a short time. Wait a moment and retry") {
 		t.Fatalf("blocked copy must align with the FloodGuard wording, got: %s", err.Error())
 	}
 }

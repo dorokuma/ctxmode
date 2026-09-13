@@ -247,3 +247,112 @@ func TestNewStore_URISpecialChars(t *testing.T) {
 		})
 	}
 }
+
+// ---------- PurgeExactAndChunks ----------
+
+// TestPurgeExactAndChunks covers the documented semantics: delete the exact
+// path plus path#chunk-* children only — never a longer sibling (docx), never
+// other prefixes. The chunk deletion is a range scan (>= prefix, < prefix +
+// U+10ffff), so nested chunk-prefixed paths are included by design.
+func TestPurgeExactAndChunks(t *testing.T) {
+	tests := []struct {
+		name          string
+		seed          []string
+		target        string
+		wantDeleted   int
+		wantRemaining []string
+	}{
+		{
+			name:          "deletes exact doc and chunk children, keeps longer sibling",
+			seed:          []string{"doc", "doc#chunk-0", "doc#chunk-1", "docx", "other"},
+			target:        "doc",
+			wantDeleted:   3,
+			wantRemaining: []string{"docx", "other"},
+		},
+		{
+			name:          "nonexistent target deletes nothing",
+			seed:          []string{"docx", "other"},
+			target:        "doc",
+			wantDeleted:   0,
+			wantRemaining: []string{"docx", "other"},
+		},
+		{
+			name:          "chunk range also covers nested chunk-prefixed paths",
+			seed:          []string{"doc#chunk-0", "doc#chunk-0-extra"},
+			target:        "doc",
+			wantDeleted:   2,
+			wantRemaining: nil,
+		},
+		{
+			name:          "sibling with shared chunk prefix is not touched",
+			seed:          []string{"doc#chunk-0", "docx#chunk-0", "docx"},
+			target:        "doc",
+			wantDeleted:   1,
+			wantRemaining: []string{"docx#chunk-0", "docx"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStore(t)
+			for _, p := range tt.seed {
+				indexDoc(t, s, p, "content of "+p)
+			}
+			n, err := s.PurgeExactAndChunks(tt.target)
+			if err != nil {
+				t.Fatalf("PurgeExactAndChunks(%q): %v", tt.target, err)
+			}
+			if n != tt.wantDeleted {
+				t.Fatalf("deleted = %d, want %d", n, tt.wantDeleted)
+			}
+			for _, p := range tt.seed {
+				doc, err := s.Get(p)
+				if err != nil {
+					t.Fatalf("Get(%q): %v", p, err)
+				}
+				remaining := false
+				for _, want := range tt.wantRemaining {
+					if p == want {
+						remaining = true
+						break
+					}
+				}
+				if remaining && doc == nil {
+					t.Errorf("path %q was deleted but must remain", p)
+				}
+				if !remaining && doc != nil {
+					t.Errorf("path %q must be deleted but is still present", p)
+				}
+			}
+		})
+	}
+}
+
+// ---------- firstFTSToken ----------
+
+// TestFirstFTSToken pins the probe-token extraction used to validate user
+// queries against the FTS index: the first whitespace-separated run of >= 3
+// alphanumerics, capped at 8 characters; empty when no such run exists.
+func TestFirstFTSToken(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "simple word", content: "hello world", want: "hello"},
+		{name: "short leading runs are skipped", content: "ab cd efgh", want: "efgh"},
+		{name: "capped at 8 alphanumerics", content: "abcdefghij", want: "abcdefgh"},
+		{name: "exactly 8 stops the scan", content: "x.abcdef12 more", want: "abcdef12"},
+		{name: "punctuation terminates a run", content: "hello,world!", want: "hello"},
+		{name: "alnum runs may contain digits", content: "a1b2c3 rest", want: "a1b2c3"},
+		{name: "digits only still qualify", content: "12 ab hello", want: "hello"},
+		{name: "no run reaches 3 chars", content: "ab x1 y2", want: ""},
+		{name: "empty content", content: "", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := firstFTSToken(tt.content); got != tt.want {
+				t.Errorf("firstFTSToken(%q) = %q, want %q", tt.content, got, tt.want)
+			}
+		})
+	}
+}

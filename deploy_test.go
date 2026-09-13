@@ -332,3 +332,201 @@ func TestDeployScript_SuccessMessageRequiresVersion(t *testing.T) {
 		t.Error("initialize must run before printing 部署成功")
 	}
 }
+
+// ---------- rollback: static constraints ----------
+
+const (
+	rollbackFragmentStart = "# ===== rollback fragment: start =====\n"
+	rollbackFragmentEnd   = "# ===== rollback fragment: end =====\n"
+)
+
+func extractRollbackFragment(t *testing.T, src string) string {
+	t.Helper()
+	start := strings.Index(src, rollbackFragmentStart)
+	end := strings.Index(src, rollbackFragmentEnd)
+	if start < 0 || end < 0 || end <= start+len(rollbackFragmentStart) {
+		t.Fatalf("rollback fragment markers not found in %s", deployScript)
+	}
+	return src[start+len(rollbackFragmentStart) : end]
+}
+
+// runRollbackFragment runs the rollback section in a temp copy with BINARY
+// injected and argv[1]=rollback (rollback never compiles, no BUILD_OUT).
+func runRollbackFragment(t *testing.T, binary string) (string, error) {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "deploy-rollback.sh")
+	header := "#!/bin/bash\nset -euo pipefail\nBINARY=" + shellQuote(binary) + "\n"
+	content := header + extractRollbackFragment(t, readDeployScript(t))
+	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
+		t.Fatalf("write rollback copy: %v", err)
+	}
+	cmd := exec.Command("bash", script, "rollback")
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func TestDeployScript_RollbackStaticConstraints(t *testing.T) {
+	src := readDeployScript(t)
+	frag := extractRollbackFragment(t, src)
+
+	// missing backup / failed verification must be hard errors.
+	if !strings.Contains(frag, "exit 1") {
+		t.Error("rollback must exit 1 when the .prev backup is missing or fails verification")
+	}
+	// restore must be an atomic rename within the target directory.
+	if !strings.Contains(frag, `mv -f -- "$PREV" "$BINARY"`) {
+		t.Error(`rollback must atomically rename the backup over the target: mv -f -- "$PREV" "$BINARY"`)
+	}
+	// the backup must be verified with initialize before it replaces the target.
+	initAt := strings.Index(frag, "initialize")
+	mvAt := strings.Index(frag, `mv -f -- "$PREV" "$BINARY"`)
+	if initAt < 0 || mvAt < 0 || initAt > mvAt {
+		t.Error("rollback must run initialize on the backup before mv")
+	}
+	if strings.Contains(frag, `timeout 5 "$BINARY"`) {
+		t.Error("rollback must not initialize the live target; verify the backup instead")
+	}
+	if !strings.Contains(frag, `timeout 5 "$PREV"`) {
+		t.Error("rollback must initialize the staged backup with timeout")
+	}
+	if !strings.Contains(src, "rollback") || !strings.Contains(src, "用法") {
+		t.Error("deploy.sh must document rollback usage")
+	}
+	// every variable use must be double-quoted (BINARY may contain spaces).
+	for _, v := range []string{"$BINARY", "$PREV", "$TARGET_DIR", "$ROLL_ERR"} {
+		for i := 0; ; {
+			j := strings.Index(frag[i:], v)
+			if j < 0 {
+				break
+			}
+			pos := i + j
+			if pos == 0 || frag[pos-1] != '"' {
+				t.Errorf("variable %s must be double-quoted (use at offset %d)", v, pos)
+			}
+			i = pos + len(v)
+		}
+	}
+}
+
+// ---------- rollback: behavior ----------
+
+func TestDeployRollback_RestoresPrevAndReportsVersion(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "ctx mode.bin")
+	if err := os.WriteFile(binary, []byte("CURRENT"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := binary + ".prev"
+	writeStubBinary(t, prev, stubInitializeJSON, "", 0)
+	want, err := os.ReadFile(prev)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runRollbackFragment(t, binary)
+	if err != nil {
+		t.Fatalf("rollback failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "9.9.9") || !strings.Contains(out, "回滚成功") {
+		t.Errorf("rollback must report restored version, got:\n%s", out)
+	}
+	got, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("rolled-back content = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(prev); !os.IsNotExist(err) {
+		t.Errorf(".prev should be consumed by a successful rollback (stat err=%v)", err)
+	}
+	if files := listTempFiles(t, dir); len(files) != 0 {
+		t.Errorf("rollback temp files left behind: %v", files)
+	}
+}
+
+func TestDeployRollback_MissingPrevFailsWithoutTouchingTarget(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "ctxmode")
+	if err := os.WriteFile(binary, []byte("CURRENT"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runRollbackFragment(t, binary)
+	if err == nil {
+		t.Fatalf("expected rollback to fail without .prev\n%s", out)
+	}
+	if !strings.Contains(out, "备份不存在") {
+		t.Errorf("must report the missing backup, got:\n%s", out)
+	}
+	got, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "CURRENT" {
+		t.Errorf("target must stay untouched, got %q", got)
+	}
+}
+
+func TestDeployRollback_VerifyFailureKeepsTargetAndPrev(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "ctxmode")
+	if err := os.WriteFile(binary, []byte("CURRENT"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := binary + ".prev"
+	writeStubBinary(t, prev, "not-a-json-rpc-response", "initialize boom from stub", 1)
+
+	out, err := runRollbackFragment(t, binary)
+	if err == nil {
+		t.Fatalf("expected verify failure, got success\n%s", out)
+	}
+	if !strings.Contains(out, "initialize boom from stub") {
+		t.Errorf("verify failure must surface initialize stderr, got:\n%s", out)
+	}
+	got, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "CURRENT" {
+		t.Errorf("target must stay untouched after verify failure, got %q", got)
+	}
+	if _, err := os.Stat(prev); err != nil {
+		t.Errorf(".prev must survive a failed rollback: %v", err)
+	}
+	if files := listTempFiles(t, dir); len(files) != 0 {
+		t.Errorf("rollback temp files left behind: %v", files)
+	}
+}
+
+func TestDeployFragment_CreatesPrevBackupBeforeReplace(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "my tools")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(dir, "ctxmode")
+	if err := os.WriteFile(binary, []byte("OLDV1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	buildOut := filepath.Join(t.TempDir(), "ctxmode-build")
+	writeStubBinary(t, buildOut, stubInitializeJSON, "", 0)
+
+	out, err := runFragment(t, buildOut, binary)
+	if err != nil {
+		t.Fatalf("fragment failed: %v\n%s", err, out)
+	}
+	prevData, err := os.ReadFile(binary + ".prev")
+	if err != nil {
+		t.Fatalf("deploy must back up the current binary to .prev: %v\n%s", err, out)
+	}
+	if string(prevData) != "OLDV1" {
+		t.Errorf(".prev content = %q, want OLDV1", prevData)
+	}
+	got, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "9.9.9") {
+		t.Errorf("deployed content should be the new stub, got %q", got)
+	}
+}

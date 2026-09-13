@@ -231,7 +231,7 @@ func (sp *SearchPipeline) search(query, pathPrefix string, limit int, mode flood
 		case StatusBlocked:
 			meta.FloodStatus = "blocked"
 			meta.TimeMs = time.Since(start).Milliseconds()
-			return nil, meta, fmt.Errorf("search blocked: too many requests in a short time. Wait a moment and retry. ctx_run action=batch with query_scope=batch only searches that batch run's indexed output and bypasses this guard.")
+			return nil, meta, fmt.Errorf("search blocked: too many requests in a short time. Wait a moment and retry. ctx_run action=batch with query_scope=batch only searches that batch run's indexed output and bypasses this guard")
 		case StatusThrottled:
 			meta.FloodStatus = "throttled"
 			meta.ThrottleMsg = "Search volume is high: showing limited results. Wait before retrying global search. ctx_run action=batch with query_scope=batch only searches that batch run's documents."
@@ -248,7 +248,7 @@ func (sp *SearchPipeline) search(query, pathPrefix string, limit int, mode flood
 			case StatusBlocked:
 				meta.FloodStatus = "blocked"
 				meta.TimeMs = time.Since(start).Milliseconds()
-				return nil, meta, fmt.Errorf("rg-scoped search blocked: too many requests in a short time. Wait a moment and retry.")
+				return nil, meta, fmt.Errorf("rg-scoped search blocked: too many requests in a short time. Wait a moment and retry")
 			case StatusThrottled:
 				meta.FloodStatus = "throttled"
 				meta.ThrottleMsg = "Search volume is high: showing limited results. Wait before retrying rg-scoped search."

@@ -1,10 +1,77 @@
 #!/bin/bash
 # ctxmode 一键部署：编译 → 原子替换二进制
+# 用法: deploy.sh [deploy]    编译并原子部署（默认）
+#       deploy.sh rollback    回滚到上一次部署前的二进制（${BINARY}.prev）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BINARY="${BINARY:-$HOME/.local/bin/ctxmode}"
 BUILD_OUT="$ROOT/bin/ctxmode"
+
+case "${1:-deploy}" in
+  deploy|rollback) ;;
+  *)
+    echo "用法: $0 [deploy|rollback]" >&2
+    exit 1
+    ;;
+esac
+
+# ===== rollback fragment: start =====
+# deploy.sh rollback：把上一次部署前的二进制（${BINARY}.prev）原子换回。
+# 与 deploy 相同的铁律：先 initialize 验证，验证通过才替换；任何失败都
+# 保持现状并以 1 退出。回滚成功会消耗 .prev（mv）；再次 deploy 会重新生成备份。
+if [ "${1:-}" = "rollback" ]; then
+  PREV="${BINARY}.prev"
+  TARGET_DIR="$(dirname "$BINARY")"
+  if [ ! -f "$PREV" ]; then
+    echo "rollback 失败: 备份不存在 (${PREV})，无从回滚" >&2
+    exit 1
+  fi
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "需要 coreutils timeout 才能验证备份二进制" >&2
+    exit 1
+  fi
+  echo "=== 验证备份二进制 ==="
+  ROLL_ERR="$(mktemp "$TARGET_DIR/.ctxmode.XXXXXX")"
+  cleanup_roll_err() {
+    rm -f -- "$ROLL_ERR"
+  }
+  trap cleanup_roll_err EXIT
+  # stdin EOF 竞态：与 deploy 相同，失败重试 3 次。
+  VERIFY=""
+  VERIFY_RC=1
+  # 验证失败是预期分支，先关 set -e（与 deploy fragment 相同），循环后再恢复。
+  set +e
+  for attempt in 1 2 3; do
+    VERIFY=$( (echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"deploy-check","version":"1"}}}'; sleep 1) | timeout 5 "$PREV" 2>"$ROLL_ERR" )
+    VERIFY_RC=$?
+    if [ "$VERIFY_RC" -eq 0 ] && printf '%s' "$VERIFY" | grep -qE '"version"[[:space:]]*:[[:space:]]*"[^"]+"'; then
+      break
+    fi
+    [ "$attempt" -eq 3 ] || sleep 1
+  done
+  set -e
+  if [ "$VERIFY_RC" -ne 0 ] || ! printf '%s' "$VERIFY" | grep -qE '"version"[[:space:]]*:[[:space:]]*"[^"]+"'; then
+    echo "备份二进制 initialize 验证失败 (exit ${VERIFY_RC})，保持现状不回滚" >&2
+    if [ -s "$ROLL_ERR" ]; then
+      echo "initialize stderr:" >&2
+      cat -- "$ROLL_ERR" >&2
+    fi
+    exit 1
+  fi
+  VERSION="$(printf '%s' "$VERIFY" | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | cut -d'"' -f4)"
+  if [ -z "$VERSION" ]; then
+    echo "备份二进制 initialize 响应里没有版本号，保持现状不回滚" >&2
+    exit 1
+  fi
+  rm -f -- "$ROLL_ERR"
+  # PREV 与 BINARY 同目录：mv 是同文件系统 rename，原子生效。
+  mv -f -- "$PREV" "$BINARY"
+  echo "ctxmode v${VERSION} 回滚成功 → ${BINARY}"
+  echo "提示: .prev 已被消耗；再次 deploy.sh 会重新部署并生成新备份"
+  exit 0
+fi
+# ===== rollback fragment: end =====
 
 echo "=== 编译 ==="
 cd "$ROOT"
@@ -79,6 +146,11 @@ fi
 rm -f -- "$TMP_FILE.err"
 
 trap cleanup_tmp ERR
+# 替换前备份当前线上二进制，供 deploy.sh rollback 原子换回。
+# 失败容忍：备份失败只告警不阻断部署（没有备份时 rollback 会明确报错）。
+if [ -f "$BINARY" ]; then
+  cp -- "$BINARY" "${BINARY}.prev" || echo "警告: 备份当前二进制失败，本次部署后 rollback 不可用" >&2
+fi
 mv -f -- "$TMP_FILE" "$BINARY"
 trap - ERR
 # ===== atomic deploy fragment: end =====

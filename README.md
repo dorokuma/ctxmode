@@ -4,7 +4,7 @@ A 100% NPM/NodeJS-free, Go implementation of Mert Koseoglu's [context-mode](http
 
 Local-first Model Context Protocol (MCP) server that virtualizes tool outputs, allowing AI coding agents to execute heavy tasks and save up to 98% in token usage.
 
-Current version: **4.0.7**.
+Current version: **4.0.8**.
 
 Supported platform: **Linux**. Background process identity verification reads `/proc/<pid>/stat`; on other platforms ctxmode still runs, but `ctx_bg` termination is not promised (see [ctx_bg](#ctx_bg--background-process-supervision-from-ctx_run-actionexecute-backgroundtrue)).
 
@@ -149,6 +149,29 @@ Side effects to be aware of:
 ## Database
 
 Each primary workdir gets its own SQLite database at `~/.local/share/ctxmode/<hash>-<basename>/context_mode.db`, where `<hash>` is the first 8 bytes of SHA-256 over the primary workdir's absolute path. The on-disk path is opened as a `file:` URI with special characters (`%`, `?`, `#`, spaces) percent-encoded, so a basename or `CTXMODE_DB` containing those characters does not get parsed as URI syntax. Documents indexed in one project are never searchable from another. `CTXMODE_DB` overrides the location entirely. The legacy global shared database (`~/.local/share/ctxmode/context_mode.db`) is **no longer used and is not migrated automatically**.
+
+## Deployment
+
+`deploy.sh` builds the binary, verifies it with an `initialize` handshake, and atomically replaces the live binary. Right before the atomic swap it backs up the current live binary to `<BINARY>.prev` (best-effort; a failed backup only disables rollback for that deployment).
+
+```bash
+./deploy.sh            # build + verify + atomic deploy (default)
+./deploy.sh rollback   # restore the previous binary
+```
+
+`rollback` runs the same `initialize` verification against `<BINARY>.prev` and only then atomically renames it back over `<BINARY>`, printing the restored version. If `<BINARY>.prev` is missing (no prior deploy, or already consumed by a previous rollback), or verification fails, it exits 1 without touching the live binary. A successful rollback consumes `.prev`; deploying again recreates the backup.
+
+### Backups
+
+A weekly cron job (root, Sunday 06:00 UTC) snapshots every `context_mode.db` under the data root via `sqlite3 .backup` (consistent even while the server is writing), runs `PRAGMA integrity_check` on each snapshot, gzips it, and keeps the last 4 weekly sets in `/root/backups/ctxmode/<YYYY-MM-DD>/<hash>-<basename>.db.gz`. The script lives at `/root/backups/ctxmode/backup-ctxmode.sh` and logs to `/var/log/ctxmode-backup.log`.
+
+To restore one project's KB:
+
+```bash
+gzip -dc /root/backups/ctxmode/<date>/<hash>-<basename>.db.gz > /tmp/restore.db
+sqlite3 ~/.local/share/ctxmode/<hash>-<basename>/context_mode.db ".restore '/tmp/restore.db'"
+# or: stop ctxmode, replace context_mode.db with the snapshot, start ctxmode again
+```
 
 ## License
 

@@ -266,11 +266,11 @@ func checkIP(ip net.IP) error {
 		if ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x00 {
 			serverV4 := net.IP(ip[4:8])
 			if err := checkIPv4(serverV4); err != nil {
-				return fmt.Errorf("Teredo server IPv4 blocked: %w", err)
+				return fmt.Errorf("teredo server IPv4 blocked: %w", err)
 			}
 			clientV4 := net.IP{ip[12] ^ 0xff, ip[13] ^ 0xff, ip[14] ^ 0xff, ip[15] ^ 0xff}
 			if err := checkIPv4(clientV4); err != nil {
-				return fmt.Errorf("Teredo client IPv4 blocked: %w", err)
+				return fmt.Errorf("teredo client IPv4 blocked: %w", err)
 			}
 		}
 
@@ -293,42 +293,6 @@ func ipv6Zeros(ip net.IP, start, end int) bool {
 		}
 	}
 	return true
-}
-
-// embeddedIPv4 extracts an IPv4 address hidden inside IPv6 (mapped, deprecated
-// compatible, NAT64 64:ff9b::/96, RFC 8215 local-use 64:ff9b:1::/48, 6to4
-// 2002::/16, or ISATAP). Plain IPv4 is returned as-is.
-func embeddedIPv4(ip net.IP) net.IP {
-	if v4 := ip.To4(); v4 != nil {
-		return v4
-	}
-	if len(ip) != net.IPv6len {
-		return nil
-	}
-	// IPv4-compatible ::a.b.c.d (deprecated; To4() does not decode these).
-	// :: and ::1 are IPv6 unspecified/loopback, not IPv4-compatible.
-	if ipv6Zeros(ip, 0, 12) {
-		if ip[12] == 0 && ip[13] == 0 && ip[14] == 0 && (ip[15] == 0 || ip[15] == 1) {
-			return nil
-		}
-		return net.IP(ip[12:16])
-	}
-	// NAT64 well-known prefix 64:ff9b::/96 and RFC 8215 local-use 64:ff9b:1::/48
-	// (IPv4 in the last 32 bits, the /96 embedding used inside that /48).
-	if ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b {
-		if ipv6Zeros(ip, 4, 12) || (ip[4] == 0x00 && ip[5] == 0x01 && ipv6Zeros(ip, 6, 12)) {
-			return net.IP(ip[12:16])
-		}
-	}
-	// 6to4 2002:AABB:CCDD::/48 — bytes 2-5 are the IPv4 address.
-	if ip[0] == 0x20 && ip[1] == 0x02 {
-		return net.IP(ip[2:6])
-	}
-	// ISATAP 0000:5efe / 0200:5efe
-	if (ip[8] == 0x00 || ip[8] == 0x02) && ip[9] == 0x00 && ip[10] == 0x5e && ip[11] == 0xfe {
-		return net.IP(ip[12:16])
-	}
-	return nil
 }
 
 // ---------- HTTP client (singleton) ----------
@@ -637,22 +601,6 @@ func (s *server) indexContentLocked(docPath, content string) (int, error) {
 		return len(chunks), err
 	}
 	return len(chunks), nil
-}
-
-// storePurgePrefixLocked deletes all documents under a path prefix with the
-// server mutex held (same serialization as storeIndexLocked).
-func (s *server) storePurgePrefixLocked(prefix string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, err := s.store.PurgeByPrefix(prefix)
-	return err
-}
-
-func (s *server) storePurgeExactAndChunksLocked(docPath string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, err := s.store.PurgeExactAndChunks(docPath)
-	return err
 }
 
 // fetchDocPath builds the KB document path for a fetched URL. The format is
@@ -1047,7 +995,7 @@ func (s *server) toolFetchAndIndex(ctx context.Context, _ *mcp.CallToolRequest, 
 	if fg := s.fetchFloodGuard(); fg != nil {
 		switch fg.Allow() {
 		case StatusBlocked:
-			return nil, nil, fmt.Errorf("fetch blocked: too many requests in a short time. Wait a moment and retry.")
+			return nil, nil, fmt.Errorf("fetch blocked: too many requests in a short time. Wait a moment and retry")
 		case StatusThrottled:
 			fetchThrottled = true
 		}

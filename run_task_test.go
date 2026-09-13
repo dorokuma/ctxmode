@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -198,11 +197,9 @@ func TestToolRunTask_CustomEmptyArgs(t *testing.T) {
 func TestToolRunTask_OutsideCwd(t *testing.T) {
 	wd := t.TempDir()
 	s := testServerWithWorkdir(t, wd)
-	// Pick a path almost certainly outside the temp workdir.
-	outside := filepath.Join(os.TempDir(), "ctxmode-outside-cwd-should-not-exist-parent")
-	// Use /tmp which is a real dir but outside the sandboxed temp workdir
+	// Use /etc: a real directory outside the sandboxed temp workdir
 	// (unless workdir itself is under /tmp — still must reject sibling paths).
-	outside = "/etc"
+	outside := "/etc"
 	_, _, err := s.toolRunTask(context.Background(), nil, runTaskArgs{
 		Kind: "custom",
 		Args: []string{"echo", "x"},
