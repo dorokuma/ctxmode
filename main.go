@@ -303,7 +303,7 @@ type executeArgs struct {
 	Command    string            `json:"command,omitempty" jsonschema:"Command or code to execute (ignored when argv is non-empty)"`
 	Language   string            `json:"language,omitempty" jsonschema:"Runtime language (javascript/python/shell/go/...). Ignored in argv mode"`
 	TimeoutMs  int               `json:"timeout_ms,omitempty" jsonschema:"ms (default 30000, max 3600000)"`
-	Background bool              `json:"background,omitempty" jsonschema:"Run asynchronously in background (terminated on timeout if specified, default max 1h). Manage via ctx_bg"`
+	Background bool              `json:"background,omitempty" jsonschema:"Run asynchronously in background (terminated on timeout if specified, default max 3600000ms). Manage via ctx_bg"`
 	Intent     string            `json:"intent,omitempty" jsonschema:"What you're looking for in the output (for auto-indexing)"`
 	CWD        string            `json:"cwd,omitempty" jsonschema:"Working directory"`
 	Argv       []string          `json:"argv,omitempty" jsonschema:"If non-empty, exec directly without shell (preferred over command). argv[0]=executable"`

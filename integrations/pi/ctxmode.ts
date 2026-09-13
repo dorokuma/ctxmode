@@ -679,7 +679,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       command: Type.Optional(Type.String()),
       language: Type.Optional(Type.String()),
       timeout_ms: Type.Optional(Type.Number({ description: "ms (execute/execute_file/batch default 30000, run_task default 300000, max 3600000)" })),
-      background: Type.Optional(Type.Boolean({ description: "Only with action=execute. Starts and returns immediately; no proactive push. Then call ctx_bg action=wait once with id or pid (default 60000ms, max 1h); timeout does not kill. Do not poll list/log." })),
+      background: Type.Optional(Type.Boolean({ description: "Only with action=execute. Starts and returns immediately; no proactive push. Then call ctx_bg action=wait once with id or pid (default 60000ms, max 3600000ms); timeout does not kill. Do not poll list/log." })),
       intent: Type.Optional(Type.String()),
       cwd: Type.Optional(Type.String()),
       argv: Type.Optional(Type.Array(Type.String())),
@@ -785,7 +785,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
   pi.registerTool({
     name: "ctx_bg",
     label: "CTX Background",
-    description: "后台进程。仅由 ctx_run action=execute background:true 启动；启动立即返回且不会主动推送。拿到 id 后默认调用一次 ctx_bg action=wait（阻塞本次调用，默认60000ms，最大1小时，超时不杀进程）。id 和 pid 二选一；禁止用 list/log 周期轮询。list 快照、log 查看尾部、kill 终止进程。",
+    description: "后台进程。仅由 ctx_run action=execute background:true 启动；启动立即返回且不会主动推送。拿到 id 后默认调用一次 ctx_bg action=wait（阻塞本次调用，默认60000ms，最大3600000ms，超时不杀进程）。id 和 pid 二选一；禁止用 list/log 周期轮询。list 快照、log 查看尾部、kill 终止进程。",
     promptSnippet: "Manage background jobs from ctx_run execute background:true",
     promptGuidelines: ["Use ctx_bg after starting background processes with ctx_run action=execute background:true."],
     parameters: Type.Object({
