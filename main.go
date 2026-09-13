@@ -35,7 +35,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "4.0.8"
+const Version = "4.0.9"
 
 // toolIndex walk / size limits.
 const (

@@ -3,6 +3,11 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [4.0.9] - 2026-09-13
+
+### Fixed
+- **Timing schema copy unified to ms**: the last three descriptions still using human units now state the bound in milliseconds — the `ctx_run` `background` jsonschema ("default max 1h" → "default max 3600000ms") and the Pi adapter's `background` parameter description and `ctx_bg` tool description ("max 1h" / "最大1小时" → "max 3600000ms"). No behaviour change: every tool-facing timing input was and remains `timeout_ms`/`ttl_ms` in ms with matching code defaults.
+
 ## [4.0.8] - 2026-09-13
 
 ### Fixed
