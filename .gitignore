@@ -6,3 +6,4 @@ context_mode.db
 context_mode.db-shm
 context_mode.db-wal
 .codegraph/
+.agents/notes/INDEX.md

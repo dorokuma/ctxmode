@@ -3,6 +3,11 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Agent collaboration scaffolding**: added `AGENTS.md` collaboration rules, `.agents/notes/` architecture decision records, and `scripts/notes-index.sh` indexing script.
+
 ## [4.0.9] - 2026-09-13
 
 ### Fixed
