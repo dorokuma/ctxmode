@@ -7,6 +7,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ### Added
 - **Agent collaboration scaffolding**: added `AGENTS.md` collaboration rules, `.agents/notes/` architecture decision records, and `scripts/notes-index.sh` indexing script.
+- Align skeleton test commands with CI (glob Pi extension tests, race-enabled go tests) and unify notes-index.sh.
 
 ## [4.0.9] - 2026-09-13
 

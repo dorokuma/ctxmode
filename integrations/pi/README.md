@@ -32,7 +32,7 @@ Handshake 失败（`initialize` / `tools/list`）会回收已 spawn 的子进程
 零新增依赖（node:test + `--experimental-strip-types`，Node ≥ 22.15）：
 
 ```bash
-node --experimental-strip-types --test integrations/pi/ctxmode.test.ts
+node --experimental-strip-types --test integrations/pi/*.test.ts
 ```
 
 版本下限由 `node:module` 的 `registerHooks` 卡住：测试用它把 `typebox`
