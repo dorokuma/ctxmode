@@ -20,7 +20,7 @@ Given a version number `MAJOR.MINOR.PATCH`:
 
 1. Create a feature branch from `main`.
 2. Make your changes. Keep them focused — one change per branch.
-3. Build and test: `go build ./... && go test ./...`
+3. Build and test: `go build ./... && go test -race ./...`
 4. Update `CHANGELOG.md`.
 5. Open a pull request against `main`.
 
