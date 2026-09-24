@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -19,7 +18,7 @@ import (
 
 type batchCommand struct {
 	Label   string `json:"label"`
-	Command string `json:"command"`
+	Command string `json:"command" jsonschema:"Shell command; runs with the same fixed /bin/sh -c semantics as the execute command (SHELL is ignored, no command allowlist)."`
 }
 
 type batchArgs struct {
@@ -72,19 +71,15 @@ const (
 // (maxCmdOutput) — it is the ONLY source of the batch Truncated flag; the 100KB
 // auto-index threshold is unrelated to real truncation.
 func (s *server) executeCommand(ctx context.Context, command, cwd string) (output string, exitCode int, execErr error, truncated bool) {
-	var cmd *exec.Cmd
-	shellPath := os.Getenv("SHELL")
-	if shellPath != "" {
-		parts := strings.Fields(shellPath)
-		if len(parts) == 0 {
-			cmd = exec.Command("sh", "-c", command)
-		} else {
-			args := append(parts[1:], "-c", command)
-			cmd = exec.Command(parts[0], args...)
-		}
-	} else {
-		cmd = exec.Command("sh", "-c", command)
+	// Graded pre-execution screen (shared with toolExecute). Length/NUL blocks
+	// live in runShellOpts; pattern warns are applied here so batch runs get the
+	// same heuristic logging. A block fails only THIS command's batchResult.
+	if verdict, rule := screenShellCommand(command); verdict == shellBlock {
+		return "", -1, fmt.Errorf("shell command blocked (%s)", rule), false
+	} else if verdict == shellWarn {
+		logShellScreen(rule, command)
 	}
+	cmd := shellCommand(command)
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 

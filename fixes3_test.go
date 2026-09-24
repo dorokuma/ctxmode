@@ -136,10 +136,17 @@ func TestAutoIndex_SensitiveContentRefused_Batch(t *testing.T) {
 	wd := t.TempDir()
 	s := &server{workdirs: []string{wd}, store: st}
 
-	bigSensitive := strings.Repeat("C", 105*1024) + "\n" + testPrivateKeyPayload
+	// The graded screen now hard-blocks any command string >64KiB, so build the
+	// >100KB OUTPUT from a small command (fill NUL->'C') and read the private key
+	// from a file instead of embedding it in an oversized command. The assertion
+	// under test — index-time refusal of sensitive content — is unchanged.
+	keyPath := filepath.Join(wd, "leak.key")
+	if err := os.WriteFile(keyPath, []byte(testPrivateKeyPayload), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
 	resp, _, err := s.toolBatchExecute(context.Background(), nil, batchArgs{
 		Commands: []batchCommand{
-			{Label: "sensitive_cmd", Command: fmt.Sprintf("printf '%%s' '%s'", bigSensitive)},
+			{Label: "sensitive_cmd", Command: "head -c 110000 /dev/zero | tr '\\0' 'C'; printf '\\n'; cat \"" + keyPath + "\""},
 		},
 		CWD: wd,
 	})

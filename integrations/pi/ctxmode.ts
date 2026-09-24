@@ -783,12 +783,12 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
     promptSnippet: "Run commands, batch jobs, or structured test/build tasks",
     promptGuidelines: [
       "Use ctx_run action=run_task for go/npm/cargo/make test and build.",
-      "Use ctx_run action=execute for shell/code; prefer argv over command.",
-      "Use ctx_run action=execute for shell/code; prefer argv over command.",
+      "Use ctx_run action=execute for shell/code; prefer argv over command; command runs via a fixed /bin/sh -c (SHELL ignored, no allowlist).",
+      "Use ctx_run action=batch for multiple commands with optional queries (same fixed /bin/sh -c semantics).",
     ],
     parameters: Type.Object({
       action: Type.String({ description: "execute|execute_file|batch|run_task", enum: ["execute", "execute_file", "batch", "run_task"] }),
-      command: Type.Optional(Type.String()),
+      command: Type.Optional(Type.String({ description: "Shell command text run via a fixed, controlled /bin/sh -c (SHELL ignored; no command allowlist). Pipes/redirects/&&/heredoc/$() allowed. Ignored when argv is non-empty; prefer argv." })),
       language: Type.Optional(Type.String()),
       timeout_ms: Type.Optional(Type.Number({ description: "ms (execute/execute_file/batch default 30000, run_task default 300000, max 3600000)" })),
       background: Type.Optional(Type.Boolean({ description: "Only with action=execute. Starts and returns immediately; no proactive push. Then call ctx_bg action=wait once with id or pid (default 60000ms, max 3600000ms); timeout does not kill. Do not poll list/log." })),

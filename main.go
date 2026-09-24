@@ -300,7 +300,7 @@ func ensureDBDir(dbPath string) error {
 // ---------- tool implementations ----------
 
 type executeArgs struct {
-	Command    string            `json:"command,omitempty" jsonschema:"Command or code to execute (ignored when argv is non-empty)"`
+	Command    string            `json:"command,omitempty" jsonschema:"Shell command text run via a fixed, controlled /bin/sh -c (the SHELL env var is ignored; no command allowlist). Pipes, redirects, &&, heredocs and $() are allowed. NOT a sandbox: runs with the server process's privileges. Ignored when argv is non-empty — prefer argv."`
 	Language   string            `json:"language,omitempty" jsonschema:"Runtime language (javascript/python/shell/go/...). Ignored in argv mode"`
 	TimeoutMs  int               `json:"timeout_ms,omitempty" jsonschema:"ms (default 30000, max 3600000)"`
 	Background bool              `json:"background,omitempty" jsonschema:"Run asynchronously in background (terminated on timeout if specified, default max 3600000ms). Manage via ctx_bg"`
@@ -364,6 +364,16 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		}
 		result, err = runArgv(ctx, argv, cwd, timeout, args.Background, opts)
 	} else {
+		// Graded pre-execution screen for command-form shell input only
+		// (language empty or "shell"). shellBlock aborts; shellWarn is logged
+		// then the command runs. Non-shell interpreters are not content-screened.
+		if language == "" || language == "shell" {
+			if verdict, rule := screenShellCommand(args.Command); verdict == shellBlock {
+				return nil, nil, fmt.Errorf("shell command blocked (%s)", rule)
+			} else if verdict == shellWarn {
+				logShellScreen(rule, args.Command)
+			}
+		}
 		result, err = runCodeOpts(ctx, language, args.Command, cwd, timeout, args.Background, opts)
 	}
 	if err != nil {

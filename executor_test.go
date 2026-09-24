@@ -215,42 +215,50 @@ func TestRunShell_TimeoutSIGKILL_ForceKill(t *testing.T) {
 // runShell 测试 — SHELL 环境变量拆分（S14）
 // ============================================================================
 
-func TestRunShell_SHELLWithArgs(t *testing.T) {
-	// S14: SHELL="/bin/bash -l" → strings.Fields 拆分为 ["/bin/bash", "-l"]
-	// 验证 bash -l 模式确实被执行（通过 BASH_VERSION 环境变量验证）。
+// runShellAndCheckFixed verifies that runShell always executes via the fixed,
+// controlled /bin/sh -c (dash/sh), regardless of the SHELL env var, and that the
+// payload itself still runs. set=false unsets SHELL; otherwise shellEnv is used.
+func runShellAndCheckFixed(t *testing.T, shellEnv string, set bool) {
+	t.Helper()
 	origShell := os.Getenv("SHELL")
 	defer os.Setenv("SHELL", origShell)
-	os.Setenv("SHELL", "/bin/bash -l")
+	if set {
+		os.Setenv("SHELL", shellEnv)
+	} else {
+		os.Unsetenv("SHELL")
+	}
 
-	// bash -l 会设置一些 login shell 环境，echo 基本命令应正常执行
-	result, err := runShell(context.Background(), "echo hello_from_bash", "/tmp", 5*time.Second, false)
+	// $$ is the shell's own PID; /proc/$$/exe resolves the real interpreter that
+	// is actually running, independent of the SHELL variable.
+	code := `readlink /proc/$$/exe; echo FIXED_SHELL_MARKER`
+	result, err := runShell(context.Background(), code, "/tmp", 5*time.Second, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if result.ExitCode != 0 {
 		t.Fatalf("expected exit code 0, got %d, stderr=%q", result.ExitCode, result.Stderr)
 	}
-	if !strings.Contains(result.Stdout, "hello_from_bash") {
-		t.Fatalf("expected stdout to contain 'hello_from_bash', got %q", result.Stdout)
+	if !strings.Contains(result.Stdout, "FIXED_SHELL_MARKER") {
+		t.Fatalf("expected stdout to contain marker, got %q", result.Stdout)
+	}
+	exe := strings.TrimSpace(strings.SplitN(result.Stdout, "\n", 2)[0])
+	if exe != "sh" && filepath.Base(exe) != "dash" && filepath.Base(exe) != "sh" {
+		t.Fatalf("SHELL=%q: expected fixed child shell dash/sh, got %q", shellEnv, exe)
+	}
+}
+
+func TestRunShell_SHELLWithArgs(t *testing.T) {
+	// Fixed-shell hardening: SHELL is ignored. Whatever SHELL is set to — a
+	// plain binary, a binary with arguments, or a hostile path — the child
+	// shell must be the controlled /bin/sh (dash), and echo must still work.
+	for _, sh := range []string{"/bin/bash", "/bin/bash -l", "/tmp/evil"} {
+		runShellAndCheckFixed(t, sh, true)
 	}
 }
 
 func TestRunShell_EmptySHELL_FallbackSh(t *testing.T) {
-	// S14 兜底: SHELL 为空时 fallback 到 "sh"
-	origShell := os.Getenv("SHELL")
-	defer os.Setenv("SHELL", origShell)
-	os.Unsetenv("SHELL")
-
-	result, err := runShell(context.Background(), "echo hello_from_sh", "/tmp", 5*time.Second, false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.ExitCode != 0 {
-		t.Fatalf("expected exit code 0, got %d", result.ExitCode)
-	}
-	if !strings.Contains(result.Stdout, "hello_from_sh") {
-		t.Fatalf("expected stdout to contain 'hello_from_sh', got %q", result.Stdout)
-	}
+	// SHELL unset still resolves to the fixed /bin/sh (dash), echo works.
+	runShellAndCheckFixed(t, "", false)
 }
 
 // ============================================================================

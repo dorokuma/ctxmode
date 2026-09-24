@@ -116,66 +116,52 @@ func TestExecuteCommand_ContextCancelled(t *testing.T) {
 // executeCommand 测试 — SHELL 环境变量
 // ============================================================================
 
-func TestExecuteCommand_WithSHELLEnv(t *testing.T) {
+// executeCommandCheckFixed verifies that executeCommand always runs via the
+// fixed, controlled /bin/sh -c (dash/sh), regardless of the SHELL env var, and
+// that the payload itself still runs. set=false unsets SHELL.
+func executeCommandCheckFixed(t *testing.T, shellEnv string, set bool) {
+	t.Helper()
 	origShell := os.Getenv("SHELL")
 	defer os.Setenv("SHELL", origShell)
-	os.Setenv("SHELL", "/bin/bash")
+	if set {
+		os.Setenv("SHELL", shellEnv)
+	} else {
+		os.Unsetenv("SHELL")
+	}
 
-	// executeCommand 使用 strings.Fields 拆分 SHELL，支持带参数。
-	// 不带参数时也能正常工作。
 	s := &server{}
-	ctx := context.Background()
-	out, exitCode, err, _ := s.executeCommand(ctx, "echo from_bash", "/tmp")
+	// $$ is the shell's own PID; /proc/$$/exe resolves the real interpreter.
+	out, exitCode, err, _ := s.executeCommand(context.Background(), `readlink /proc/$$/exe; echo FIXED_SHELL_MARKER`, "/tmp")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if exitCode != 0 {
 		t.Fatalf("expected exit code 0, got %d, output=%q", exitCode, out)
 	}
-	if !strings.Contains(out, "from_bash") {
-		t.Fatalf("expected output to contain 'from_bash', got %q", out)
+	if !strings.Contains(out, "FIXED_SHELL_MARKER") {
+		t.Fatalf("expected output to contain marker, got %q", out)
 	}
+	exe := strings.TrimSpace(strings.SplitN(out, "\n", 2)[0])
+	if exe != "sh" && !strings.HasSuffix(exe, "/dash") && !strings.HasSuffix(exe, "/sh") {
+		t.Fatalf("SHELL=%q: expected fixed child shell dash/sh, got %q", shellEnv, exe)
+	}
+}
+
+func TestExecuteCommand_WithSHELLEnv(t *testing.T) {
+	// Fixed-shell hardening: SHELL=/bin/bash is ignored; the controlled
+	// /bin/sh (dash) runs the command.
+	executeCommandCheckFixed(t, "/bin/bash", true)
 }
 
 func TestExecuteCommand_SHELLWithArgs(t *testing.T) {
-	// S14: verify that SHELL with extra arguments (e.g. "/bin/sh -e") is
-	// correctly split via strings.Fields instead of treating the whole string
-	// as an executable name.
-	origShell := os.Getenv("SHELL")
-	defer os.Setenv("SHELL", origShell)
-	os.Setenv("SHELL", "/bin/sh -e")
-
-	s := &server{}
-	ctx := context.Background()
-	out, exitCode, err, _ := s.executeCommand(ctx, "echo shell_split_ok", "/tmp")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if exitCode != 0 {
-		t.Fatalf("expected exit code 0, got %d, output=%q", exitCode, out)
-	}
-	if !strings.Contains(out, "shell_split_ok") {
-		t.Fatalf("expected output to contain 'shell_split_ok', got %q", out)
-	}
+	// Fixed-shell hardening: even SHELL carrying arguments ("/bin/sh -e") is
+	// ignored; the controlled /bin/sh (dash) runs the command verbatim.
+	executeCommandCheckFixed(t, "/bin/sh -e", true)
 }
 
 func TestExecuteCommand_EmptySHELL_FallbackSh(t *testing.T) {
-	origShell := os.Getenv("SHELL")
-	defer os.Setenv("SHELL", origShell)
-	os.Unsetenv("SHELL")
-
-	s := &server{}
-	ctx := context.Background()
-	out, exitCode, err, _ := s.executeCommand(ctx, "echo from_sh", "/tmp")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if exitCode != 0 {
-		t.Fatalf("expected exit code 0, got %d", exitCode)
-	}
-	if !strings.Contains(out, "from_sh") {
-		t.Fatalf("expected output to contain 'from_sh', got %q", out)
-	}
+	// SHELL unset still resolves to the fixed /bin/sh (dash).
+	executeCommandCheckFixed(t, "", false)
 }
 
 // ============================================================================

@@ -17,7 +17,7 @@ type ctxRunArgs struct {
 	Action string `json:"action" jsonschema:"execute|execute_file|batch|run_task"`
 
 	// execute
-	Command    string            `json:"command,omitempty"`
+	Command    string            `json:"command,omitempty" jsonschema:"Shell command text run via a fixed, controlled /bin/sh -c (SHELL ignored; no allowlist). Pipes/redirects/&&/heredoc/$() allowed. Ignored when argv is non-empty; prefer argv."`
 	Language   string            `json:"language,omitempty"`
 	TimeoutMs  int               `json:"timeout_ms,omitempty" jsonschema:"ms (execute/execute_file/batch default 30000, run_task default 300000, max 3600000)"`
 	Background bool              `json:"background,omitempty" jsonschema:"Only for action=execute: start and return immediately; no proactive push. Configured execution timeout terminates on timeout; ctx_bg wait timeout does not kill. After receiving id, call ctx_bg action=wait once (default 60000ms, max 3600000ms); not supported by other actions. (terminated on timeout)"`

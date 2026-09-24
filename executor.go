@@ -1499,7 +1499,8 @@ var runtimes = map[string]runtimeConfig{
 
 // ---------- wrapper functions ----------
 
-// shellWrapper returns the code as-is. Shell is run via "sh -c" directly.
+// shellWrapper returns the code as-is. Shell is run via the fixed /bin/sh -c
+// (the SHELL environment variable is ignored). See shellCommand.
 func shellWrapper(code string) string {
 	return code
 }
@@ -2350,26 +2351,30 @@ func runCodeOpts(ctx context.Context, language, code, cwd string, timeout time.D
 	return runCompiledOpts(ctx, language, rt, tmpPath, cwd, timeout, background, opts)
 }
 
-// runShell executes code directly via "sh -c".
+// runShell executes code via the fixed, controlled shell: /bin/sh -c
+// (SHELL is ignored). See shellCommand.
 func runShell(ctx context.Context, code, cwd string, timeout time.Duration, background bool) (*executeResult, error) {
 	return runShellOpts(ctx, code, cwd, timeout, background, nil)
 }
 
+// shellCommand returns the fixed, controlled shell executor for command-form
+// shell execution. It always uses the absolute path "/bin/sh" with "-c": the
+// SHELL environment variable is ignored and is never split into arguments, so
+// the interpreter used for shell commands is not caller-controllable.
+func shellCommand(code string) *exec.Cmd {
+	return exec.Command("/bin/sh", "-c", code)
+}
+
 // runShellOpts is runShell with optional env/stdin.
 func runShellOpts(ctx context.Context, code, cwd string, timeout time.Duration, background bool, opts *runOptions) (*executeResult, error) {
-	var cmd *exec.Cmd
-	shellPath := os.Getenv("SHELL")
-	if shellPath != "" {
-		parts := strings.Fields(shellPath)
-		if len(parts) == 0 {
-			cmd = exec.Command("sh", "-c", code)
-		} else {
-			args := append(parts[1:], "-c", code)
-			cmd = exec.Command(parts[0], args...)
-		}
-	} else {
-		cmd = exec.Command("sh", "-c", code)
+	// Length/NUL block only — sunk here so it covers BOTH execute and
+	// execute_file (both reach runShellOpts for language=shell). Warn-level
+	// pattern scanning is deliberately NOT done here (see toolExecute and
+	// executeCommand) to avoid false warnings on whole-file FILE_CONTENT.
+	if verdict, rule := screenShellBlock(code); verdict == shellBlock {
+		return nil, fmt.Errorf("shell command blocked (%s)", rule)
 	}
+	cmd := shellCommand(code)
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	applyRunOptions(cmd, opts)
