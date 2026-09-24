@@ -27,6 +27,29 @@ install -m 644 integrations/pi/ctxmode.ts ~/.pi/agent/extensions/ctxmode.ts
 
 Handshake 失败（`initialize` / `tools/list`）会回收已 spawn 的子进程。`callTool` 遇到 disconnect / not running 时可以拉起客户端，但不会自动重放刚才那次 `tools/call`（execute/batch 非幂等）。
 
+## Esc / 取消语义
+
+用户按 Esc 时 Pi 只会本地中止这一轮（`session.abort()`），并把 `AbortSignal`
+传给扩展工具。桥现在把这个 signal 透传给 ctxmode：abort 时向前一个 `tools/call`
+补发 `notifications/cancelled`（requestId 对得上，且一定晚于请求行本身，否则取消
+落空），ctxmode 的 handler ctx 随之取消，`runCmd` 的 `ctx.Done` 分支对进程组两段式
+kill，子进程跟着请求一起结束——注意取消只覆盖前台请求：`execute` 带
+`background: true` 拉起的后台进程不受取消影响（它已不隶属于这个前台请求），按
+max age（默认 1h）回收，要提前结束得走 `ctx_bg`。同时本地立即拒绝等待，不再空等到客户端超时。
+客户端超时（`CTXMODE_REQUEST_TIMEOUT_MS` 等）同样会先发取消——否则服务端任务会
+变成孤儿进程，一路跑到默认预算（execute 30s / run_task 5min / background 1h）。
+
+## 停止语义
+
+`stop()`（`/ctxmode-stop`、`session_shutdown`、Pi 退出都会调用）对 client 是终态：
+之后再调 `start()` 一律拒绝、不会拉起进程。这条堵的是一个竞态：在途 `tools/call`
+被 `cleanup()` 以 `ctxmode disconnected` 拒绝后，`callTool` 的重连分支会去调
+`start()`，而旧实现无条件把 `stopped` 复位，于是本该退出的进程又被拉起一个，且
+扩展侧 `client` 已置 null，谁都管不到它（实测：2 个 spawn，第二个存活）。
+
+显式启动（`/ctxmode-start`、`session_start`）总是新建 `CtxmodeClient`；进程崩溃后的
+自动重连 `stopped` 仍为 false，兜底能力不受影响。
+
 ## Tests
 
 零新增依赖（node:test + `--experimental-strip-types`，Node ≥ 22.15）：

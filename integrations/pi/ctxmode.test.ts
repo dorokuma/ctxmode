@@ -24,21 +24,33 @@ interface ClientTestSurface {
   dumpStderrBuffer(force?: boolean): void
   handleProcExit(code: number | null, signal: NodeJS.Signals | null): void
   disposeProc(proc: unknown): Promise<void>
-  sendRequest(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<{ content?: Array<{ text: string }> }>
+  sendRequest(
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs?: number,
+    onId?: (id: number) => void,
+  ): Promise<{ content?: Array<{ text: string }> }>
   start(): Promise<void>
-  callTool(name: string, args: Record<string, unknown>): Promise<string>
+  callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string>
   timeoutForTool(name: string, args: Record<string, unknown>): number
   stderrBuffer: string[]
   stderrCarry: string
   stopped: boolean
   initialized: boolean
-  proc: { pid?: number } | null
+  proc: { pid?: number; stdin?: { end(): void; write(line: string): unknown } } | null
   rl: { close(): void } | null
+  /** 在途 JSON-RPC 请求（id → resolve/reject/timer），测试直接响应或断言其存在。 */
+  pending: Map<
+    number,
+    { resolve: (result: unknown) => void; reject: (err: Error) => void; timer?: ReturnType<typeof setTimeout> }
+  >
 }
 
 let CtxmodeClient: new (workdir: string) => ClientTestSurface
 let diagLog: (msg: string) => void
 let compressToolText: (text: string) => string
+/** ctxmode.ts 的默认导出（pi 扩展入口）：registerTools 的工具就是它注册的。 */
+let ctxmodeExtension: (pi: unknown) => void
 
 let tmpDir: string
 const logPath = () => path.join(tmpDir, "ctxmode.log")
@@ -64,6 +76,7 @@ before(async () => {
   CtxmodeClient = mod.CtxmodeClient
   diagLog = mod.diagLog
   compressToolText = mod.compressToolText
+  ctxmodeExtension = mod.default
 
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ctxmode-test-"))
   process.env.CTXMODE_DIAG_DIR = tmpDir
@@ -295,6 +308,96 @@ function writeStubBin(name: string, body: string): string {
   return p
 }
 
+/**
+ * 回复 initialize / tools/list 的最小 ctxmode 替身，并把收到的每一行 JSON-RPC
+ * 追加到 $CTXMODE_TEST_RECV —— 用来断言"取消通知是否真的写给了服务端"。
+ */
+function writeRecordingStubBin(name: string): string {
+  return writeStubBin(
+    name,
+    [
+      'const fs = require("fs");',
+      'if (process.env.CTXMODE_TEST_PIDLOG) fs.appendFileSync(process.env.CTXMODE_TEST_PIDLOG, process.pid + "\\n");',
+      'let buf = "";',
+      'process.stdin.setEncoding("utf8");',
+      'process.stdin.on("data", (chunk) => {',
+      '  buf += chunk;',
+      '  let idx;',
+      '  while ((idx = buf.indexOf("\\n")) >= 0) {',
+      '    const line = buf.slice(0, idx);',
+      '    buf = buf.slice(idx + 1);',
+      '    if (!line.trim()) continue;',
+      '    if (process.env.CTXMODE_TEST_RECV) fs.appendFileSync(process.env.CTXMODE_TEST_RECV, line + "\\n");',
+      '    let msg;',
+      '    try { msg = JSON.parse(line); } catch { continue; }',
+      '    if (msg.method === "initialize") {',
+      '      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id,',
+      '        result: { protocolVersion: "2024-11-05", capabilities: {},',
+      '          serverInfo: { name: "ctxmode", version: "stub" }, instructions: "stub" } }) + "\\n");',
+      '    } else if (msg.method === "tools/list") {',
+      '      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id,',
+      '        result: { tools: [{ name: "ctx_run", description: "stub", inputSchema: { type: "object" } }] } }) + "\\n");',
+      '    }',
+      '  }',
+      '});',
+      'process.stdin.resume();',
+    ].join("\n"),
+  )
+}
+
+/** 握手完成后延迟退出的 stub：用来验证"进程崩溃后仍会自动重连"这条既有兜底。 */
+function writeCrashingStubBin(name: string, crashAfterMs: number): string {
+  return writeStubBin(
+    name,
+    [
+      'const fs = require("fs");',
+      'if (process.env.CTXMODE_TEST_PIDLOG) fs.appendFileSync(process.env.CTXMODE_TEST_PIDLOG, process.pid + "\\n");',
+      'let buf = "";',
+      'let served = false;',
+      'process.stdin.setEncoding("utf8");',
+      'setTimeout(() => process.exit(3), ' + String(crashAfterMs) + ');',
+      'process.stdin.on("data", (chunk) => {',
+      '  buf += chunk;',
+      '  let idx;',
+      '  while ((idx = buf.indexOf("\\n")) >= 0) {',
+      '    const line = buf.slice(0, idx);',
+      '    buf = buf.slice(idx + 1);',
+      '    if (!line.trim()) continue;',
+      '    let msg;',
+      '    try { msg = JSON.parse(line); } catch { continue; }',
+      '    if (msg.method === "initialize") {',
+      '      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id,',
+      '        result: { protocolVersion: "2024-11-05", capabilities: {},',
+      '          serverInfo: { name: "ctxmode", version: "stub" }, instructions: "stub" } }) + "\\n");',
+      '    } else if (msg.method === "tools/list") {',
+      '      served = true;',
+      '      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id,',
+      '        result: { tools: [{ name: "ctx_run", description: "stub", inputSchema: { type: "object" } }] } }) + "\\n");',
+      '    }',
+      '  }',
+      '});',
+      'process.stdin.resume();',
+    ].join("\n"),
+  )
+}
+
+/** 极简 ExtensionAPI 替身：只留下测试要用的 on/registerTool。 */
+function fakePi() {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>()
+  const tools = new Map<string, Record<string, unknown>>()
+  const pi = {
+    on(event: string, handler: (...args: unknown[]) => unknown) {
+      handlers.set(event, handler)
+      return () => handlers.delete(event)
+    },
+    registerTool(tool: Record<string, unknown>) {
+      tools.set(String(tool.name), tool)
+    },
+    registerCommand() {},
+  }
+  return { pi, handlers, tools }
+}
+
 function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0)
@@ -381,4 +484,295 @@ test("timeoutForTool: fetch 默认大于服务端 150s，并读取 timeout_ms", 
   assert.ok(custom >= 230000, `timeout_ms 200000 + buffer, got ${custom}`)
   const snake = c.timeoutForTool("ctx_run", { action: "run_task", timeout_ms: 400000 })
   assert.ok(snake >= 430000, `timeout_ms still works, got ${snake}`)
+})
+
+// ---- Esc / 客户端超时必须闭环成 notifications/cancelled ----
+// 背景：pi 只做前端中止（session.abort）而不会替 MCP 子进程收尸；ctxmode 的
+// runCmd 只在 handler ctx 被取消时才 kill 子进程组。若桥不发取消通知，子进程
+// 会一路跑到服务端默认超时（execute 30s / run_task 5min）——用户按 Esc 却杀不掉。
+
+/** 装一个只记录 stdin 写入的假 proc，并直接标记 initialized（跳过 start 握手）。 */
+function stubRecordingProc(c: ClientTestSurface): string[] {
+  const writes: string[] = []
+  c.initialized = true
+  c.proc = {
+    stdin: {
+      end: () => {},
+      write: (line: string) => {
+        writes.push(line)
+      },
+    },
+  } as unknown as ClientTestSurface["proc"]
+  return writes
+}
+
+/** 取出在途请求（不存在即断言失败），并清掉它的超时计时器后响应它让 promise 落地。 */
+function settleWith(
+  c: ClientTestSurface,
+  id: number,
+  result: { content: Array<{ type: string; text: string }> },
+): Promise<unknown> {
+  const entry = c.pending.get(id)
+  assert.ok(entry, `request ${id} 应在 pending 中`)
+  if (entry.timer) clearTimeout(entry.timer) // 否则 120s 计时器挂住事件循环
+  entry.resolve(result)
+  return Promise.resolve(result)
+}
+
+const nextTick = () => new Promise((r) => setImmediate(r))
+
+test("Esc（AbortSignal.abort）→ 发 notifications/cancelled 并立刻拒绝等待，不留 120s 计时器", async () => {
+  const c = newClient()
+  const writes = stubRecordingProc(c)
+  const ctrl = new AbortController()
+
+  const done = c.callTool(
+    "ctx_run",
+    { action: "execute", argv: ["sleep", "300"] },
+    ctrl.signal,
+  )
+  await nextTick()
+  assert.equal(writes.length, 1, "先发 tools/call")
+  const req = JSON.parse(writes[0])
+  assert.equal(req.method, "tools/call")
+  assert.equal(c.pending.size, 1, "请求在途")
+
+  ctrl.abort() // 用户按 Esc
+  assert.equal(writes.length, 2, "abort 后立刻补发取消通知")
+  // 顺序不变量：请求必须先上线，取消通知才可能命中在途的 requestId；
+  // 早发的取消服务端 preempter 根本找不到目标，等于白写、请求照跑到超时。
+  const idxReq = writes.findIndex((w) => w.includes('"tools/call"'))
+  const idxCancel = writes.findIndex((w) => w.includes('"notifications/cancelled"'))
+  assert.ok(idxReq >= 0 && idxCancel >= 0, "tools/call 与取消通知都必须写出")
+  assert.ok(idxReq < idxCancel, `request(idx ${idxReq}) 必须先于 cancel(idx ${idxCancel})`)
+  const notify = JSON.parse(writes[1])
+  assert.equal(notify.method, "notifications/cancelled")
+  assert.equal(notify.params.requestId, req.id, "requestId 必须对上前一个 tools/call")
+  assert.match(String(notify.params.reason), /esc/, "reason 说明是用户中止")
+  assert.equal(c.pending.size, 0, "本地等待同步结束，不等服务端回包")
+  await assert.rejects(done, /cancelled \(user pressed esc\)/, "Esc 后立刻 reject，不干等超时")
+})
+
+test("客户端超时也发取消通知，不把子进程丢给服务端默认超时", async () => {
+  const c = newClient()
+  const writes = stubRecordingProc(c)
+  c.timeoutForTool = () => 20
+
+  await assert.rejects(
+    () => c.callTool("ctx_run", { action: "execute", argv: ["sleep", "300"] }),
+    /timed out after 20ms/,
+  )
+  assert.equal(writes.length, 2, "超时后先发取消再 reject")
+  const notify = JSON.parse(writes[1])
+  assert.equal(notify.method, "notifications/cancelled")
+  assert.equal(notify.params.requestId, 1)
+  assert.match(String(notify.params.reason), /client gave up/, "reason 标明是客户端放弃")
+  assert.equal(c.pending.size, 0, "pending 已清空")
+})
+
+test("无 signal 且正常返回：只写 tools/call，绝不发取消通知", async () => {
+  const c = newClient()
+  const writes = stubRecordingProc(c)
+
+  const done = c.callTool("ctx_git", { action: "status" })
+  await nextTick()
+  assert.equal(writes.length, 1, "无 signal → 只有 tools/call，没有多余通知")
+  assert.ok(!writes[0].includes("cancelled"), "不得出现取消通知")
+
+  settleWith(c, 1, { content: [{ type: "text", text: "CLEAN" }] })
+  assert.equal(await done, "CLEAN")
+})
+
+test("调用前 signal 已 abort：不发请求、不发通知，直接拒绝", async () => {
+  const c = newClient()
+  const writes = stubRecordingProc(c)
+  const ctrl = new AbortController()
+  ctrl.abort()
+
+  await assert.rejects(
+    () => c.callTool("ctx_run", { action: "execute", argv: ["sleep", "300"] }, ctrl.signal),
+    /cancelled \(user pressed esc\)/,
+  )
+  assert.equal(writes.length, 0, "未连接上就取消：连 tools/call 都不该写")
+  assert.equal(c.pending.size, 0)
+})
+
+test("abort 晚于响应到达：请求已完成，不再补发取消通知", async () => {
+  const c = newClient()
+  const writes = stubRecordingProc(c)
+  const ctrl = new AbortController()
+
+  const done = c.callTool("ctx_git", { action: "status" }, ctrl.signal)
+  await nextTick()
+  settleWith(c, 1, { content: [{ type: "text", text: "CLEAN" }] })
+  assert.equal(await done, "CLEAN")
+
+  ctrl.abort() // 结果已回收之后 abort
+  assert.equal(writes.length, 1, "无在途请求 → 不再写取消通知")
+  assert.ok(!writes.some((w) => w.includes("cancelled")), "不得出现取消通知")
+})
+
+// ---- 扩展层：abort 必须让工具调用 reject（与 pi 内置工具一致），而不是
+// 变成一段 "ctxmode error: ... cancelled" 的成功结果留在对话历史里。----
+test("扩展层：ctx_run 在 abort 时 reject，且不向服务端发 tools/call", async () => {
+  const recvPath = path.join(tmpDir, "ext-recv.jsonl")
+  fs.writeFileSync(recvPath, "")
+  const bin = writeRecordingStubBin("recording-ctxmode")
+  process.env.CTXMODE_BIN = bin
+  process.env.CTXMODE_TEST_RECV = recvPath
+  process.env.CTXMODE_DISPOSE_WAIT_MS = "50"
+  try {
+    const { pi, handlers, tools } = fakePi()
+    ctxmodeExtension(pi)
+    const start = handlers.get("session_start") as (
+      e: unknown,
+      ctx: unknown,
+    ) => Promise<void>
+    await start({ type: "session_start" }, { cwd: tmpDir, ui: { notify() {} } })
+
+    const ctxRun = tools.get("ctx_run") as {
+      execute: (
+        id: string,
+        params: Record<string, unknown>,
+        signal?: AbortSignal,
+        onUpdate?: unknown,
+        ctx?: unknown,
+      ) => Promise<unknown>
+    }
+    assert.ok(ctxRun, "ctx_run 已注册")
+
+    const ctrl = new AbortController()
+    ctrl.abort() // 用户早已按过 Esc
+    await assert.rejects(
+      () => ctxRun.execute("id-1", { action: "execute", argv: ["sleep", "300"] }, ctrl.signal),
+      /cancelled \(user pressed esc\)/,
+      "abort 时必须 reject，而不是返回 error 文本结果",
+    )
+
+    const lines = fs.readFileSync(recvPath, "utf8").trim().split("\n").filter(Boolean)
+    const methods = lines.map((l) => JSON.parse(l).method)
+    assert.ok(methods.includes("initialize") && methods.includes("tools/list"), "握手正常")
+    assert.ok(!methods.includes("tools/call"), "已取消 → 不该发出 tools/call")
+    assert.ok(!methods.includes("notifications/cancelled"), "没有在途请求可取消")
+
+    const shutdown = handlers.get("session_shutdown") as () => Promise<void>
+    await shutdown()
+  } finally {
+    delete process.env.CTXMODE_BIN
+    delete process.env.CTXMODE_TEST_RECV
+    delete process.env.CTXMODE_DISPOSE_WAIT_MS
+  }
+})
+
+// ---- 显式停止是终态：stop 之后不得再被内部重连拉起新进程 ----
+// 这是 shutdown 竞态的根因：stopped 曾会被 start() 里的 `this.stopped = false`
+// 无条件抹掉，于是 stop() 路径上被 cleanup() 拒绝的在途调用，会经 callTool 的
+// reconnect 分支把 client 复活，spawn 出一个扩展侧已引用不到的进程。
+const spawnCount = () =>
+  fs.readFileSync(process.env.CTXMODE_TEST_PIDLOG!, "utf8").trim().split("\n").filter(Boolean).length
+
+const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/** 轮询直到 predicate 成立或超时（返回是否成立）。 */
+async function waitUntil(predicate: () => boolean, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await sleepMs(25)
+  }
+  return predicate()
+}
+
+test("stop 之后的 start() 一律拒绝，且不拉起任何进程", async () => {
+  const pidLog = path.join(tmpDir, "stop-guard-pids.log")
+  fs.writeFileSync(pidLog, "")
+  process.env.CTXMODE_BIN = writeRecordingStubBin("stop-guard-bin")
+  process.env.CTXMODE_TEST_RECV = path.join(tmpDir, "stop-guard-recv.jsonl")
+  process.env.CTXMODE_TEST_PIDLOG = pidLog
+  process.env.CTXMODE_DISPOSE_WAIT_MS = "50"
+  try {
+    const c = newClient()
+    c.stopped = true // 等价 stop() 之后的终态
+    await assert.rejects(() => c.start(), /was stopped/, "显式停止后拒绝启动")
+    assert.equal(spawnCount(), 0, "一个进程都不该拉起")
+  } finally {
+    delete process.env.CTXMODE_BIN
+    delete process.env.CTXMODE_TEST_RECV
+    delete process.env.CTXMODE_TEST_PIDLOG
+    delete process.env.CTXMODE_DISPOSE_WAIT_MS
+  }
+})
+
+test("在途长任务 + session_shutdown：只 spawn 1 个进程，不泄漏第二个", async () => {
+  const pidLog = path.join(tmpDir, "shutdown-race-pids.log")
+  const recvPath = path.join(tmpDir, "shutdown-race-recv.jsonl")
+  fs.writeFileSync(pidLog, "")
+  fs.writeFileSync(recvPath, "")
+  process.env.CTXMODE_BIN = writeRecordingStubBin("shutdown-race-bin")
+  process.env.CTXMODE_TEST_RECV = recvPath
+  process.env.CTXMODE_TEST_PIDLOG = pidLog
+  process.env.CTXMODE_DISPOSE_WAIT_MS = "50"
+  try {
+    const { pi, handlers, tools } = fakePi()
+    ctxmodeExtension(pi)
+    await (handlers.get("session_start") as (e: unknown, c: unknown) => Promise<void>)(
+      { type: "session_start" },
+      { cwd: tmpDir, ui: { notify() {} } },
+    )
+    const ctxRun = tools.get("ctx_run") as {
+      execute: (id: string, p: Record<string, unknown>) => Promise<unknown>
+    }
+
+    // stub 永不回复 tools/call → 调用一直挂在途（等价一个长任务）
+    const settled = ctxRun
+      .execute("id-1", { action: "run_task", kind: "go_test", timeout_ms: 600000 })
+      .then(
+        (r) => ({
+          rejected: false,
+          text: (r as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? "",
+        }),
+        (e: Error) => ({ rejected: true, text: e?.message ?? "" }),
+      )
+    await waitUntil(() => spawnCount() === 1, 3000)
+    assert.equal(spawnCount(), 1, "启动只 spawn 1 个")
+
+    await (handlers.get("session_shutdown") as () => Promise<void>)()
+    const outcome = await settled
+    assert.equal(outcome.rejected, false, "disconnect 走文本错误路径（与其它错误一致）")
+    assert.match(outcome.text, /ctxmode disconnected/, "stop 后调用应以 disconnected 收尾")
+    // 给任何错误的重连留足时间（重连是同步发起、无退避）；若有第二个 spawn 会立刻出现
+    await sleepMs(500)
+    assert.equal(spawnCount(), 1, "stop 后不得再拉起第二个进程（回归：shutdown 竞态）")
+  } finally {
+    delete process.env.CTXMODE_BIN
+    delete process.env.CTXMODE_TEST_RECV
+    delete process.env.CTXMODE_TEST_PIDLOG
+    delete process.env.CTXMODE_DISPOSE_WAIT_MS
+  }
+})
+
+test("回归保护：进程崩溃后仍会自动重连（修复没有削弱既有兜底）", async () => {
+  const pidLog = path.join(tmpDir, "crash-restart-pids.log")
+  fs.writeFileSync(pidLog, "")
+  process.env.CTXMODE_BIN = writeCrashingStubBin("crash-restart-bin", 400)
+  process.env.CTXMODE_TEST_RECV = path.join(tmpDir, "crash-restart-recv.jsonl")
+  process.env.CTXMODE_TEST_PIDLOG = pidLog
+  process.env.CTXMODE_DISPOSE_WAIT_MS = "50"
+  try {
+    const c = newClient()
+    await c.start()
+    assert.equal(spawnCount(), 1, "首次启动")
+    // stub 400ms 后 exit(3) → 异常退出 → scheduleRestart 退避重拉
+    const restarted = await waitUntil(() => spawnCount() >= 2, 6000)
+    assert.equal(restarted, true, "进程崩溃后仍应自动重连（stopped=false 不受 start 守卫影响）")
+    await c.stop()
+    const afterStop = spawnCount()
+    await sleepMs(600)
+    assert.equal(spawnCount(), afterStop, "stop 之后重启链也停住")
+  } finally {
+    delete process.env.CTXMODE_BIN
+    delete process.env.CTXMODE_TEST_RECV
+    delete process.env.CTXMODE_TEST_PIDLOG
+    delete process.env.CTXMODE_DISPOSE_WAIT_MS
+  }
 })

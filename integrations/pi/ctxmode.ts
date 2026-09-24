@@ -237,7 +237,24 @@ export class CtxmodeClient {
     this.workdir = workdir
   }
 
+  /**
+   * 启动（或复用在途的握手）。
+   *
+   * 显式停止（stop()）对这个 client 是终态：stop 之后再调 start() 一律拒绝。
+   * 背景：在途 tools/call 被 stop() 路径上的 cleanup() 以 "ctxmode disconnected"
+   * 拒绝后，callTool 的 catch 会走重连分支调 start()，于是本该死掉的进程又被拉起
+   * 一个——而扩展侧这时已把 client 置 null（/ctxmode-stop、session_shutdown
+   * 都如此），新进程引用不到、也没法再 stop，只能等宿主退出才收尾。
+   *
+   * 只挡"显式停止后"，因此不影响：
+   *   - 进程崩溃/异常退出后的自动重连（stopped 仍为 false）；
+   *   - /ctxmode-start 与 session_start：两者都会新建 CtxmodeClient 实例，
+   *     不会复用已停止的客户端。
+   */
   async start(): Promise<void> {
+    if (this.stopped) {
+      throw new Error("ctxmode client was stopped; create a new client (e.g. /ctxmode-start) instead")
+    }
     if (this.proc && this.initialized) return
     if (this.starting) return this.starting
     this.stopped = false
@@ -427,7 +444,22 @@ export class CtxmodeClient {
     }
   }
 
-  private sendRequest(method: string, params: Record<string, unknown>, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<MCPToolResult> {
+  /**
+   * 发 JSON-RPC 请求并等待响应。onId（可选）在写入前同步回调 request id，
+   * 调用方据此把 id 交给取消通道（notifications/cancelled）。
+   *
+   * 超时只代表"客户端不再等"，不等于"服务端取消"：放弃前必须先把 cancel
+   * 通知写给服务端，否则 ctxmode 的 tools/call handler ctx 不会取消，
+   * executor.runCmd 的 ctx.Done 两段式 kill 不会触发，子进程会一路跑到自己的
+   * 默认超时（execute 30s / run_task 5min / background 1h）才死——表现就是
+   * "用户按了 Esc，命令还在后台跑"。
+   */
+  private sendRequest(
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs: number = REQUEST_TIMEOUT_MS,
+    onId?: (id: number) => void,
+  ): Promise<MCPToolResult> {
     return new Promise((resolve, reject) => {
       if (!this.proc?.stdin) {
         reject(new Error("ctxmode not running"))
@@ -438,11 +470,36 @@ export class CtxmodeClient {
       const timer = setTimeout(() => {
         if (!this.pending.has(id)) return
         this.pending.delete(id)
+        this.cancelRequest(id, `client gave up after ${timeoutMs}ms`)
         reject(new Error(`ctxmode ${method} timed out after ${timeoutMs}ms`))
       }, timeoutMs)
       this.pending.set(id, { resolve, reject, timer })
+      // onId 必须晚于写入：取消通知若先于请求上线，服务端的 preempter 找不到
+      // 在途请求，取消就落空了，tools/call 仍会跑到默认超时。
       this.proc.stdin.write(JSON.stringify(req) + "\n")
+      onId?.(id)
     })
+  }
+
+  /**
+   * 发 MCP 标准取消通知 notifications/cancelled。ctxmode 服务端的 preempter
+   * 收到后会取消该 tools/call 的 handler context，executor.runCmd 的 ctx.Done
+   * 分支随即对进程组 kill(-pgid, SIGTERM)→3s→SIGKILL（并清扫 setsid 逃逸者），
+   * 子进程随请求一起终止。未持有子进程时静默返回。
+   */
+  private cancelRequest(id: number, reason: string): void {
+    if (!this.proc?.stdin || id <= 0) return
+    try {
+      this.proc.stdin.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "notifications/cancelled",
+          params: { requestId: id, reason },
+        }) + "\n",
+      )
+    } catch (err) {
+      diagLog(`cancel notify for request ${id} failed: ${errMessage(err)}`)
+    }
   }
 
   private sendNotification(method: string, params?: Record<string, unknown>): void {
@@ -472,21 +529,66 @@ export class CtxmodeClient {
     return Math.min(base, 3600000 + 60000)
   }
 
-  async callTool(name: string, args: Record<string, unknown>): Promise<string> {
+  /**
+   * 执行一次 tools/call。signal 是 pi 在用户按 Esc（session.abort）时触发的
+   * AbortSignal；必须转发成服务端的 notifications/cancelled，否则 pi 只是自己
+   * 不等了，ctxmode 的子进程仍会跑到默认超时才被杀。
+   */
+  async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+    if (signal?.aborted) {
+      throw new Error("ctxmode tool call cancelled (user pressed esc)")
+    }
     if (!this.initialized) {
       await this.start()
+      // start 是 15s 级的握手/重连窗口，期间用户按 Esc 同样必须作数：
+      // 否则刚拉起的连接会立刻跑一个注定被丢弃的 tools/call。
+      if (signal?.aborted) {
+        throw new Error("ctxmode tool call cancelled (user pressed esc)")
+      }
     }
     if (!this.initialized) throw new Error("ctxmode not initialized")
     const timeoutMs = this.timeoutForTool(name, args)
+
+    let requestId = 0
+    let listener: (() => void) | null = null
+    const onAbort = () => {
+      // 只取消仍在途的请求：条目已被 resolve/reject（含异常退出后的重连把
+      // this.proc 换成新进程）时，写出去的通知会落到一条服务端不认识的
+      // requestId 上，既无用也可能打到新连接。
+      const entry = requestId > 0 ? this.pending.get(requestId) : undefined
+      if (!entry) return
+      // 1) 通知服务端取消（服务端据此 kill 子进程组），2) 本地立刻结束等待
+      this.cancelRequest(requestId, "tool call aborted by user (esc)")
+      if (entry.timer) clearTimeout(entry.timer)
+      this.pending.delete(requestId)
+      entry.reject(new Error("ctxmode tool call cancelled (user pressed esc)"))
+    }
+    if (signal) {
+      listener = onAbort
+      if (!signal.aborted) signal.addEventListener("abort", onAbort, { once: true })
+    }
     try {
-      const result = await this.sendRequest("tools/call", { name, arguments: args }, timeoutMs)
+      const result = await this.sendRequest(
+        "tools/call",
+        { name, arguments: args },
+        timeoutMs,
+        (id) => {
+          requestId = id
+          // 竞态兜底：id 尚未拿到时用户已按 Esc，此刻立即补发取消通知
+          if (signal?.aborted) onAbort()
+        },
+      )
       const text = result.content?.map((c) => c.text).join("\n") || ""
       this.restartAttempts = 0
       return compressToolText(text)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      // Do not restart+retry on tool-call timeout: long jobs may still be running
-      // server-side and a retry would duplicate work / orphan processes.
+      // 取消（用户按 Esc）：通知已发、本地已拒绝，静默上抛，不重连更不重放。
+      if (/cancelled/i.test(msg)) {
+        throw err
+      }
+      // 超时（或 Esc 取消）后不重连重放 tools/call：长任务可能仍在服务端跑，
+      // 重放会重复工作/留下孤儿进程。取消通知由 sendRequest/onAbort 负责发送。
       if (/timed out/i.test(msg)) {
         throw err
       }
@@ -498,6 +600,9 @@ export class CtxmodeClient {
         throw err
       }
       throw err
+    } finally {
+      // 无论成败都摘掉 abort 监听，避免跨调用累积
+      if (signal && listener) signal.removeEventListener("abort", listener)
     }
   }
 
@@ -643,7 +748,7 @@ ${serverInstructions}`,
 // ---- Tool Registration (v2.0 category tools; MCP names match) ----
 
 function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) {
-  const run = async (name: string, params: Record<string, unknown>) => {
+  const run = async (name: string, params: Record<string, unknown>, signal?: AbortSignal) => {
     const c = getClient()
     if (!c) {
       return {
@@ -652,10 +757,17 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       }
     }
     try {
-      const result = await c.callTool(name, params)
+      const result = await c.callTool(name, params, signal)
       return { content: [{ type: "text" as const, text: result }], details: {} }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
+      // 取消（用户按 Esc）不能像别的错误那样吞成一段 "ctxmode error: ..." 文本：
+      // pi 的内置工具在 abort 时是 reject（见 pi bundle "Operation aborted"），
+      // 宿主据此把这次调用标记为 cancelled 并丢弃本轮结果。吞掉会让取消伪装成
+      // 一次成功的工具调用，把 "ctxmode error: ... cancelled" 留进对话历史。
+      if (/cancelled \(user pressed esc\)/.test(msg)) {
+        throw err
+      }
       return {
         content: [{ type: "text" as const, text: `ctxmode error: ${msg}` }],
         details: {},
@@ -672,7 +784,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
     promptGuidelines: [
       "Use ctx_run action=run_task for go/npm/cargo/make test and build.",
       "Use ctx_run action=execute for shell/code; prefer argv over command.",
-      "Use ctx_run action=batch for multiple commands with optional queries.",
+      "Use ctx_run action=execute for shell/code; prefer argv over command.",
     ],
     parameters: Type.Object({
       action: Type.String({ description: "execute|execute_file|batch|run_task", enum: ["execute", "execute_file", "batch", "run_task"] }),
@@ -695,8 +807,8 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       target: Type.Optional(Type.String()),
       args: Type.Optional(Type.Array(Type.String())),
     }),
-    async execute(_id, params) {
-      return run("ctx_run", params as Record<string, unknown>)
+    async execute(_id, params, signal) {
+      return run("ctx_run", params as Record<string, unknown>, signal)
     },
   })
 
@@ -724,8 +836,8 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       context: Type.Optional(Type.Number()),
       literal: Type.Optional(Type.Boolean()),
     }),
-    async execute(_id, params) {
-      return run("ctx_fs", params as Record<string, unknown>)
+    async execute(_id, params, signal) {
+      return run("ctx_fs", params as Record<string, unknown>, signal)
     },
   })
 
@@ -745,8 +857,8 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       n: Type.Optional(Type.Number()),
       oneline: Type.Optional(Type.Boolean()),
     }),
-    async execute(_id, params) {
-      return run("ctx_git", params as Record<string, unknown>)
+    async execute(_id, params, signal) {
+      return run("ctx_git", params as Record<string, unknown>, signal)
     },
   })
 
@@ -777,8 +889,8 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       sessionId: Type.Optional(Type.String()),
       dryRun: Type.Optional(Type.Boolean()),
     }),
-    async execute(_id, params) {
-      return run("ctx_kb", params as Record<string, unknown>)
+    async execute(_id, params, signal) {
+      return run("ctx_kb", params as Record<string, unknown>, signal)
     },
   })
 
@@ -796,8 +908,8 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       tail_bytes: Type.Optional(Type.Number()),
       timeout_ms: Type.Optional(Type.Number({ description: "ms (default 60000, max 3600000; does not kill)" })),
     }),
-    async execute(_id, params) {
-      return run("ctx_bg", params as Record<string, unknown>)
+    async execute(_id, params, signal) {
+      return run("ctx_bg", params as Record<string, unknown>, signal)
     },
   })
 }
