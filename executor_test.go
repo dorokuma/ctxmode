@@ -992,23 +992,44 @@ func TestToolExecute_ArgvEnvStdin(t *testing.T) {
 	}
 }
 
+// TestValidateArgv locks the post-fence contract: validateArgv normalizes
+// argv[0] but never restricts it to a workspace. Only an empty argv and an
+// empty argv[0] are rejected; an absolute path outside every workdir is passed
+// through (cleaned), because argv and a bare name now mean the same thing.
 func TestValidateArgv(t *testing.T) {
 	wd := t.TempDir()
 	s := testServerWithWorkdir(t, wd)
-	// simple name ok
+	// simple name ok — passed through verbatim for exec.LookPath at spawn time
 	got, err := s.validateArgv([]string{"echo", "a"}, wd)
 	if err != nil || got[0] != "echo" {
 		t.Fatalf("simple: got=%v err=%v", got, err)
 	}
-	// empty rejected
+	// empty argv / empty argv[0] still rejected
 	if _, err := s.validateArgv(nil, wd); err == nil {
-		t.Fatal("empty argv")
+		t.Fatal("expected empty argv rejected")
 	}
-	// outside path rejected
-	if _, err := s.validateArgv([]string{"/etc/passwd"}, wd); err == nil {
-		t.Fatal("expected outside path rejected")
+	if _, err := s.validateArgv([]string{""}, wd); err == nil {
+		t.Fatal("expected empty argv[0] rejected")
 	}
-	// workdir-relative path ok
+	// absolute path OUTSIDE every workspace is allowed and kept
+	got, err = s.validateArgv([]string{"/bin/echo", "hi"}, wd)
+	if err != nil {
+		t.Fatalf("absolute path must be allowed: %v", err)
+	}
+	if got[0] != "/bin/echo" {
+		t.Fatalf("absolute path must be preserved, got %q", got[0])
+	}
+	// ...and cleaned to one canonical spelling
+	got, err = s.validateArgv([]string{"/usr/bin/./echo"}, wd)
+	if err != nil || got[0] != "/usr/bin/echo" {
+		t.Fatalf("absolute path must be cleaned: got=%q err=%v", got[0], err)
+	}
+	// argv[1:] is never rewritten
+	got, err = s.validateArgv([]string{"/bin/echo", "../etc"}, wd)
+	if err != nil || got[1] != "../etc" {
+		t.Fatalf("argv[1:] must be untouched: got=%v err=%v", got, err)
+	}
+	// workdir path ok (kept as-is)
 	tool := filepath.Join(wd, "mytool")
 	if err := os.WriteFile(tool, []byte("#!/bin/sh\necho ok\n"), 0755); err != nil {
 		t.Fatal(err)
@@ -1017,8 +1038,16 @@ func TestValidateArgv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("workdir path: %v", err)
 	}
-	if got[0] != tool && !strings.HasPrefix(got[0], wd) {
-		t.Fatalf("expected resolved under wd, got %q", got[0])
+	if got[0] != tool {
+		t.Fatalf("expected %q, got %q", tool, got[0])
+	}
+	// ".." traversal is resolved and cleaned, not rejected
+	got, err = s.validateArgv([]string{"../outside/tool"}, wd)
+	if err != nil {
+		t.Fatalf("relative traversal must not be rejected: %v", err)
+	}
+	if want := filepath.Clean(filepath.Join(wd, "../outside/tool")); got[0] != want {
+		t.Fatalf("got %q want %q", got[0], want)
 	}
 
 	// Relative executable paths resolve from the requested cwd, including a

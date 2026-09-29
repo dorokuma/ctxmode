@@ -1479,6 +1479,11 @@ type executeResult struct {
 	Truncated  bool   `json:"truncated,omitempty"`
 	Indexed    bool   `json:"indexed,omitempty"`
 	IndexLabel string `json:"index_label,omitempty"`
+	// BackgroundID is the ctx_bg job id when this result is the START of a
+	// background job (empty for every foreground run). The job's real exit code
+	// is not observable here — it is known only to ctx_bg/ctx_bg wait — so the
+	// audit trail uses this id to name the job instead of reporting a status.
+	BackgroundID string `json:"background_id,omitempty"`
 }
 
 // runtimes maps language name to its configuration.
@@ -2383,7 +2388,8 @@ func runShellOpts(ctx context.Context, code, cwd string, timeout time.Duration, 
 }
 
 // runArgv runs exec.Command(argv[0], argv[1:]...) without a shell.
-// argv must already be validated (non-empty; argv[0] simple name or workdir path).
+// argv must already be normalized by validateArgv (non-empty, argv[0] a bare
+// name or a path); argv[0] is not restricted to the workspaces.
 func runArgv(ctx context.Context, argv []string, cwd string, timeout time.Duration, background bool, opts *runOptions) (*executeResult, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("argv must not be empty")
@@ -2715,7 +2721,8 @@ func runCmd(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, backgroun
 		return &executeResult{
 			Stdout: fmt.Sprintf("Process started in background (id: %s, PID: %d). Next: call ctx_bg action=wait with id %s (default timeout 60000ms; timeout does not kill). No proactive push; do not poll list/log. ctx_bg action=list|kill|log|wait remains available for snapshots, logs, and termination. Max age %s.",
 				entry.ID, cmd.Process.Pid, entry.ID, maxAge),
-			ExitCode: 0,
+			ExitCode:     0,
+			BackgroundID: entry.ID,
 		}, nil
 	}
 

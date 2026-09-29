@@ -311,8 +311,29 @@ type executeArgs struct {
 	Stdin      string            `json:"stdin,omitempty" jsonschema:"Stdin payload written to the process then closed (max 1MB)"`
 }
 
-func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args executeArgs) (*mcp.CallToolResult, any, error) {
+func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args executeArgs) (res *mcp.CallToolResult, out any, err error) {
 	useArgv := len(args.Argv) > 0
+
+	// Audit record for this call, emitted from a defer so every return path
+	// lands exactly one line. It is created before ANY validation — including the
+	// required-field check below — so all four ctx_run entry points start
+	// recording at the same point and a rejected call is in the trail too. The
+	// named results above are what the deferred closure folds in, so no return
+	// statement has to remember to report anything.
+	var result *executeResult
+	commandType, rawCmd := "command", args.Command
+	if useArgv {
+		commandType, rawCmd = "argv", strings.Join(args.Argv, " ")
+	}
+	audit := s.startAudit("execute", commandType, rawCmd)
+	audit.setInputs(args.Env, len(args.Stdin))
+	audit.rec.Background = args.Background
+	defer func() {
+		audit.setResult(result)
+		audit.setError(err)
+		audit.emit()
+	}()
+
 	if !useArgv && args.Command == "" {
 		return nil, nil, fmt.Errorf("command is required (or provide non-empty argv)")
 	}
@@ -341,6 +362,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		}
 		cwd = resolved
 	}
+	audit.rec.CWD = cwd
 
 	// Validate env allowlist and stdin size.
 	filteredEnv, err := filterExecEnv(args.Env)
@@ -356,8 +378,18 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 	}
 
 	// Execute: argv mode (no shell) takes priority over command string.
-	var result *executeResult
 	if useArgv {
+		audit.setArgv(args.Argv, cwd)
+		// Graded screen for argv mode, shared with run_task so both argv entry
+		// points behave identically: a NUL byte in any argument is a hard block
+		// (execve(2) rejects such an argument with EINVAL, so the spawn can never
+		// succeed), an over-length argv is only warned about (argv is not a shell
+		// string and large build/codegen arguments are legitimate).
+		verdict, rule, serr := applyArgvScreen(args.Argv, rawCmd)
+		audit.setScreen(verdict, rule)
+		if serr != nil {
+			return nil, nil, serr
+		}
 		argv, aerr := s.validateArgv(args.Argv, cwd)
 		if aerr != nil {
 			return nil, nil, aerr
@@ -368,11 +400,17 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		// (language empty or "shell"). shellBlock aborts; shellWarn is logged
 		// then the command runs. Non-shell interpreters are not content-screened.
 		if language == "" || language == "shell" {
-			if verdict, rule := screenShellCommand(args.Command); verdict == shellBlock {
+			verdict, rule := screenShellCommand(args.Command)
+			audit.setScreen(verdict, rule)
+			audit.setInterpreter("/bin/sh")
+			if verdict == shellBlock {
 				return nil, nil, fmt.Errorf("shell command blocked (%s)", rule)
 			} else if verdict == shellWarn {
 				logShellScreen(rule, args.Command)
 			}
+		} else if rt, ok := runtimes[language]; ok {
+			// Non-shell language: record the interpreter that will run the code.
+			audit.setInterpreter(rt.Exe)
 		}
 		result, err = runCodeOpts(ctx, language, args.Command, cwd, timeout, args.Background, opts)
 	}
@@ -803,7 +841,20 @@ type executeFileArgs struct {
 	CWD       string `json:"cwd,omitempty" jsonschema:"Working directory"`
 }
 
-func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, args executeFileArgs) (*mcp.CallToolResult, any, error) {
+func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, args executeFileArgs) (res *mcp.CallToolResult, out any, err error) {
+	// Audit record first, same as the other three entry points: the required-field
+	// checks below must not be able to skip the trail (see audit.go). raw_cmd
+	// carries the resolved path, the language and the caller's code; the injected
+	// FILE_CONTENT body is file content rather than caller input and is never
+	// recorded.
+	var result *executeResult
+	audit := s.startAudit("execute_file", "file", auditFileCommand(args.Path, args.Language, args.Code))
+	defer func() {
+		audit.setResult(result)
+		audit.setError(err)
+		audit.emit()
+	}()
+
 	if args.Path == "" {
 		return nil, nil, fmt.Errorf("path is required")
 	}
@@ -912,12 +963,22 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		}
 		cwd = resolved
 	}
+	audit.setCommand(auditFileCommand(target, language, args.Code), cwd)
+	if rt, ok := runtimes[language]; ok {
+		audit.setInterpreter(rt.Exe)
+	}
 
 	// Inject FILE_CONTENT into user code.
 	injectedCode := injectFileContent(language, args.Code, string(fileContent))
+	if language == "shell" {
+		// runShellOpts screens exactly this string (shellWrapper is the identity
+		// function), so recording it here reports the same verdict the runner
+		// will apply. Other languages run from a temp file and are not screened.
+		audit.setScreen(screenShellBlock(injectedCode))
+	}
 
 	// Execute the injected code.
-	result, err := runCode(ctx, language, injectedCode, cwd, timeout, false)
+	result, err = runCode(ctx, language, injectedCode, cwd, timeout, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1004,6 +1065,14 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		return textResult(sensitiveWithheldNotice(result.ExitCode, len(outputText), err), errorClass), nil, nil
 	}
 	return textResult(outputText, errorClass), nil, nil
+}
+
+// auditFileCommand renders one execute_file request as a single line for the
+// audit record: the resolved path, the language, and the caller's code. The
+// FILE_CONTENT body is deliberately left out — it is file content, and the
+// audit log is plaintext with no redaction step.
+func auditFileCommand(path, language, code string) string {
+	return fmt.Sprintf("path=%s language=%s code=%s", path, language, code)
 }
 
 // ---------- db helpers ----------
@@ -1744,9 +1813,19 @@ func (s *server) storeIndexLocked(path, content string) error {
 	return s.store.Index(path, content)
 }
 
-// validateArgv checks argv for ctx_run action=execute argv mode.
-// argv[0] must be a simple executable name (no path separators) or a path
-// resolved inside a workdir. Empty argv / empty argv[0] are rejected.
+// validateArgv checks argv for ctx_run action=execute argv mode and for
+// run_task's "custom" kind, and normalizes argv[0]. len(argv)==0 and
+// argv[0]=="" are rejected; everything else is passed through.
+//
+// argv[0] is deliberately NOT fenced to the workspaces: an absolute path is
+// cleaned and kept, a relative path is resolved against the requested cwd and
+// cleaned, and a bare command name is left untouched for exec.LookPath at spawn
+// time. Absolute paths and bare names therefore mean the same thing (both may
+// name anything the server user can execute), which is what the documented
+// trusted-environment model already says — the argv fence was the last place
+// still implying otherwise. The ctx_fs / ctx_git workspace fences
+// (resolvePath / ensureInsideWorkspaces) are untouched and still apply to
+// path/pathspec arguments.
 func (s *server) validateArgv(argv []string, cwd string) ([]string, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("argv must not be empty")
@@ -1755,34 +1834,39 @@ func (s *server) validateArgv(argv []string, cwd string) ([]string, error) {
 	if exe == "" {
 		return nil, fmt.Errorf("argv[0] must not be empty")
 	}
-	// Absolute or relative path -> must stay inside workspaces.
-	if strings.Contains(exe, "/") || strings.Contains(exe, string(filepath.Separator)) ||
-		strings.Contains(exe, `\`) || exe == "." || exe == ".." || strings.HasPrefix(exe, ".") {
-		target := exe
-		if !filepath.IsAbs(target) {
-			if cwd == "" {
-				cwd = s.workdirs[0]
-			}
-			target = filepath.Join(cwd, target)
-		}
-		target = filepath.Clean(target)
-		if !s.lexicallyInside(target) {
-			return nil, fmt.Errorf("argv[0] path %q is outside all workspaces", exe)
-		}
-		resolved, err := s.ensureInsideWorkspaces(target)
-		if err != nil {
-			return nil, fmt.Errorf("argv[0] path invalid: %w", err)
-		}
-		out := make([]string, len(argv))
-		copy(out, argv)
-		out[0] = resolved
-		return out, nil
+	resolved := s.resolveArgvExe(exe, cwd)
+	if resolved == exe {
+		return argv, nil
 	}
-	// Simple name: no path traversal.
-	if strings.Contains(exe, "..") {
-		return nil, fmt.Errorf("argv[0] %q is invalid", exe)
+	out := make([]string, len(argv))
+	copy(out, argv)
+	out[0] = resolved
+	return out, nil
+}
+
+// resolveArgvExe normalizes argv[0] without restricting it to a workspace.
+// Bare command names are returned verbatim (the kernel-side lookup is
+// exec.LookPath's job); a path is made absolute against cwd when relative, then
+// cleaned so "./x", "../x" and "dir/../x" have one canonical spelling.
+func (s *server) resolveArgvExe(exe, cwd string) string {
+	if filepath.IsAbs(exe) {
+		return filepath.Clean(exe)
 	}
-	return argv, nil
+	if !looksLikePath(exe) {
+		return exe
+	}
+	if cwd == "" && len(s.workdirs) > 0 {
+		cwd = s.workdirs[0]
+	}
+	return filepath.Clean(filepath.Join(cwd, exe))
+}
+
+// looksLikePath reports argv[0] spellings that name a file rather than a
+// command on PATH: anything containing a separator, or a dotted name
+// ("./tool", "../tool", ".hidden").
+func looksLikePath(exe string) bool {
+	return exe == "." || exe == ".." || strings.HasPrefix(exe, ".") ||
+		strings.ContainsRune(exe, filepath.Separator) || strings.ContainsRune(exe, '\\')
 }
 
 // resolvePath converts a user-supplied path into an absolute path within any workspace.

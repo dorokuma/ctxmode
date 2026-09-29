@@ -24,7 +24,7 @@ action argument.
 ## Usage policy
 
 - Prefer argv over shell command strings; prefer ctx_fs over shell find/ls/rg.
-- ctx_run execute command (language shell/unset) and batch commands run via a fixed, controlled /bin/sh -c (the SHELL variable is ignored; there is no command allowlist). argv bypasses the shell entirely and is path-validated — prefer it. The command screen logs (does not block) a few hostile-looking patterns and hard-blocks only NUL bytes or >64KiB.
+- ctx_run execute command (language shell/unset) and batch commands run via a fixed, controlled /bin/sh -c (the SHELL variable is ignored; there is no command allowlist). argv is exec'd directly, with no shell in between (so no shell-injection surface) and no path fence: any executable path or bare name the server user can run is allowed. The command screen logs (does not block) a few hostile-looking patterns and hard-blocks only a NUL byte or a command >64KiB; in argv mode a NUL byte in an argument is blocked and an over-length argv is only warned about. Every ctx_run call (all four entry points, one line per CALL — not per spawned subprocess) appends a record to a local audit log (CTXMODE_AUDIT_LOG, default /root/.local/state/ctxmode/audit.jsonl); nothing else is audited, and an unwritable or non-regular-file target is refused with a log line while the call itself still runs.
 - rg: search with a concrete identifier (e.g. MyFunc), never '.*' — grep is not a file reader.
 - rg: after 1-2 greps, Read the top-hit file instead of grepping again.
 - rg: for huge result sets use ctx_kb action=search or ctx_fs rg offset paging.

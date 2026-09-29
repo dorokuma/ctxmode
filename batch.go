@@ -179,9 +179,41 @@ func (s *server) executeCommand(ctx context.Context, command, cwd string) (outpu
 	}
 }
 
+// auditBatchCommand renders every label/command pair of one batch call into the
+// single raw_cmd string of its audit line (the line is capped by capAuditText).
+func auditBatchCommand(commands []batchCommand) string {
+	var b strings.Builder
+	for i, c := range commands {
+		if i > 0 {
+			b.WriteString(" ; ")
+		}
+		b.WriteString(c.Label)
+		b.WriteString(": ")
+		b.WriteString(c.Command)
+	}
+	return b.String()
+}
+
 // ---------- MCP tool handler ----------
 
-func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, args batchArgs) (*mcp.CallToolResult, any, error) {
+func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, args batchArgs) (res *mcp.CallToolResult, out any, err error) {
+	// Audit record (see audit.go): one line per batch call, emitted from a defer
+	// so failed submissions are recorded too. Batch has no single exit status, so
+	// the deferred closure folds in an aggregate (see setAggregate).
+	var (
+		batchExit    = auditExitNotRun
+		batchSeen    bool
+		batchOutput  int
+		batchTrunc   bool
+		batchResults []auditCommandResult
+	)
+	audit := s.startAudit("batch", "command", auditBatchCommand(args.Commands))
+	defer func() {
+		audit.setError(err)
+		audit.setAggregate(batchExit, batchOutput, batchTrunc, batchResults)
+		audit.emit()
+	}()
+
 	// Validate commands.
 	if len(args.Commands) == 0 {
 		return nil, nil, fmt.Errorf("commands is required")
@@ -222,6 +254,46 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 			return nil, nil, fmt.Errorf("invalid cwd: %w", err)
 		}
 		cwd = resolved
+	}
+	audit.rec.CWD = cwd
+
+	// Per-command screen, computed once and used twice: it feeds the call-level
+	// summary and the per-command entries of the audit line. Each command is
+	// screened again inside executeCommand, which is what actually blocks a bad
+	// command; this pass is for the record only. Keeping the rule per command is
+	// what stops a specific idiom rule from disappearing behind the size rule
+	// when both appear in one batch (the call-level fields can only report the
+	// worst verdict and one rule).
+	screenVerdicts := make([]shellVerdict, len(args.Commands))
+	screenRules := make([]string, len(args.Commands))
+	var blockRule, idiomRule, oversizeRule string
+	for i, cmd := range args.Commands {
+		v, r := screenShellCommand(cmd.Command)
+		screenVerdicts[i], screenRules[i] = v, r
+		switch v {
+		case shellBlock:
+			if blockRule == "" {
+				blockRule = r
+			}
+		case shellWarn:
+			if r == shellRuleOversized {
+				if oversizeRule == "" {
+					oversizeRule = r
+				}
+			} else if idiomRule == "" {
+				idiomRule = r
+			}
+		}
+	}
+	switch {
+	case blockRule != "":
+		audit.setScreen(shellBlock, blockRule)
+	case idiomRule != "":
+		audit.setScreen(shellWarn, idiomRule)
+	case oversizeRule != "":
+		audit.setScreen(shellWarn, oversizeRule)
+	default:
+		audit.setScreen(shellOK, "")
 	}
 
 	// Validate query_scope (batch or global, default batch). Invalid values are errors.
@@ -267,7 +339,7 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 	totalIndexed := 0
 	indexFailures := 0
 	anyTruncated := false
-	for _, r := range results {
+	for i, r := range results {
 		if r.Indexed {
 			totalIndexed++
 		}
@@ -277,7 +349,33 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 		if r.Truncated {
 			anyTruncated = true
 		}
+		batchOutput += r.Size
+		// Per-command outcomes are recorded as an array so the line stays
+		// machine-readable: the call-level exit_code alone cannot say which
+		// command failed, and the first version's comma-joined label list broke on
+		// a label containing a comma.
+		batchResults = append(batchResults, auditCommandResult{
+			Label:         r.Label,
+			ExitCode:      r.ExitCode,
+			ScreenVerdict: screenVerdicts[i].String(),
+			ScreenRule:    screenRules[i],
+			Indexed:       r.Indexed,
+			IndexLabel:    r.IndexLabel,
+		})
+		// Call-level exit status: 0 only when every command succeeded, otherwise
+		// the first non-zero code (including -1 for a blocked, skipped or killed
+		// command). batchSeen is tracked separately from the sentinel value on
+		// purpose: -1 is both "no exit status yet" and the code of a blocked/
+		// killed command, so using the sentinel as "no result yet" folded a first
+		// failure into a later success.
+		if !batchSeen {
+			batchExit = r.ExitCode
+			batchSeen = true
+		} else if batchExit == 0 && r.ExitCode != 0 {
+			batchExit = r.ExitCode
+		}
 	}
+	batchTrunc = anyTruncated
 
 	// ---------- handle queries ----------
 

@@ -47,7 +47,19 @@ type runTaskArgs struct {
 	Env       map[string]string `json:"env,omitempty" jsonschema:"Extra env (same allowlist as ctx_run action=execute; never PATH/HOME/LD_*)"`
 }
 
-func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args runTaskArgs) (*mcp.CallToolResult, any, error) {
+func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args runTaskArgs) (res *mcp.CallToolResult, out any, err error) {
+	// Audit record (see audit.go), emitted from a defer so every return path is
+	// recorded. raw_cmd starts as a request descriptor and is replaced by the
+	// real argv once it is built.
+	var result *executeResult
+	audit := s.startAudit("run_task", "task", fmt.Sprintf("kind=%s target=%s args=%s", args.Kind, args.Target, strings.Join(args.Args, " ")))
+	audit.setInputs(args.Env, 0)
+	defer func() {
+		audit.setResult(result)
+		audit.setError(err)
+		audit.emit()
+	}()
+
 	if args.Kind == "" {
 		return nil, nil, fmt.Errorf("kind is required (go_test|go_build|go_vet|npm_test|npm_run_build|cargo_test|cargo_build|make|custom)")
 	}
@@ -78,6 +90,7 @@ func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args r
 		}
 		cwd = resolved
 	}
+	audit.rec.CWD = cwd
 
 	// Env allowlist (same as ctx_run action=execute / P1).
 	filteredEnv, err := filterExecEnv(args.Env)
@@ -94,15 +107,29 @@ func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args r
 	if err != nil {
 		return nil, nil, err
 	}
+	audit.setCommand(strings.Join(argv, " "), cwd)
+	audit.setArgv(argv, cwd)
 
-	// custom (and any path-like argv[0]) go through validateArgv.
+	// Same argv screen as ctx_run action=execute: run_task's fixed kinds use
+	// simple exe names and "custom" takes a caller-supplied argv, so the grade is
+	// recorded here too instead of leaving run_task as an unscreened argv path.
+	// NUL bytes are already rejected element-wise by validateRunTaskArgElements
+	// with a more precise message, so in practice this records ok/warn.
+	verdict, rule, serr := applyArgvScreen(argv, strings.Join(argv, " "))
+	audit.setScreen(verdict, rule)
+	if serr != nil {
+		return nil, nil, serr
+	}
+
+	// custom (and any path-like argv[0]) go through validateArgv, which now only
+	// normalizes argv[0] — it no longer fences it to a workspace (see main.go).
 	// Fixed kinds use simple exe names (go/npm/cargo/make) which pass as-is.
 	argv, err = s.validateArgv(argv, cwd)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	result, err := runArgv(ctx, argv, cwd, timeout, false, opts)
+	result, err = runArgv(ctx, argv, cwd, timeout, false, opts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -120,7 +147,7 @@ func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args r
 	outputText := formatRunTaskOutput(args.Kind, argv, result)
 
 	// Auto-index large / intent-tagged outputs (same thresholds as toolExecute).
-	return s.finishRunTaskOutput(outputText, result.ExitCode, args.Kind, args.Intent)
+	return s.finishRunTaskOutput(outputText, result.ExitCode, args.Kind, args.Intent, audit)
 }
 
 var makeArgRe = regexp.MustCompile(`^[A-Za-z0-9_.-]+(?:=[A-Za-z0-9_.-]+)?$`)
@@ -279,7 +306,16 @@ func formatRunTaskOutput(kind string, argv []string, result *executeResult) stri
 
 // finishRunTaskOutput applies auto-index thresholds and shapes the MCP result.
 // On failure with large output, returns a tail preview + index label when indexed.
-func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, intent string) (*mcp.CallToolResult, any, error) {
+// The audit call is optional (variadic, at most one): when supplied it records the
+// label of an output that was actually indexed (the label is minted here, so the
+// caller cannot know it otherwise), and callers that have no audit record — the
+// tests, and any future non-audited caller — keep their existing call shape.
+// auditCall.setIndex is nil-safe for the same reason.
+func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, intent string, audit ...*auditCall) (*mcp.CallToolResult, any, error) {
+	var ac *auditCall
+	if len(audit) > 0 {
+		ac = audit[0]
+	}
 	labelBase := kind
 	if intent != "" {
 		labelBase = intent
@@ -312,6 +348,7 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 		// Search hint must use the index label (not empty intent).
 		msg := fmt.Sprintf("exit_code: %d\nOutput is too large (%d bytes). Indexed as %q. Use ctx_kb action=search query=%q to search the indexed content.\n\n--- Tail preview ---\n%s",
 			exitCode, len(outputText), label, label, preview)
+		ac.setIndex(label)
 		return textResult(msg, errorClass), nil, nil
 	}
 
@@ -334,6 +371,7 @@ func (s *server) finishRunTaskOutput(outputText string, exitCode int, kind, inte
 				exitCode, len(outputText), indexErr, preview), errorClass), nil, nil
 		}
 		preview := tailUTF8(outputText, runTaskPreviewBytes)
+		ac.setIndex(label)
 		return textResult(fmt.Sprintf("exit_code: %d\nOutput (%d bytes) indexed as %q. Use ctx_kb action=search query=%q to search.\n\n--- Tail preview ---\n%s",
 			exitCode, len(outputText), label, label, preview), errorClass), nil, nil
 	}
