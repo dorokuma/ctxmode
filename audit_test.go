@@ -707,9 +707,18 @@ func TestAudit_BatchAndRunTaskWireEntryPoints(t *testing.T) {
 		t.Fatalf("toolRunTask: %v", err)
 	}
 
+	// The auto-index branch writes through the store, which the audit fixture
+	// server does not carry (no other case in this family reaches it).
+	s.store = newTestStore(t)
+	if _, _, err := s.toolRunTask(context.Background(), nil, runTaskArgs{
+		Kind: "custom", Args: []string{"sh", "-c", "yes indexed_line | head -n 40000"},
+	}); err != nil {
+		t.Fatalf("toolRunTask (indexed): %v", err)
+	}
+
 	_, recs := decodeAuditLines(t, readAuditLines(t, logPath))
-	if len(recs) != 2 {
-		t.Fatalf("expected two audit lines, got %d: %+v", len(recs), recs)
+	if len(recs) != 3 {
+		t.Fatalf("expected three audit lines, got %d: %+v", len(recs), recs)
 	}
 	if recs[0].Action != "batch" || recs[0].CommandType != "command" {
 		t.Fatalf("batch record = %+v", recs[0])
@@ -732,6 +741,12 @@ func TestAudit_BatchAndRunTaskWireEntryPoints(t *testing.T) {
 	}
 	if len(recs[1].AuditTags) != 1 || recs[1].AuditTags[0] != auditTagEvalInterpreter {
 		t.Fatalf("run_task tags = %v, want [%s]", recs[1].AuditTags, auditTagEvalInterpreter)
+	}
+	// R5 gap: the auto-index branch above runTaskAutoIndexBytes mints the label
+	// inside finishRunTaskOutput, so indexed/index_label are only recorded when
+	// the audit call is actually passed through.
+	if !recs[2].Indexed || recs[2].IndexLabel == "" {
+		t.Fatalf("indexed run_task record = %+v, want indexed=true and a label", recs[2])
 	}
 }
 
