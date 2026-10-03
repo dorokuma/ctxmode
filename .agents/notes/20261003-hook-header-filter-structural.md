@@ -165,7 +165,7 @@ $ ls -l /root/.git-hooks/             # 该目录内没有 pre-commit
 
 - **R1**：笔记与 CHANGELOG 说“没有仓本地覆盖的仓不跑 pre-commit”时未提示：那些仓的 commit-msg 阶段仍会用 `git diff --cached` 扫密钥模式（oracle 实测 `/root/.git-hooks/commit-msg` 自身会拦 `ghp_` 形状），读者不应据此推出“密钥不设防”。
 - **R2**：`fixes_test.go` 的 `TestVersionAligned` 是硬编码字面量比对、不解析 CHANGELOG，能抓“忘记 bump Version”但抓不到“Version 改了而 CHANGELOG 标题没改”，下次发版可考虑让测试读 CHANGELOG 首个版本标题。
-- **R3**：CHANGELOG 的 `[4.1.0]` 历史段保留的 `global pre-commit` 旧措辞是有意不改（历史段落不清洗），判定可接受。
+- **R3（锚点已更正，2026-10-03）**：本条初稿曾写「CHANGELOG 的 `[4.1.0]` 历史段保留的 `global pre-commit` 旧措辞是有意不改（历史段落不清洗）」，该锚点经实测有误——CHANGELOG 里的 `pre-commit` 字样只出现在 `[4.2.0]` 段，`[4.1.0]` 段（第 46-60 行）没有任何 `pre-commit` 字样；那句 `global pre-commit` 是同一次事实误判的产物，且早已在 `bd83f34` 更正。保留的原则仍成立：历史发版段落不清洗，本轮无需为此清洗任何历史段落，判定可接受。
 
 ## 来源
 
