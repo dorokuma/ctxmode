@@ -64,7 +64,41 @@ supersedes: ""
 
 ### 5) 模板 pre-commit 同步（同一轮补做）
 
-`/root/.git-templates/hooks/pre-commit`（真实文件，非指向 `/root/.git-hooks` 的符号链接）含同一类前缀过滤，但全局 `core.hooksPath=/root/.git-hooks` 会整体覆盖 `.git/hooks`，该文件实际不生效。**本笔记成稿后、同一轮内它已被改成与两个全局 hook 逐字相同的 awk 状态机**：改后 sha256 `2b8b4be7dfba7d1546c4ca766f1391522e14b5aa1d6591f3c21f7f95af517245`，改动前副本 `/root/.git-templates/hooks/pre-commit.bak-20261003143116`，端到端差分回归 `TOTAL ok=25 bad=0`（见"验证"）。它**只**匹配已知密钥格式、**没有**凭据赋值扫描，所以上面第 3)、4) 两节针对赋值判定的规则与它无关，也没有为它新增赋值检查。
+`/root/.git-templates/hooks/pre-commit`（真实文件，非指向 `/root/.git-hooks` 的符号链接）含同一类前缀过滤。
+
+**实测更正（2026-10-03，作者自查，此前判断有误）**：本笔记初稿在此写过「全局 `core.hooksPath=/root/.git-hooks` 会整体覆盖 `.git/hooks`，该文件实际不生效」，该判断是错的，现按实测事实更正——本仓 `.git/config` 带**仓本地覆盖** `core.hooksPath=/root/.git-templates/hooks`，本仓生效的 hooks 目录就是它；该目录里 `commit-msg`、`pre-push` 是指向 `/root/.git-hooks/` 的**符号链接**，而 `pre-commit` 是**真实可执行文件**——所以**本仓生效的 pre-commit 正是这个文件，它在生效**。全局 `/root/.gitconfig` 的 `core.hooksPath=/root/.git-hooks` 里**没有** pre-commit，因此只有「没有仓本地覆盖」的仓才不会跑 pre-commit。实测命令与原始输出：
+
+```text
+$ git config --local --get core.hooksPath
+/root/.git-templates/hooks
+$ git config --global --get core.hooksPath
+/root/.git-hooks
+$ git config core.hooksPath            # 本仓生效值
+/root/.git-templates/hooks
+
+$ ls -l /root/.git-templates/hooks/
+总计 16
+lrwxrwxrwx 1 root root   27  9月17日 09:58 commit-msg -> /root/.git-hooks/commit-msg
+-rwx--x--x 1 root root 3398 10月  3日 14:31 pre-commit
+-rwx--x--x 1 root root 1317  7月  5日 15:35 pre-commit.bak-20260930092955
+-rwx--x--x 1 root root 1318  9月30日 09:30 pre-commit.bak-20260930094017
+-rwx--x--x 1 root root 1335  9月30日 09:40 pre-commit.bak-20261003143116
+lrwxrwxrwx 1 root root   25  9月17日 09:58 pre-push -> /root/.git-hooks/pre-push
+
+$ ls -l /root/.git-hooks/             # 该目录内没有 pre-commit
+总计 92
+-rwxr-xr-x 1 root root 12202 10月  3日 14:53 commit-msg
+-rwxr-xr-x 1 root root  8977  9月17日 09:57 commit-msg.bak-20260930082550
+-rwxr-xr-x 1 root root 10355  9月30日 08:47 commit-msg.bak-20260930094017
+-rwxr-xr-x 1 root root 10714  9月30日 09:40 commit-msg.bak-20261003141636
+-rwxr-xr-x 1 root root 11749 10月  3日 14:17 commit-msg.bak-20261003145322
+-rwxr-xr-x 1 root root  6740 10月  3日 14:53 pre-push
+-rwxr-xr-x 1 root root  4447 10月  3日 13:56 pre-push.bak-20261003-055646
+-rwxr-xr-x 1 root root  5259 10月  3日 13:57 pre-push.bak-20261003141636
+-rwxr-xr-x 1 root root  6236 10月  3日 14:17 pre-push.bak-20261003145322
+```
+
+**本笔记成稿后、同一轮内它已被改成与两个全局 hook 逐字相同的 awk 状态机**：改后 sha256 `2b8b4be7dfba7d1546c4ca766f1391522e14b5aa1d6591f3c21f7f95af517245`，改动前副本 `/root/.git-templates/hooks/pre-commit.bak-20261003143116`，端到端差分回归 `TOTAL ok=25 bad=0`（见"验证"）。它**只**匹配已知密钥格式、**没有**凭据赋值扫描，所以上面第 3)、4) 两节针对赋值判定的规则与它无关，也没有为它新增赋值检查。
 
 ## 验证（原始证据，全部在 /tmp 一次性跑）
 
