@@ -122,9 +122,15 @@ supersedes: ""
 - "git 发出 `--- ` 前缀行"仅作理论残留列出：本机实测 git 2.47.3，未能构造出 hunk 外、非文件头的 `--- ` 输出行（本笔记初稿依据的"2.39.5"与本机实测版本不符，此处以实测为准）。
 - 仓内 `githooks/` 镜像（`githooks/commit-msg`、`githooks/pre-push`）**未同步**，仍是可被 `githooks_test.go` 测的旧实现；本轮范围只覆盖全局 hook（任务明确要求不动镜像）。
 
+**第二轮复验新测得的窄形状（只记录、不修）**
+
+- `password -> v12345`、`password =>> v12345`、`password = > v12345`、`password => => v12345` 放行：分隔符消费后若值侧仍以单个符号（`-`、`>`）开头，它成为"第一个 token"，低于 ≥6 门槛。`->` 不是任何语言的赋值运算符（Perl/Ruby 的 `->` 是解引用、`=>` 才是哈希赋值），`=>>`、`= >` 属同族伪形状；三者若值命中 `sk-`/`AKIA` 等已知格式仍被模式层拦。
+- 判据：**只记录不修**——再扩分隔符表边际收益递减，且"首 token 为单字符符号时取第二个 token"会改变取值语义。
+
 ## 来源
 
 - 备份（结构判定那一轮）：`/root/.git-hooks/commit-msg.bak-20261003141636`、`/root/.git-hooks/pre-push.bak-20261003141636`（改动前 sha256 见当次回报）。
 - 备份（本轮分隔符/关键字收口之前）：`/root/.git-hooks/commit-msg.bak-20261003145322`（sha256 `4b054371015f9ff8101826e8f21e02e242fcb2302191d0d25f21b3cbf77896a6`）、`/root/.git-hooks/pre-push.bak-20261003145322`（sha256 `85beff271a5cf4b78fdc81ff3b2d4a267bdd72276cd55b9756110f097aa0eb64`）；模板 hook 改动前副本 `/root/.git-templates/hooks/pre-commit.bak-20261003143116`。
 - 上一轮笔记：`.agents/notes/20260930-audit-review-fixes-round2.md`（第 49、52 行，本文取代其 hook 文件头过滤结论）。
 - 一次性回归脚本：`/tmp/hook-regress/{filters,credval,e2e,olddiff,precommit,sepkw,residuals}.sh`（未入仓，属一次性中间产物）。
+- 本节形状来自第二轮复验（oracle 原会话，2026-10-03，`f0c6050` 之后）。
