@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -665,9 +666,18 @@ func TestAudit_ReopenAfterRotationFailsKeepsRecord(t *testing.T) {
 
 	restore, ok := tightenFDLimitToOneExtraOpen(t)
 	if !ok {
-		// The oracle reached this branch with RLIMIT_NOFILE; bail out loudly
-		// rather than silently asserting nothing.
-		t.Skip("cannot tighten RLIMIT_NOFILE to one spare descriptor on this host")
+		// This half of the R2-F1 invariant must not be silently untested. Every
+		// Linux host in the CI matrix can tighten RLIMIT_NOFILE (the helper only
+		// gives up when Getrlimit fails, /proc/self/fd is unreadable, or the soft
+		// limit already equals the hard one), so a failure here on Linux is a
+		// broken signal: fail loudly instead of reporting a green run that
+		// asserted nothing. Only a non-Linux host, where syscall.RLIMIT_NOFILE
+		// and /proc/self/fd need not exist, is allowed to skip.
+		if runtime.GOOS != "linux" {
+			t.Skipf("cannot tighten RLIMIT_NOFILE to one spare descriptor on %s", runtime.GOOS)
+		}
+		t.Fatalf("cannot tighten RLIMIT_NOFILE to one spare descriptor on linux; " +
+			"the failed-reopen path would be silently untested")
 	}
 	appendErr := appendAuditLine([]byte("{\"seq\":2}\n"))
 	restore()
