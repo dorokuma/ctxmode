@@ -3,7 +3,7 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [4.2.0] - 2026-10-03
 
 ### Changed
 - **Deployment is run by the agent, not by hand.** The build/deploy rule no longer describes `./deploy.sh` as a manual, human-only step: the agent runs `./deploy.sh` directly (build → `initialize` verification → atomic replacement of the live binary), with no hand-off, confirmation or approval in between. `README.md`'s Deployment section states the same for readers of the repository; the local, gitignored `AGENTS.md` carries the matching wording. Nothing else about the build/deploy rule changed.
