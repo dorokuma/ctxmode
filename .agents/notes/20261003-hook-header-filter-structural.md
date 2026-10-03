@@ -161,6 +161,12 @@ $ ls -l /root/.git-hooks/             # 该目录内没有 pre-commit
 - `password -> v12345`、`password =>> v12345`、`password = > v12345`、`password => => v12345` 放行：分隔符消费后若值侧仍以单个符号（`-`、`>`）开头，它成为"第一个 token"，低于 ≥6 门槛。`->` 不是任何语言的赋值运算符（Perl/Ruby 的 `->` 是解引用、`=>` 才是哈希赋值），`=>>`、`= >` 属同族伪形状；三者若值命中 `sk-`/`AKIA` 等已知格式仍被模式层拦。
 - 判据：**只记录不修**——再扩分隔符表边际收益递减，且"首 token 为单字符符号时取第二个 token"会改变取值语义。
 
+**第二轮对抗复验观察项（只记录；来源：第二轮对抗复验，oracle 原会话，2026-10-03，`bd83f34` 之后）**
+
+- **R1**：笔记与 CHANGELOG 说“没有仓本地覆盖的仓不跑 pre-commit”时未提示：那些仓的 commit-msg 阶段仍会用 `git diff --cached` 扫密钥模式（oracle 实测 `/root/.git-hooks/commit-msg` 自身会拦 `ghp_` 形状），读者不应据此推出“密钥不设防”。
+- **R2**：`fixes_test.go` 的 `TestVersionAligned` 是硬编码字面量比对、不解析 CHANGELOG，能抓“忘记 bump Version”但抓不到“Version 改了而 CHANGELOG 标题没改”，下次发版可考虑让测试读 CHANGELOG 首个版本标题。
+- **R3**：CHANGELOG 的 `[4.1.0]` 历史段保留的 `global pre-commit` 旧措辞是有意不改（历史段落不清洗），判定可接受。
+
 ## 来源
 
 - 备份（结构判定那一轮）：`/root/.git-hooks/commit-msg.bak-20261003141636`、`/root/.git-hooks/pre-push.bak-20261003141636`（改动前 sha256 见当次回报）。

@@ -3,6 +3,11 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **Hook notes addendum records the second adversarial-review pass's observation items (R1–R3).** In `.agents/notes/20261003-hook-header-filter-structural.md`, R1 notes that the "repos without a repo-local `core.hooksPath` override skip `pre-commit`" wording did not add that those repos' `commit-msg` stage still scans the staged diff for secret patterns (measured: `/root/.git-hooks/commit-msg` itself rejects a GitHub-token-shaped string), so that wording must not be read as "secrets are unchecked there"; R2 records that `TestVersionAligned` in `fixes_test.go` compares a hardcoded literal and does not parse `CHANGELOG.md`, so it catches a forgotten `Version` bump but not a changed `Version` paired with an unchanged CHANGELOG heading; R3 records that historical CHANGELOG sections are not reworded, and the `[4.1.0]`-era `global pre-commit` phrase is deliberately left as is. Documentation only; no behaviour change.
+
 ## [4.2.0] - 2026-10-03
 
 ### Changed
