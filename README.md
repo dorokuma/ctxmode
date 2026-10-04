@@ -162,6 +162,8 @@ Each primary workdir gets its own SQLite database at `~/.local/share/ctxmode/<ha
 
 The agent runs `deploy.sh` directly: the script is non-interactive, needs no confirmation and has **no manual step**. `deploy.sh` builds the binary, verifies it with an `initialize` handshake, and atomically replaces the live binary. Right before the atomic swap it backs up the current live binary to `<BINARY>.prev` (best-effort; a failed backup only disables rollback for that deployment).
 
+The same run also syncs the Pi extension through `integrations/pi/install.sh` (md5-identical target left untouched; destination `PI_CTXMODE_EXT` or `~/.pi/agent/extensions/ctxmode.ts`); a failed sync aborts the deployment, matching the script's existing hard-failure convention.
+
 ```bash
 ./deploy.sh            # build + verify + atomic deploy (default)
 ./deploy.sh rollback   # restore the previous binary

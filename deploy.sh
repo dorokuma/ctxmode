@@ -165,15 +165,17 @@ fi
 echo "ctxmode v${VERSION} 部署成功"
 
 echo "=== Pi extension ==="
-EXT_SRC="$ROOT/integrations/pi/ctxmode.ts"
-EXT_DST="${PI_CTXMODE_EXT:-$HOME/.pi/agent/extensions/ctxmode.ts}"
-if [ ! -f "$EXT_SRC" ]; then
-  echo "missing Pi extension $EXT_SRC" >&2
+# Pi 扩展（integrations/pi/ctxmode.ts）的同步收进独立小脚本
+# integrations/pi/install.sh，与二进制流程解耦，也可单独执行验证：
+#   integrations/pi/install.sh
+# 契约：md5 一致则不重写（幂等，不动 mtime）；md5sum 缺失、HOME 未设置、
+# 目标为目录或非绝对路径、源/目标 md5 取空——一律显式报错并非零退出。
+# 失败策略沿用 deploy.sh 既有约定：硬失败。同步不过，整套部署不算完成
+# （codegraph-go 那边是非阻断 WARN，两仓语义不同，不照抄）。
+if ! bash "$ROOT/integrations/pi/install.sh"; then
+  echo "Pi 扩展同步失败：按 deploy.sh 既有硬失败约定，部署中止" >&2
   exit 1
 fi
-mkdir -p -- "$(dirname "$EXT_DST")"
-install -m 644 "$EXT_SRC" "$EXT_DST"
-echo "Pi extension → $EXT_DST"
 
 echo "=== 完成 ==="
 echo "Pi 无 MCP：工具来自扩展。在 Pi 里 /reload 重载扩展（会再 spawn 新二进制）。"

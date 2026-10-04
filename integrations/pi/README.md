@@ -10,7 +10,20 @@ install -m 755 ctxmode ~/.local/bin/ctxmode
 install -m 644 integrations/pi/ctxmode.ts ~/.pi/agent/extensions/ctxmode.ts
 ```
 
-建议直接用仓库自带的 `deploy.sh` 一键部署（编译 → 原子替换到 `~/.local/bin`），不要手动 install，避免装到别处造成版本分叉。
+建议直接用仓库自带的 `deploy.sh` 一键部署（编译 → 原子替换到 `~/.local/bin`，
+并同步 Pi 扩展到 `~/.pi/agent/extensions/`），不要手动 install，避免装到
+别处造成版本分叉。
+
+`deploy.sh` 末尾的 Pi 扩展同步由独立脚本 `integrations/pi/install.sh` 完成
+（也可单独执行验证）。其契约：
+
+- 目标为 **`~/.pi/agent/extensions/ctxmode.ts` 文件路径**（可用
+  `PI_CTXMODE_EXT` 覆盖，路径语义与 deploy.sh 既有口径一致）；
+- **幂等**：目标与源 md5 一致时报告 `unchanged` 且不重写（不动 mtime）；
+- md5sum 缺失、`HOME` 未设置（且未指定 `PI_CTXMODE_EXT`）、目标为目录或非
+  绝对路径、源/目标 md5 取空——一律显式报错并非零退出；
+- 同步失败时 `deploy.sh` **硬失败退出**（沿用本仓既有约定：扩展不过，
+  部署不算完成）。
 
 `/reload` or restart Pi.
 
@@ -24,6 +37,9 @@ install -m 644 integrations/pi/ctxmode.ts ~/.pi/agent/extensions/ctxmode.ts
 - `CTXMODE_DIAG_DIR` — 诊断日志目录（默认 `~/.pi/agent/logs`）
 - `CTXMODE_DIAG_MAX_BYTES` — 日志轮转体积上限（默认 5MB；超限轮转为 `ctxmode.log.1/.2`，最多两个历史）
 - `CTXMODE_DISPOSE_WAIT_MS` — 换进程时 SIGTERM→SIGKILL 等待窗口（默认 3000ms）
+- `PI_CTXMODE_EXT` — 部署时 Pi 扩展的目标文件路径（默认
+  `~/.pi/agent/extensions/ctxmode.ts`；`deploy.sh` 与
+  `integrations/pi/install.sh` 共用此变量，必须是绝对路径）
 
 Handshake 失败（`initialize` / `tools/list`）会回收已 spawn 的子进程。`callTool` 遇到 disconnect / not running 时可以拉起客户端，但不会自动重放刚才那次 `tools/call`（execute/batch 非幂等）。
 
