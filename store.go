@@ -261,7 +261,12 @@ func (s *Store) Index(path, content string) error {
 	// migration re-indexes old docs), so neutralize a literal "[def] "
 	// prefix at content position 0 here as well. Idempotent, and a no-op
 	// unless the document starts with the marker; the rest of the content
-	// is preserved byte-for-byte.
+	// is preserved byte-for-byte. The fencing layers cover different sets of
+	// write paths: the toolIndex gate (main.go) is narrower than
+	// storeIndexLocked, and the ctx_stats kept-out accounting
+	// (statRecordKeptOut) follows storeIndexLocked — so batch.go's direct
+	// Store.Index call and ctx_kb fetch's ReplaceExactAndChunks write are
+	// counted by neither.
 	content = neutralizeDefMarker(content)
 	var mtimeNS, size int64
 	if info, statErr := os.Stat(path); statErr == nil {

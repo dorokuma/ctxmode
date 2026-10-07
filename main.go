@@ -71,6 +71,10 @@ type server struct {
 	gitDirtyRunner       func(ctx context.Context, cwd string, args ...string) (string, error)
 	rgIndexMu            sync.Mutex
 	rgIndexDedupMap      map[string]rgIndexEntry
+	// scanMaxFilesOverride, when > 0, replaces resolveMaxFiles for the
+	// ctx_fs resolve/related workspace walk. Tests use it to exercise the
+	// budget-exhausted path without building a 100k-file fixture.
+	scanMaxFilesOverride int
 }
 
 func fatal(s *Store, format string, args ...any) {

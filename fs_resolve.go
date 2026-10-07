@@ -134,10 +134,17 @@ func normalizeFuzzy(s string) string {
 // calls fn with each regular file's absolute path. It stops on ctx
 // cancellation, the wall-clock budget, or the file cap, and reuses the glob
 // walk's fences: skipWalkDirs, .gitignore layers, symlink fencing, and the
-// sensitive-path gate.
-func (s *server) scanWorkspaceFiles(ctx context.Context, root string, fn func(p string)) error {
+// sensitive-path gate. The bool result reports that the budget or the cap cut
+// the walk short: the caller holds a partial result, not a complete one, and
+// surfaces it as `truncated` rather than as an error.
+func (s *server) scanWorkspaceFiles(ctx context.Context, root string, fn func(p string)) (bool, error) {
 	deadline := time.Now().Add(resolveScanBudget)
+	maxFiles := resolveMaxFiles
+	if s.scanMaxFilesOverride > 0 {
+		maxFiles = s.scanMaxFilesOverride
+	}
 	seen := 0
+	truncated := false
 	for _, wd := range s.workdirs {
 		scanRoot := wd
 		if root != "" {
@@ -148,7 +155,10 @@ func (s *server) scanWorkspaceFiles(ctx context.Context, root string, fn func(p 
 		}
 		gitignore := newGitignoreStack(scanRoot)
 		err := filepath.Walk(scanRoot, func(p string, fi os.FileInfo, walkErr error) error {
-			if seen >= resolveMaxFiles || time.Now().After(deadline) {
+			if seen >= maxFiles || time.Now().After(deadline) {
+				// filepath.Walk swallows SkipAll and returns nil, so
+				// record the early stop for the caller here.
+				truncated = true
 				return filepath.SkipAll
 			}
 			select {
@@ -200,10 +210,15 @@ func (s *server) scanWorkspaceFiles(ctx context.Context, root string, fn func(p 
 			return nil
 		})
 		if err != nil {
-			return err
+			return truncated, err
+		}
+		if truncated {
+			// Budget or cap exhausted: walking the remaining workdirs
+			// cannot add anything.
+			return true, nil
 		}
 	}
-	return nil
+	return truncated, nil
 }
 
 // ---------- action=resolve ----------
@@ -235,7 +250,7 @@ func (s *server) toolResolve(ctx context.Context, _ *mcp.CallToolRequest, args r
 	}
 
 	var hits []resolveHit
-	err := s.scanWorkspaceFiles(ctx, "", func(p string) {
+	scanTruncated, err := s.scanWorkspaceFiles(ctx, "", func(p string) {
 		score, ok := fuzzyScore(query, p)
 		if !ok {
 			return
@@ -251,7 +266,7 @@ func (s *server) toolResolve(ctx context.Context, _ *mcp.CallToolRequest, args r
 		}
 		return len(hits[i].Path) < len(hits[j].Path)
 	})
-	truncated := false
+	truncated := scanTruncated
 	if len(hits) > limit {
 		hits = hits[:limit]
 		truncated = true
@@ -336,11 +351,11 @@ func (s *server) toolRelated(ctx context.Context, _ *mcp.CallToolRequest, args r
 	// the stripped stem says whether the target itself is a test.
 	targetIsTest := isTestName(targetStem, targetExt)
 	targetPairStem := pairStem(targetStem, targetExt)
-	pairExts, _ := relatedPairRules[strings.ToLower(targetExt)]
+	pairExts := relatedPairRules[strings.ToLower(targetExt)]
 	rootOf := workspaceRootOf(abs, s.workdirs)
 
 	var hits []relatedHit
-	err = s.scanWorkspaceFiles(ctx, rootOf, func(p string) {
+	scanTruncated, err := s.scanWorkspaceFiles(ctx, rootOf, func(p string) {
 		if p == abs {
 			return
 		}
@@ -349,6 +364,10 @@ func (s *server) toolRelated(ctx context.Context, _ *mcp.CallToolRequest, args r
 		stemPair := pairStem(stem, ext)
 		dir := filepath.Dir(p)
 		var hit relatedHit
+		// Tiers are checked in descending score order, so the same-directory
+		// sibling tier (40) has to precede the stem-prefix tier (30): a
+		// same-directory file whose stem is also a >= 4 char prefix of the
+		// target's stem would otherwise never reach the sibling tier.
 		switch {
 		case stemPair == targetPairStem && extIn(ext, pairExts) && isTestName(stem, ext) != targetIsTest:
 			hit = relatedHit{Path: s.displayPath(p), Score: 100, Reason: "test/impl pair with " + base}
@@ -356,10 +375,10 @@ func (s *server) toolRelated(ctx context.Context, _ *mcp.CallToolRequest, args r
 			hit = relatedHit{Path: s.displayPath(p), Score: 90, Reason: "same stem (" + targetExt + " ↔ " + ext + ")"}
 		case stemPair == targetPairStem:
 			hit = relatedHit{Path: s.displayPath(p), Score: 70, Reason: "same stem, other extension"}
-		case stemStartsWith(stemPair, targetPairStem) || stemStartsWith(targetPairStem, stemPair):
-			hit = relatedHit{Path: s.displayPath(p), Score: 30, Reason: "stem prefix match"}
 		case dir == targetDir:
 			hit = relatedHit{Path: s.displayPath(p), Score: 40, Reason: "sibling in " + s.displayPath(dir)}
+		case stemStartsWith(stemPair, targetPairStem) || stemStartsWith(targetPairStem, stemPair):
+			hit = relatedHit{Path: s.displayPath(p), Score: 30, Reason: "stem prefix match"}
 		}
 		if hit.Path != "" {
 			hits = append(hits, hit)
@@ -374,7 +393,7 @@ func (s *server) toolRelated(ctx context.Context, _ *mcp.CallToolRequest, args r
 		}
 		return hits[i].Path < hits[j].Path
 	})
-	truncated := false
+	truncated := scanTruncated
 	if len(hits) > limit {
 		hits = hits[:limit]
 		truncated = true

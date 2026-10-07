@@ -308,7 +308,7 @@ func (s *server) registerCategoryTools(srv *mcp.Server) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_stats",
-		Description: "Context-consumption statistics for this session: per-tool call counts, bytes returned to the context window, estimated tokens, and bytes kept out by auto-indexing (KB store). Ported from the original context-mode ctx_stats. Set json:true for machine-readable output.",
+		Description: "Context-consumption statistics for this session: per-tool call counts, bytes returned to the context window, estimated tokens, and bytes kept out by auto-indexing at the storeIndexLocked choke point only — ctx_run action=batch direct stores and ctx_kb fetch are not counted. Ported from the original context-mode ctx_stats. Set json:true for machine-readable output.",
 		Annotations: ann["ctx_stats"],
 	}, counted(s, "ctx_stats", s.toolCtxStats))
 }

@@ -12,6 +12,7 @@
 1. **`ctx_stats`**（新只读 MCP 工具，`stats.go`）— 来自 context-mode 的同名工具。本仓已有 audit JSONL（`audit.go`）与 `storeIndexLocked` 入库口径，统计功能只差聚合层：
    - `router.go` 的 `counted()` 泛型包装器包住全部 6 个工具 handler，按响应 `TextContent` 字节数记入 `server.statTools`（新字段 `statMu`/`statTools`/`startedAt`）。
    - `storeIndexLocked` 成功后把入库字节数记入伪工具行 `store` —— 全部索引路径（rg 超限入库、run 输出截断入库、kb index/fetch）的唯一汇合点，一处插桩覆盖 11 个调用点。
+   - **订正（2026-10-07 后补标注，原文不改）**：上面「全部索引路径（…kb index/fetch）的唯一汇合点」这一表述已被 `.agents/notes/20261007-175eb05-audit-residuals.md` 的「既定口径」项订正——kept-out 只统计**经过 `storeIndexLocked` 的索引汇合点**的路径；`ctx_run action=batch` 的超限直存（直接调 `Store.Index`）与 `ctx_kb fetch`（`indexContentLocked` → `Store.ReplaceExactAndChunks`）**不经该汇合点、不计入**。
    - `aggregateAuditLog` 按当前 `session_id` 过滤 audit JSONL，给 lifetime 视图（calls/output/indexed/truncated）。超长行跳过而非整体失败。
    - token 估算 bytes÷4，与 context-mode 相同口径。
 2. **`ctx_fs action=resolve`**（`fs_resolve.go`）— 来自 pi-fff 的 `resolve_file`。模糊排序：exact > suffix > basename substring > path substring > 有序子序列；路径边界（`/_-.`）加分、连续段加分、span 归一化防“散落在长路径里的短查询”逆袭。`@path` 风格与引号包裹的输入均接受。
