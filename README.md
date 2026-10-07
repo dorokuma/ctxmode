@@ -10,15 +10,16 @@ Supported platform: **Linux**. Background process identity verification reads `/
 
 ## MCP tools (v2)
 
-Five real tools (not skills). Each takes **`action=`** plus capability-specific fields:
+Six real tools (not skills). Each takes **`action=`** plus capability-specific fields:
 
 | Tool | Actions | Key parameters |
 |------|---------|----------------|
 | **ctx_run** | `execute`, `execute_file`, `batch`, `run_task` | `command`/`language`/`timeout_ms`/`background`/`intent`/`cwd`/`argv`/`env`/`stdin`; `path`+`code`; `commands`/`queries`/`concurrency`/`query_scope`; `kind`/`target`/`args`/`timeout_ms` |
-| **ctx_fs** | `ls`, `glob`, `stat`, `rg` | `path`/`depth`/`include_hidden`/`limit`; `pattern`/`path`/`limit`; `path`; `pattern`/`glob`/`ignore_case`/`context`/`literal` |
+| **ctx_fs** | `ls`, `glob`, `stat`, `rg`, `resolve`, `related` | `path`/`depth`/`include_hidden`/`limit`; `pattern`/`path`/`limit`; `path`; `pattern`/`glob`/`ignore_case`/`context`/`literal` |
 | **ctx_git** | `status`, `diff`, `log` | `cwd`; `path`/`stat`/`unified`/`staged`; `n`/`path`/`oneline` |
 | **ctx_kb** | `index`, `search`, `fetch`, `stats`, `purge`, `doctor` | `path`; `query`; `url`/`urls`/`source`/`format`/`force`/`maxBytes`/`timeout_ms`/`ttl_ms`; —; `confirm`/`scope`/`sessionId`/`dryRun`; — |
 | **ctx_bg** | `list`, `kill`, `log`, `wait` | —; `id`/`pid`; `id`/`pid`/`tail_lines`/`tail_bytes`; `id`/`pid`/`timeout_ms` |
+| **ctx_stats** | — (no `action=`; single capability) | `json` (machine-readable output) |
 
 Any MCP host (Grok, Pi, …) uses this surface. Grok prefixes the server name (e.g. `ctxmode__ctx_run`).
 
@@ -129,6 +130,8 @@ Side effects to be aware of:
 - `glob` — `pattern` (`**` supported), `path` (same default as `ls`), `limit` (default 200, max 2000; >2000 is an error); skips `.git`/`node_modules`/`vendor` and applies basic `.gitignore` rules.
 - `stat` — `path`: size/mode/mtime/symlink/workdir metadata (symlink-aware).
 - `rg` — content search: `pattern` (or `literal`), `path` (same default as `ls`), `glob`, `ignore_case`, `context` (0-5), `limit` (default 20 with summary on, max 500; >500 is an error); system `rg` with `--no-config` (ignores `RIPGREP_CONFIG_PATH` / `~/.ripgreprc`) and a pure-Go fallback; skips binaries. Wildcard-only patterns (`.*`, `*`, `.+`, `.`) are rejected (always-on; pass `literal:true` to search those characters). Match lines longer than 500 runes are truncated (`CTXMODE_RG_MAX_LINE_RUNES`; `<=0` disables). Files over 20KiB (`20*1024` bytes) get a size tag in the summary.
+- `resolve` — fuzzy path resolution: `path` (approximate or `@path`-style reference), `limit` (default 10, max 2000). Returns ranked candidates across all workdirs (exact > suffix > substring > subsequence, boundary-aware; ported from pi-fff's `resolve_file`, pure Go).
+- `related` — related-file ranking: `path` (an existing file), `limit`. Returns test/impl pairs (same stem across `_test.go`/`.test.ts`/`test_*.py` conventions), same-stem other-extension files, directory siblings, and stem-prefix matches, each with a `reason`; ported from pi-fff's `related_files`. Both actions walk under the same gitignore/symlink/sensitive-path fences as glob/rg with a 5s wall-clock budget.
 
 ### ctx_git — read-only git (no commit/push/reset)
 
@@ -153,6 +156,11 @@ Side effects to be aware of:
 - `wait` — `id`/`pid`, `timeout_ms` (default 60000, max 1h); never kills on timeout; includes `log_truncated` when the log cap fired.
 - Max 16 concurrent background jobs (exceeding is an error); a caller-provided `timeout_ms` on the launch is honored (default max age 1h); log files capped at 16MB.
 - Platform contract: the `kill` identity check reads `/proc/<pid>/stat` (Linux). On platforms where that file is unavailable the check fails closed — a job with unknown identity is never signaled — so `ctx_bg` termination is only guaranteed on Linux; `list`/`log`/`wait` keep working everywhere.
+
+### ctx_stats — session context-consumption statistics
+- Reports per-tool call counts, bytes returned into the context window, estimated tokens (bytes ÷ 4), bytes kept out of the window by auto-indexing (rg auto-index, truncated run output, kb index/fetch — recorded at the `storeIndexLocked` choke point, shown under the `store` row), and the overall savings ratio.
+- Second section aggregates the ctx_run audit log for the current session: calls, raw output bytes, auto-indexed and truncated counts.
+- `json:true` returns the same report as JSON. Ported from the original context-mode `ctx_stats` (mksglu/context-mode). Counters are recorded after each handler returns; a `ctx_stats` call racing a concurrent sibling call may not include it yet (sequential callers always see complete rows).
 
 ## Database
 

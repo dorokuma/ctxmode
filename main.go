@@ -54,6 +54,9 @@ type server struct {
 	workdirs             []string
 	dbPath               string
 	sessionID            string
+	startedAt            time.Time
+	statMu               sync.Mutex
+	statTools            map[string]*toolStat
 	mu                   sync.Mutex
 	store                *Store
 	floodGuard           *FloodGuard
@@ -161,6 +164,7 @@ func main() {
 		workdirs:        workdirs,
 		dbPath:          dbPath,
 		sessionID:       sessionID,
+		startedAt:       time.Now(),
 		store:           store,
 		floodGuard:      floodGuard,
 		searchPipeline:  searchPipeline,
@@ -1809,8 +1813,12 @@ func formatIntentIndexed(exitCode, n int, label, outputText string, indexErr err
 // index operations.
 func (s *server) storeIndexLocked(path, content string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.store.Index(path, content)
+	err := s.store.Index(path, content)
+	s.mu.Unlock()
+	if err == nil {
+		s.statRecordKeptOut("store", len(content))
+	}
+	return err
 }
 
 // validateArgv checks argv for ctx_run action=execute argv mode and for

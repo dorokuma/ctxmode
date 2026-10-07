@@ -79,7 +79,7 @@ func (s *server) toolCtxRun(ctx context.Context, req *mcp.CallToolRequest, args 
 // ---------- ctx_fs ----------
 
 type ctxFsArgs struct {
-	Action        string `json:"action" jsonschema:"ls|glob|stat|rg"`
+	Action        string `json:"action" jsonschema:"ls|glob|stat|rg|resolve|related"`
 	Path          string `json:"path,omitempty"`
 	Pattern       string `json:"pattern,omitempty"`
 	Glob          string `json:"glob,omitempty"`
@@ -112,10 +112,14 @@ func (s *server) toolCtxFs(ctx context.Context, req *mcp.CallToolRequest, args c
 			IgnoreCase: args.IgnoreCase, Context: args.Context, Limit: args.Limit, Literal: args.Literal,
 			Offset: args.Offset,
 		})
+	case "resolve":
+		return s.toolResolve(ctx, req, resolveArgs{Path: args.Path, Limit: args.Limit})
+	case "related":
+		return s.toolRelated(ctx, req, relatedArgs{Path: args.Path, Limit: args.Limit})
 	case "":
-		return nil, nil, fmt.Errorf("action is required (ls|glob|stat|rg)")
+		return nil, nil, fmt.Errorf("action is required (ls|glob|stat|rg|resolve|related)")
 	default:
-		return nil, nil, fmt.Errorf("unknown ctx_fs action %q (ls|glob|stat|rg)", args.Action)
+		return nil, nil, fmt.Errorf("unknown ctx_fs action %q (ls|glob|stat|rg|resolve|related)", args.Action)
 	}
 }
 
@@ -245,7 +249,7 @@ const ctxRunDescription = "PRIMARY for commands/tests/builds. action=execute (sh
 // boolPtr returns a distinct *bool so ToolAnnotations hints are not aliased.
 func boolPtr(v bool) *bool { return &v }
 
-// categoryToolAnnotations returns MCP ToolAnnotations for the five public tools.
+// categoryToolAnnotations returns MCP ToolAnnotations for the six public tools.
 // Pointer hints are set explicitly so false values appear in tools/list JSON.
 // Each tool gets its own *bool so mutating one annotation cannot leak to another.
 func categoryToolAnnotations() map[string]*mcp.ToolAnnotations {
@@ -257,43 +261,54 @@ func categoryToolAnnotations() map[string]*mcp.ToolAnnotations {
 		"ctx_run": {ReadOnlyHint: false, DestructiveHint: boolPtr(true), OpenWorldHint: boolPtr(true)},
 		"ctx_kb":  {ReadOnlyHint: false, DestructiveHint: boolPtr(true)},
 		"ctx_bg":  {ReadOnlyHint: false, DestructiveHint: boolPtr(true)},
+		// ctx_stats is read-only diagnostics over in-process counters + the audit log.
+		"ctx_stats": {ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
 	}
 }
 
 // registerCategoryTools wires the v2.0 multi-category MCP surface (end state).
 func (s *server) registerCategoryTools(srv *mcp.Server) {
 	ann := categoryToolAnnotations()
+	// counted() feeds ctx_stats: every call's returned text length is the
+	// context cost of that call.
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_run",
 		Description: ctxRunDescription,
 		Annotations: ann["ctx_run"],
-	}, s.toolCtxRun)
+	}, counted(s, "ctx_run", s.toolCtxRun))
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctx_fs",
 		Description: "Workspace filesystem (sandboxed). action=ls (list), glob (pattern), " +
-			"stat (metadata), rg (content search; default limit=20; matches > limit auto-indexed to ctx_kb with summary returned; use offset for linear paging). Prefer over ad-hoc shell find/ls/rg when possible.",
+			"stat (metadata), rg (content search; default limit=20; matches > limit auto-indexed to ctx_kb with summary returned; use offset for linear paging), " +
+			"resolve (fuzzy-ranked file lookup from an approximate/@-style path; ported from pi-fff), related (files related to a given file: test/impl pairs, same stem, siblings). Prefer over ad-hoc shell find/ls/rg when possible.",
 		Annotations: ann["ctx_fs"],
-	}, s.toolCtxFs)
+	}, counted(s, "ctx_fs", s.toolCtxFs))
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctx_git",
 		Description: "Read-only git. action=status (porcelain -b), diff (optional path/stat/staged), " +
 			"log (n, path, oneline). No commit/push/reset.",
 		Annotations: ann["ctx_git"],
-	}, s.toolCtxGit)
+	}, counted(s, "ctx_git", s.toolCtxGit))
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctx_kb",
 		Description: "Local knowledge base / context virtualization. action=index (path), search (query), " +
 			"fetch (URL→markdown→index), stats, purge (confirm:true), doctor (install check).",
 		Annotations: ann["ctx_kb"],
-	}, s.toolCtxKb)
+	}, counted(s, "ctx_kb", s.toolCtxKb))
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_bg",
 		Description: "Background processes from ctx_run action=execute background:true. Starts return immediately and never proactively push notifications. action=wait (preferred once after launch; blocking, default 60000ms, max 3600000ms, timeout does not kill), list (snapshot), log (tail output), kill (terminate). Identify with either id or pid; do not poll list/log.",
 		Annotations: ann["ctx_bg"],
-	}, s.toolCtxBg)
+	}, counted(s, "ctx_bg", s.toolCtxBg))
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_stats",
+		Description: "Context-consumption statistics for this session: per-tool call counts, bytes returned to the context window, estimated tokens, and bytes kept out by auto-indexing (KB store). Ported from the original context-mode ctx_stats. Set json:true for machine-readable output.",
+		Annotations: ann["ctx_stats"],
+	}, counted(s, "ctx_stats", s.toolCtxStats))
 }
