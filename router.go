@@ -296,7 +296,9 @@ func (s *server) registerCategoryTools(srv *mcp.Server) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctx_kb",
 		Description: "Local knowledge base / context virtualization. action=index (path), search (query), " +
-			"fetch (URL→markdown→index), stats, purge (confirm:true), doctor (install check).",
+			"fetch (URL→markdown→index), stats (document/cache/DB stats plus kept_out_bytes, this session's " +
+			"KB-store bytes kept out of the context window; total_input_bytes/total_output_bytes are raw " +
+			"command byte counters, not savings), purge (confirm:true), doctor (install check).",
 		Annotations: ann["ctx_kb"],
 	}, counted(s, "ctx_kb", s.toolCtxKb))
 
@@ -308,7 +310,7 @@ func (s *server) registerCategoryTools(srv *mcp.Server) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_stats",
-		Description: "Context-consumption statistics for this session: per-tool call counts, bytes returned to the context window, estimated tokens, and bytes kept out by auto-indexing at the storeIndexLocked choke point only — ctx_run action=batch direct stores and ctx_kb fetch are not counted. Ported from the original context-mode ctx_stats. Set json:true for machine-readable output.",
+		Description: "Context-consumption statistics for this session: per-tool call counts, bytes returned to the context window, estimated tokens, and bytes kept out of it by auto-indexing into the KB store (every KB write path is covered: oversized ctx_run output, ctx_fs rg auto-index, ctx_kb index, ctx_run action=batch, ctx_kb fetch, legacy migration). Ported from the original context-mode ctx_stats. Set json:true for machine-readable output.",
 		Annotations: ann["ctx_stats"],
 	}, counted(s, "ctx_stats", s.toolCtxStats))
 }

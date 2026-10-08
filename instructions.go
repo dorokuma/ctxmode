@@ -22,9 +22,7 @@ action argument (ctx_stats takes none).
 - ctx_kb: local knowledge base. index (path), search (query), fetch
   (URL→markdown→index), stats, purge (confirm:true), doctor (install check).
 - ctx_bg: background processes from ctx_run action=execute background:true. Starting a background job returns immediately and never proactively pushes notifications. After receiving its id, call ctx_bg action=wait once by id or pid (blocking this tool call; default 60000ms, maximum 1 hour; timeout does not kill). Completed results remain wait-addressable through a bounded handoff window even if the detailed registry entry is pruned; after that window the id is unknown. id and pid are mutually exclusive. kill terminates (and wakes waiters); repeated wait is a stable read of the same terminal result, while repeated kill or kill of a completed/expired id returns no-match.
-- ctx_stats: context-consumption statistics for the session: per-tool call counts, bytes returned to the context window, estimated tokens, and bytes kept out by auto-indexing (counted only where
-  output is stored through the storeIndexLocked choke point; ctx_run action=batch
-  direct stores and ctx_kb fetch are not counted). No action argument; pass
+- ctx_stats: context-consumption statistics for the session: per-tool call counts, bytes returned to the context window, estimated tokens, and bytes kept out of it by auto-indexing into the KB store (every KB write path is covered: oversized ctx_run output, ctx_fs rg auto-index, ctx_kb index, ctx_run action=batch, ctx_kb fetch, legacy migration). No action argument; pass
   json:true for machine-readable output.
 
 ## Usage policy

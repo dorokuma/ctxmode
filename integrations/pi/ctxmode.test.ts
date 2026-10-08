@@ -664,6 +664,59 @@ test("扩展层：ctx_run 在 abort 时 reject，且不向服务端发 tools/cal
   }
 })
 
+// ---- 扩展层：ctx_stats 必须真的注册（服务端 instructions 已广告它，
+// 不注册则模型调不到）。----
+test("扩展层：ctx_stats 已注册且列入 getTools()", async () => {
+  const recvPath = path.join(tmpDir, "stats-recv.jsonl")
+  fs.writeFileSync(recvPath, "")
+  process.env.CTXMODE_BIN = writeRecordingStubBin("stats-bin")
+  process.env.CTXMODE_TEST_RECV = recvPath
+  process.env.CTXMODE_DISPOSE_WAIT_MS = "50"
+  const { pi, handlers, tools } = fakePi()
+  ctxmodeExtension(pi)
+  try {
+    await (handlers.get("session_start") as (e: unknown, c: unknown) => Promise<void>)(
+      { type: "session_start" },
+      { cwd: tmpDir, ui: { notify() {} } },
+    )
+
+    const ctxStats = tools.get("ctx_stats") as {
+      execute: (id: string, p: Record<string, unknown>) => Promise<unknown>
+    }
+    assert.ok(ctxStats, "ctx_stats 已注册")
+    assert.ok(
+      newClient().getTools().includes("ctx_stats"),
+      "getTools() 必须包含 ctx_stats",
+    )
+
+    // 走真实执行路径：stub 只回 initialize/tools/list，tools/call 无人应答。
+    // 因此只断言请求真的发出（名字对得上），不假装拿到结果；shutdown 会把
+    // 在途请求以 disconnected 结束，避免挂在客户端超时上。
+    const call = ctxStats.execute("id-1", { json: true }).then(
+      (r) => (r as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? "",
+      (e: Error) => `rejected: ${e?.message}`,
+    )
+    const sent = await waitUntil(
+      () => fs.readFileSync(recvPath, "utf8").includes('"ctx_stats"'),
+      3000,
+    )
+    assert.ok(sent, "ctx_stats 调用必须以该名字发往服务端")
+
+    await (handlers.get("session_shutdown") as () => Promise<void>)()
+    assert.match(
+      await call,
+      /ctxmode disconnected/,
+      "shutdown 后在途调用以 disconnected 文本收尾（与其它工具一致）",
+    )
+  } finally {
+    // 任何断言失败都要收尾：在途 tools/call 会挂住一个客户端计时器。
+    await (handlers.get("session_shutdown") as () => Promise<void>)()
+    delete process.env.CTXMODE_BIN
+    delete process.env.CTXMODE_TEST_RECV
+    delete process.env.CTXMODE_DISPOSE_WAIT_MS
+  }
+})
+
 // ---- 显式停止是终态：stop 之后不得再被内部重连拉起新进程 ----
 // 这是 shutdown 竞态的根因：stopped 曾会被 start() 里的 `this.stopped = false`
 // 无条件抹掉，于是 stop() 路径上被 cleanup() 拒绝的在途调用，会经 callTool 的

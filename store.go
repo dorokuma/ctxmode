@@ -34,6 +34,24 @@ type SearchResult struct {
 type Store struct {
 	db     *sql.DB
 	dbPath string
+	// onIndexedBytes, when non-nil, is called once after each successful KB
+	// write with the number of content bytes handed to the store. It is the
+	// single kept-out accounting hook (ctx_stats' "store" row): because it
+	// lives in the Store, every write path is covered — oversized ctx_run
+	// execute/execute_file/run_task output and ctx_fs rg auto-index (both via
+	// storeIndexLocked), ctx_kb index, ctx_run action=batch direct
+	// Store.Index calls, ctx_kb fetch via ReplaceExactAndChunks, and the
+	// legacy JSON migration re-index. nil-safe: a Store built without a server
+	// (tests, CLI paths) simply does not account.
+	onIndexedBytes func(int)
+}
+
+// recordIndexedBytes fires the optional kept-out accounting callback after a
+// write has been committed. It must only be called on success.
+func (s *Store) recordIndexedBytes(n int) {
+	if s.onIndexedBytes != nil {
+		s.onIndexedBytes(n)
+	}
 }
 
 // sqliteDSN builds a file: URI DSN so paths containing space, %, ?, or #
@@ -255,6 +273,9 @@ func (s *Store) Index(path, content string) error {
 	if err := checkSensitiveContent(content); err != nil {
 		return err
 	}
+	// Kept-out accounting counts the content as handed in (before the
+	// neutralizeDefMarker rewrite below, which can add at most one byte).
+	inputBytes := len(content)
 	// Defense in depth, same rationale as the checkSensitiveContent gate
 	// above: not every KB write path flows through the toolIndex gate in
 	// main.go (batch.go writes output via Store.Index directly, JSON
@@ -262,11 +283,10 @@ func (s *Store) Index(path, content string) error {
 	// prefix at content position 0 here as well. Idempotent, and a no-op
 	// unless the document starts with the marker; the rest of the content
 	// is preserved byte-for-byte. The fencing layers cover different sets of
-	// write paths: the toolIndex gate (main.go) is narrower than
-	// storeIndexLocked, and the ctx_stats kept-out accounting
-	// (statRecordKeptOut) follows storeIndexLocked — so batch.go's direct
-	// Store.Index call and ctx_kb fetch's ReplaceExactAndChunks write are
-	// counted by neither.
+	// write paths: the toolIndex gate (main.go) is narrower than the store
+	// itself. The ctx_stats kept-out accounting (statRecordKeptOut) is
+	// installed on the Store (onIndexedBytes), so it covers this method
+	// wherever it is called from — batch.go's direct call included.
 	content = neutralizeDefMarker(content)
 	var mtimeNS, size int64
 	if info, statErr := os.Stat(path); statErr == nil {
@@ -293,6 +313,7 @@ func (s *Store) Index(path, content string) error {
 	if err := s.secureDBFiles(); err != nil {
 		return err
 	}
+	s.recordIndexedBytes(inputBytes)
 	return nil
 }
 
@@ -874,10 +895,16 @@ func (s *Store) PurgeExactAndChunks(docPath string) (deleted int, err error) {
 // and inserts the provided chunks within a single transaction. If any check or step fails,
 // the transaction is rolled back and existing entries are preserved.
 func (s *Store) ReplaceExactAndChunks(docPath string, chunks []string) error {
+	// Kept-out accounting counts the chunks as handed in (before the
+	// neutralizeDefMarker rewrite below, which can add at most one byte per
+	// chunk). Sensitive-content refusal happens in the same loop, so nothing
+	// is accounted when any chunk is refused.
+	inputBytes := 0
 	for i, chunk := range chunks {
 		if err := checkSensitiveContent(chunk); err != nil {
 			return err
 		}
+		inputBytes += len(chunk)
 		// Each chunk is stored as its own KB document row, so a literal
 		// "[def] " prefix at a chunk start spoofs the ctxmode marker the
 		// same way a doc-level prefix does (see neutralizeDefMarker).
@@ -931,6 +958,7 @@ func (s *Store) ReplaceExactAndChunks(docPath string, chunks []string) error {
 	if err := s.secureDBFiles(); err != nil {
 		return err
 	}
+	s.recordIndexedBytes(inputBytes)
 	return nil
 }
 

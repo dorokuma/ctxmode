@@ -3,6 +3,17 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **`ctx_kb action=stats` reports `kept_out_bytes` instead of `saved_estimate_bytes`.** The old field was `totalOutput - totalInput`, i.e. the raw byte counters of the commands this server ran, so an output that was returned to the caller verbatim was still counted as "saved" almost in full. The field is now the session's kept-out total — the same figure `ctx_stats` reports as `total_kept_out` — and is named `kept_out_bytes`. `total_input_bytes` / `total_output_bytes` are kept (they are legitimate raw quantities) with their descriptions now stating that they are command input/output bytes, not a context-saving measure.
+- **kept-out accounting moved into the `Store` (every KB write path is now covered).** `Store` gains an optional `onIndexedBytes func(int)` callback invoked after `Store.Index` and `Store.ReplaceExactAndChunks` commit successfully (`Index` passes the input `content` length, `ReplaceExactAndChunks` the sum of the chunk lengths, both measured before `neutralizeDefMarker` rewrites them); `main` installs it via the new `server.attachStore` so it feeds `statRecordKeptOut("store", n)`. The `statRecordKeptOut` call inside `storeIndexLocked` is removed to avoid double counting. Two paths that previously counted nothing are therefore counted now: `ctx_run action=batch`'s direct `Store.Index` writes and `ctx_kb action=fetch`'s `Store.ReplaceExactAndChunks` chunked writes. Only successful writes are counted, the pseudo-tool row stays `store`, and a nil callback stays nil-safe.
+- **`ctx_stats` is registered in the Pi extension.** `integrations/pi/ctxmode.ts` now returns `ctx_stats` from `getTools()` and registers it via `pi.registerTool` (label, Chinese description, `promptSnippet`, `promptGuidelines`, `parameters: { json?: boolean }`, `execute` → `run("ctx_stats", params, signal)`), matching the other five tools. The tool was already advertised by `instructions.go` and `README.md` but was unreachable from Pi.
+
+### Fixed
+- **`ctx_stats` no longer advertises an exemption that no longer exists.** The tool description in `router.go`, the `instructions.go` playbook line, the `README.md` `ctx_stats`/`batch`/`ctx_kb stats` sections, the `stats.go`/`store.go`/`main.go` comments and the `integrations/pi/README.md` boundary paragraph all stated (or implied) that kept-out bytes were counted only where output went through `storeIndexLocked`, and that `ctx_run action=batch` and `ctx_kb fetch` were not counted. They now describe the full coverage above.
+- **Regression tests for the two accounting gaps** (`stats_test.go`, appended to the existing file): `TestStoreLayerKeptOutCoversBatchDirectIndex`, `TestStoreLayerKeptOutCoversFetchChunks` and `TestToolStatsKeptOutBytesIsKeptOutTotal`. All three were measured red against the pre-change code (the batch/fetch probes saw no `store` row at all, and `ctx_kb action=stats` returned `saved_estimate_bytes: 99000` for a 100000/1000 output/input pair) and are green after.
+
 ## [4.3.0] - 2026-10-07
 
 ### Added

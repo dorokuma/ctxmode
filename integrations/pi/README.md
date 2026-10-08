@@ -1,18 +1,15 @@
 # Pi integration
 
 Thin bridge: Pi has **no MCP client**. This extension spawns the `ctxmode`
-binary (MCP over stdio, internal only) and registers five **native Pi tools**
-(`ctx_run`, `ctx_fs`, `ctx_git`, `ctx_kb`, `ctx_bg`). 桥本身**不校验**服务端
-`ctxmode` 的版本；下文描述的是随 4.3.0 一起发布的桥（注册的仍是这五个工具）。
-Go MCP 面的 `ctx_stats` 与 `ctx_fs action=resolve|related` 自 4.3.0 起才有，且
-**本桥不暴露**（详见下方边界段）。
+binary (MCP over stdio, internal only) and registers six **native Pi tools**
+(`ctx_run`, `ctx_fs`, `ctx_git`, `ctx_kb`, `ctx_bg`, `ctx_stats`). 桥本身**不校验**服务端
+`ctxmode` 的版本；下文描述的是本仓当前的桥。
 
-边界：桥只暴露上述五个工具。`ctx_stats`（Go MCP 面注册于 `router.go:309-313`）与
-`ctx_fs action=resolve|related`（Go MCP 面的动作枚举见 `router.go:285`；Pi 侧
-`integrations/pi/ctxmode.ts:827` 的 enum 仅 `ls|glob|stat|rg`）目前**只在 Go MCP 面
-提供，Pi 桥未暴露**（`integrations/pi/ctxmode.ts:778-913` 只注册了上述五个
-`pi.registerTool`）。凡涉及 `ctx_stats` 或 `resolve`/`related` 的用法，不要写成
-「Pi 已支持」。
+边界：桥只暴露上述六个工具。`ctx_stats` 自本次改动起已在 Pi 面注册
+（`integrations/pi/ctxmode.ts` 的 `getTools()` 与 `pi.registerTool` 同步）；
+`ctx_fs action=resolve|related`（Go MCP 面的动作枚举见 `router.go`；Pi 侧
+`ctx_fs` 的 enum 仍只有 `ls|glob|stat|rg`）目前**只在 Go MCP 面提供，Pi 桥未暴露**。
+凡涉及 `resolve`/`related` 的用法，不要写成「Pi 已支持」。
 
 ```bash
 go build -o ctxmode .

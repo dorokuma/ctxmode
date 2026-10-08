@@ -77,6 +77,21 @@ type server struct {
 	scanMaxFilesOverride int
 }
 
+// attachStore wires a Store to this server and installs the kept-out
+// accounting sink on it (Store.onIndexedBytes → statRecordKeptOut). Every
+// successful KB write is then counted, wherever it originates: the
+// auto-indexing paths that funnel through storeIndexLocked, ctx_run
+// action=batch's direct Store.Index calls, ctx_kb fetch's
+// Store.ReplaceExactAndChunks writes, and the legacy JSON migration re-index.
+// Production code reaches it through main; tests that build a server around a
+// store can use it to get the same accounting.
+func (s *server) attachStore(store *Store) {
+	s.store = store
+	if store != nil {
+		store.onIndexedBytes = func(n int) { s.statRecordKeptOut("store", n) }
+	}
+}
+
 func fatal(s *Store, format string, args ...any) {
 	shutdownBackground()
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
@@ -169,13 +184,18 @@ func main() {
 		dbPath:          dbPath,
 		sessionID:       sessionID,
 		startedAt:       time.Now(),
-		store:           store,
 		floodGuard:      floodGuard,
 		searchPipeline:  searchPipeline,
 		httpClient:      newHTTPClient(),
 		gitDirtyCache:   make(map[string]gitDirtyEntry),
 		rgIndexDedupMap: make(map[string]rgIndexEntry),
 	}
+	// Install the kept-out accounting sink on the store itself: every
+	// successful KB write (Store.Index, Store.ReplaceExactAndChunks) is
+	// counted, so batch's direct writes and fetch's chunked writes are
+	// covered by the same single hook as the auto-indexing paths.
+	s.attachStore(store)
+
 	s.migrateFromJSONOrWarn()
 	s.excludeFromGit()
 
@@ -787,14 +807,22 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 
 // statsResult is the detailed response for ctx_kb action=stats.
 type statsResult struct {
-	DocsIndexed        int    `json:"docs_indexed"`
-	CacheEntries       int    `json:"cache_entries"`
-	DBSizeBytes        int64  `json:"db_size_bytes"`
-	TotalInput         int64  `json:"total_input_bytes"`
-	TotalOutput        int64  `json:"total_output_bytes"`
-	SavedEstimateBytes int64  `json:"saved_estimate_bytes"`
-	SearchCallsWindow  int    `json:"search_calls_60s,omitempty" jsonschema:"number of OK search calls in the 60s sliding window (counts only allowed calls, not throttled or blocked)"`
-	SessionID          string `json:"session_id,omitempty"`
+	DocsIndexed  int   `json:"docs_indexed"`
+	CacheEntries int   `json:"cache_entries"`
+	DBSizeBytes  int64 `json:"db_size_bytes"`
+	// TotalInput/TotalOutput are raw byte counters of the commands this server
+	// ran (stdin/code/argv in, captured stdout+stderr out). They are NOT a
+	// context-saving measure: an output that was returned to the caller in
+	// full still counts here in full.
+	TotalInput  int64 `json:"total_input_bytes"`
+	TotalOutput int64 `json:"total_output_bytes"`
+	// KeptOutBytes is this session's context saving: the sum of every tool's
+	// kept-out bytes, i.e. content written into the KB store instead of being
+	// returned to the context window. Same figure ctx_stats reports as
+	// total_kept_out.
+	KeptOutBytes      int64  `json:"kept_out_bytes"`
+	SearchCallsWindow int    `json:"search_calls_60s,omitempty" jsonschema:"number of OK search calls in the 60s sliding window (counts only allowed calls, not throttled or blocked)"`
+	SessionID         string `json:"session_id,omitempty"`
 }
 
 type statsArgs struct{}
@@ -816,20 +844,25 @@ func (s *server) toolStats(ctx context.Context, _ *mcp.CallToolRequest, _ statsA
 		return nil, nil, fmt.Errorf("store cache count: %w", err)
 	}
 
-	savedBytes := s.totalOutput - s.totalInput
-	if savedBytes < 0 {
-		savedBytes = 0
+	// Kept-out total comes from the ctx_stats counters (statMu), not from the
+	// raw output-input byte counters: only bytes that were actually written
+	// into the KB instead of being returned to the caller count as saved.
+	s.statMu.Lock()
+	var keptOut int64
+	for _, st := range s.statTools {
+		keptOut += st.keptOut
 	}
+	s.statMu.Unlock()
 
 	res := statsResult{
-		DocsIndexed:        docCount,
-		CacheEntries:       cacheCount,
-		DBSizeBytes:        dbSize,
-		TotalInput:         s.totalInput,
-		TotalOutput:        s.totalOutput,
-		SavedEstimateBytes: savedBytes,
-		SearchCallsWindow:  windowCount,
-		SessionID:          s.sessionID,
+		DocsIndexed:       docCount,
+		CacheEntries:      cacheCount,
+		DBSizeBytes:       dbSize,
+		TotalInput:        s.totalInput,
+		TotalOutput:       s.totalOutput,
+		KeptOutBytes:      keptOut,
+		SearchCallsWindow: windowCount,
+		SessionID:         s.sessionID,
 	}
 
 	js, _ := json.MarshalIndent(res, "", "  ")
@@ -1815,13 +1848,16 @@ func formatIntentIndexed(exitCode, n int, label, outputText string, indexErr err
 // concurrent writes from different goroutines are serialized. Combined with
 // SetMaxOpenConns(1) in the store, this prevents SQLITE_BUSY on concurrent
 // index operations.
+//
+// It is no longer a kept-out accounting point: that accounting lives in the
+// Store itself (Store.onIndexedBytes, installed in main), so the paths that
+// call store.Index directly (ctx_run action=batch) and the chunked writes
+// (ctx_kb fetch via Store.ReplaceExactAndChunks) are counted too. Accounting
+// here as well would double-count every path that goes through this helper.
 func (s *server) storeIndexLocked(path, content string) error {
 	s.mu.Lock()
 	err := s.store.Index(path, content)
 	s.mu.Unlock()
-	if err == nil {
-		s.statRecordKeptOut("store", len(content))
-	}
 	return err
 }
 

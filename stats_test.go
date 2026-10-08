@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStatRecordCallAndKeptOut(t *testing.T) {
@@ -106,6 +107,75 @@ func TestToolCtxStatsTextAndJSON(t *testing.T) {
 	}
 	if text := mcpResultText(t, res); !strings.Contains(text, `"total_kept_out"`) {
 		t.Fatalf("json output wrong:\n%s", text)
+	}
+}
+
+func TestStoreLayerKeptOutCoversBatchDirectIndex(t *testing.T) {
+	// Regression: the batch auto-index path writes with a direct
+	// Store.Index call, so the kept-out accounting used to miss it. The sink
+	// now lives in the Store itself, so this path is counted too.
+	s := &server{workdirs: []string{t.TempDir()}}
+	s.attachStore(newTestStore(t))
+
+	out := strings.Repeat("x", maxOutputSize+1)
+	r := &batchResult{Label: "big", ExitCode: 0}
+	s.completeBatchResult(r, "run-1", out, "")
+	if !r.Indexed {
+		t.Fatalf("batch output was not indexed: %q", r.IndexError)
+	}
+	s.statMu.Lock()
+	st := s.statTools["store"]
+	s.statMu.Unlock()
+	if st == nil || st.keptOut != int64(len(out)) {
+		t.Fatalf("batch direct store must be counted as kept-out: %+v (want %d)", st, len(out))
+	}
+}
+
+func TestStoreLayerKeptOutCoversFetchChunks(t *testing.T) {
+	// Regression: ctx_kb fetch writes through indexContentLocked →
+	// Store.ReplaceExactAndChunks, which bypassed the old storeIndexLocked
+	// accounting point. The Store-layer sink counts the chunk bytes.
+	s := &server{}
+	s.attachStore(newTestStore(t))
+
+	content := strings.Repeat("fetch chunk body text\n\n", 300)
+	if _, err := s.indexContentLocked("session:x:src:md:http://example.com/probe", content); err != nil {
+		t.Fatalf("indexContentLocked: %v", err)
+	}
+	var want int64
+	for _, c := range chunkContent(content) {
+		want += int64(len(c))
+	}
+	s.statMu.Lock()
+	st := s.statTools["store"]
+	s.statMu.Unlock()
+	if st == nil || st.keptOut != want {
+		t.Fatalf("fetch chunked write must be counted as kept-out: %+v (want %d)", st, want)
+	}
+}
+
+func TestToolStatsKeptOutBytesIsKeptOutTotal(t *testing.T) {
+	// ctx_kb action=stats must report kept_out_bytes (the kept-out total),
+	// not totalOutput-totalInput — a short output returned verbatim saves
+	// nothing even though it makes the old subtraction look large.
+	s := &server{store: newTestStore(t), floodGuard: NewFloodGuard(60*time.Second, 64)}
+	s.totalOutput = 100000
+	s.totalInput = 1000
+	s.statRecordKeptOut("store", 4096)
+
+	res, _, err := s.toolStats(context.Background(), nil, statsArgs{})
+	if err != nil {
+		t.Fatalf("toolStats: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, `"kept_out_bytes": 4096`) {
+		t.Fatalf("kept_out_bytes must be the kept-out total:\n%s", text)
+	}
+	if strings.Contains(text, "saved_estimate_bytes") {
+		t.Fatalf("saved_estimate_bytes must be gone:\n%s", text)
+	}
+	if !strings.Contains(text, `"total_output_bytes": 100000`) {
+		t.Fatalf("raw byte counters must be kept:\n%s", text)
 	}
 }
 

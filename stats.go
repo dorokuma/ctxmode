@@ -53,15 +53,14 @@ func (s *server) statRecordCall(tool string, returnedBytes int) {
 }
 
 // statRecordKeptOut counts bytes written to the KB store instead of the
-// context window. Called from storeIndexLocked — the choke point the
-// auto-indexing paths funnel through (oversized ctx_run execute /
-// execute_file / run_task output, ctx_fs rg auto-index, ctx_kb index, and the
-// legacy JSON migration re-index) — and attributed to the pseudo-tool "store"
-// because the choke point does not know which top-level tool triggered it.
-// It does not fence every KB write: ctx_run action=batch writes through
-// Store.Index directly (batch.go) and ctx_kb fetch through indexContentLocked
-// → Store.ReplaceExactAndChunks (fetch.go, store.go), so the bytes of neither
-// are counted here.
+// context window. It is installed on the Store itself (Store.onIndexedBytes,
+// wired up in main), so every successful KB write is covered — the
+// auto-indexing paths that funnel through storeIndexLocked (oversized ctx_run
+// execute / execute_file / run_task output, ctx_fs rg auto-index, ctx_kb
+// index), ctx_run action=batch's direct Store.Index calls, ctx_kb fetch's
+// Store.ReplaceExactAndChunks writes, and the legacy JSON migration re-index.
+// Attributed to the pseudo-tool "store" because the sink does not know which
+// top-level tool triggered the write.
 func (s *server) statRecordKeptOut(tool string, bytes int) {
 	if bytes <= 0 {
 		return
@@ -80,8 +79,9 @@ func (s *server) statRecordKeptOut(tool string, bytes int) {
 }
 
 // counted wraps a tool handler so every call's returned text length feeds
-// ctx_stats. Kept-out bytes are recorded separately at the storeIndexLocked
-// choke point (statRecordKeptOut lists the paths it does and does not cover).
+// ctx_stats. Kept-out bytes are recorded separately by the Store-layer sink
+// (Store.onIndexedBytes → statRecordKeptOut), which covers every KB write
+// path.
 func counted[T any](s *server, name string, h func(context.Context, *mcp.CallToolRequest, T) (*mcp.CallToolResult, any, error)) func(context.Context, *mcp.CallToolRequest, T) (*mcp.CallToolResult, any, error) {
 	return func(ctx context.Context, req *mcp.CallToolRequest, args T) (*mcp.CallToolResult, any, error) {
 		res, anyRes, err := h(ctx, req, args)

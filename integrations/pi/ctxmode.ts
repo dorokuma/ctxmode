@@ -607,7 +607,7 @@ export class CtxmodeClient {
   }
 
   getTools(): string[] {
-    return ["ctx_run", "ctx_fs", "ctx_git", "ctx_kb", "ctx_bg"]
+    return ["ctx_run", "ctx_fs", "ctx_git", "ctx_kb", "ctx_bg", "ctx_stats"]
   }
 
   /** Instructions announced by the server during initialize (absent → null). */
@@ -910,6 +910,23 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
     }),
     async execute(_id, params, signal) {
       return run("ctx_bg", params as Record<string, unknown>, signal)
+    },
+  })
+
+  pi.registerTool({
+    name: "ctx_stats",
+    label: "CTX Stats",
+    description: "上下文消耗统计（本会话）：各工具调用次数、回给上下文窗口的字节、估算 token，以及被自动入库到 KB 而省下的 kept-out 字节（覆盖全部入库路径：ctx_run 超限输出、ctx_fs rg 自动入库、ctx_kb index、ctx_run action=batch、ctx_kb fetch、旧 JSON 迁移）。无 action 参数；json:true 返回机器可读输出。",
+    promptSnippet: "Session context-consumption statistics (returned vs kept-out bytes)",
+    promptGuidelines: [
+      "Use ctx_stats to see how many bytes this session returned to the context window versus kept out by auto-indexing.",
+      "ctx_stats takes no action argument; pass json:true for machine-readable output.",
+    ],
+    parameters: Type.Object({
+      json: Type.Optional(Type.Boolean({ description: "Return the report as JSON" })),
+    }),
+    async execute(_id, params, signal) {
+      return run("ctx_stats", params as Record<string, unknown>, signal)
     },
   })
 }
