@@ -1,7 +1,7 @@
 // ctxmode: a Go MCP server that virtualizes tool output to save context tokens.
-// v2.0 MCP surface (category tools + action=):
+// v2.0 MCP surface (category tools + action=; ctx_stats takes no action):
 //
-//	ctx_run, ctx_fs, ctx_git, ctx_kb, ctx_bg
+//	ctx_run, ctx_fs, ctx_git, ctx_kb, ctx_bg, ctx_stats
 //
 // Internal handlers retain the former ctx_* names; they are not registered as MCP tools.
 package main

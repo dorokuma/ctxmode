@@ -4,8 +4,8 @@ package main
 const serverInstructions = `# ctxmode — context virtualization for agent tool output
 
 ctxmode runs code, inspects files and git, and virtualizes large output into a
-local knowledge base to save context tokens. Five tools; each takes a required
-action argument.
+local knowledge base to save context tokens. Six tools; five take a required
+action argument (ctx_stats takes none).
 
 ## Tool map (action)
 
@@ -14,12 +14,18 @@ action argument.
   queries), run_task (go_test|go_build|go_vet|npm_test|npm_run_build|
   cargo_test|cargo_build|make|custom; fixed argv). Large output auto-indexed.
 - ctx_fs: sandboxed workspace filesystem. ls (list), glob (pattern), stat
-  (metadata), rg (content search). Prefer over ad-hoc shell find/ls/rg.
+  (metadata), rg (content search), resolve (fuzzy-ranked file lookup from an
+  approximate/@-style path), related (files related to a given file: test/impl
+  pairs, same stem, siblings). Prefer over ad-hoc shell find/ls/rg.
 - ctx_git: read-only git. status (porcelain -b), diff (path/stat/staged), log
   (n/path/oneline). No commit/push/reset.
 - ctx_kb: local knowledge base. index (path), search (query), fetch
   (URL→markdown→index), stats, purge (confirm:true), doctor (install check).
 - ctx_bg: background processes from ctx_run action=execute background:true. Starting a background job returns immediately and never proactively pushes notifications. After receiving its id, call ctx_bg action=wait once by id or pid (blocking this tool call; default 60000ms, maximum 1 hour; timeout does not kill). Completed results remain wait-addressable through a bounded handoff window even if the detailed registry entry is pruned; after that window the id is unknown. id and pid are mutually exclusive. kill terminates (and wakes waiters); repeated wait is a stable read of the same terminal result, while repeated kill or kill of a completed/expired id returns no-match.
+- ctx_stats: context-consumption statistics for the session: per-tool call counts, bytes returned to the context window, estimated tokens, and bytes kept out by auto-indexing (counted only where
+  output is stored through the storeIndexLocked choke point; ctx_run action=batch
+  direct stores and ctx_kb fetch are not counted). No action argument; pass
+  json:true for machine-readable output.
 
 ## Usage policy
 
@@ -36,8 +42,8 @@ action argument.
 
 ## Host notes
 
-- Tool names: ctx_run, ctx_fs, ctx_git, ctx_kb, ctx_bg; action is a required
-  argument (e.g. ctx_fs action=ls path=.).
+- Tool names: ctx_run, ctx_fs, ctx_git, ctx_kb, ctx_bg, ctx_stats; action is a
+  required argument for all but ctx_stats (e.g. ctx_fs action=ls path=.).
 - Grok prefixes the server name onto tool names; pi registers the same tool
   names directly.
 `

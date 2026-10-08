@@ -10,7 +10,7 @@ Supported platform: **Linux**. Background process identity verification reads `/
 
 ## MCP tools (v2)
 
-Six real tools (not skills). Each takes **`action=`** plus capability-specific fields:
+Six real tools (not skills). Five take **`action=`** plus capability-specific fields; `ctx_stats` takes no action and only accepts `json`:
 
 | Tool | Actions | Key parameters |
 |------|---------|----------------|
@@ -21,11 +21,11 @@ Six real tools (not skills). Each takes **`action=`** plus capability-specific f
 | **ctx_bg** | `list`, `kill`, `log`, `wait` | —; `id`/`pid`; `id`/`pid`/`tail_lines`/`tail_bytes`; `id`/`pid`/`timeout_ms` |
 | **ctx_stats** | — (no `action=`; single capability) | `json` (machine-readable output) |
 
-Any MCP host (Grok, Pi, …) uses this surface. Grok prefixes the server name (e.g. `ctxmode__ctx_run`).
+Any MCP host (e.g. Grok) uses this surface; the Pi adapter below is the exception. Grok prefixes the server name (e.g. `ctxmode__ctx_run`).
 
 ## Pi integration
 
-A Pi-specific TypeScript adapter is maintained in [`integrations/pi/`](integrations/pi/README.md). It registers the **same five tools** and bridges stdio MCP to the Go binary.
+A Pi-specific TypeScript adapter is maintained in [`integrations/pi/`](integrations/pi/README.md). It registers **five of those tools** (`ctx_run`, `ctx_fs`, `ctx_git`, `ctx_kb`, `ctx_bg`; `ctx_stats` is not exposed) and bridges stdio MCP to the Go binary.
 
 ## Quick Start
 
