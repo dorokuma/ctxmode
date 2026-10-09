@@ -3,7 +3,7 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [5.0.0] - 2026-10-09
 
 ### Changed
 - **BREAKING: `ctx_kb action=stats` reports `kept_out_bytes` instead of `saved_estimate_bytes`.** The old JSON field name is no longer returned, so an external consumer that reads it now sees a missing key. The old field was `totalOutput - totalInput`, i.e. the raw byte counters of the commands this server ran, so an output that was returned to the caller verbatim was still counted as "saved" almost in full. The field is now the session's kept-out total — the same figure `ctx_stats` reports as `total_kept_out` — and is named `kept_out_bytes`. `total_input_bytes` / `total_output_bytes` are kept (they are legitimate raw quantities) with their descriptions now stating that they are command input/output bytes, not a context-saving measure.
