@@ -717,6 +717,113 @@ test("扩展层：ctx_stats 已注册且列入 getTools()", async () => {
   }
 })
 
+test("扩展层：ctx_fs 暴露 resolve 与 related 动作枚举并透传调用", async () => {
+  const recvPath = path.join(tmpDir, "fs-resolve-related-recv.jsonl")
+  fs.writeFileSync(recvPath, "")
+  process.env.CTXMODE_BIN = writeRecordingStubBin("fs-resolve-related-bin")
+  process.env.CTXMODE_TEST_RECV = recvPath
+  process.env.CTXMODE_DISPOSE_WAIT_MS = "50"
+  const { pi, handlers, tools } = fakePi()
+  ctxmodeExtension(pi)
+  try {
+    await (handlers.get("session_start") as (e: unknown, c: unknown) => Promise<void>)(
+      { type: "session_start" },
+      { cwd: tmpDir, ui: { notify() {} } },
+    )
+
+    const ctxFs = tools.get("ctx_fs") as {
+      description: string
+      parameters: {
+        action: { description: string; enum: string[] }
+      }
+      execute: (id: string, p: Record<string, unknown>) => Promise<unknown>
+    }
+    assert.ok(ctxFs, "ctx_fs 已注册")
+    assert.deepEqual(
+      ctxFs.parameters.action.enum,
+      ["ls", "glob", "stat", "rg", "resolve", "related"],
+      "ctx_fs action enum 须对齐 router.go 的六项动作",
+    )
+    assert.equal(
+      ctxFs.parameters.action.description,
+      "ls|glob|stat|rg|resolve|related",
+      "ctx_fs action description 须包含 resolve|related",
+    )
+    assert.ok(
+      ctxFs.description.includes("resolve") && ctxFs.description.includes("related"),
+      "ctx_fs 工具描述须写明 resolve 与 related",
+    )
+
+    const resolveCall = ctxFs
+      .execute("id-resolve", { action: "resolve", path: "@router.go", limit: 5 })
+      .then(
+        (r) => (r as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? "",
+        (e: Error) => `rejected: ${e?.message}`,
+      )
+    const relatedCall = ctxFs
+      .execute("id-related", { action: "related", path: "router.go", limit: 3 })
+      .then(
+        (r) => (r as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? "",
+        (e: Error) => `rejected: ${e?.message}`,
+      )
+    const parseToolCalls = (): Array<{
+      method?: string
+      params?: { name?: string; arguments?: Record<string, unknown> }
+    }> =>
+      fs
+        .readFileSync(recvPath, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .flatMap((line) => {
+          try {
+            return [JSON.parse(line)]
+          } catch {
+            return []
+          }
+        })
+        .filter((req) => req?.method === "tools/call")
+
+    const sent = await waitUntil(() => {
+      const calls = parseToolCalls()
+      return (
+        calls.some(
+          (r) => r.params?.name === "ctx_fs" && r.params?.arguments?.action === "resolve",
+        ) &&
+        calls.some(
+          (r) => r.params?.name === "ctx_fs" && r.params?.arguments?.action === "related",
+        )
+      )
+    }, 3000)
+    assert.ok(sent, "ctx_fs resolve 与 related 调用须透传发往服务端")
+
+    const calls = parseToolCalls()
+    const resolveReq = calls.find(
+      (r) => r.params?.name === "ctx_fs" && r.params?.arguments?.action === "resolve",
+    )
+    const relatedReq = calls.find(
+      (r) => r.params?.name === "ctx_fs" && r.params?.arguments?.action === "related",
+    )
+    assert.deepEqual(resolveReq?.params, {
+      name: "ctx_fs",
+      arguments: { action: "resolve", path: "@router.go", limit: 5 },
+    })
+    assert.deepEqual(relatedReq?.params, {
+      name: "ctx_fs",
+      arguments: { action: "related", path: "router.go", limit: 3 },
+    })
+
+    await (handlers.get("session_shutdown") as () => Promise<void>)()
+    assert.match(await resolveCall, /ctxmode disconnected/)
+    assert.match(await relatedCall, /ctxmode disconnected/)
+  } finally {
+    await (handlers.get("session_shutdown") as () => Promise<void>)()
+    delete process.env.CTXMODE_BIN
+    delete process.env.CTXMODE_TEST_RECV
+    delete process.env.CTXMODE_DISPOSE_WAIT_MS
+  }
+})
+
 // ---- 显式停止是终态：stop 之后不得再被内部重连拉起新进程 ----
 // 这是 shutdown 竞态的根因：stopped 曾会被 start() 里的 `this.stopped = false`
 // 无条件抹掉，于是 stop() 路径上被 cleanup() 拒绝的在途调用，会经 callTool 的

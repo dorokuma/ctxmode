@@ -15,17 +15,17 @@ Six real tools (not skills). Five take **`action=`** plus capability-specific fi
 | Tool | Actions | Key parameters |
 |------|---------|----------------|
 | **ctx_run** | `execute`, `execute_file`, `batch`, `run_task` | `command`/`language`/`timeout_ms`/`background`/`intent`/`cwd`/`argv`/`env`/`stdin`; `path`+`code`; `commands`/`queries`/`concurrency`/`query_scope`; `kind`/`target`/`args`/`timeout_ms` |
-| **ctx_fs** | `ls`, `glob`, `stat`, `rg`, `resolve`, `related` | `path`/`depth`/`include_hidden`/`limit`; `pattern`/`path`/`limit`; `path`; `pattern`/`glob`/`ignore_case`/`context`/`literal` |
+| **ctx_fs** | `ls`, `glob`, `stat`, `rg`, `resolve`, `related` | `path`/`depth`/`include_hidden`/`limit`; `pattern`/`path`/`limit`; `path`; `pattern`/`glob`/`ignore_case`/`context`/`literal`/`offset`; `path`/`limit`; `path`/`limit` |
 | **ctx_git** | `status`, `diff`, `log` | `cwd`; `path`/`stat`/`unified`/`staged`; `n`/`path`/`oneline` |
 | **ctx_kb** | `index`, `search`, `fetch`, `stats`, `purge`, `doctor` | `path`; `query`; `url`/`urls`/`source`/`format`/`force`/`maxBytes`/`timeout_ms`/`ttl_ms`; —; `confirm`/`scope`/`sessionId`/`dryRun`; — |
 | **ctx_bg** | `list`, `kill`, `log`, `wait` | —; `id`/`pid`; `id`/`pid`/`tail_lines`/`tail_bytes`; `id`/`pid`/`timeout_ms` |
 | **ctx_stats** | — (no `action=`; single capability) | `json` (machine-readable output) |
 
-Any MCP host (e.g. Grok) uses this surface; the Pi adapter below is the exception. Grok prefixes the server name (e.g. `ctxmode__ctx_run`).
+Any MCP host (Grok, Pi via the adapter below, …) uses this surface. Grok prefixes the server name (e.g. `ctxmode__ctx_run`).
 
 ## Pi integration
 
-A Pi-specific TypeScript adapter is maintained in [`integrations/pi/`](integrations/pi/README.md). It registers **six tools** (`ctx_run`, `ctx_fs`, `ctx_git`, `ctx_kb`, `ctx_bg`, `ctx_stats`) and bridges stdio MCP to the Go binary.
+A Pi-specific TypeScript adapter is maintained in [`integrations/pi/`](integrations/pi/README.md). It registers the **same six tools** (`ctx_run`, `ctx_fs` including `resolve` and `related`, `ctx_git`, `ctx_kb`, `ctx_bg`, `ctx_stats`) and bridges stdio MCP to the Go binary.
 
 ## Quick Start
 

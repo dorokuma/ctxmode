@@ -815,8 +815,8 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
   pi.registerTool({
     name: "ctx_fs",
     label: "CTX FS",
-    description: "工作区文件（沙箱）。action=ls|glob|stat|rg（rg 默认 limit=20，超限自动落库并返回摘要，支持 offset 线性翻页）。",
-    promptSnippet: "List, glob, stat, or search files under workdirs",
+    description: "工作区文件（沙箱）。action=ls|glob|stat|rg|resolve|related（rg 默认 limit=20，超限自动落库并返回摘要，支持 offset 线性翻页；resolve 按近似/@路径模糊检索候选文件，移植自 pi-fff；related 查找给定文件的测试/实现配对、同 stem 与同目录关联文件）。",
+    promptSnippet: "List, glob, stat, search, resolve, or find related files under workdirs",
     promptGuidelines: [
       "Prefer ctx_fs over shell find/ls/rg when listing or searching workspace files.",
       "rg: grep for a concrete identifier (e.g. MyFunc), never '.*' — grep is not a file reader.",
@@ -824,7 +824,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
       "rg: for huge result sets use ctx_kb action=search or ctx_fs rg offset paging.",
     ],
     parameters: Type.Object({
-      action: Type.String({ description: "ls|glob|stat|rg", enum: ["ls", "glob", "stat", "rg"] }),
+      action: Type.String({ description: "ls|glob|stat|rg|resolve|related", enum: ["ls", "glob", "stat", "rg", "resolve", "related"] }),
       path: Type.Optional(Type.String()),
       pattern: Type.Optional(Type.String()),
       glob: Type.Optional(Type.String()),

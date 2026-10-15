@@ -3,6 +3,11 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **`ctx_fs action=resolve|related` is exposed in the Pi extension.** `integrations/pi/ctxmode.ts` updates `ctx_fs`'s `action` enum and description from `ls|glob|stat|rg` to `ls|glob|stat|rg|resolve|related` (matching `router.go`'s `ctxFsArgs` and tool description; `path` and `limit` were already present on the Pi parameter schema), and `README.md` / `integrations/pi/README.md` remove the former boundary note that `resolve` and `related` were omitted by the Pi bridge. One test in `integrations/pi/ctxmode.test.ts` asserts the six-action enum, description, and `tools/call` forwarding for both actions (measured red before the change, green after).
+
 ## [5.0.0] - 2026-10-09
 
 ### Changed
