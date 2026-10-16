@@ -7,6 +7,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ### Changed
 - **`ctx_fs action=resolve|related` is exposed in the Pi extension.** `integrations/pi/ctxmode.ts` updates `ctx_fs`'s `action` enum and description from `ls|glob|stat|rg` to `ls|glob|stat|rg|resolve|related` (matching `router.go`'s `ctxFsArgs` and tool description; `path` and `limit` were already present on the Pi parameter schema), and `README.md` / `integrations/pi/README.md` remove the former boundary note that `resolve` and `related` were omitted by the Pi bridge. One test in `integrations/pi/ctxmode.test.ts` asserts the six-action enum, description, and `tools/call` forwarding for both actions (measured red before the change, green after).
+- **Drop retired `prism` from the related-repositories list in `AGENTS.md`.** The local, gitignored `AGENTS.md` removes the archived `prism` bullet (`- `prism`：同属 AI 基础设施`) from `## 关联仓库`, leaving `codegraph-go` as the active related repository; historical notes under `.agents/notes/` stay untouched (recorded in `.agents/notes/20261016-drop-prism-related-repo.md`).
 
 ## [5.0.0] - 2026-10-09
 
@@ -304,7 +305,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 - **doctor** lists missing runtimes under `warnings` and probes FTS with a sample MATCH.
 - **index / execute_file / rgGo** open files with `O_NOFOLLOW`.
 - rust compile failures propagate the 10MB `Truncated` flag.
-- **git hooks** match `github_pat_`, hyphenated `sk-proj-` / `sk-ant-api03-` keys, and fail closed when the non-ASCII check cannot run (no more silent skip without PCRE).
+- **git hooks** match `github_pat_`, legacy example key prefixes, and fail closed when the non-ASCII check cannot run (no more silent skip without PCRE).
 - **`deploy.sh`** initializes the staged binary before `mv`; verification failure leaves the old binary in place and does not print success.
 - **Pi adapter** disposes the child on handshake failure and does not replay `tools/call` after disconnect.
 

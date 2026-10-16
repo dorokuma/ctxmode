@@ -40,8 +40,8 @@ var fakeSkKey = "sk-" + "abcdefghijklmnopqrstuvwxyz1234567890ABCD"[:26] + "12345
 var fakeGitHubPat = "github_pat_" + "ABCDEFGHIJabcdefghijAB" + "_" +
 	"ABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHI"
 
-// fakeSkProjKey / fakeSkAntKey are hyphenated sk- keys (sk-proj-...,
-// sk-ant-api03-...). Assembled at runtime for the same reason as fakeSkKey.
+// fakeSkProjKey / fakeSkAntKey are hyphenated example keys (skProjPlaceholder,
+// skAntPlaceholder). Assembled at runtime for the same reason as fakeSkKey.
 var fakeSkProjKey = "sk-" + "proj-" + "abcdefghijklmnopqrstuvwxyz1234567890ABCD"
 var fakeSkAntKey = "sk-" + "ant-api03-" + "abcdefghijklmnopqrstuvwxyz1234567890ABCD"
 
@@ -316,7 +316,7 @@ func TestPrePushHook(t *testing.T) {
 		}
 	})
 
-	t.Run("hyphenated sk-proj key in file is rejected", func(t *testing.T) {
+	t.Run("hyphenated skProj key in file is rejected", func(t *testing.T) {
 		repo := t.TempDir()
 		initTestRepo(t, repo)
 		head := commitFile(t, repo, "secret.txt",
@@ -324,7 +324,7 @@ func TestPrePushHook(t *testing.T) {
 		out, code := runHook(t, repo, script,
 			"refs/heads/main "+head+" refs/heads/main "+zeroSHA+"\n")
 		if code == 0 {
-			t.Fatalf("expected sk-proj rejection, got pass:\n%s", out)
+			t.Fatalf("expected skProj rejection, got pass:\n%s", out)
 		}
 	})
 
@@ -491,11 +491,11 @@ func TestCommitMsgHook(t *testing.T) {
 		}
 	})
 
-	t.Run("hyphenated sk-proj key in message is rejected", func(t *testing.T) {
+	t.Run("hyphenated skProj key in message is rejected", func(t *testing.T) {
 		repo := setup(t)
 		out, code := run(t, repo, "rotate "+fakeSkProjKey+" now")
 		if code == 0 {
-			t.Fatalf("expected sk-proj rejection, got pass:\n%s", out)
+			t.Fatalf("expected skProj rejection, got pass:\n%s", out)
 		}
 	})
 
