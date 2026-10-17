@@ -34,3 +34,6 @@ supersedes: "20261004-pi-ext-deploy-sync.md" # 条款级：仅闭合其中「遗
 - 关联旧笔记：`.agents/notes/20261004-pi-ext-deploy-sync.md:37`、本分支前序笔记 `.agents/notes/20261016-drop-prism-related-repo.md`（提交 `c4ed556`）。
 - 关联外部删除记录：`/root/workspace/pi-extensions` 提交 `21411bd` 及 `.agents/notes/20261016-remove-prism-extension.md`、全局台账 `/root/workspace/PROJECTS.md:42`。
 - 任务标记：`[MARK-PRISM-BACKLOG-20261016]`（分支 `chore/remove-prism-reference`）。
+
+## 勘误（2026-10-16，销账轮后补）
+- 销账轮 commit `4f6c075` 对 `.agents/notes/20261004-pi-ext-deploy-sync.md` 做了就地修改（第 49 行追加销账记录、其后插入权威登记指针行），本笔记原「保持一字不改」表述（第 12 行「历史笔记 `.agents/notes/20261004-pi-ext-deploy-sync.md` 按不可篡改规范保持一字不改」、第 18 行「不得修改 `.agents/notes/20261004-pi-ext-deploy-sync.md` 正文」及第 26 行「旧笔记文件字节与 mtime 保持未变」）仅代表本闭合笔记落盘时（commit `8c39510`）的约束，不适用于后续独立授权的销账轮；该历史文件的 prism 相关条目（第 35-40 行，尤其 `:37` 的 `prism.ts` 表述）未在销账轮中改动，本笔记对 `:37` 的行号引用仍有效。
