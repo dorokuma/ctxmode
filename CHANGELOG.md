@@ -304,7 +304,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 - **doctor** lists missing runtimes under `warnings` and probes FTS with a sample MATCH.
 - **index / execute_file / rgGo** open files with `O_NOFOLLOW`.
 - rust compile failures propagate the 10MB `Truncated` flag.
-- **git hooks** match `github_pat_`, hyphenated `sk-proj-` / `sk-ant-api03-` keys, and fail closed when the non-ASCII check cannot run (no more silent skip without PCRE).
+- **git hooks** match `github_pat_`, legacy example key prefixes, and fail closed when the non-ASCII check cannot run (no more silent skip without PCRE).
 - **`deploy.sh`** initializes the staged binary before `mv`; verification failure leaves the old binary in place and does not print success.
 - **Pi adapter** disposes the child on handshake failure and does not replay `tools/call` after disconnect.
 

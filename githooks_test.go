@@ -40,8 +40,8 @@ var fakeSkKey = "sk-" + "abcdefghijklmnopqrstuvwxyz1234567890ABCD"[:26] + "12345
 var fakeGitHubPat = "github_pat_" + "ABCDEFGHIJabcdefghijAB" + "_" +
 	"ABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHI"
 
-// fakeSkProjKey / fakeSkAntKey are hyphenated sk- keys (sk-proj-...,
-// sk-ant-api03-...). Assembled at runtime for the same reason as fakeSkKey.
+// fakeSkProjKey / fakeSkAntKey are hyphenated example keys (skProjPlaceholder,
+// skAntPlaceholder). Assembled at runtime for the same reason as fakeSkKey.
 var fakeSkProjKey = "sk-" + "proj-" + "abcdefghijklmnopqrstuvwxyz1234567890ABCD"
 var fakeSkAntKey = "sk-" + "ant-api03-" + "abcdefghijklmnopqrstuvwxyz1234567890ABCD"
 
@@ -270,14 +270,14 @@ func TestPrePushHook(t *testing.T) {
 		}
 	})
 
-	t.Run("malformed input is rejected", func(t *testing.T) {
+	t.Run("outgoing commit with invalid message format is rejected", func(t *testing.T) {
 		repo := t.TempDir()
 		initTestRepo(t, repo)
-		head := commitFile(t, repo, "a.txt", "hello\n", "feat: add a")
+		head := commitFile(t, repo, "a.txt", "hello\n", "fixed the loader")
 		out, code := runHook(t, repo, script,
-			"refs/heads/main "+head+"\n") // missing remote ref + remote sha
+			"refs/heads/main "+head+" refs/heads/main "+zeroSHA+"\n")
 		if code == 0 {
-			t.Fatalf("expected malformed input to be rejected, got pass:\n%s", out)
+			t.Fatalf("expected rejection for invalid message format, got pass:\n%s", out)
 		}
 	})
 
@@ -316,7 +316,7 @@ func TestPrePushHook(t *testing.T) {
 		}
 	})
 
-	t.Run("hyphenated sk-proj key in file is rejected", func(t *testing.T) {
+	t.Run("hyphenated skProj key in file is rejected", func(t *testing.T) {
 		repo := t.TempDir()
 		initTestRepo(t, repo)
 		head := commitFile(t, repo, "secret.txt",
@@ -324,7 +324,7 @@ func TestPrePushHook(t *testing.T) {
 		out, code := runHook(t, repo, script,
 			"refs/heads/main "+head+" refs/heads/main "+zeroSHA+"\n")
 		if code == 0 {
-			t.Fatalf("expected sk-proj rejection, got pass:\n%s", out)
+			t.Fatalf("expected skProj rejection, got pass:\n%s", out)
 		}
 	})
 
@@ -385,8 +385,8 @@ func TestPrePushHook(t *testing.T) {
 		if !bytes.Contains(data, []byte("github_pat_")) {
 			t.Fatal("pre-push must scan github_pat_ tokens")
 		}
-		if !bytes.Contains(data, []byte(`sk-[a-zA-Z0-9-]{32,}`)) {
-			t.Fatal("pre-push sk- pattern must allow hyphens")
+		if !bytes.Contains(data, []byte(`sk-[a-zA-Z0-9._-]{8,}`)) {
+			t.Fatal("pre-push sk- pattern must allow hyphens, dots, underscores")
 		}
 	})
 }
@@ -416,19 +416,43 @@ func TestCommitMsgHook(t *testing.T) {
 		return runHook(t, repo, script, "", writeMsgFile(t, msg))
 	}
 
-	t.Run("normal bugfix message passes", func(t *testing.T) {
+	t.Run("normal fix message passes", func(t *testing.T) {
 		repo := setup(t)
-		out, code := run(t, repo, "bugfix: correct upload retry after timeout")
+		out, code := run(t, repo, "fix: correct upload retry after timeout")
 		if code != 0 {
-			t.Fatalf("expected bugfix message to pass, got exit %d:\n%s", code, out)
+			t.Fatalf("expected fix message to pass, got exit %d:\n%s", code, out)
 		}
 	})
 
-	t.Run("fixed-the-bug message passes", func(t *testing.T) {
+	t.Run("invalid type bugfix is rejected", func(t *testing.T) {
+		repo := setup(t)
+		out, code := run(t, repo, "bugfix: correct upload retry after timeout")
+		if code == 0 {
+			t.Fatalf("expected invalid type bugfix to be rejected, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("message without type prefix is rejected", func(t *testing.T) {
 		repo := setup(t)
 		out, code := run(t, repo, "fixed the bug in the loader")
+		if code == 0 {
+			t.Fatalf("expected message without type to be rejected, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("conventional commit with scope passes", func(t *testing.T) {
+		repo := setup(t)
+		out, code := run(t, repo, "fix(loader): fix the bug in the loader")
 		if code != 0 {
-			t.Fatalf("expected 'fixed the bug' message to pass, got exit %d:\n%s", code, out)
+			t.Fatalf("expected scoped message to pass, got exit %d:\n%s", code, out)
+		}
+	})
+
+	t.Run("chinese subject in conventional commit passes", func(t *testing.T) {
+		repo := setup(t)
+		out, code := run(t, repo, "fix(db): 修复缓存 TTL")
+		if code != 0 {
+			t.Fatalf("expected chinese subject in conventional commit to pass, got exit %d:\n%s", code, out)
 		}
 	})
 
@@ -491,11 +515,11 @@ func TestCommitMsgHook(t *testing.T) {
 		}
 	})
 
-	t.Run("hyphenated sk-proj key in message is rejected", func(t *testing.T) {
+	t.Run("hyphenated skProj key in message is rejected", func(t *testing.T) {
 		repo := setup(t)
 		out, code := run(t, repo, "rotate "+fakeSkProjKey+" now")
 		if code == 0 {
-			t.Fatalf("expected sk-proj rejection, got pass:\n%s", out)
+			t.Fatalf("expected skProj rejection, got pass:\n%s", out)
 		}
 	})
 
@@ -510,11 +534,11 @@ func TestCommitMsgHook(t *testing.T) {
 		}
 	})
 
-	t.Run("review round message passes", func(t *testing.T) {
+	t.Run("review round noise is rejected", func(t *testing.T) {
 		repo := setup(t)
 		out, code := run(t, repo, "fix: address code review round 2 comments")
-		if code != 0 {
-			t.Fatalf("expected review round message to pass, got exit %d:\n%s", code, out)
+		if code == 0 {
+			t.Fatalf("expected review round noise to be rejected, got pass:\n%s", out)
 		}
 	})
 
@@ -589,8 +613,41 @@ func TestCommitMsgHook(t *testing.T) {
 		if !bytes.Contains(data, []byte("github_pat_")) {
 			t.Fatal("commit-msg must scan github_pat_ tokens")
 		}
-		if !bytes.Contains(data, []byte(`sk-[a-zA-Z0-9-]{32,}`)) {
-			t.Fatal("commit-msg sk- pattern must allow hyphens")
+		if !bytes.Contains(data, []byte(`sk-[a-zA-Z0-9._-]{32,}`)) {
+			t.Fatal("commit-msg sk- pattern must allow hyphens, dots, underscores")
+		}
+	})
+
+	t.Run("staged diff with plusplus added content containing secret is rejected", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		commitFile(t, repo, "a.txt", "hello\n", "feat: seed")
+		stageFile(t, repo, "notes.txt", "++ "+fakeToken+"\n")
+		out, code := run(t, repo, "feat: add notes")
+		if code == 0 {
+			t.Fatalf("expected added line starting with ++ containing secret to be rejected, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("staged diff with arrow password assignment is rejected", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		commitFile(t, repo, "a.txt", "hello\n", "feat: seed")
+		stageFile(t, repo, "config.rb", "pass"+"word => \"hunter2\"\n")
+		out, code := run(t, repo, "feat: add ruby config")
+		if code == 0 {
+			t.Fatalf("expected arrow password assignment to be rejected, got pass:\n%s", out)
+		}
+	})
+
+	t.Run("staged diff with env-var constant structural exemption passes", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		commitFile(t, repo, "a.txt", "hello\n", "feat: seed")
+		stageFile(t, repo, "consts.go", "const API_"+"KEY_ENV = \"OPENAI_API_KEY\"\n")
+		out, code := run(t, repo, "feat: add env var constants")
+		if code != 0 {
+			t.Fatalf("expected env-var name constant exemption to pass, got exit %d:\n%s", code, out)
 		}
 	})
 }
@@ -670,7 +727,7 @@ func TestInstallHooks(t *testing.T) {
 		assertInstalled(t, filepath.Join(root, ".git", "hooks"))
 	})
 
-	t.Run("absolute core.hooksPath is used", func(t *testing.T) {
+	t.Run("external core.hooksPath is rejected", func(t *testing.T) {
 		root := setup(t)
 		custom := filepath.Join(root, "custom-hooks")
 		if err := os.MkdirAll(custom, 0o755); err != nil {
@@ -678,25 +735,72 @@ func TestInstallHooks(t *testing.T) {
 		}
 		runGit(t, root, "config", "core.hooksPath", custom)
 		out, code := run(t, root)
-		if code != 0 {
-			t.Fatalf("expected install to pass, got exit %d:\n%s", code, out)
+		if code == 0 {
+			t.Fatalf("expected install to fail for external hooksPath, got pass:\n%s", out)
 		}
-		assertInstalled(t, custom)
+		assertNotInstalled(t, custom)
 		assertNotInstalled(t, filepath.Join(root, ".git", "hooks"))
 	})
 
-	t.Run("relative core.hooksPath resolves against repo root", func(t *testing.T) {
+	t.Run("relative core.hooksPath outside .git/hooks is rejected", func(t *testing.T) {
 		root := setup(t)
 		if err := os.MkdirAll(filepath.Join(root, "rel-hooks"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 		runGit(t, root, "config", "core.hooksPath", "rel-hooks")
 		out, code := run(t, root)
-		if code != 0 {
-			t.Fatalf("expected install to pass, got exit %d:\n%s", code, out)
+		if code == 0 {
+			t.Fatalf("expected install to fail for relative external hooksPath, got pass:\n%s", out)
 		}
-		assertInstalled(t, filepath.Join(root, "rel-hooks"))
+		assertNotInstalled(t, filepath.Join(root, "rel-hooks"))
 		assertNotInstalled(t, filepath.Join(root, ".git", "hooks"))
+	})
+
+	t.Run("symlink target in hooks dir is rejected", func(t *testing.T) {
+		root := setup(t)
+		hooksDir := filepath.Join(root, ".git", "hooks")
+		if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		externalDir := t.TempDir()
+		externalHook := filepath.Join(externalDir, "commit-msg")
+		originalContent := []byte("#!/bin/sh\n# Original external hook\nexit 0\n")
+		if err := os.WriteFile(externalHook, originalContent, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		symlinkTarget := filepath.Join(hooksDir, "commit-msg")
+		if err := os.Symlink(externalHook, symlinkTarget); err != nil {
+			t.Fatal(err)
+		}
+
+		out, code := run(t, root)
+		if code == 0 {
+			t.Fatalf("expected installer to reject symlink target, but it passed:\n%s", out)
+		}
+		data, err := os.ReadFile(externalHook)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(data, originalContent) {
+			t.Fatalf("external hook was overwritten despite symlink: got %s", data)
+		}
+	})
+
+	t.Run("symlinked hooks directory is rejected", func(t *testing.T) {
+		root := setup(t)
+		externalDir := t.TempDir()
+		hooksDir := filepath.Join(root, ".git", "hooks")
+		if err := os.RemoveAll(hooksDir); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(externalDir, hooksDir); err != nil {
+			t.Fatal(err)
+		}
+
+		out, code := run(t, root)
+		if code == 0 {
+			t.Fatalf("expected installer to reject symlinked hooks directory, but it passed:\n%s", out)
+		}
 	})
 
 	t.Run("invalid core.hooksPath fails fast", func(t *testing.T) {

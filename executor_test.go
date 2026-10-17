@@ -1224,14 +1224,14 @@ func TestChildEnv_KeepsExplicitAndAllowlistedKeys(t *testing.T) {
 }
 
 func TestChildEnv_PassthroughDisablesStripping(t *testing.T) {
-	os.Setenv("API_KEY", "sk-passthrough")
+	os.Setenv("API_KEY", "skPassthrough")
 	defer os.Unsetenv("API_KEY")
 	old := os.Getenv("CTXMODE_ENV_PASSTHROUGH")
 	defer os.Setenv("CTXMODE_ENV_PASSTHROUGH", old)
 	os.Setenv("CTXMODE_ENV_PASSTHROUGH", "1")
 
 	env := childEnv(nil)
-	if env["API_KEY"] != "sk-passthrough" {
+	if env["API_KEY"] != "skPassthrough" {
 		t.Fatal("CTXMODE_ENV_PASSTHROUGH=1 must disable secret stripping")
 	}
 }

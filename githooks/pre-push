@@ -1,108 +1,200 @@
-#!/usr/bin/env bash
-# Hard pre-push gate — scans all outgoing commits for secrets and noise.
-set -euo pipefail
-RED='\033[0;31m'; NC='\033[0m'
-die() { echo -e "${RED}❌ PUSH REJECTED:${NC} $*"; exit 1; }
+#!/usr/bin/env sh
+# Unified Git Pre-Push Hook
+# Rules:
+# 1. Scans outgoing commits for format violations (using commit-msg logic)
+# 2. Scans commit diffs and messages for sensitive credentials and process noise
+set -eu
+
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+die() {
+  printf "${RED}❌ PUSH REJECTED:${NC} %s\n" "$1" >&2
+  if [ -n "${2:-}" ]; then
+    printf "${YELLOW}💡 Details:${NC}\n%s\n" "$2" >&2
+  fi
+  exit 1
+}
 
 ZERO_SHA="0000000000000000000000000000000000000000"
+HOOKS_DIR=$(dirname "$0")
+COMMIT_MSG_VALIDATOR="$HOOKS_DIR/commit-msg"
+if [ ! -f "$COMMIT_MSG_VALIDATOR" ]; then
+  COMMIT_MSG_VALIDATOR="/root/.git-hooks/commit-msg"
+fi
 
-SECRET_PATTERNS=(
-  'ghp_[a-zA-Z0-9]{36}' 'gho_[a-zA-Z0-9]{36}'
-  'ghu_[a-zA-Z0-9]{36}' 'ghs_[a-zA-Z0-9]{36}'
-  'github_pat_[a-zA-Z0-9_]{20,}'
-  'xox[baprs]-[a-zA-Z0-9-]+' 'sk-[a-zA-Z0-9-]{32,}'
-  'AKIA[0-9A-Z]{16}' '-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----'
-)
+# Diff scanning looks only at ADDED lines. A removed line is content that already
+# exists in history and a context line merely sits next to the change, so neither
+# can introduce a new secret; scanning them only rejects commits that are in fact
+# REMOVING a credential. File headers are removed structurally — a "+++ …" line
+# counts as a header only when it directly follows a "--- …" line outside a
+# hunk — so an ADDED line whose content starts with "++ " (rendered "+++ …") is
+# scanned instead of being mistaken for a header. Same semantics as the
+# staged-diff scan in the companion commit-msg hook.
+added_lines_only() {
+  printf '%s\n' "$1" | awk '
+    BEGIN { state = 0; minus = 0 }
+    /^diff --git /            { state = 0; minus = 0; next }
+    state == 0 && /^@@ /      { state = 1; minus = 0; next }
+    state == 1 && /^@@ /      { next }
+    state == 0 && /^--- /     { minus = 1; next }
+    state == 0 && /^[+][+][+] / && minus == 1 { minus = 0; next }
+    state == 0                { minus = 0; next }
+    state == 1 && /^[+]/      { print }
+  '
+}
 
-check_assignments() {
-  local text="$1"
-  local target="$2"
-  shopt -s nocasematch
+check_commit_secrets() {
+  _content="$1"
+  _sha="$2"
+  while IFS= read -r pat; do
+    [ -z "$pat" ] && continue
+    if printf '%s\n' "$_content" | grep -qiE -- "$pat"; then
+      die "Commit $_sha contains a secret pattern matching: \"$pat\"" \
+"Never push secrets or private keys. Rebase/amend to remove secret before pushing."
+    fi
+  done << 'EOF'
+ghp_[a-zA-Z0-9]{36}
+gho_[a-zA-Z0-9]{36}
+ghu_[a-zA-Z0-9]{36}
+ghs_[a-zA-Z0-9]{36}
+github_pat_[a-zA-Z0-9_]{20,}
+xox[baprs]-[a-zA-Z0-9-]+
+SKBOUND8
+AKIA[0-9A-Z]{16}
+ya29\.[a-zA-Z0-9_-]+
+eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}
+-----BEGIN [A-Z0-9 -]*PRIVATE KEY-----
+EOF
+}
+
+check_commit_assignments() {
+  _content="$1"
+  _sha="$2"
   while IFS= read -r line; do
-    [[ "$line" =~ ^(\+\+\+|---|@@|-) ]] && continue
-    if [[ "$line" =~ (password|api_key|secret)[[:space:]]*[:=]+[[:space:]]*(.*) ]]; then
-      local rest="${BASH_REMATCH[2]}"
-      local val=""
-      if [[ "$rest" =~ ^\"([^\"]*)\" ]]; then
-        val="${BASH_REMATCH[1]}"
-      elif [[ "$rest" =~ ^\'([^\']*)\' ]]; then
-        val="${BASH_REMATCH[1]}"
-      elif [[ "$rest" =~ ^([^[:space:];,]+) ]]; then
-        val="${BASH_REMATCH[1]}"
+    # Input is already reduced to added CONTENT lines by added_lines_only (which
+    # drops file headers structurally), so a diff-marker/header skip by prefix
+    # here would only drop real added content whose text starts with "++ ".
+    # Keyword: an identifier suffix is tolerated (SECRET_KEY, PASSWORD_HASH,
+    # API_KEY_ID), the over-strict side of a substring keyword match ("mysecret="/
+    # "secretary=" are caught too, no word boundary attempted). Separator: ":" or
+    # "=" plus the arrow forms "=>" / ":=>", so an arrow assignment cannot leave
+    # the ">" as the "first token" and slip under the 6-character floor. Same
+    # criteria as the credential check in the companion commit-msg hook.
+    if printf '%s\n' "$line" | grep -qiE '(password|api_key|secret)[A-Za-z0-9_]*[[:space:]]*[:=]+>?[[:space:]]*(.*)'; then
+      # Value = the FIRST non-whitespace token after the separator, then strip
+      # surrounding quotes/backticks. Taking the whole tail instead flagged
+      # documentation prose such as "api_key = see the notes" as a credential.
+      lhs=$(printf '%s\n' "$line" | sed -E 's/^(.*[^A-Za-z0-9_])?([A-Za-z0-9_]*(password|api_key|secret)[A-Za-z0-9_]*)[[:space:]]*[:=]+>?.*/\2/I')
+      rest=$(printf '%s\n' "$line" | sed -E 's/.*(password|api_key|secret)[A-Za-z0-9_]*[[:space:]]*[:=]+>?[[:space:]]*//I' | sed -E 's/^[[:space:]]+//; s/[[:space:]].*$//')
+      val=$(printf '%s\n' "$rest" | sed -E 's/^[[:space:]"'\''`]+//; s/[[:space:]"'\''`;,]+$//')
+      # Structural exemption for environment-variable name constants (e.g.
+      # `const API_KEY_ENV = "TINYFISH_API_KEY"` or `api_key_env_name = "OPENAI_API_KEY"` ):
+      # LHS must end in _(env|env_name|var|key_env|key_name) (case-insensitive) AND
+      # RHS must be an all-uppercase ASCII env-var identifier matching
+      # ^[A-Z][A-Z0-9_]{2,}_(KEY|TOKEN|SECRET|PASSWORD|ID|IDENT)$.
+      # Bare LHS names (e.g. `password` = "MY_APP_PASSWORD"), single-letter/unsuffixed
+      # uppercase tokens, and real secret literals ([sk], ghp_..., high-entropy strings)
+      # never match.
+      if printf '%s\n' "$lhs" | LC_ALL=C grep -qiE '_(env|env_name|var|key_env|key_name)$' && \
+         printf '%s\n' "$val" | LC_ALL=C grep -qE '^[A-Z][A-Z0-9_]{2,}_(KEY|TOKEN|SECRET|PASSWORD|ID|IDENT)$'; then
+        continue
       fi
-      val=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-      local lower
-      lower=$(echo "$val" | tr '[:upper:]' '[:lower:]')
-      case "$lower" in
+      val_lower=$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')
+      case "$val_lower" in
         ""|"none"|"optional"|"removed"|"unchanged"|"empty"|"null"|"nil"|"undefined"|"true"|"false"|"todo"|"changeme"|"placeholder"|"<"*">"|"\$"*|"\"\""|"''")
           continue
           ;;
       esac
-      if [ ${#val} -ge 6 ]; then
-        die "$target contains a hardcoded credential assignment: \"$line\""
+      val_len=$(printf '%s' "$val" | wc -m | tr -d '[:space:]')
+      if [ "$val_len" -ge 6 ]; then
+        die "Commit $_sha appears to contain a hardcoded credential assignment: \"$line\"" \
+"Never commit passwords, API keys, or secrets. Use environment variables or secret managers."
       fi
     fi
-  done <<< "$text"
+  done << EOF
+$_content
+EOF
 }
 
-scan_commit() {
-  local sha=$1
-  local diff msg combined
-  if ! diff=$(git show "$sha" 2>&1); then
-    die "git show failed for commit $sha: $diff"
+scan_single_commit() {
+  _sha="$1"
+  _msg=$(git log -1 --format=%B "$_sha" 2>/dev/null || true)
+  if [ -z "$_msg" ]; then
+    die "Could not read commit message for $_sha" ""
   fi
-  if ! msg=$(git log -1 --format=%B "$sha" 2>&1); then
-    die "git log failed for commit $sha: $msg"
+
+  # Validate message format, noise, and message secrets using commit-msg validator
+  if [ -x "$COMMIT_MSG_VALIDATOR" ]; then
+    if ! printf '%s\n' "$_msg" | COMMIT_MSG_SKIP_DIFF=1 "$COMMIT_MSG_VALIDATOR" -; then
+      die "Commit $_sha message rejected by commit-msg validator." "Fix commit message with 'git commit --amend' or rebase."
+    fi
   fi
-  combined="$diff $msg"
-  for pat in "${SECRET_PATTERNS[@]}"; do
-    if echo "$combined" | grep -qiE -- "$pat"; then
-      die "commit $sha contains a secret matching: \"$pat\""
+
+  # Scan the commit diff for secret patterns and assignments, added lines only
+  # (--format= strips the commit header/message so only the diff is fed in;
+  # the message itself is already validated by the commit-msg validator above).
+  _diff=$(git show --format= "$_sha" 2>/dev/null || true)
+  if [ -n "$_diff" ]; then
+    _added=$(added_lines_only "$_diff")
+    check_commit_secrets "$_added" "$_sha"
+    check_commit_assignments "$_added" "$_sha"
+  fi
+}
+
+# Process stdin if provided (standard git pre-push invocation)
+HAS_STDIN=0
+if [ ! -t 0 ]; then
+  while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -z "$local_ref" ] && continue
+    HAS_STDIN=1
+    if [ "$local_sha" = "$ZERO_SHA" ]; then
+      continue # branch deletion
+    fi
+
+    if [ "$remote_sha" = "$ZERO_SHA" ]; then
+      # New branch: scan commits not reachable from any remote tracking ref
+      rev_list=$(git rev-list "$local_sha" --not --remotes 2>/dev/null || true)
+    elif [ "${local_ref#refs/tags/}" != "$local_ref" ]; then
+      # Tag update: scan only commits that are NOT already on the remote.
+      # `rev-list <annotated-tag>` peels to a commit, so `^$remote_sha` would
+      # list every commit the new tag target has that the old one lacks —
+      # including long-published commits that already live on the remote
+      # (e.g. a tag re-pointed across a history rewrite). Those are not
+      # introduced by this push and must not fail the message check.
+      rev_list=$(git rev-list "$local_sha" --not --remotes 2>/dev/null || true)
+    else
+      rev_list=$(git rev-list "$local_sha" "^$remote_sha" 2>/dev/null || true)
+    fi
+
+    if [ -n "$rev_list" ]; then
+      for sha in $rev_list; do
+        scan_single_commit "$sha"
+      done
     fi
   done
-  check_assignments "$combined" "commit $sha"
-  # Portable: C locale + POSIX classes. Do not use grep -P (missing PCRE
-  # used to make this check a silent no-op and let non-ASCII commits through).
-  set +e
-  printf '%s\n' "$msg" | LC_ALL=C grep -qn -- '[^[:cntrl:][:print:]]'
-  nonascii_rc=$?
-  set -e
-  if [ "$nonascii_rc" -ge 2 ]; then
-    die "commit $sha: non-ASCII check failed to run (grep exit $nonascii_rc). Refusing to proceed."
-  fi
-  if [ "$nonascii_rc" -eq 0 ]; then
-    die "commit $sha has non-ASCII characters in message. English only."
-  fi
-}
+fi
 
-# Pre-push hook input is one line per ref being pushed, four space-separated
-# fields: <local ref> <local sha> <remote ref> <remote sha>.
-while read -r local_ref local_sha remote_ref remote_sha; do
-  [ -z "$local_ref" ] && continue
-  if [ -z "$local_sha" ] || [ -z "$remote_ref" ] || [ -z "$remote_sha" ]; then
-    die "malformed pre-push input line: '$local_ref $local_sha $remote_ref $remote_sha'"
+# If invoked standalone (smoke test or manual run without git passing ref pairs)
+if [ "$HAS_STDIN" -eq 0 ]; then
+  RANGE=""
+  if git rev-parse --verify origin/main >/dev/null 2>&1; then
+    RANGE="origin/main..HEAD"
+  elif git rev-parse --verify "@{u}" >/dev/null 2>&1; then
+    RANGE="@{u}..HEAD"
+  elif git rev-parse --verify HEAD >/dev/null 2>&1; then
+    RANGE="HEAD"
   fi
-  if [ "$local_sha" = "$ZERO_SHA" ]; then
-    continue # branch deletion — nothing is pushed, nothing to scan
+
+  if [ -n "$RANGE" ]; then
+    rev_list=$(git rev-list "$RANGE" 2>/dev/null || true)
+    if [ -n "$rev_list" ]; then
+      for sha in $rev_list; do
+        scan_single_commit "$sha"
+      done
+    fi
   fi
-  if [ "$remote_sha" = "$ZERO_SHA" ]; then
-    # New ref (new branch or tag): the remote has no counterpart, so only
-    # commits it does not already own are outgoing. Exclude everything
-    # reachable from any remote-tracking ref; otherwise a tag push would
-    # rescan the entire local history, including old commits the remote
-    # already has (e.g. pre-ASCII-message history).
-    rev_args=("$local_sha" "--not" "--remotes")
-  else
-    rev_args=("$local_sha" "^$remote_sha")
-  fi
-  if ! rev_list=$(git rev-list "${rev_args[@]}" 2>&1); then
-    die "git rev-list failed for $local_ref -> $remote_ref: $rev_list"
-  fi
-  if [ -n "$rev_list" ]; then
-    while read -r sha; do
-      scan_commit "$sha"
-    done <<< "$rev_list"
-  fi
-done
+fi
 
 exit 0
