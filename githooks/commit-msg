@@ -175,12 +175,12 @@ check_secret_patterns() {
   _content="$1"
   _target="$2"
   # Two sk- forms coexist on purpose and neither replaces the other.
-  # The boundary form (SKPBOUNDARY) keeps word-internal
+  # The boundary form (see patterns HEREDOC, boundary entry) keeps word-internal
   # false positives out (e.g. the package name in
   # "example-package-name"), but it also lets letter-glued long
   # keys through: "prefixSKPROJ-" plus long suffix has no separator before
   # "sk-", so the boundary never fires. The long form
-  # SKPLONG drops the boundary requirement and covers exactly
+  # the long-form entry (SK-LONG) drops the boundary requirement and covers exactly
   # that glued shape, so it is a supplement to the boundary form.
   while IFS= read -r pat; do
     [ -z "$pat" ] && continue
