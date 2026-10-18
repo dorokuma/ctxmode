@@ -389,6 +389,54 @@ func TestPrePushHook(t *testing.T) {
 			t.Fatal("pre-push sk- pattern must allow hyphens, dots, underscores")
 		}
 	})
+
+	// Message format, noise words and in-message secrets are enforced by the
+	// sibling commit-msg hook. When that hook is not next to pre-push, the
+	// check must fail closed instead of being skipped. The fallback path is
+	// pointed at an empty directory so a machine-global commit-msg cannot
+	// satisfy the check for this test; a sibling that exists but is not
+	// executable is covered by the same failure (the hook must not fall
+	// through to a global copy either).
+	t.Run("missing sibling commit-msg fails the message check", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		head := commitFile(t, repo, "a.txt", "hello\n", "fixed the loader")
+		hooksDir := filepath.Join(repo, ".git", "hooks")
+		if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		local := filepath.Join(hooksDir, "pre-push")
+		copyFile(t, script, local)
+		t.Setenv("CTXMODE_COMMIT_MSG_FALLBACK", filepath.Join(t.TempDir(), "commit-msg"))
+		out, code := runHook(t, repo, local,
+			"refs/heads/main "+head+" refs/heads/main "+zeroSHA+"\n")
+		if code == 0 || !strings.Contains(out, "commit-msg is missing or not executable") {
+			t.Fatalf("expected an explicit missing-commit-msg failure, got exit %d:\n%s", code, out)
+		}
+	})
+
+	// A sibling that exists but is not executable must fail the same way. It
+	// must not be skipped, and it must not fall through to another commit-msg.
+	t.Run("non-executable sibling commit-msg fails the message check", func(t *testing.T) {
+		repo := t.TempDir()
+		initTestRepo(t, repo)
+		head := commitFile(t, repo, "a.txt", "hello\n", "fixed the loader")
+		hooksDir := filepath.Join(repo, ".git", "hooks")
+		if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		copyFile(t, script, filepath.Join(hooksDir, "pre-push"))
+		cm := filepath.Join(hooksDir, "commit-msg")
+		copyFile(t, realCommitMsg, cm)
+		if err := os.Chmod(cm, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out, code := runHook(t, repo, filepath.Join(hooksDir, "pre-push"),
+			"refs/heads/main "+head+" refs/heads/main "+zeroSHA+"\n")
+		if code == 0 || !strings.Contains(out, "commit-msg is missing or not executable") {
+			t.Fatalf("expected an explicit non-executable commit-msg failure, got exit %d:\n%s", code, out)
+		}
+	})
 }
 
 // ============================================================================
@@ -756,7 +804,7 @@ func TestInstallHooks(t *testing.T) {
 		assertNotInstalled(t, filepath.Join(root, ".git", "hooks"))
 	})
 
-	t.Run("symlink target in hooks dir is rejected", func(t *testing.T) {
+	t.Run("symlink target in hooks dir is replaced without following it", func(t *testing.T) {
 		root := setup(t)
 		hooksDir := filepath.Join(root, ".git", "hooks")
 		if err := os.MkdirAll(hooksDir, 0o755); err != nil {
@@ -774,15 +822,25 @@ func TestInstallHooks(t *testing.T) {
 		}
 
 		out, code := run(t, root)
-		if code == 0 {
-			t.Fatalf("expected installer to reject symlink target, but it passed:\n%s", out)
+		if code != 0 {
+			t.Fatalf("expected installer to replace the symlink target, got exit %d:\n%s", code, out)
 		}
 		data, err := os.ReadFile(externalHook)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if !bytes.Equal(data, originalContent) {
-			t.Fatalf("external hook was overwritten despite symlink: got %s", data)
+			t.Fatalf("external hook was overwritten through the symlink: got %s", data)
+		}
+		if _, err := os.Readlink(symlinkTarget); err == nil {
+			t.Fatalf("installed hook %s is still a symlink", symlinkTarget)
+		}
+		got, err := os.ReadFile(symlinkTarget)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, commitMsgData) {
+			t.Fatalf("installed commit-msg does not match githooks/commit-msg")
 		}
 	})
 
@@ -822,6 +880,92 @@ func TestInstallHooks(t *testing.T) {
 		out, code := run(t, root)
 		if code == 0 {
 			t.Fatalf("expected failure outside a git work tree, got pass:\n%s", out)
+		}
+	})
+
+	// Trailing "/", "/." and "//" must not hide that .git/hooks itself is a
+	// symlink to a directory outside the repository. The installer used to
+	// canonicalize with pwd -P (which follows the link) and then test [ -L ]
+	// on the decorated path, so those spellings compared equal and were not
+	// reported as a symlink, and cp wrote the hooks outside the repo.
+	for _, spelling := range []string{".git/hooks/", ".git/hooks/.", ".git/hooks//"} {
+		spelling := spelling
+		t.Run("symlinked .git/hooks via "+spelling+" is rejected", func(t *testing.T) {
+			root := setup(t)
+			externalDir := t.TempDir()
+			marker := filepath.Join(externalDir, "marker")
+			if err := os.WriteFile(marker, []byte("untouched\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			hooksDir := filepath.Join(root, ".git", "hooks")
+			if err := os.RemoveAll(hooksDir); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(externalDir, hooksDir); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, root, "config", "core.hooksPath", spelling)
+
+			out, code := run(t, root)
+			if code == 0 {
+				t.Fatalf("expected installer to reject hooksPath %q when .git/hooks is a symlink, got pass:\n%s", spelling, out)
+			}
+			if _, err := os.Stat(filepath.Join(externalDir, "pre-push")); !os.IsNotExist(err) {
+				t.Fatalf("installer wrote pre-push into the external directory via %q", spelling)
+			}
+			data, err := os.ReadFile(marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != "untouched\n" {
+				t.Fatalf("external directory was modified via %q", spelling)
+			}
+		})
+	}
+
+	// cp -P does not follow a *source* symlink, but it still follows a symlink
+	// at the destination and overwrites the file it points at. A hook name that
+	// is a symlink must be removed (the link itself) before the copy.
+	t.Run("destination symlink is not followed by the copy", func(t *testing.T) {
+		root := setup(t)
+		hooksDir := filepath.Join(root, ".git", "hooks")
+		if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		externalDir := t.TempDir()
+		externalHook := filepath.Join(externalDir, "real-commit-msg")
+		originalContent := []byte("#!/bin/sh\n# original external hook\nexit 0\n")
+		if err := os.WriteFile(externalHook, originalContent, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(externalHook, filepath.Join(hooksDir, "commit-msg")); err != nil {
+			t.Fatal(err)
+		}
+
+		out, code := run(t, root)
+		if code != 0 {
+			t.Fatalf("expected install to pass after replacing the destination symlink, got exit %d:\n%s", code, out)
+		}
+		data, err := os.ReadFile(externalHook)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(data, originalContent) {
+			t.Fatalf("external file behind the destination symlink was overwritten: %q", data)
+		}
+		installed := filepath.Join(hooksDir, "commit-msg")
+		if _, err := os.Lstat(installed); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Readlink(installed); err == nil {
+			t.Fatalf("installed hook %s is still a symlink", installed)
+		}
+		got, err := os.ReadFile(installed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, commitMsgData) {
+			t.Fatalf("installed commit-msg does not match githooks/commit-msg")
 		}
 	})
 }

@@ -20,8 +20,16 @@ die() {
 ZERO_SHA="0000000000000000000000000000000000000000"
 HOOKS_DIR=$(dirname "$0")
 COMMIT_MSG_VALIDATOR="$HOOKS_DIR/commit-msg"
-if [ ! -f "$COMMIT_MSG_VALIDATOR" ]; then
-  COMMIT_MSG_VALIDATOR="/root/.git-hooks/commit-msg"
+# Optional override for tests. Unset, the sibling hook next to this script is
+# the only validator; a missing global copy must not silently skip the check.
+if [ -n "${CTXMODE_COMMIT_MSG_FALLBACK:-}" ]; then
+  if [ ! -f "$COMMIT_MSG_VALIDATOR" ]; then
+    COMMIT_MSG_VALIDATOR="$CTXMODE_COMMIT_MSG_FALLBACK"
+  fi
+fi
+if [ ! -f "$COMMIT_MSG_VALIDATOR" ] || [ ! -x "$COMMIT_MSG_VALIDATOR" ]; then
+  die "commit-msg is missing or not executable ($COMMIT_MSG_VALIDATOR)." \
+"Install githooks/commit-msg next to pre-push and make it executable. Format, noise-word and in-message secret checks cannot run without it."
 fi
 
 # Diff scanning looks only at ADDED lines. A removed line is content that already
@@ -125,11 +133,11 @@ scan_single_commit() {
     die "Could not read commit message for $_sha" ""
   fi
 
-  # Validate message format, noise, and message secrets using commit-msg validator
-  if [ -x "$COMMIT_MSG_VALIDATOR" ]; then
-    if ! printf '%s\n' "$_msg" | COMMIT_MSG_SKIP_DIFF=1 "$COMMIT_MSG_VALIDATOR" -; then
-      die "Commit $_sha message rejected by commit-msg validator." "Fix commit message with 'git commit --amend' or rebase."
-    fi
+  # Validate message format, noise, and message secrets using commit-msg validator.
+  # The validator was required above, so a missing or non-executable hook
+  # cannot skip these checks.
+  if ! printf '%s\n' "$_msg" | COMMIT_MSG_SKIP_DIFF=1 "$COMMIT_MSG_VALIDATOR" -; then
+    die "Commit $_sha message rejected by commit-msg validator." "Fix commit message with 'git commit --amend' or rebase."
   fi
 
   # Scan the commit diff for secret patterns and assignments, added lines only
