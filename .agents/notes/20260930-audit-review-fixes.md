@@ -34,12 +34,5 @@ supersedes: ""
 - **每命令一行 / 后台行记真实 exit_code**：拒绝。前者制造记录噪声，后者在启动时刻根本不存在。
 - **去掉 batch 调用级 screen 汇总字段**：拒绝。保留汇总（最差 verdict + 一条代表规则）同时给每命令明细，两层都能读。
 
-## 已知缺口（本批未修，已写进 README/CHANGELOG）
-- O6 审计只覆盖 ctx_run，不含 ctx_fs/ctx_git/ctx_kb/ctx_bg。
-- O7 一行 = 一次**调用**，不是一次**执行**（子进程不单独记）。
-- 「append-only」只是 `O_APPEND`，同 uid 可 truncate/改写/删除/伪造；`readonly_role_call` 需派发层设置 `CTXMODE_ROLE`/`CTXMODE_READONLY`，在此之前恒不出现。
-- O3 部分完成：`raw_cmd` 有 64KiB 上限，但 `commands` 数组里的 `label`/`index_label` 有意**原样记录不截断**（label 是调用方给 batch 的键，也会真实用于 KB index label；截断会让审计行与库里的标签对不上）。因此 batch 单行上限只剩「50 条命令 + MCP 请求体积」约束，已写入代码注释与本清单。
-- 敏感内容检查按模式匹配，未格式化的凭据仍可能随 `raw_cmd`、`env_keys` 落入明文文件。
-
 ## 来源
 双审回修第二批。修复包 `/tmp/fix-package-argv-audit-20260930-0005.md`；代码：`audit.go`（F1/F2 辅助、S1/S2/S5/S6/S7/S8/S10、O1–O3、每命令 screen 字段）、`batch.go`（F2/S4/O8）、`run_task.go`（S3/S10）、`shell_screen.go`（O2）、`main.go`/`run_task.go`（S9、S2 inputs）、`audit_test.go`（新用例）、`README.md`、`instructions.go`、`CHANGELOG.md [Unreleased]`。
