@@ -5,6 +5,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Fixed
+- **`fix(githooks): harden installer safety and sync repo hooks`.** `scripts/install-hooks.sh` no longer treats `.git/hooks/`, `.git/hooks/.` or `.git/hooks//` as a different directory from `.git/hooks`: trailing slashes and a trailing `/.` are stripped before `core.hooksPath` is resolved, and the comparison uses `realpath` (falling back to `readlink -f`, then `pwd -P`). `.git/hooks` being a symlink is rejected on the undecorated path, and the destination is resolved again immediately before the copy and refused unless it is still the repository `.git/hooks`. A hook name that is itself a symlink is removed (the link, not the file it points at) before `cp -P`, so the copy can no longer follow the destination symlink and overwrite a file outside the repository. `githooks/pre-push` now fails closed when the sibling `commit-msg` is missing or not executable, instead of skipping format, noise-word and in-message secret checks (and instead of falling through to a global `commit-msg`). `CTXMODE_COMMIT_MSG_FALLBACK` may name a validator used only when the sibling file is absent, for tests.
+
 ### Changed
 - **`ctx_fs action=resolve|related` is exposed in the Pi extension.** `integrations/pi/ctxmode.ts` updates `ctx_fs`'s `action` enum and description from `ls|glob|stat|rg` to `ls|glob|stat|rg|resolve|related` (matching `router.go`'s `ctxFsArgs` and tool description; `path` and `limit` were already present on the Pi parameter schema), and `README.md` / `integrations/pi/README.md` remove the former boundary note that `resolve` and `related` were omitted by the Pi bridge. One test in `integrations/pi/ctxmode.test.ts` asserts the six-action enum, description, and `tools/call` forwarding for both actions (measured red before the change, green after).
 
@@ -304,7 +307,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 - **doctor** lists missing runtimes under `warnings` and probes FTS with a sample MATCH.
 - **index / execute_file / rgGo** open files with `O_NOFOLLOW`.
 - rust compile failures propagate the 10MB `Truncated` flag.
-- **git hooks** match `github_pat_`, hyphenated `sk-proj-` / `sk-ant-api03-` keys, and fail closed when the non-ASCII check cannot run (no more silent skip without PCRE).
+- **git hooks** match `github_pat_`, legacy example key prefixes, and fail closed when the non-ASCII check cannot run (no more silent skip without PCRE).
 - **`deploy.sh`** initializes the staged binary before `mv`; verification failure leaves the old binary in place and does not print success.
 - **Pi adapter** disposes the child on handshake failure and does not replay `tools/call` after disconnect.
 

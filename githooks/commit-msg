@@ -1,111 +1,309 @@
-#!/usr/bin/env bash
-# Hard commit-message gate — blocks noise, Chinese, and sensitive leaks.
-set -euo pipefail
+#!/usr/bin/env sh
+# Unified Git Commit Message Hook
+# Rules:
+# 1. Format: TYPE: <subject> or TYPE(SCOPE): <subject>
+# 2. Whitelist types: feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert (case-sensitive)
+# 3. Scope whitelist: [a-z0-9._-]+ (case-sensitive)
+# 4. Colon followed by exactly one space
+# 5. Subject non-empty, <= 72 characters (Unicode chars), English/Chinese allowed
+# 6. Exemptions: lines starting with Merge , Revert , fixup! , squash!
+# 7. Process noise words prevention
+# 8. Secret leak scanning (message + staged diff)
+set -eu
 
-MSG=$(cat "$1")
 RED='\033[0;31m'
+YELLOW='\033[0;33m'
 NC='\033[0m'
 
-die() { echo -e "${RED}❌ REJECTED:${NC} $*"; exit 1; }
-
-# ── 1. Non-ASCII block ──────────────────────────────────────────────
-# Chinese / Japanese / Korean / Cyrillic → reject.
-# Portable: C locale + POSIX classes. Do not use grep -P (missing PCRE
-# used to make this check a silent no-op and let non-ASCII commits through).
-set +e
-nonascii=$(printf '%s\n' "$MSG" | LC_ALL=C grep -n -- '[^[:cntrl:][:print:]]')
-nonascii_rc=$?
-set -e
-if [ "$nonascii_rc" -ge 2 ]; then
-  die "non-ASCII check failed to run (grep exit $nonascii_rc). Refusing to proceed."
-fi
-if [ "$nonascii_rc" -eq 0 ]; then
-  die "commit message contains non-ASCII characters. English only.
-Offending lines:
-$(printf '%s\n' "$nonascii" | head -5)"
-fi
-
-# ── 2. Noise-word block ─────────────────────────────────────────────
-# Lines that scream "process diary" instead of "what changed".
-NOISE_WORDS=(
-  "审计" "审查" "轮审"
-  "fix.*audit" "audit.*fix"
-  "修了" "改了" "搞了" "弄了"
-)
-for word in "${NOISE_WORDS[@]}"; do
-  if echo "$MSG" | grep -qiE -- "$word"; then
-    die "commit message contains noise word: \"$word\"
-Write what the change IS, not what process produced it."
+die() {
+  printf "${RED}❌ COMMIT REJECTED:${NC} %s\n" "$1" >&2
+  if [ -n "${2:-}" ]; then
+    printf "${YELLOW}💡 How to fix:${NC}\n%s\n" "$2" >&2
   fi
-done
+  exit 1
+}
 
-# ── 3. Secret-leak block ────────────────────────────────────────────
-# Common secret patterns — token, key, password, private key material.
-SECRET_PATTERNS=(
-  'ghp_[a-zA-Z0-9]{36}'           # GitHub PAT
-  'gho_[a-zA-Z0-9]{36}'           # GitHub OAuth
-  'ghu_[a-zA-Z0-9]{36}'           # GitHub user token
-  'ghs_[a-zA-Z0-9]{36}'           # GitHub server token
-  'github_pat_[a-zA-Z0-9_]{20,}'  # GitHub fine-grained PAT
-  'xox[baprs]-[a-zA-Z0-9-]+'      # Slack
-  'sk-[a-zA-Z0-9-]{32,}'          # OpenAI / Anthropic / generic API key
-  'AKIA[0-9A-Z]{16}'              # AWS Access Key
-  '-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----'
-)
+# ── 0. Read commit message ──────────────────────────────────────────
+if [ -n "${1:-}" ] && [ "$1" != "-" ]; then
+  if [ ! -f "$1" ]; then
+    die "Commit message file '$1' not found." ""
+  fi
+  RAW_MSG=$(cat "$1")
+else
+  RAW_MSG=$(cat)
+fi
 
-check_assignments() {
-  local text="$1"
-  local target="$2"
-  shopt -s nocasematch
+# Strip comments (lines starting with optional whitespace and #)
+CLEAN_MSG=$(printf '%s\n' "$RAW_MSG" | grep -v '^[[:space:]]*#' || true)
+
+# Extract first non-empty line as subject
+SUBJECT_LINE=$(printf '%s\n' "$CLEAN_MSG" | grep -m1 '[^[:space:]]' || true)
+
+if [ -z "$SUBJECT_LINE" ]; then
+  die "Commit message is empty." \
+"Please provide a valid commit message in the format:
+  <type>(<scope>): <subject>
+Examples:
+  feat: add timeout configuration
+  fix(db): 修复缓存 TTL
+  docs(readme): 添加入口"
+fi
+
+# ── 1. Check for exemptions (Merge, Revert, fixup!, squash!) ────────
+IS_EXEMPT=0
+case "$SUBJECT_LINE" in
+  "Merge "*|"Revert "*|"fixup! "*|"squash! "*)
+    IS_EXEMPT=1
+    ;;
+esac
+
+# ── 2. Validate Conventional Commit format (if not exempt) ──────────
+if [ "$IS_EXEMPT" -eq 0 ]; then
+  # 2.1 Check colon separator presence
+  if ! printf '%s\n' "$SUBJECT_LINE" | grep -q ':'; then
+    die "Commit subject missing colon separator: \"$SUBJECT_LINE\"" \
+"Commit subject must follow Conventional Commits format:
+  TYPE: <subject>
+  TYPE(SCOPE): <subject>
+Allowed types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
+  fi
+
+  # 2.2 Check that colon is followed by exactly one space
+  if printf '%s\n' "$SUBJECT_LINE" | grep -qE '^[^:]+:[^ ]|^[^:]+:  +'; then
+    die "Colon must be followed by exactly one space: \"$SUBJECT_LINE\"" \
+"Ensure there is exactly one space after the colon:
+  Correct:   feat: add timeout
+  Incorrect: feat:add timeout / feat:  add timeout"
+  fi
+
+  HEADER_PREFIX=$(printf '%s\n' "$SUBJECT_LINE" | sed 's/: .*//')
+  SUBJECT_CONTENT=$(printf '%s\n' "$SUBJECT_LINE" | sed 's/^[^:]*: //')
+
+  # 2.3 Check non-empty subject
+  if [ -z "$SUBJECT_CONTENT" ] || [ "$SUBJECT_CONTENT" = "$SUBJECT_LINE" ]; then
+    die "Commit subject is empty after colon: \"$SUBJECT_LINE\"" \
+"Please specify a descriptive commit subject after the colon:
+  Example: feat(api): add healthcheck endpoint"
+  fi
+
+  # 2.4 Check no whitespace in type/scope header prefix
+  if printf '%s\n' "$HEADER_PREFIX" | grep -q '[[:space:]]'; then
+    die "Header prefix contains whitespace: \"$HEADER_PREFIX\"" \
+"Do not include spaces before the colon or inside type/scope:
+  Correct:   fix(core): fix bug
+  Incorrect: fix (core): fix bug / fix: "
+  fi
+
+  # 2.5 Parse and validate Type & Scope
+  if printf '%s\n' "$HEADER_PREFIX" | grep -q '('; then
+    if ! printf '%s\n' "$HEADER_PREFIX" | grep -qE '^[a-zA-Z0-9_-]+\([a-zA-Z0-9._-]+\)$'; then
+      die "Malformed type/scope format: \"$HEADER_PREFIX\"" \
+"Scope must contain only lowercase alphanumeric characters, dots, underscores, or hyphens: [a-z0-9._-]+
+Format: TYPE(scope): <subject>
+Example: feat(client-v2): add retry logic"
+    fi
+    COMMIT_TYPE=$(printf '%s\n' "$HEADER_PREFIX" | sed -n 's/^\([^(]*\)(.*)$/\1/p')
+    COMMIT_SCOPE=$(printf '%s\n' "$HEADER_PREFIX" | sed -n 's/^[^(]*(\(.*\))$/\1/p')
+    
+    if ! printf '%s\n' "$COMMIT_SCOPE" | grep -qE '^[a-z0-9._-]+$'; then
+      die "Invalid scope \"$COMMIT_SCOPE\" in \"$SUBJECT_LINE\"" \
+"Scope must be lowercase letters, numbers, dot, underscore, or hyphen ([a-z0-9._-]+).
+Example: fix(cache_db): resolve memory leak"
+    fi
+  else
+    COMMIT_TYPE="$HEADER_PREFIX"
+  fi
+
+  # 2.6 Validate TYPE against whitelist (case-sensitive lowercase)
+  VALID_TYPES_REGEX="^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)$"
+  if ! printf '%s\n' "$COMMIT_TYPE" | grep -qE "$VALID_TYPES_REGEX"; then
+    die "Invalid or uppercase commit type: \"$COMMIT_TYPE\"" \
+"Type must be one of the following lowercase keywords:
+  feat     - New feature
+  fix      - Bug fix
+  docs     - Documentation changes
+  style    - Formatting, missing semicolons, etc. (no code logic change)
+  refactor - Code change that neither fixes a bug nor adds a feature
+  perf     - Performance improvement
+  test     - Adding or updating tests
+  build    - Build system or external dependencies
+  ci       - CI/CD configuration files and scripts
+  chore    - Housekeeping tasks, tooling, maintenance
+  revert   - Reverts a previous commit"
+  fi
+
+  # 2.7 Validate Subject character length <= 72
+  SUBJECT_LEN=$(printf '%s' "$SUBJECT_CONTENT" | wc -m | tr -d '[:space:]')
+  if [ "$SUBJECT_LEN" -gt 72 ]; then
+    die "Commit subject exceeds 72 characters (actual: $SUBJECT_LEN chars): \"$SUBJECT_CONTENT\"" \
+"Keep the subject line concise (<= 72 characters). Detailed descriptions should go into the commit body (after a blank line)."
+  fi
+fi
+
+# ── 3. Check for process noise words ────────────────────────────────
+check_noise_words() {
+  _msg="$1"
+  while IFS= read -r pat; do
+    [ -z "$pat" ] && continue
+    if printf '%s\n' "$_msg" | grep -qiE -- "$pat"; then
+      die "Commit message contains process noise words matching: \"$pat\"" \
+"Write what the change IS, not what conversational/audit process produced it.
+Avoid process diary terms like '审计', '审查', '轮审', '修了', '改了', '搞了', '弄了', '完善了', 'round review', etc.
+Example: Use 'fix(auth): handle expired token' instead of 'fix: 审计改动' or 'fix: 修了auth bug'"
+    fi
+  done << 'EOF'
+审计
+审查
+轮审
+修了
+改了
+搞了
+弄了
+完善了
+review[ -_]*round
+round[ -_]*review
+fix[ -_]*audit
+audit[ -_]*fix
+audit[ -_]*round
+round[ -_]*audit
+EOF
+}
+check_noise_words "$CLEAN_MSG"
+
+# ── 4. Secret leak scanning ─────────────────────────────────────────
+check_secret_patterns() {
+  _content="$1"
+  _target="$2"
+  # Two sk- forms coexist on purpose and neither replaces the other.
+  # The boundary form (SKPBOUNDARY) keeps word-internal
+  # false positives out (e.g. the package name in
+  # "example-package-name"), but it also lets letter-glued long
+  # keys through: "prefixSKPROJ-" + <32+ chars> has no separator before
+  # "sk-", so the boundary never fires. The long form
+  # SKPLONG drops the boundary requirement and covers exactly
+  # that glued shape, so it is a supplement to the boundary form.
+  while IFS= read -r pat; do
+    [ -z "$pat" ] && continue
+    if printf '%s\n' "$_content" | grep -qiE -- "$pat"; then
+      die "$_target contains a secret pattern matching: \"$pat\"" \
+"Never commit API keys, tokens, or private keys. Revoke any exposed secrets immediately."
+    fi
+  done << 'EOF'
+ghp_[a-zA-Z0-9]{36}
+gho_[a-zA-Z0-9]{36}
+ghu_[a-zA-Z0-9]{36}
+ghs_[a-zA-Z0-9]{36}
+github_pat_[a-zA-Z0-9_]{20,}
+xox[baprs]-[a-zA-Z0-9-]+
+SKPBOUNDARY
+SKPLONG
+AKIA[0-9A-Z]{16}
+ya29\.[a-zA-Z0-9_-]+
+eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}
+-----BEGIN [A-Z0-9 -]*PRIVATE KEY-----
+EOF
+}
+
+check_credential_assignments() {
+  _content="$1"
+  _target="$2"
+  # No diff-marker/header skip here. Every caller feeds this function through
+  # added_lines_only() (staged diff) or a commit message, and the header removal
+  # in added_lines_only is STRUCTURAL (see there). A prefix-based skip at this
+  # layer would drop an ADDED line whose CONTENT starts with "++ " — rendered
+  # byte-identically to a file header — and let its credential through.
   while IFS= read -r line; do
-    [[ "$line" =~ ^(\+\+\+|---|@@|-) ]] && continue
-    if [[ "$line" =~ (password|api_key|secret)[[:space:]]*[:=]+[[:space:]]*(.*) ]]; then
-      local rest="${BASH_REMATCH[2]}"
-      local val=""
-      if [[ "$rest" =~ ^\"([^\"]*)\" ]]; then
-        val="${BASH_REMATCH[1]}"
-      elif [[ "$rest" =~ ^\'([^\']*)\' ]]; then
-        val="${BASH_REMATCH[1]}"
-      elif [[ "$rest" =~ ^([^[:space:];,]+) ]]; then
-        val="${BASH_REMATCH[1]}"
+    # Keyword: an identifier suffix is tolerated (SECRET_KEY, PASSWORD_HASH,
+    # API_KEY_ID), which is the over-strict side of matching a keyword substring:
+    # "mysecret="/"secretary=" are caught too (no word boundary is attempted).
+    # Separator: ":" or "=" plus the arrow forms "=>" / ":=>", so an arrow
+    # assignment cannot leave the ">" behind as the "first token" and slip
+    # under the 6-character floor.
+    if printf '%s\n' "$line" | grep -qiE '(password|api_key|secret)[A-Za-z0-9_]*[[:space:]]*[:=]+>?[[:space:]]*(.*)'; then
+      # Value = the FIRST non-whitespace token after the separator, then strip
+      # surrounding quotes/backticks. Taking the whole tail (the earlier
+      # behaviour) turned documentation prose such as "api_key = see the notes"
+      # into a hardcoded-credential hit as soon as the tail reached 6 chars.
+      lhs=$(printf '%s\n' "$line" | sed -E 's/^(.*[^A-Za-z0-9_])?([A-Za-z0-9_]*(password|api_key|secret)[A-Za-z0-9_]*)[[:space:]]*[:=]+>?.*/\2/I')
+      rest=$(printf '%s\n' "$line" | sed -E 's/.*(password|api_key|secret)[A-Za-z0-9_]*[[:space:]]*[:=]+>?[[:space:]]*//I' | sed -E 's/^[[:space:]]+//; s/[[:space:]].*$//')
+      val=$(printf '%s\n' "$rest" | sed -E 's/^[[:space:]"'\''`]+//; s/[[:space:]"'\''`;,]+$//')
+      # Structural exemption for environment-variable name constants (e.g.
+      # `const API_KEY_ENV = "TINYFISH_API_KEY"` or `api_key_env_name = "OPENAI_API_KEY"` ):
+      # LHS must end in _(env|env_name|var|key_env|key_name) (case-insensitive) AND
+      # RHS must be an all-uppercase ASCII env-var identifier matching
+      # ^[A-Z][A-Z0-9_]{2,}_(KEY|TOKEN|SECRET|PASSWORD|ID|IDENT)$.
+      # Bare LHS names (e.g. `password` = "MY_APP_PASSWORD"), single-letter/unsuffixed
+      # uppercase tokens, and real secret literals (sk-..., ghp_..., high-entropy strings)
+      # never match.
+      if printf '%s\n' "$lhs" | LC_ALL=C grep -qiE '_(env|env_name|var|key_env|key_name)$' && \
+         printf '%s\n' "$val" | LC_ALL=C grep -qE '^[A-Z][A-Z0-9_]{2,}_(KEY|TOKEN|SECRET|PASSWORD|ID|IDENT)$'; then
+        continue
       fi
-      val=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-      local lower
-      lower=$(echo "$val" | tr '[:upper:]' '[:lower:]')
-      case "$lower" in
+      val_lower=$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')
+      case "$val_lower" in
         ""|"none"|"optional"|"removed"|"unchanged"|"empty"|"null"|"nil"|"undefined"|"true"|"false"|"todo"|"changeme"|"placeholder"|"<"*">"|"\$"*|"\"\""|"''")
           continue
           ;;
       esac
-      if [ ${#val} -ge 6 ]; then
-        die "$target appears to contain a hardcoded credential assignment: \"$line\"
-Secrets must never be committed. Use environment variables."
+      val_len=$(printf '%s' "$val" | wc -m | tr -d '[:space:]')
+      if [ "$val_len" -ge 6 ]; then
+        die "$_target appears to contain a hardcoded credential assignment: \"$line\"" \
+"Never commit passwords, API keys, or secrets. Use environment variables or secret managers."
       fi
     fi
-  done <<< "$text"
+  done << EOF
+$_content
+EOF
 }
 
-for pat in "${SECRET_PATTERNS[@]}"; do
-  if echo "$MSG" | grep -qiE -- "$pat"; then
-    die "commit message appears to contain a secret matching: \"$pat\"
-Secrets must never be committed. Use environment variables."
-  fi
-done
-check_assignments "$MSG" "commit message"
+# Staged-diff scanning looks only at added lines. A removed line is content that
+# already exists in history and a context line merely sits next to the change, so
+# neither can introduce a new secret; scanning them only rejects commits that are
+# in fact REMOVING a credential.
+#
+# File headers are removed STRUCTURALLY, not by prefix. A "+++ …" line is a
+# file header only when it directly follows a "--- …" line while still outside
+# any hunk: git always emits that pair immediately before the first "@@ " of a
+# file, and the "diff --git" line that opens every file resets the state. Inside
+# a hunk every line is content, so an ADDED line whose text starts with "++ "
+# (rendered "+++ …" — byte-identical to a header by prefix alone) is kept
+# instead of being silently dropped together with a real secret inside it. That
+# covers content starting with "++ b/", "++ /dev/null", "++ ", "++" and "+++"
+# alike. Prefix skew (diff.noprefix=true, diff.mnemonicPrefix=true) no longer
+# makes real headers survive the filter either: they are matched by position, so
+# a secret-shaped FILE NAME is not scanned (the old prefix filter only dropped
+# "+++ b/…"/"+++ /dev/null", which noprefix/mnemonicPrefix do not emit).
+#   Known limit (unchanged in spirit): the reset key is the "diff --git" line,
+#   so a diff format that omits it (e.g. "git diff --no-index") would treat a
+#   later file's "+++ " header as added content and over-report. None of the
+#   callers here use such a format: they run "git diff --cached" and
+#   "git show --format=".
+added_lines_only() {
+  printf '%s\n' "$1" | awk '
+    BEGIN { state = 0; minus = 0 }
+    /^diff --git /            { state = 0; minus = 0; next }
+    state == 0 && /^@@ /      { state = 1; minus = 0; next }
+    state == 1 && /^@@ /      { next }
+    state == 0 && /^--- /     { minus = 1; next }
+    state == 0 && /^[+][+][+] / && minus == 1 { minus = 0; next }
+    state == 0                { minus = 0; next }
+    state == 1 && /^[+]/      { print }
+  '
+}
 
-# ── 4. Staged-diff secret check ─────────────────────────────────────
-# Also scan the actual staged diff for secrets, not just the message.
-if git rev-parse --verify HEAD >/dev/null 2>&1; then
-  DIFF=$(git diff --cached HEAD 2>/dev/null || true)
-else
-  DIFF=$(git diff --cached 2>/dev/null || true)
-fi
-for pat in "${SECRET_PATTERNS[@]}"; do
-  if echo "$DIFF" | grep -qiE -- "$pat"; then
-    die "staged changes contain a secret matching: \"$pat\"
-Secrets must never be committed. Use environment variables."
+# Scan commit message for secrets
+check_secret_patterns "$RAW_MSG" "Commit message"
+check_credential_assignments "$RAW_MSG" "Commit message"
+
+# Scan staged diff for secrets (if in git repo and diff checking is not skipped)
+if [ "${COMMIT_MSG_SKIP_DIFF:-0}" != "1" ] && command -v git >/dev/null 2>&1; then
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    DIFF=$(git diff --cached 2>/dev/null || true)
+    if [ -n "$DIFF" ]; then
+      check_secret_patterns "$(added_lines_only "$DIFF")" "Staged changes"
+      check_credential_assignments "$(added_lines_only "$DIFF")" "Staged changes"
+    fi
   fi
-done
-check_assignments "$DIFF" "staged changes"
+fi
 
 exit 0

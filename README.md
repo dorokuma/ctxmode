@@ -32,7 +32,7 @@ A Pi-specific TypeScript adapter is maintained in [`integrations/pi/`](integrati
 ```bash
 git clone https://github.com/dorokuma/ctxmode.git
 cd ctxmode
-bash scripts/install-hooks.sh   # ← MANDATORY: blocks bad commits & secret leaks
+bash scripts/install-hooks.sh   # ← MANDATORY: blocks format violations & secret leaks (safely aborts if external hooksPath is set)
 go build -o ctxmode .
 ```
 
@@ -42,10 +42,10 @@ go build -o ctxmode .
 
 | Hook | What it blocks |
 |------|---------------|
-| `commit-msg` | Non-English characters, noise words, secret patterns (tokens, keys, passwords) |
+| `commit-msg` | Non-conventional commit formats, process noise words, secret patterns (tokens, keys, passwords) |
 | `pre-push` | Same checks across all outgoing commits |
 
-Run the script once after `git clone`. Without it, commits may be written in Chinese or leak credentials — both are rejected at the hook level.
+Run the script once after `git clone` (for setups using repository-local `.git/hooks/`). If an external or global `core.hooksPath` is active, or if target hooks are symlinks, the script safely refuses to install to avoid overwriting external/global hooks. Commits must follow Conventional Commits format (<= 72 chars subject, English/Chinese allowed) and contain no secrets or process noise.
 
 ## Configuration
 
