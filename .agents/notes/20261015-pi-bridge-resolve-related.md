@@ -29,11 +29,6 @@ supersedes: ""
 3. **最小测试纪律**：
    - 在已有 `integrations/pi/ctxmode.test.ts`（`:720-817`）新增单条测试 `扩展层：ctx_fs 暴露 resolve 与 related 动作枚举并透传调用`，覆盖 `action.enum`、`action.description`、工具 `description`，并解析 recorded JSONL 请求行断言同一条 `tools/call` 请求中同时包含 `name === "ctx_fs"`、`arguments.action === "resolve"`（含 `path: "@router.go", limit: 5`）及 `arguments.action === "related"`（含 `path: "router.go", limit: 3`）（改动前实测 FAIL，改动后 PASS）。
 
-## 审查观察项登记
-- ① `integrations/pi/ctxmode.ts:818` 的 `related` 描述（「同目录关联文件」）与 `router.go:286`（`:285` 工具描述中的 `siblings`）一样，比 `fs_resolve.go:371-380` 实际实现的跨目录同 stem 匹配与 stem 前缀匹配（`:380-381`）略窄，属于与 Go MCP 面一致的既有描述压缩口径，保持现状。
-- ② `resolve` / `related` 返回的大结果不走服务端 `ctx_kb` 自动落库，在 Pi 客户端与 `ls` / `glob` 共用 `OUTPUT_LINE_CAP=500` / `OUTPUT_CHAR_CAP=50000`（`integrations/pi/ctxmode.ts:120-121`、`compressToolText` `:155-180`）输出压缩器。
-- ③ `integrations/pi/ctxmode.ts:820-825` 的 `promptGuidelines` 维持仅针对 `rg` 的防误用约束（具体标识符检索、命中后直接 Read、大结果集用 `ctx_kb` 或 `offset` 翻页），无需为 `resolve` / `related` 额外膨胀系统提示。
-
 ## 被放弃的方案（必填）
 - **方案 A：在 Pi 桥将 `resolve` 与 `related` 拆成独立顶层工具（如 `ctx_resolve` / `ctx_related`）**。否决：违背 v2 类别工具面设计（`ctx_fs` 通过 `action=` 承载文件类能力），且会与 Go MCP 面 `router.go` 及 `instructions.go` 的 playbook 产生分叉。
 - **方案 B：在 `timeoutForTool` 为 `ctx_fs` 的 `resolve|related` 单独加超时分支**。否决：服务端 `resolve`/`related` 已有 5s 墙钟预算上限（`resolveScanBudget`），远小于客户端默认 120s 超时，增加分支属于无依据的冗余复杂度。
