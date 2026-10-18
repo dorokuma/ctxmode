@@ -5,6 +5,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [5.1.0] - 2026-10-18
+
 ### Fixed
 - **`fix(githooks): harden installer safety and sync repo hooks`.** `scripts/install-hooks.sh` no longer treats `.git/hooks/`, `.git/hooks/.` or `.git/hooks//` as a different directory from `.git/hooks`: trailing slashes and a trailing `/.` are stripped before `core.hooksPath` is resolved, and the comparison uses `realpath` (falling back to `readlink -f`, then `pwd -P`). `.git/hooks` being a symlink is rejected on the undecorated path, and the destination is resolved again immediately before the copy and refused unless it is still the repository `.git/hooks`. A hook name that is itself a symlink is removed (the link, not the file it points at) before `cp -P`, so the copy can no longer follow the destination symlink and overwrite a file outside the repository. `githooks/pre-push` now fails closed when the sibling `commit-msg` is missing or not executable, instead of skipping format, noise-word and in-message secret checks (and instead of falling through to a global `commit-msg`). `CTXMODE_COMMIT_MSG_FALLBACK` may name a validator used only when the sibling file is absent, for tests.
 
