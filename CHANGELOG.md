@@ -5,6 +5,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [5.2.0] - 2026-10-22
+
 ### Fixed
 - **`-workdir` always takes precedence as `workdirs[0]`.** `main.go` previously skipped prepending `-workdir` when the path already appeared later in `config.yaml`'s `workdirs` list (e.g. `/tmp` at a non-first index), leaving `workdirs[0]` (and therefore the per-workdir database and default `cwd`/`.` resolution) bound to the config's first entry instead of `-workdir`. `absWd` is now unconditionally prepended and deduplicated in order so `-workdir` is always `workdirs[0]`.
 - **`ctx_stats` (`json=true`) serializes `audit_session` counters.** `auditAgg` in `stats.go` had unexported fields, causing `json.Marshal` to emit `"audit_session": {}`. Exporting `Calls`, `Output`, `Indexed`, and `Truncated` with `json:"calls"|"output"|"indexed"|"truncated"` tags restores the session audit breakdown in JSON mode.
