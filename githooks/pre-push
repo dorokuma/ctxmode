@@ -69,7 +69,8 @@ ghu_[a-zA-Z0-9]{36}
 ghs_[a-zA-Z0-9]{36}
 github_pat_[a-zA-Z0-9_]{20,}
 xox[baprs]-[a-zA-Z0-9-]+
-SKBOUND8
+(^|[^A-Za-z])sk-[a-zA-Z0-9._-]{8,}
+sk-[a-zA-Z0-9._-]{32,}
 AKIA[0-9A-Z]{16}
 ya29\.[a-zA-Z0-9_-]+
 eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}

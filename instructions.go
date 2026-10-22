@@ -43,5 +43,7 @@ action argument (ctx_stats takes none).
 - Tool names: ctx_run, ctx_fs, ctx_git, ctx_kb, ctx_bg, ctx_stats; action is a
   required argument for all but ctx_stats (e.g. ctx_fs action=ls path=.).
 - Grok prefixes the server name onto tool names; pi registers the same tool
-  names directly.
+  names directly; agy (Antigravity CLI) exposes them as MCP tools under server
+  "ctxmode" (lazy schemas in ~/.gemini/antigravity-cli/mcp/ctxmode/, called via
+  call_mcp_tool).
 `

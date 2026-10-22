@@ -269,6 +269,33 @@ func TestPurgeSession_DeletesServerTaggedDocs(t *testing.T) {
 	}
 }
 
+func TestPurgeProject_RebuildsFTSAndReclaimsBytes(t *testing.T) {
+	srv := newTestServer(t)
+	for i := 0; i < 20; i++ {
+		indexDoc(t, srv.store, "doc:"+string(rune('a'+i)), strings.Repeat("tokencontent ", 600))
+	}
+	res, _, err := srv.toolPurge(context.Background(), nil, purgeArgs{
+		Confirm:       true,
+		Scope:         "project",
+		ConfirmPhrase: srv.purgeKBName(),
+	})
+	if err != nil {
+		t.Fatalf("purge project: %v", err)
+	}
+	if text := contentText(res); !strings.Contains(text, `"freed_bytes":`) {
+		t.Fatalf("expected freed_bytes > 0 after project purge+vacuum, got:\n%s", text)
+	}
+	for _, tbl := range []string{"documents_fts_data", "documents_trigram_data"} {
+		var bytes int64
+		if err := srv.store.db.QueryRow("SELECT COALESCE(SUM(LENGTH(block)), 0) FROM " + tbl).Scan(&bytes); err != nil {
+			t.Fatalf("query %s: %v", tbl, err)
+		}
+		if bytes > 1024 {
+			t.Fatalf("%s still holds %d bytes of tombstones after PurgeAll", tbl, bytes)
+		}
+	}
+}
+
 // helpers
 
 func contentText(result *mcp.CallToolResult) string {

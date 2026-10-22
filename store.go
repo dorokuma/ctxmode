@@ -833,13 +833,20 @@ func (s *Store) PurgeAll() (deletedDocs int, deletedCache int, err error) {
 	}
 	defer tx.Rollback()
 
-	// Delete all documents — the AFTER DELETE triggers clean up FTS tables automatically.
+	// Delete all documents — the AFTER DELETE triggers write tombstones into FTS5
+	// shadow tables, so rebuild both FTS5 tables to drop tombstone segments.
 	res, err := tx.Exec(`DELETE FROM documents`)
 	if err != nil {
 		return 0, 0, fmt.Errorf("purge documents: %w", err)
 	}
 	docRows, _ := res.RowsAffected()
 	deletedDocs = int(docRows)
+
+	for _, tbl := range []string{"documents_fts", "documents_trigram"} {
+		if _, err := tx.Exec(fmt.Sprintf("INSERT INTO %s(%s) VALUES('rebuild')", tbl, tbl)); err != nil {
+			return 0, 0, fmt.Errorf("rebuild %s: %w", tbl, err)
+		}
+	}
 
 	// Delete all cache entries.
 	res, err = tx.Exec(`DELETE FROM fetch_cache`)
@@ -1015,6 +1022,9 @@ func (s *Store) Vacuum() error {
 	_, err := s.db.Exec(`VACUUM`)
 	if err != nil {
 		return fmt.Errorf("vacuum: %w", err)
+	}
+	if _, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("vacuum wal checkpoint: %w", err)
 	}
 	if err := s.secureDBFiles(); err != nil {
 		return fmt.Errorf("vacuum secure db files: %w", err)

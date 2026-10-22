@@ -218,6 +218,7 @@ func TestAudit_ReadonlyRoleTag(t *testing.T) {
 		wantRO   bool
 	}{
 		{name: "readonly role", role: "reviewer", wantTag: true},
+		{name: "verifier role", role: "verifier", wantTag: true},
 		{name: "readonly env", role: "worker", readonly: "1", wantTag: true, wantRO: true},
 		{name: "ordinary role", role: "worker", wantTag: false},
 		{name: "no role", wantTag: false},

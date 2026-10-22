@@ -49,6 +49,7 @@ interface ClientTestSurface {
 let CtxmodeClient: new (workdir: string) => ClientTestSurface
 let diagLog: (msg: string) => void
 let compressToolText: (text: string) => string
+let resolveRoleEnv: (argv?: string[], baseEnv?: NodeJS.ProcessEnv) => NodeJS.ProcessEnv
 /** ctxmode.ts 的默认导出（pi 扩展入口）：registerTools 的工具就是它注册的。 */
 let ctxmodeExtension: (pi: unknown) => void
 
@@ -76,6 +77,7 @@ before(async () => {
   CtxmodeClient = mod.CtxmodeClient
   diagLog = mod.diagLog
   compressToolText = mod.compressToolText
+  resolveRoleEnv = mod.resolveRoleEnv
   ctxmodeExtension = mod.default
 
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ctxmode-test-"))
@@ -484,6 +486,20 @@ test("timeoutForTool: fetch 默认大于服务端 150s，并读取 timeout_ms", 
   assert.ok(custom >= 230000, `timeout_ms 200000 + buffer, got ${custom}`)
   const snake = c.timeoutForTool("ctx_run", { action: "run_task", timeout_ms: 400000 })
   assert.ok(snake >= 430000, `timeout_ms still works, got ${snake}`)
+})
+
+test("扩展层：resolveRoleEnv 从 --name 提取角色且不覆盖显式环境变量", () => {
+  const roEnv = resolveRoleEnv(["pi", "--name", "role-verifier-a1b2c3d4"], {})
+  assert.equal(roEnv.CTXMODE_ROLE, "verifier")
+  assert.equal(roEnv.CTXMODE_READONLY, "1")
+  const wkEnv = resolveRoleEnv(["pi", "--name=role-worker-1234abcd"], {})
+  assert.equal(wkEnv.CTXMODE_ROLE, "worker")
+  assert.equal(wkEnv.CTXMODE_READONLY, undefined)
+  const keptEnv = resolveRoleEnv(["pi", "--name", "role-verifier-a1b2c3d4"], {
+    CTXMODE_ROLE: "worker",
+  })
+  assert.equal(keptEnv.CTXMODE_ROLE, "worker")
+  assert.equal(keptEnv.CTXMODE_READONLY, undefined)
 })
 
 // ---- Esc / 客户端超时必须闭环成 notifications/cancelled ----

@@ -1382,6 +1382,12 @@ func (s *server) rgSystemBounded(ctx, parentCtx context.Context, rgPath, root st
 		"--glob", "!*.tfstate",
 		"--glob", "!*.kdbx",
 		"--glob", "!service-account*.json",
+		"--glob", "!antigravity-oauth-token*",
+		"--glob", "!auth.json*",
+		"--glob", "!logins.json*",
+		"--glob", "!plugin-auth.json*",
+		"--glob", "!hosts.yml*",
+		"--glob", "!hosts.yaml*",
 		"-m", strconv.Itoa(fetchLimit),
 	)
 	if args.IgnoreCase {

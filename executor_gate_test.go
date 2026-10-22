@@ -239,6 +239,12 @@ func TestExecutorGate_SensitiveFilePathListExtended(t *testing.T) {
 		"/gcp/service-account.json",
 		"/gcp/service-account-prod.json",
 		"/gcp/Service-Account-Keys.JSON", // case-insensitive
+		"/root/.gemini/antigravity-oauth-token",
+		"/root/.pi/agent/auth.json",
+		"/home/u/.mozilla/firefox/logins.json",
+		"/home/u/.config/plugin-auth.json",
+		"/root/.config/gh/hosts.yml",
+		"/root/.config/gh/hosts.yaml",
 	}
 	misses := []string{
 		"/proj/config.json",

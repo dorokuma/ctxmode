@@ -105,10 +105,10 @@ type ctxStatsArgs struct {
 }
 
 type auditAgg struct {
-	calls     int64
-	output    int64
-	indexed   int64
-	truncated int64
+	Calls     int64 `json:"calls"`
+	Output    int64 `json:"output"`
+	Indexed   int64 `json:"indexed"`
+	Truncated int64 `json:"truncated"`
 }
 
 func (s *server) toolCtxStats(_ context.Context, _ *mcp.CallToolRequest, args ctxStatsArgs) (*mcp.CallToolResult, any, error) {
@@ -175,7 +175,7 @@ func (s *server) toolCtxStats(_ context.Context, _ *mcp.CallToolRequest, args ct
 		fmt.Fprintf(&b, "audit log: unavailable (%v)\n", auditErr)
 	} else {
 		fmt.Fprintf(&b, "audit log (ctx_run, this session): %d calls, %s raw output, %d auto-indexed, %d truncated\n",
-			audit.calls, humanBytes(audit.output), audit.indexed, audit.truncated)
+			audit.Calls, humanBytes(audit.Output), audit.Indexed, audit.Truncated)
 	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: b.String()}}}, nil, nil
 }
@@ -204,13 +204,13 @@ func aggregateAuditLog(path, sessionID string, agg *auditAgg) error {
 		if sessionID != "" && rec.SessionID != sessionID {
 			continue
 		}
-		agg.calls++
-		agg.output += int64(rec.OutputLen)
+		agg.Calls++
+		agg.Output += int64(rec.OutputLen)
 		if rec.Indexed {
-			agg.indexed++
+			agg.Indexed++
 		}
 		if rec.Truncated {
-			agg.truncated++
+			agg.Truncated++
 		}
 	}
 	return sc.Err()

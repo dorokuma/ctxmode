@@ -9,7 +9,7 @@ import (
 )
 
 // Category MCP tools (v2.0): fewer top-level tools, action= selects capability.
-// Hosts (Grok, Pi, others) call these as real tools — not skills.
+// Hosts (Grok, Pi, agy / Antigravity CLI, others) call these as real tools — not skills.
 
 // ---------- ctx_run ----------
 
@@ -171,7 +171,7 @@ type ctxKbArgs struct {
 	TTLMs         *int     `json:"ttl_ms,omitempty" jsonschema:"ms (0=skip cache, omit=86400000)"`
 	Confirm       bool     `json:"confirm,omitempty"`
 	ConfirmPhrase string   `json:"confirm_phrase,omitempty"`
-	Scope         string   `json:"scope,omitempty"`
+	Scope         string   `json:"scope,omitempty" jsonschema:"search: 'rg' to restrict to indexed rg results; purge: 'session' (default) or 'project'"`
 	SessionID     string   `json:"sessionId,omitempty"`
 	DryRun        bool     `json:"dryRun,omitempty"`
 }
@@ -221,11 +221,11 @@ func (s *server) toolCtxBg(ctx context.Context, req *mcp.CallToolRequest, args c
 		return nil, nil, fmt.Errorf("id and pid are mutually exclusive; provide exactly one")
 	}
 	switch strings.ToLower(strings.TrimSpace(args.Action)) {
-	case "list":
+	case "list", "status":
 		return s.toolBackgroundList(ctx, req, backgroundListArgs{})
 	case "kill":
 		return s.toolBackgroundKill(ctx, req, backgroundKillArgs{ID: args.ID, PID: args.PID})
-	case "log":
+	case "log", "output":
 		return s.toolBackgroundLog(ctx, req, backgroundLogArgs{
 			ID: args.ID, PID: args.PID, TailLines: args.TailLines, TailBytes: args.TailBytes,
 		})

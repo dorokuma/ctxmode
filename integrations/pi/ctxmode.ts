@@ -206,6 +206,33 @@ interface MCPToolResult {
   instructions?: string
 }
 
+const READONLY_ROLES = new Set(["scout", "planner", "researcher", "reviewer", "oracle", "verifier"])
+
+export function resolveRoleEnv(
+  argv: string[] = process.argv,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  if (baseEnv.CTXMODE_ROLE) return baseEnv
+  for (let i = 0; i < argv.length; i++) {
+    let nameVal = ""
+    if (argv[i] === "--name" && i + 1 < argv.length) {
+      nameVal = argv[i + 1]
+    } else if (argv[i]?.startsWith("--name=")) {
+      nameVal = argv[i].slice("--name=".length)
+    }
+    const m = /^role-([a-z0-9_-]+)-[0-9a-f]{8}$/i.exec(nameVal)
+    if (m) {
+      const role = m[1].toLowerCase()
+      const out: NodeJS.ProcessEnv = { ...baseEnv, CTXMODE_ROLE: role }
+      if (READONLY_ROLES.has(role) && !baseEnv.CTXMODE_READONLY) {
+        out.CTXMODE_READONLY = "1"
+      }
+      return out
+    }
+  }
+  return baseEnv
+}
+
 export class CtxmodeClient {
   private proc: ChildProcess | null = null
   private requestId = 0
@@ -380,6 +407,7 @@ export class CtxmodeClient {
     this.intentionalClose = false
     this.proc = spawn(bin, ["-workdir", this.workdir], {
       stdio: ["pipe", "pipe", "pipe"],
+      env: resolveRoleEnv(),
     })
     const proc = this.proc
 

@@ -634,6 +634,7 @@ var readonlyAuditRoles = map[string]bool{
 	"researcher": true,
 	"reviewer":   true,
 	"oracle":     true,
+	"verifier":   true,
 }
 
 // auditRoleIsReadonly reports whether CTXMODE_ROLE names a read-only role.

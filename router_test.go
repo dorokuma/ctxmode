@@ -56,6 +56,13 @@ func TestCtxBgMissingAction(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
+	if _, _, err := s.toolCtxBg(context.Background(), nil, ctxBgArgs{Action: "status"}); err != nil {
+		t.Fatalf("status alias should route to list, got %v", err)
+	}
+	// empty id/pid routes "output" to the "log" branch and triggers "id or pid is required" (not "unknown ctx_bg action")
+	if _, _, err := s.toolCtxBg(context.Background(), nil, ctxBgArgs{Action: "output"}); err == nil || strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("output alias should route to log, got %v", err)
+	}
 }
 
 func TestCtxRunExecuteRequiresCommand(t *testing.T) {

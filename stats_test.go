@@ -69,14 +69,14 @@ func TestAggregateAuditLogSessionFilter(t *testing.T) {
 	if err := aggregateAuditLog(path, "s1", &agg); err != nil {
 		t.Fatalf("aggregateAuditLog: %v", err)
 	}
-	if agg.calls != 2 || agg.output != 300 || agg.indexed != 1 || agg.truncated != 1 {
+	if agg.Calls != 2 || agg.Output != 300 || agg.Indexed != 1 || agg.Truncated != 1 {
 		t.Fatalf("aggregation wrong: %+v", agg)
 	}
 	var all auditAgg
 	if err := aggregateAuditLog(path, "", &all); err != nil {
 		t.Fatalf("aggregateAuditLog all: %v", err)
 	}
-	if all.calls != 3 {
+	if all.Calls != 3 {
 		t.Fatalf("unfiltered aggregation wrong: %+v", all)
 	}
 	if err := aggregateAuditLog(filepath.Join(dir, "missing.jsonl"), "s1", &agg); err == nil {
@@ -85,7 +85,11 @@ func TestAggregateAuditLogSessionFilter(t *testing.T) {
 }
 
 func TestToolCtxStatsTextAndJSON(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	t.Setenv(auditEnvLogPath, logPath)
 	s := testServerWithWorkdir(t, t.TempDir())
+	s.sessionID = "sess-stats-json"
+	mustWrite(t, logPath, `{"session_id":"sess-stats-json","action":"execute","output_len":64}`+"\n")
 	s.statRecordCall("ctx_run", 4096)
 	s.statRecordKeptOut("store", 8192)
 	res, _, err := s.toolCtxStats(context.Background(), nil, ctxStatsArgs{})
@@ -105,7 +109,7 @@ func TestToolCtxStatsTextAndJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("toolCtxStats json: %v", err)
 	}
-	if text := mcpResultText(t, res); !strings.Contains(text, `"total_kept_out"`) {
+	if text := mcpResultText(t, res); !strings.Contains(text, `"total_kept_out"`) || !strings.Contains(text, "\"audit_session\": {\n    \"calls\": 1,") {
 		t.Fatalf("json output wrong:\n%s", text)
 	}
 }

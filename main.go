@@ -120,22 +120,14 @@ func main() {
 	}
 	workdirs := cfg.Workdirs
 
-	// If -workdir flag was given, prepend it (backward compatibility).
+	// If -workdir flag was given, prepend it so it becomes workdirs[0];
+	// the deduplication loop below preserves order and removes duplicates.
 	if workdir != "" {
 		absWd, err := filepath.Abs(workdir)
 		if err != nil {
 			fatal(nil, "bad workdir: %v", err)
 		}
-		hasWd := false
-		for _, wd := range workdirs {
-			if wd == absWd {
-				hasWd = true
-				break
-			}
-		}
-		if !hasWd {
-			workdirs = append([]string{absWd}, workdirs...)
-		}
+		workdirs = append([]string{absWd}, workdirs...)
 	}
 
 	// Deduplicate and absolutize all workdirs.
@@ -925,8 +917,9 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	if !info.Mode().IsRegular() {
 		return nil, nil, fmt.Errorf("file %q is not a regular file", target)
 	}
+	var sensitiveInodes map[fileID]struct{}
 	if st, ok := info.Sys().(*syscall.Stat_t); ok && uint64(st.Nlink) > 1 {
-		sensitiveInodes := s.collectSensitiveInodes()
+		sensitiveInodes = s.collectSensitiveInodes()
 		if id, ok := fileDevIno(info); ok {
 			if _, seen := sensitiveInodes[id]; seen {
 				return nil, nil, fmt.Errorf("refusing to execute on sensitive file %q (hardlink to sensitive file)", target)
@@ -956,8 +949,11 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		return nil, nil, fmt.Errorf("file %q is not a regular file", target)
 	}
 	if st, ok := fdInfo.Sys().(*syscall.Stat_t); ok && uint64(st.Nlink) > 1 {
-		for id := range s.collectSensitiveInodes() {
-			if current, ok := fileDevIno(fdInfo); ok && current == id {
+		if sensitiveInodes == nil {
+			sensitiveInodes = s.collectSensitiveInodes()
+		}
+		if current, ok := fileDevIno(fdInfo); ok {
+			if _, seen := sensitiveInodes[current]; seen {
 				rf.Close()
 				return nil, nil, fmt.Errorf("refusing to execute on sensitive file %q (hardlink to sensitive file)", target)
 			}
@@ -1549,7 +1545,9 @@ func isSensitiveCredentialBase(base string) bool {
 	switch base {
 	case "credentials.json", "credentials", ".npmrc", ".netrc", "netrc",
 		".git-credentials", "git-credentials", ".bash_history", ".zsh_history",
-		".pgpass", "pgpass", ".htpasswd":
+		".pgpass", "pgpass", ".htpasswd",
+		"antigravity-oauth-token", "auth.json", "logins.json", "plugin-auth.json",
+		"hosts.yml", "hosts.yaml":
 		return true
 	}
 	return false
@@ -1619,8 +1617,9 @@ func fileDevIno(info os.FileInfo) (fileID, bool) {
 
 // collectSensitiveInodes walks every workdir and records device+inode of
 // paths that match isSensitiveFilePath. Symlink targets are recorded via
-// Stat so a hardlink or alias of the real file is also blocked. .git and
-// node_modules are skipped; secret dirs such as .ssh are not.
+// Stat so a hardlink or alias of the real file is also blocked. Bulk/cache
+// dirs (skipWalkDirs plus .cache/.cargo/.rustup/.npm/.pnpm-store) are skipped;
+// secret dirs such as .ssh/.aws/.gnupg/.kube/.gemini/.pi/.grok/.config are not.
 func (s *server) collectSensitiveInodes() map[fileID]struct{} {
 	s.sensitiveInodesScans.Add(1)
 	out := make(map[fileID]struct{})
@@ -1634,7 +1633,11 @@ func (s *server) collectSensitiveInodes() map[fileID]struct{} {
 			}
 			if fi.IsDir() {
 				base := filepath.Base(path)
-				if base == ".git" || base == "node_modules" {
+				if skipWalkDirs[base] {
+					return filepath.SkipDir
+				}
+				switch base {
+				case ".cache", ".cargo", ".rustup", ".npm", ".pnpm-store":
 					return filepath.SkipDir
 				}
 				return nil
