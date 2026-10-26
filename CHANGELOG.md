@@ -5,6 +5,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Fixed
+- **Category tools tolerate the parameter spellings hosts actually send.** `ctx_run`'s `action` is now optional in the inferred MCP JSON Schema (`omitempty`) and the router normalizes a missing `action` — or the legacy `"run"` — to `execute`, including for the `background` guard, instead of rejecting the call with `missing properties: ["action"]`. `ctx_fs` accepts `action="list"` as an alias for `ls`. `ctx_git` accepts `limit` and `max_count` as aliases for `n` on `action=log` (`n` still wins when set), so those calls no longer fail schema validation with `unexpected additional properties`.
+
 ## [5.2.0] - 2026-10-22
 
 ### Fixed
