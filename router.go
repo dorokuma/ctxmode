@@ -14,7 +14,11 @@ import (
 // ---------- ctx_run ----------
 
 type ctxRunArgs struct {
-	Action string `json:"action" jsonschema:"execute|execute_file|batch|run_task"`
+	// omitempty keeps action optional in the inferred MCP JSON Schema: a call
+	// that omits it must reach the router (where it defaults to execute) instead
+	// of being rejected at the schema-validation layer with
+	// `missing properties: ["action"]`.
+	Action string `json:"action,omitempty" jsonschema:"execute|execute_file|batch|run_task"`
 
 	// execute
 	Command    string            `json:"command,omitempty" jsonschema:"Shell command text run via a fixed, controlled /bin/sh -c (SHELL ignored; no allowlist). Pipes/redirects/&&/heredoc/$() allowed. Ignored when argv is non-empty; prefer argv."`
@@ -44,10 +48,17 @@ type ctxRunArgs struct {
 }
 
 func (s *server) toolCtxRun(ctx context.Context, req *mcp.CallToolRequest, args ctxRunArgs) (*mcp.CallToolResult, any, error) {
-	if args.Background && strings.ToLower(strings.TrimSpace(args.Action)) != "execute" {
+	// Normalize before any branching: a missing action or the legacy spelling
+	// "run" both mean execute, and the background guard below must see the
+	// normalized value.
+	action := strings.ToLower(strings.TrimSpace(args.Action))
+	if action == "" || action == "run" {
+		action = "execute"
+	}
+	if args.Background && action != "execute" {
 		return nil, nil, fmt.Errorf("background is only supported for ctx_run action=execute")
 	}
-	switch strings.ToLower(strings.TrimSpace(args.Action)) {
+	switch action {
 	case "execute":
 		return s.toolExecute(ctx, req, executeArgs{
 			Command: args.Command, Language: args.Language, TimeoutMs: args.TimeoutMs,
@@ -69,8 +80,6 @@ func (s *server) toolCtxRun(ctx context.Context, req *mcp.CallToolRequest, args 
 			Kind: args.Kind, Target: args.Target, Args: args.Args,
 			CWD: args.CWD, TimeoutMs: args.TimeoutMs, Intent: args.Intent, Env: args.Env,
 		})
-	case "":
-		return nil, nil, fmt.Errorf("action is required (execute|execute_file|batch|run_task)")
 	default:
 		return nil, nil, fmt.Errorf("unknown ctx_run action %q (execute|execute_file|batch|run_task)", args.Action)
 	}
@@ -93,7 +102,12 @@ type ctxFsArgs struct {
 }
 
 func (s *server) toolCtxFs(ctx context.Context, req *mcp.CallToolRequest, args ctxFsArgs) (*mcp.CallToolResult, any, error) {
-	switch strings.ToLower(strings.TrimSpace(args.Action)) {
+	action := strings.ToLower(strings.TrimSpace(args.Action))
+	// "list" is the spelling most hosts guess; route it to ls.
+	if action == "list" {
+		action = "ls"
+	}
+	switch action {
 	case "ls":
 		return s.toolLs(ctx, req, lsArgs{
 			Path: args.Path, Depth: args.Depth, IncludeHidden: args.IncludeHidden, Limit: args.Limit,
@@ -133,7 +147,12 @@ type ctxGitArgs struct {
 	Unified int    `json:"unified,omitempty"`
 	Staged  bool   `json:"staged,omitempty"`
 	N       int    `json:"n,omitempty"`
-	Oneline *bool  `json:"oneline,omitempty"`
+	// Limit / MaxCount are accepted aliases for N on action=log. They exist so
+	// the inferred schema allows the spellings hosts commonly send instead of
+	// rejecting the call with `unexpected additional properties ["limit"]`.
+	Limit    int   `json:"limit,omitempty"`
+	MaxCount int   `json:"max_count,omitempty"`
+	Oneline  *bool `json:"oneline,omitempty"`
 }
 
 func (s *server) toolCtxGit(ctx context.Context, req *mcp.CallToolRequest, args ctxGitArgs) (*mcp.CallToolResult, any, error) {
@@ -145,8 +164,18 @@ func (s *server) toolCtxGit(ctx context.Context, req *mcp.CallToolRequest, args 
 			CWD: args.CWD, Path: args.Path, Stat: args.Stat, Unified: args.Unified, Staged: args.Staged,
 		})
 	case "log":
+		n := args.N
+		if n <= 0 {
+			// `n` wins; `limit` then `max_count` are the accepted aliases.
+			switch {
+			case args.Limit > 0:
+				n = args.Limit
+			case args.MaxCount > 0:
+				n = args.MaxCount
+			}
+		}
 		return s.toolGitLog(ctx, req, gitLogArgs{
-			CWD: args.CWD, N: args.N, Path: args.Path, Oneline: args.Oneline,
+			CWD: args.CWD, N: n, Path: args.Path, Oneline: args.Oneline,
 		})
 	case "":
 		return nil, nil, fmt.Errorf("action is required (status|diff|log)")
