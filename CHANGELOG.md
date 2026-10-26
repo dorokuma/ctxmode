@@ -6,6 +6,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 ## [Unreleased]
 
 ### Fixed
+- **`TestAudit_ReopenAfterRotationFailsKeepsRecord` no longer flakes under `-race` on CI.** The test forced the post-rotation reopen failure by tightening `RLIMIT_NOFILE` to one spare descriptor; FD churn from the race detector and other tests' finalizers could free a descriptor between the probe and the reopen, so the reopen succeeded and the assertion on `<path>.1` failed (`rotated generation = [{"seq":1}]`). `appendAuditLine` now opens through package var `auditOpenFile` (same pattern as `auditRotateBytes`); the test swaps it so the second open returns `EMFILE`, exercising the keep-writing-to-`.1` branch without process-wide FD limits.
+
 - **Category tools tolerate the parameter spellings hosts actually send.** `ctx_run`'s `action` is now optional in the inferred MCP JSON Schema (`omitempty`) and the router normalizes a missing `action` — or the legacy `"run"` — to `execute`, including for the `background` guard, instead of rejecting the call with `missing properties: ["action"]`. `ctx_fs` accepts `action="list"` as an alias for `ls`. `ctx_git` accepts `limit` and `max_count` as aliases for `n` on `action=log` (`n` still wins when set), so those calls no longer fail schema validation with `unexpected additional properties`.
 
 ## [5.2.0] - 2026-10-22

@@ -108,6 +108,12 @@ const (
 // shrink it.
 var auditRotateBytes int64 = 32 << 20
 
+// auditOpenFile is the open used by appendAuditLine. Tests replace it to force a
+// post-rotation reopen failure (e.g. EMFILE) without touching process-wide
+// RLIMIT_NOFILE, which races with FD churn from the race detector and other
+// tests' finalizers and was flaking CI on TestAudit_ReopenAfterRotationFailsKeepsRecord.
+var auditOpenFile = openAuditFile
+
 // auditRecord is one JSONL line. The schema is fixed — every field is present on
 // every line (empty string, 0, false, [] when not applicable) — so a consumer
 // can rely on the same key set instead of treating a missing key as a third
@@ -367,7 +373,7 @@ func appendAuditLine(line []byte) error {
 			return err
 		}
 	}
-	f, err := openAuditFile(path)
+	f, err := auditOpenFile(path)
 	if err != nil {
 		return err
 	}
@@ -387,7 +393,7 @@ func appendAuditLine(line []byte) error {
 		case rerr != nil:
 			logAuditFailure(path+".1", fmt.Errorf("rotate (keeping the current file): %w", rerr))
 		default:
-			nf, nerr := openAuditFile(path)
+			nf, nerr := auditOpenFile(path)
 			if nerr != nil {
 				// The rotation succeeded but the replacement could not be opened.
 				// Keep the record: this line lands in the generation that was just

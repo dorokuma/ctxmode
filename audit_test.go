@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -607,51 +606,17 @@ func TestAudit_RotationFailureKeepsWriting(t *testing.T) {
 	}
 }
 
-// tightenFDLimitToOneExtraOpen lowers RLIMIT_NOFILE so that exactly one more
-// descriptor can be opened, which is what makes the post-rotation reopen fail
-// deterministically (EMFILE) while the call's own first open still succeeds.
-// It returns a restore function and ok=false when the limit cannot be tightened
-// (no RLIMIT_NOFILE, no /proc, or the soft limit already sits at the hard one).
-func tightenFDLimitToOneExtraOpen(t *testing.T) (restore func(), ok bool) {
-	t.Helper()
-	var orig syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &orig); err != nil {
-		return func() {}, false
-	}
-	entries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		return func() {}, false
-	}
-	// ReadDir includes the descriptor it needed to read the directory, which is
-	// already closed by now, so the live count is at most that. The probe below
-	// settles the off-by-one empirically on either behaviour: raise the candidate
-	// until one single extra open is exactly what still fits.
-	live := uint64(len(entries))
-	reset := func() { _ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &orig) }
-	for k := live; k < live+8; k++ {
-		if k > orig.Max {
-			break
-		}
-		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &syscall.Rlimit{Cur: k, Max: orig.Max}); err != nil {
-			continue
-		}
-		f, oerr := os.Open(os.DevNull)
-		if oerr == nil {
-			f.Close()
-			return reset, true
-		}
-	}
-	reset()
-	return func() {}, false
-}
-
 // TestAudit_ReopenAfterRotationFailsKeepsRecord covers the second half of the
 // R2-F1 invariant (same rotation family as
 // TestAudit_RotationFailureKeepsWriting): the rename succeeds but the replacement
 // file cannot be opened. The record must land in the generation that was just
-// rotated to "<path>.1" instead of being dropped. The branch is reached with
-// RLIMIT_NOFILE tightened to exactly one spare descriptor, so the call's first
-// open succeeds and the reopen after the rename fails with EMFILE.
+// rotated to "<path>.1" instead of being dropped.
+//
+// The reopen failure is forced through auditOpenFile (second call returns
+// EMFILE). An earlier version tightened RLIMIT_NOFILE to one spare descriptor,
+// but that probe races with FD churn from the race detector and other tests'
+// finalizers: a closed FD between the probe and the reopen leaves extra spares,
+// the reopen succeeds, and the assertion on .1 flakes on CI.
 func TestAudit_ReopenAfterRotationFailsKeepsRecord(t *testing.T) {
 	old := auditRotateBytes
 	auditRotateBytes = 1 // the seed append fills a "cap" of one byte
@@ -665,25 +630,22 @@ func TestAudit_ReopenAfterRotationFailsKeepsRecord(t *testing.T) {
 		t.Fatalf("seed append: %v", err)
 	}
 
-	restore, ok := tightenFDLimitToOneExtraOpen(t)
-	if !ok {
-		// This half of the R2-F1 invariant must not be silently untested. Every
-		// Linux host in the CI matrix can tighten RLIMIT_NOFILE (the helper only
-		// gives up when Getrlimit fails, /proc/self/fd is unreadable, or the soft
-		// limit already equals the hard one), so a failure here on Linux is a
-		// broken signal: fail loudly instead of reporting a green run that
-		// asserted nothing. Only a non-Linux host, where syscall.RLIMIT_NOFILE
-		// and /proc/self/fd need not exist, is allowed to skip.
-		if runtime.GOOS != "linux" {
-			t.Skipf("cannot tighten RLIMIT_NOFILE to one spare descriptor on %s", runtime.GOOS)
+	oldOpen := auditOpenFile
+	defer func() { auditOpenFile = oldOpen }()
+	opens := 0
+	auditOpenFile = func(path string) (*os.File, error) {
+		opens++
+		if opens >= 2 {
+			return nil, &os.PathError{Op: "open", Path: path, Err: syscall.EMFILE}
 		}
-		t.Fatalf("cannot tighten RLIMIT_NOFILE to one spare descriptor on linux; " +
-			"the failed-reopen path would be silently untested")
+		return oldOpen(path)
 	}
-	appendErr := appendAuditLine([]byte("{\"seq\":2}\n"))
-	restore()
-	if appendErr != nil {
-		t.Fatalf("a failed reopen must not fail the append: %v", appendErr)
+
+	if err := appendAuditLine([]byte("{\"seq\":2}\n")); err != nil {
+		t.Fatalf("a failed reopen must not fail the append: %v", err)
+	}
+	if opens < 2 {
+		t.Fatalf("expected the post-rotation reopen to be attempted, got %d open(s)", opens)
 	}
 
 	// The record survives, in the generation that was rotated away...
