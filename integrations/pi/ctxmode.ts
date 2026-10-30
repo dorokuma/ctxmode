@@ -9,7 +9,7 @@
 //   CTXMODE_START_TIMEOUT_MS / CTXMODE_REQUEST_TIMEOUT_MS  超时
 //   CTXMODE_DEBUG            诊断同时打 stderr（会污染 TUI 输入行，仅调试用）
 //   CTXMODE_DIAG_STDERR=1    opt-in：诊断同时写 stderr（默认只写日志文件，保 TUI 干净）
-//   CTXMODE_DIAG_DIR         诊断日志目录（默认 ~/.pi/agent/logs）
+//   CTXMODE_DIAG_DIR         诊断日志目录（默认 <agent dir>/logs，agent dir 同 Go 统一链，落点 ~/.pig/agent）
 //   CTXMODE_DIAG_MAX_BYTES   日志轮转体积上限（默认 5MB，保留 .1/.2 最多两个历史）
 //   CTXMODE_DISPOSE_WAIT_MS  换进程时 SIGTERM→SIGKILL 等待窗口（默认 3000ms）
 
@@ -70,9 +70,39 @@ function rotateDiagLog(p: string): void {
   try { fs.renameSync(p, `${p}.1`) } catch { /* 不存在 */ }
 }
 
+/**
+ * Resolve the agent configuration directory the same way every Go extension
+ * does (go/agentdir.go in pi-extensions): PIG_EXT_HOST_INFO.agentDir →
+ * PI_CODING_AGENT_DIR → PIG_CODING_AGENT_DIR → $PIG_HOME/agent →
+ * ~/.pig/agent — never ~/.pi, so a redirected or isolated PiG run cannot
+ * recreate the retired Pi home. Returns "" only when no home resolves.
+ */
+function resolveAgentDir(): string {
+  try {
+    const raw = process.env.PIG_EXT_HOST_INFO
+    if (raw) {
+      const parsed = JSON.parse(raw) as { agentDir?: string }
+      if (typeof parsed.agentDir === "string" && parsed.agentDir.trim() !== "") {
+        return parsed.agentDir
+      }
+    }
+  } catch {
+    // malformed host info falls through to the env chain
+  }
+  const piDir = process.env.PI_CODING_AGENT_DIR?.trim()
+  if (piDir) return piDir
+  const pigDir = process.env.PIG_CODING_AGENT_DIR?.trim()
+  if (pigDir) return pigDir
+  const pigHome = process.env.PIG_HOME?.trim()
+  if (pigHome) return path.join(pigHome, "agent")
+  const home = os.homedir()
+  if (!home) return ""
+  return path.join(home, ".pig", "agent")
+}
+
 function ensureDiagLogPath(): string | null {
   if (diagLogPath) return diagLogPath
-  const dir = process.env.CTXMODE_DIAG_DIR || path.join(os.homedir() || "/tmp", ".pi", "agent", "logs")
+  const dir = process.env.CTXMODE_DIAG_DIR || path.join(resolveAgentDir() || path.join(os.homedir() || "/tmp", ".pig", "agent"), "logs")
   try {
     fs.mkdirSync(dir, { recursive: true })
     diagLogPath = path.join(dir, DIAG_LOG_FILE)
@@ -86,7 +116,7 @@ function ensureDiagLogPath(): string | null {
 /**
  * TUI-safe diagnostics. console.* corrupts Pi's input row — only DEBUG or
  * CTXMODE_DIAG_STDERR=1 may print. Otherwise append to
- * ~/.pi/agent/logs/ctxmode.log（CTXMODE_DIAG_DIR 可覆盖目录）；超体积上限
+ * ~/.pig/agent/logs/ctxmode.log（CTXMODE_DIAG_DIR 可覆盖目录）；超体积上限
  * （CTXMODE_DIAG_MAX_BYTES，默认 5MB）轮转为 .1/.2，最多保留两个历史文件；
  * 写失败首次降级提示一次并记录原因，之后静默重试。
  */
