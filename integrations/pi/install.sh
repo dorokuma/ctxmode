@@ -38,22 +38,47 @@ SRC="$ROOT/integrations/pi/ctxmode.ts"
 # codegraph-go 等其余副本一致。
 if [ -n "${PI_CTXMODE_EXT:-}" ]; then
   DEST="$PI_CTXMODE_EXT"
+  EXPLICIT_DEST=1
 else
   # HOME 未导出时 set -u 只会抛一句晦涩的「未绑定的变量」；显式给出可操作提示。
   HOME_DIR="${HOME:-}"
   [ -n "$HOME_DIR" ] || fail "HOME is not set (or empty) — export HOME or set PI_CTXMODE_EXT explicitly"
   DEST="$HOME_DIR/.pig/agent/extensions/ctxmode.ts"
+  EXPLICIT_DEST=0
 fi
 [ -n "$DEST" ] || fail "destination is empty"
 case "$DEST" in
   /*) ;;
   *) fail "destination is not an absolute path: $DEST" ;;
 esac
+case "$DEST" in
+  */)
+    fail "PI_CTXMODE_EXT ($DEST) must not end with '/' — expected the extension file path (须指定文件名而非目录路径)"
+    ;;
+esac
 if [ -d "$DEST" ]; then
   fail "destination is a directory: $DEST — expected the extension file path (须指定文件名而非目录本体)"
 fi
 
 [ -f "$SRC" ] || fail "source not found: $SRC"
+
+# 原生 Go 扩展共存保护（仅默认目标路径生效）：zero-node 宿主机会把
+# ~/.pig/agent/extensions/ctxmode 迁移为指向 Go 扩展目录（含 go.mod）的
+# 软链；此时若仍写入 ctxmode.ts，pig 启动扫描到 .ts 扩展会尝试调起不存在
+# 的 node 而直接崩溃。检测到原生扩展在位时先清掉残留的 .ts 文件/软链
+# （自愈），然后跳过安装退出 0。显式 PI_CTXMODE_EXT 不受此保护约束。
+if [ "$EXPLICIT_DEST" -eq 0 ]; then
+  NATIVE_EXT="${DEST%.ts}"
+  if [ -d "$NATIVE_EXT" ] && [ -f "$NATIVE_EXT/go.mod" ]; then
+    if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+      rm -f -- "$DEST" || fail "failed to remove stale TypeScript extension: $DEST"
+    fi
+    echo "pi extension sync"
+    echo "  native Go ext: $NATIVE_EXT"
+    echo "skipped: native Go extension active at $NATIVE_EXT (TypeScript $DEST not installed)"
+    exit 0
+  fi
+fi
 
 md5_of() {
   local line
@@ -83,8 +108,9 @@ if [ -f "$DEST" ] && [ "$DEST_MD5" = "$SRC_MD5" ]; then
   echo "unchanged: destination already matches source (md5 $SRC_MD5), nothing written"
 else
   # 目标父目录在新机器上可能不存在（~/.pig/agent/extensions），先建好。
-  mkdir -p "$(dirname "$DEST")"
-  install -m 644 "$SRC" "$DEST"
+  DEST_DIR="$(dirname "$DEST")"
+  mkdir -p "$DEST_DIR" || fail "failed to create destination directory: $DEST_DIR"
+  install -m 644 "$SRC" "$DEST" || fail "failed to install $SRC to $DEST"
   echo "changed: installed $DEST (md5 $SRC_MD5)"
 fi
 

@@ -2185,13 +2185,6 @@ var envAllowlist = map[string]bool{
 	"LC_ALL":                  true,
 }
 
-// isDeniedEnvKey reports keys that must never be overridden (PATH, loader,
-// shell, home, and — for a role-guarded caller — the caller's own
-// role/audit/database identity).
-func isDeniedEnvKey(key string) bool {
-	return isDeniedEnvKeyForCaller(key, callerIsRoleGuarded())
-}
-
 // roleIdentityEnvKeys are the guard's view of who is calling and where it
 // writes. Only a caller that HAS a role identity may not rewrite them: a
 // sub-agent setting CTXMODE_ROLE/CTXMODE_AUDIT_LOG/CTXMODE_DB in its
@@ -2210,9 +2203,10 @@ var roleIdentityEnvKeys = map[string]bool{
 	"CTXMODE_CONFIG":          true,
 }
 
-// isDeniedEnvKeyForCaller is isDeniedEnvKey with the caller classification
-// passed in, so the env screen and its tests do not have to re-read the
-// process environment.
+// isDeniedEnvKeyForCaller reports keys that must never be overridden (PATH,
+// loader, shell, home, and — for a role-guarded caller — the caller's own
+// role/audit/database identity). The caller classification is passed in, so
+// the env screen and its tests do not have to re-read the process environment.
 func isDeniedEnvKeyForCaller(key string, guarded bool) bool {
 	uk := strings.ToUpper(key)
 	switch uk {
