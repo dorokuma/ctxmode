@@ -2174,6 +2174,47 @@ func resolveHeadBase(name string) string {
 	return filepath.Base(resolved)
 }
 
+// canonicalResolvedBase maps a symlink-resolved executable basename to the
+// canonical program name the name-keyed screens know. Distro and toolchain
+// layouts resolve canonical names to versioned or script-shim targets —
+// php -> php8.3 (Debian alternatives), ruby -> ruby3.2, perl -> perl5.38.2,
+// npx -> npm's npx-cli.js — and keying a screen on the resolved spelling
+// silently skips every branch written for the canonical name (the
+// interpreter inline-code table, the npx package-runner branch), but only
+// on machines where the tool is actually installed that way: where the
+// lookup fails the typed name survives and the screen fires. Names that
+// are not a known variant pass through unchanged, so a disguised alias
+// still surfaces under its real target name.
+func canonicalResolvedBase(b string) string {
+	switch b {
+	case "npx-cli.js":
+		return "npx"
+	case "npm-cli.js":
+		return "npm"
+	}
+	for _, stem := range []string{"php", "ruby", "perl"} {
+		if rest, ok := strings.CutPrefix(b, stem); ok && isVersionSuffix(rest) {
+			return stem
+		}
+	}
+	return b
+}
+
+// isVersionSuffix reports whether s is a version tail: a digit followed by
+// digits and dots only ("8.3", "3.2", "5.38.2"). The empty string and
+// letter-led tails ("-cgi", "stan") are not versions.
+func isVersionSuffix(s string) bool {
+	if s == "" || s[0] < '0' || s[0] > '9' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < '0' || c > '9') && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
 // headBaseAliasHits returns every name a command head can resolve to: its
 // own basename plus, when the file behind head[0] is a symlink, the basename
 // of the resolved target. `ln -s $(command -v pig) /tmp/piglet &&
@@ -2514,8 +2555,14 @@ func peelResolvedDepth(argv []string, kind byte, depth int, caller callerIdentit
 	// inline code exactly like `dash -c '…'`, and reading it as a bare
 	// script-file run would block a benign query (same for py3 -> python3.13).
 	if rb := resolveHeadBase(head[0]); rb != "" && rb != base {
-		head = append([]string{rb}, head[1:]...)
-		base = rb
+		// The resolved spelling is canonicalised first: a versioned or
+		// shim target (php8.3, npx-cli.js) must key the screens exactly
+		// like the canonical program name, or every branch written for
+		// that name is skipped on machines laid out that way.
+		if rb = canonicalResolvedBase(rb); rb != base {
+			head = append([]string{rb}, head[1:]...)
+			base = rb
+		}
 	}
 	// `command` followed by a pure query option run (-v/-V, -p allowed)
 	// is a read-only builtin query — peelWrappers kept `command` as the
