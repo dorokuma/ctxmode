@@ -35,7 +35,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 - **Category tools tolerate the parameter spellings hosts actually send.** `ctx_run`'s `action` is now optional in the inferred MCP JSON Schema (`omitempty`) and the router normalizes a missing `action` — or the legacy `"run"` — to `execute`, including for the `background` guard, instead of rejecting the call with `missing properties: ["action"]`. `ctx_fs` accepts `action="list"` as an alias for `ls`. `ctx_git` accepts `limit` and `max_count` as aliases for `n` on `action=log` (`n` still wins when set), so those calls no longer fail schema validation with `unexpected additional properties`.
 
-- **Removed three `staticcheck` `U1000` unused symbols so CI `staticcheck ./...` is green again.** `isDeniedEnvKey` (`executor.go`, superseded by `isDeniedEnvKeyForCaller` at every call site), `pythonModuleWrites` (`role_guards.go`, superseded by `screenBareInterpreter`), and `tokenSet.hasAnyIdent` (`role_guards.go`, no remaining callers) are deleted with their comments; no behaviour change.
+- **Removed three `staticcheck` `U1000` unused symbols so CI `staticcheck ./...` is green again.** `isDeniedEnvKey` (`executor.go`, superseded by `isDeniedEnvKeyForCaller` at every call site), `pythonModuleWrites` (`role_guards.go`, superseded by `pythonModuleHit`), and `tokenSet.hasAnyIdent` (`role_guards.go`, no remaining callers) are deleted with their comments; no behaviour change.
 
 ## [5.2.0] - 2026-10-22
 
