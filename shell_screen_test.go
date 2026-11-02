@@ -152,7 +152,7 @@ func TestExecuteBatchSerial_BlockDoesNotCascade(t *testing.T) {
 	}
 	results := make([]batchResult, len(commands))
 	ctx := context.Background()
-	s.executeBatchSerial(ctx, commands, "/tmp", 30*time.Second, "testrun", results)
+	s.executeBatchSerial(ctx, commands, "/tmp", 30*time.Second, "testrun", results, nil, nil, nil)
 
 	if results[0].Success || results[0].Error == "" {
 		t.Fatalf("expected blocked command to fail with error, got success=%v err=%q", results[0].Success, results[0].Error)

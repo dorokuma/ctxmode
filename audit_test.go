@@ -26,6 +26,12 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	os.Setenv(auditEnvLogPath, filepath.Join(dir, "audit.jsonl"))
+	// Tests must not inherit the OUTER process's role identity: when the
+	// test binary itself runs under CTXMODE_ROLE=verifier (the dispatch
+	// role that runs go test), every non-role baseline test would
+	// otherwise be refused by the role guards for the wrong reason.
+	os.Unsetenv(auditEnvRole)
+	os.Unsetenv(auditEnvReadonly)
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
