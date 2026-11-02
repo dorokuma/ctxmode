@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -696,4 +697,155 @@ func TestDeployFragment_CreatesPrevBackupBeforeReplace(t *testing.T) {
 	if !strings.Contains(string(got), "9.9.9") {
 		t.Errorf("deployed content should be the new stub, got %q", got)
 	}
+}
+
+// ---------- pi extension install guard (native Go extension coexistence) ----------
+
+// TestPiInstallScript_NativeGoExtensionGuard covers the zero-node host
+// regression: on hosts where ~/.pig/agent/extensions/ctxmode is a symlink to
+// a native Go extension directory (containing go.mod), install.sh must NOT
+// write ctxmode.ts — pig scans *.ts extensions at startup and would try to
+// spawn a nonexistent node (>= 22.13), crashing before any session starts.
+// The guard only applies to the default destination; an explicit
+// PI_CTXMODE_EXT still installs. All fixtures live under t.TempDir(); the
+// real /root/.pig is never touched.
+func TestPiInstallScript_NativeGoExtensionGuard(t *testing.T) {
+	installScript, err := filepath.Abs(filepath.Join("integrations", "pi", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// runInstall executes the real install.sh with a minimal env: PATH (for
+	// md5sum/install), an optional fake HOME, and an optional explicit
+	// PI_CTXMODE_EXT. stdout/stderr are returned separately.
+	runInstall := func(t *testing.T, home, explicitDest string) (string, string, error) {
+		t.Helper()
+		cmd := exec.Command("bash", installScript)
+		env := []string{"PATH=" + os.Getenv("PATH")}
+		if home != "" {
+			env = append(env, "HOME="+home)
+		}
+		if explicitDest != "" {
+			env = append(env, "PI_CTXMODE_EXT="+explicitDest)
+		}
+		cmd.Env = env
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		runErr := cmd.Run()
+		return stdout.String(), stderr.String(), runErr
+	}
+
+	// newNativeFixture builds fakeHome/.pig/agent/extensions/ctxmode as a
+	// symlink to a temp dir containing go.mod — the zero-node host layout.
+	newNativeFixture := func(t *testing.T) (fakeHome, extDir, nativeDir, tsDest string) {
+		t.Helper()
+		fakeHome = t.TempDir()
+		extDir = filepath.Join(fakeHome, ".pig", "agent", "extensions")
+		if err := os.MkdirAll(extDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		nativeDir = t.TempDir()
+		if err := os.WriteFile(filepath.Join(nativeDir, "go.mod"), []byte("module example.com/native\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(nativeDir, filepath.Join(extDir, "ctxmode")); err != nil {
+			t.Fatal(err)
+		}
+		tsDest = filepath.Join(extDir, "ctxmode.ts")
+		return fakeHome, extDir, nativeDir, tsDest
+	}
+
+	t.Run("default dest skipped when native Go extension is active", func(t *testing.T) {
+		fakeHome, extDir, nativeDir, tsDest := newNativeFixture(t)
+		if err := os.WriteFile(tsDest, []byte("STALE"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		stdout, stderr, err := runInstall(t, fakeHome, "")
+		if err != nil {
+			t.Fatalf("install.sh must exit 0 when skipping for a native Go ext: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		}
+		if !strings.Contains(stdout, "skipped: native Go extension active") {
+			t.Errorf("expected skip notice on stdout, got:\n%s", stdout)
+		}
+		if _, err := os.Lstat(tsDest); !os.IsNotExist(err) {
+			t.Errorf("stale ctxmode.ts must be removed (self-heal), Lstat err=%v", err)
+		}
+		target, err := os.Readlink(filepath.Join(extDir, "ctxmode"))
+		if err != nil || target != nativeDir {
+			t.Errorf("native ext symlink must survive, target=%q err=%v", target, err)
+		}
+		if _, err := os.Stat(filepath.Join(nativeDir, "go.mod")); err != nil {
+			t.Errorf("native ext go.mod must survive: %v", err)
+		}
+	})
+
+	t.Run("default dest removes dangling symlink ctxmode.ts", func(t *testing.T) {
+		fakeHome, _, _, tsDest := newNativeFixture(t)
+		// A dangling symlink: [ -e "$DEST" ] is false but [ -L "$DEST" ] is
+		// true — the guard must still self-heal it before skipping.
+		if err := os.Symlink(filepath.Join(t.TempDir(), "nonexistent.ts"), tsDest); err != nil {
+			t.Fatal(err)
+		}
+		stdout, stderr, err := runInstall(t, fakeHome, "")
+		if err != nil {
+			t.Fatalf("install.sh must exit 0 when skipping for a native Go ext: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		}
+		if !strings.Contains(stdout, "skipped: native Go extension active") {
+			t.Errorf("expected skip notice on stdout, got:\n%s", stdout)
+		}
+		if _, err := os.Lstat(tsDest); !os.IsNotExist(err) {
+			t.Errorf("dangling ctxmode.ts symlink must be removed (self-heal), Lstat err=%v", err)
+		}
+	})
+
+	t.Run("explicit PI_CTXMODE_EXT still installs alongside native ext", func(t *testing.T) {
+		fakeHome, _, _, tsDest := newNativeFixture(t)
+		stdout, stderr, err := runInstall(t, fakeHome, tsDest)
+		if err != nil {
+			t.Fatalf("explicit PI_CTXMODE_EXT must bypass the native-ext guard: %v\nstderr:\n%s", err, stderr)
+		}
+		if !strings.Contains(stdout, "changed: installed") {
+			t.Errorf("expected install, got:\n%s", stdout)
+		}
+		got, err := os.ReadFile(tsDest)
+		if err != nil {
+			t.Fatalf("dest must be written: %v", err)
+		}
+		want, err := os.ReadFile(filepath.Join("integrations", "pi", "ctxmode.ts"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Error("installed ctxmode.ts must match the repo source")
+		}
+	})
+
+	t.Run("no native ext installs then reports unchanged", func(t *testing.T) {
+		fakeHome := t.TempDir()
+		stdout, _, err := runInstall(t, fakeHome, "")
+		if err != nil {
+			t.Fatalf("first install must succeed: %v", err)
+		}
+		if !strings.Contains(stdout, "changed: installed") {
+			t.Errorf("first run must install, got:\n%s", stdout)
+		}
+		stdout, _, err = runInstall(t, fakeHome, "")
+		if err != nil {
+			t.Fatalf("second install must succeed: %v", err)
+		}
+		if !strings.Contains(stdout, "unchanged:") {
+			t.Errorf("second run must hit the md5 idempotent branch, got:\n%s", stdout)
+		}
+	})
+
+	t.Run("trailing slash destination fails explicitly", func(t *testing.T) {
+		_, stderr, err := runInstall(t, "", filepath.Join(t.TempDir(), "foo")+"/")
+		if err == nil {
+			t.Fatal("a PI_CTXMODE_EXT ending in '/' must fail")
+		}
+		if !strings.Contains(stderr, "install.sh FAILED:") {
+			t.Errorf("failure must be explicit on stderr, got:\n%s", stderr)
+		}
+	})
 }

@@ -171,7 +171,7 @@ Each primary workdir gets its own SQLite database at `~/.local/share/ctxmode/<ha
 
 The agent runs `deploy.sh` directly: the script is non-interactive, needs no confirmation and has **no manual step**. `deploy.sh` builds the binary, verifies it with an `initialize` handshake, and atomically replaces the live binary. Right before the atomic swap it backs up the current live binary to `<BINARY>.prev` (best-effort; a failed backup only disables rollback for that deployment).
 
-The same run also syncs the Pi extension through `integrations/pi/install.sh` (md5-identical target left untouched; destination `PI_CTXMODE_EXT` or `~/.pi/agent/extensions/ctxmode.ts`); a failed sync aborts the deployment, matching the script's existing hard-failure convention.
+The same run also syncs the Pi extension through `integrations/pi/install.sh` (md5-identical target left untouched; destination `PI_CTXMODE_EXT` or `~/.pig/agent/extensions/ctxmode.ts`); a failed sync aborts the deployment, matching the script's existing hard-failure convention. On zero-node hosts — where `~/.pig/agent/extensions/ctxmode` is a symlink to a native Go extension directory containing `go.mod` — the default-destination sync is skipped (any stale `ctxmode.ts` is removed) so `pig` never tries to load a TypeScript extension without Node.js; an explicit `PI_CTXMODE_EXT` still installs.
 
 ```bash
 ./deploy.sh            # build + verify + atomic deploy (default)

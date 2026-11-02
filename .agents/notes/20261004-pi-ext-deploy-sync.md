@@ -45,3 +45,21 @@ supersedes: ""
 
 - **[已销账] 备查**：本仓改动**未执行** `deploy.sh`（PROJECTS.md 明令热替换属人工操作），真实部署路径上的扩展同步仍待人工部署时验证。**销账记录（执行日期 2026-10-16，授权来源＝用户当次指示）**：显式执行 `cd /root/workspace/ctxmode && ./deploy.sh` 完成真实部署与扩展同步验证，`EXIT=0`；构建并原子部署后的二进制 `/root/.local/bin/ctxmode`（`v5.0.0`）md5 为 `38061575aaee8656f18f9fd227c1fc55`（mtime `2026-10-17 00:13:01.092306901 +0800`）；`deploy.sh` 调用 `integrations/pi/install.sh` 命中 `unchanged` 幂等分支，仓内源 `/root/workspace/ctxmode/integrations/pi/ctxmode.ts` 与已安装目标 `/root/.pi/agent/extensions/ctxmode.ts` md5 均为 `d8b28d54d4e967485603e382f6018657`（目标 mtime `2026-10-16 08:28:31.608523078 +0800` 未被重写），`cmp -s` 对比结果一致（`CMP_EXIT=0`）。
 - **权威登记指针**：本仓 `install.sh` 部署契约观察项的权威登记处为 `/root/workspace/codegraph-go/.agents/notes/20261003-pi-ext-deploy-sync.md`，本仓不再复述同源条目。
+
+## 追加记录（2026-11-03，分支 `fix/install-skip-go-ext`，未提交）
+
+- **zero-node 致命缺陷修复**：`e265167` 把默认 `DEST` 迁到 `~/.pig/agent/extensions/ctxmode.ts` 后，zero-node 宿主机（2026-10-30 移除 Node.js，`~/.pig/agent/extensions/ctxmode` 已迁移为指向 `/root/workspace/pi-extensions/go/ctxmode`（含 `go.mod`）的原生 Go 扩展软链）每次跑 `deploy.sh` 都会把 `ctxmode.ts` 写回扩展目录；`pig` 启动扫描到 `.ts` 扩展会尝试调起不存在的 `node`（>= 22.13）而直接崩溃退出。
+- **修复契约**：仅默认目标路径（`PI_CTXMODE_EXT` 未设置，`EXPLICIT_DEST=0`）生效——`${DEST%.ts}`（本例 `.../extensions/ctxmode`）是目录（`[ -d ]` 穿透指向目录的软链）且含 `go.mod` 时：先清掉残留的 `ctxmode.ts` 文件/软链（`rm -f`，失败即 FAILED，自愈），打印 `pi extension sync` / `  native Go ext: <dir>` / `skipped: native Go extension active at <dir> (...)` 后 `exit 0`。显式 `PI_CTXMODE_EXT` 与 md5 幂等路径行为 100% 不变。
+- **顺手对齐样板**（codegraph-go `install.sh`）：`PI_CTXMODE_EXT` 以 `/` 结尾在 `-d "$DEST"` 之前显式 FAILED；`mkdir -p` / `install -m 644` 加 `|| fail "..."` 兜底。
+- **回归测试**：`deploy_test.go` 新增 `TestPiInstallScript_NativeGoExtensionGuard` 五个子用例——(a) 原生扩展在位 + 脏 `.ts` → skip + 自愈删除 + 软链/go.mod 完好；(b) 显式 `PI_CTXMODE_EXT` → 正常安装且内容同仓库源；(c) 无原生扩展连跑两次 → 先 `changed` 后 `unchanged`；(d) 尾部 `/` → 非零退出 + stderr 含 `FAILED:`；(e) 默认路径悬空软链 ctxmode.ts → skip + 自愈删除。全程 `t.TempDir()` 隔离 `HOME`，不触真实 `/root/.pig`。
+
+## 追加记录（2026-11-03 补记，oracle-ctx-inst 双审观察项处置）
+
+- **C1（联邦中枢级联传入显式 `PI_CTXMODE_EXT` 会走 `EXPLICIT_DEST=1` 绕过默认路径守卫）**：属设计预期——显式覆盖变量保留给测试与定向导出使用（`TestPiInstallScript_NativeGoExtensionGuard` 的「explicit PI_CTXMODE_EXT still installs alongside native ext」子用例即锁定该行为）；中枢侧对已迁为 Go 原生扩展条目的 TS 级联退役归属 `/root/workspace/pi-extensions` 仓后续处理（`install.sh` 的 `PI_CTXMODE_EXT` 级联传入点在那里），本仓外，登记为 `out-of-scope`。
+- **C2（子目录 `integrations/pi/README.md` 仍存 `~/.pi` 历史路径表述）**：核对确认 `integrations/pi/README.md` 有 5 处 `~/.pi/agent/...` 表述（L15/L19/L25/L42/L46），而 `install.sh` 默认 `DEST` 已迁为 `~/.pig/agent/extensions/ctxmode.ts`。登记为文档后续统一清理项：本子目录 README 的历史路径表述不止本次守卫相关段落，需与该目录文档整体口径一起刷新，本轮不顺手扩面改文档（避免超出 `fix/install-skip-go-ext` 的任务范围；且 `integrations/pi/*.ts` 不在本次触碰范围）。
+- **C3（悬空软链自愈未覆盖）**：已在本分支 `deploy_test.go` 的 `TestPiInstallScript_NativeGoExtensionGuard` 补充第 5 个子测试 `default dest removes dangling symlink ctxmode.ts`——`[ -e "$DEST" ]` 为假而 `[ -L "$DEST" ]` 为真时守卫仍经 `[ -L ]` 分支 `rm -f` 自愈并 `skipped ... exit 0`，直接代码闭环。
+
+## 追加记录（2026-11-03 二审闭环，oracle-ctx-inst2 + reviewer-ctx-inst `consider` 处置）
+
+- **oracle-ctx-inst2 `consider` #1（归档）**：`integrations/pi/install.sh:71` 对 `${DEST%.ts}` 采用 `[ -d "$NATIVE_EXT" ] && [ -f "$NATIVE_EXT/go.mod" ]` 判定——若 `ctxmode` 目录软链悬空或目标缺 `go.mod`，按「原生 Go 扩展未激活」预期回落常规 `.ts` 同步，避免误判跳过导致两边都无可用扩展。行为经复核为预期设计，归档不改码。
+- **reviewer-ctx-inst `consider` #1（闭环）**：`CHANGELOG.md` 第 38 行 `pythonModuleWrites` 的替代函数名已由 `screenBareInterpreter` 修正为 `pythonModuleHit`（对应 `role_guards.go:3327,5256` 对 `python -m <mod>` 的筛查）。

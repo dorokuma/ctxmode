@@ -2856,12 +2856,6 @@ func screenUnsetArgs(args []string, kind byte) string {
 	return ""
 }
 
-// pythonModuleWrites are `python -m` modules whose invocation writes to the
-// filesystem (package installs, venv creation, bytecode compilation).
-var pythonModuleWrites = map[string]bool{
-	"pip": true, "venv": true, "ensurepip": true, "compileall": true,
-}
-
 // xargsTargetIndex returns the index in argv of the command xargs would run,
 // or len(argv) when xargs would run its default (echo). Option arities follow
 // GNU findutils; `--` terminates xargs options.
@@ -8234,16 +8228,6 @@ func (t tokenSet) hasIdent(name string) bool {
 		}
 		idx = pos + len(name)
 	}
-}
-
-// hasAnyIdent reports whether any name occurs as a standalone token.
-func (t tokenSet) hasAnyIdent(names ...string) bool {
-	for _, n := range names {
-		if t.hasIdent(n) {
-			return true
-		}
-	}
-	return false
 }
 
 // ---------- entry points used by the handlers ----------
