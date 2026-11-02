@@ -93,7 +93,9 @@ const (
 	// `error`, `background_id` and `background` distinguish the cases.
 	auditExitNotRun = -1
 
-	// Audit tags. Recorded, never enforced.
+	// Audit tags. Recorded, never enforced (the role guards in role_guards.go
+	// enforce a separate hard-block layer on top of the same env inputs; the
+	// tag itself remains annotation-only).
 	//
 	// readonly_role_call depends on CTXMODE_ROLE / CTXMODE_READONLY being set by
 	// the dispatch layer that starts the agent session; until that layer sets
@@ -206,7 +208,7 @@ func (s *server) startAudit(action, commandType, rawCmd string) *auditCall {
 		c.rec.SessionID = s.sessionID
 	}
 	// Rule (i): a read-only role or an explicit read-only caller is tagged.
-	// Recorded only — nothing enforces a read-only role.
+	// The tag is still record-only; enforcement lives in role_guards.go.
 	if readonly || auditRoleIsReadonly(role) {
 		c.rec.AuditTags = append(c.rec.AuditTags, auditTagReadonlyRoleCall)
 	}
@@ -312,11 +314,28 @@ func (c *auditCall) setAggregate(exitCode, outputLen int, truncated bool, comman
 	}
 }
 
-// setError records the caller-visible error, if any.
+// setError records the caller-visible error, if any. The error text goes
+// through the same sensitive-content check as raw_cmd: a downstream error
+// (spawn failure, guard detail, backend message) must not carry a literal
+// credential into the trail.
 func (c *auditCall) setError(err error) {
 	if err != nil {
-		c.rec.Error = err.Error()
+		c.rec.Error = auditErrorText(err.Error())
 	}
+}
+
+// auditErrorText redacts credential-shaped content out of an error string
+// (same rule as auditCommandText, minus the length cap — errors are already
+// short, bounded by the messages the server itself builds).
+func auditErrorText(s string) string {
+	if s == "" {
+		return ""
+	}
+	if err := checkSensitiveContent(s); err != nil {
+		sum := sha256.Sum256([]byte(s))
+		return fmt.Sprintf("[redacted: %v; len=%d sha256=%x]", err, len(s), sum[:8])
+	}
+	return s
 }
 
 // emit writes the record as a single JSONL line. It is meant to be deferred.

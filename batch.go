@@ -256,6 +256,9 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 		cwd = resolved
 	}
 	audit.rec.CWD = cwd
+	// Role-guard head screening resolves relative/aliased command names the way
+	// each batched command's shell will; pin this call's cwd for the guards.
+	defer withScreenCwd(cwd)()
 
 	// Per-command screen, computed once and used twice: it feeds the call-level
 	// summary and the per-command entries of the audit line. Each command is
@@ -285,7 +288,32 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 			}
 		}
 	}
+
+	// Role guards (role_guards.go): each command's shell text gets the same
+	// sub-agent / strict-read-only head scan as execute. A hit is recorded
+	// per command (the per-command slot overrides the screen rule above) and
+	// folded into the call-level verdict; the command itself is refused inside
+	// executeBatchSerial/Concurrent via guardCommandBlocked.
+	guard := currentGuardCall()
+	guardBlocked := make([]bool, len(args.Commands))
+	guardRules := make([]string, len(args.Commands))
+	guardDetails := make([]string, len(args.Commands))
+	var guardRule string
+	if guard.subagent || guard.strictReadonly {
+		for i, cmd := range args.Commands {
+			if grule, detail := guard.guardCtxRunShell(cmd.Command); grule != "" {
+				guardBlocked[i] = true
+				guardRules[i] = grule
+				guardDetails[i] = detail
+				if guardRule == "" {
+					guardRule = grule
+				}
+			}
+		}
+	}
 	switch {
+	case guardRule != "":
+		audit.setScreen(shellBlock, guardRule)
 	case blockRule != "":
 		audit.setScreen(shellBlock, blockRule)
 	case idiomRule != "":
@@ -329,10 +357,10 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 	runID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), indexLabelSeq.Add(1))
 	if concurrency == 1 {
 		// Serial execution with a shared timeout.
-		s.executeBatchSerial(ctx, args.Commands, cwd, timeout, runID, results)
+		s.executeBatchSerial(ctx, args.Commands, cwd, timeout, runID, results, guardBlocked, guardRules, guardDetails)
 	} else {
 		// Concurrent execution with per-command timeouts.
-		s.executeBatchConcurrent(ctx, args.Commands, cwd, timeout, concurrency, runID, results)
+		s.executeBatchConcurrent(ctx, args.Commands, cwd, timeout, concurrency, runID, results, guardBlocked, guardRules, guardDetails)
 	}
 
 	// Count indexed commands, failures, and check for truncation.
@@ -362,6 +390,14 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 			Indexed:       r.Indexed,
 			IndexLabel:    r.IndexLabel,
 		})
+		if guardBlocked[i] {
+			// The guard's block is the authoritative verdict for this command:
+			// keep the call-level slot (set to the first guard rule above) and
+			// overwrite the per-command entry so the line shows WHY it was
+			// refused rather than the advisory screen's ok.
+			batchResults[len(batchResults)-1].ScreenVerdict = shellBlock.String()
+			batchResults[len(batchResults)-1].ScreenRule = guardRules[i]
+		}
 		// Call-level exit status: 0 only when every command succeeded, otherwise
 		// the first non-zero code (including -1 for a blocked, skipped or killed
 		// command). batchSeen is tracked separately from the sentinel value on
@@ -451,7 +487,10 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 // executeBatchSerial runs commands one by one with a shared timeout.
 // The timeout is the total budget for all commands combined.
 // If the shared context expires mid-way, remaining commands are marked as skipped.
-func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, runID string, results []batchResult) {
+// guardBlocked/guardRules/guardDetails carry the per-command role-guard verdict
+// computed by toolBatchExecute: a blocked command is refused without spawning
+// (exit -1, its rule recorded) but never stops its siblings.
+func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, runID string, results []batchResult, guardBlocked []bool, guardRules, guardDetails []string) {
 	var cmdCtx context.Context
 	var cancel context.CancelFunc
 	if timeout > 0 {
@@ -462,6 +501,20 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 	defer cancel()
 
 	for i, cmd := range commands {
+		// A role-guard-blocked command never spawns; the block is not a shell
+		// screen block, so it bypasses executeCommand entirely.
+		if i < len(guardBlocked) && guardBlocked[i] {
+			errMsg := guardBlockedError(guardRules[i], guardDetails[i]).Error()
+			results[i] = batchResult{
+				Label:      cmd.Label,
+				Command:    cmd.Command,
+				Success:    false,
+				ExitCode:   -1,
+				Error:      errMsg,
+				ErrorClass: classifyError(errMsg),
+			}
+			continue
+		}
 		// Check if the shared context has expired.
 		if err := cmdCtx.Err(); err != nil {
 			// Skipped commands never ran, so there is no real exit code to
@@ -501,7 +554,7 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 // executeBatchConcurrent runs commands in parallel with per-command timeouts.
 // Each command gets its own timeout budget (the full timeout value).
 // Concurrency is limited by a semaphore. Store writes are serialized with a mutex.
-func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, concurrency int, runID string, results []batchResult) {
+func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, concurrency int, runID string, results []batchResult, guardBlocked []bool, guardRules, guardDetails []string) {
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 
@@ -509,6 +562,20 @@ func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCom
 		wg.Add(1)
 		go func(idx int, c batchCommand) {
 			defer wg.Done()
+			// A role-guard-blocked command never spawns (see
+			// executeBatchSerial); reported with exit -1 and its rule.
+			if idx < len(guardBlocked) && guardBlocked[idx] {
+				errMsg := guardBlockedError(guardRules[idx], guardDetails[idx]).Error()
+				results[idx] = batchResult{
+					Label:      c.Label,
+					Command:    c.Command,
+					Success:    false,
+					ExitCode:   -1,
+					Error:      errMsg,
+					ErrorClass: classifyError(errMsg),
+				}
+				return
+			}
 			sem <- struct{}{}        // acquire
 			defer func() { <-sem }() // release
 

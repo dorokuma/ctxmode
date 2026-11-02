@@ -2185,8 +2185,35 @@ var envAllowlist = map[string]bool{
 	"LC_ALL":                  true,
 }
 
-// isDeniedEnvKey reports keys that must never be overridden (PATH, loader, shell, home).
+// isDeniedEnvKey reports keys that must never be overridden (PATH, loader,
+// shell, home, and — for a role-guarded caller — the caller's own
+// role/audit/database identity).
 func isDeniedEnvKey(key string) bool {
+	return isDeniedEnvKeyForCaller(key, callerIsRoleGuarded())
+}
+
+// roleIdentityEnvKeys are the guard's view of who is calling and where it
+// writes. Only a caller that HAS a role identity may not rewrite them: a
+// sub-agent setting CTXMODE_ROLE/CTXMODE_AUDIT_LOG/CTXMODE_DB in its
+// ctx_run env would move the guard's verdict and its audit trail, and
+// CTXMODE_ENV_PASSTHROUGH=1 would ship secrets into the child. The main
+// agent has no role to shed, so these stay ordinary CTXMODE_*-prefixed
+// knobs for it (the env allowlist accepts the prefix): hosts and tests
+// legitimately pass CTXMODE_DB/CTXMODE_CONFIG/CTXMODE_AUDIT_LOG to a child
+// ctxmode, and blocking them broke the documented "CTXMODE_*" behaviour.
+var roleIdentityEnvKeys = map[string]bool{
+	"CTXMODE_ROLE":            true,
+	"CTXMODE_READONLY":        true,
+	"CTXMODE_AUDIT_LOG":       true,
+	"CTXMODE_ENV_PASSTHROUGH": true,
+	"CTXMODE_DB":              true,
+	"CTXMODE_CONFIG":          true,
+}
+
+// isDeniedEnvKeyForCaller is isDeniedEnvKey with the caller classification
+// passed in, so the env screen and its tests do not have to re-read the
+// process environment.
+func isDeniedEnvKeyForCaller(key string, guarded bool) bool {
 	uk := strings.ToUpper(key)
 	switch uk {
 	case "PATH", "HOME", "SHELL", "USER", "LOGNAME",
@@ -2194,6 +2221,9 @@ func isDeniedEnvKey(key string) bool {
 		"DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
 		"IFS", "CDPATH", "ENV", "BASH_ENV", "SHELLOPTS", "BASHOPTS",
 		"SSLKEYLOGFILE", "TERM":
+		return true
+	}
+	if guarded && roleIdentityEnvKeys[uk] {
 		return true
 	}
 	if strings.HasPrefix(uk, "LD_") || strings.HasPrefix(uk, "DYLD_") {
@@ -2208,6 +2238,7 @@ func filterExecEnv(env map[string]string) (map[string]string, error) {
 	if len(env) == 0 {
 		return nil, nil
 	}
+	guarded := callerIsRoleGuarded()
 	out := make(map[string]string, len(env))
 	for k, v := range env {
 		if k == "" {
@@ -2216,7 +2247,7 @@ func filterExecEnv(env map[string]string) (map[string]string, error) {
 		if strings.ContainsAny(k, "=\x00") {
 			return nil, fmt.Errorf("env: invalid key %q", k)
 		}
-		if isDeniedEnvKey(k) {
+		if isDeniedEnvKeyForCaller(k, guarded) {
 			return nil, fmt.Errorf("env key %q is not allowed (security denylist)", k)
 		}
 		if envAllowlist[k] || strings.HasPrefix(k, "CTXMODE_") {

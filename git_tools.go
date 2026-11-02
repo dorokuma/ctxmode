@@ -277,6 +277,12 @@ func sanitizedGitEnv() []string {
 
 func hardenedGitArgs(args ...string) []string {
 	prefix := []string{
+		// Every ctx_git path and the rg git-rank probe are read-only
+		// subcommands: git otherwise opportunistically creates
+		// .git/index.lock, which fails hard under a read-only bind mount of
+		// .git (a Landlock sandbox profile such as `sbx --preset
+		// reviewer-agent`) instead of degrading to an unlocked read.
+		"--no-optional-locks",
 		"-c", "core.fsmonitor=false",
 		"-c", "core.hooksPath=/dev/null",
 		"-c", "log.showSignature=false",

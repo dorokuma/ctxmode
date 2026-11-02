@@ -91,6 +91,25 @@ func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args r
 		cwd = resolved
 	}
 	audit.rec.CWD = cwd
+	// Role-guard head screening resolves relative/aliased command names the way
+	// the task child will; pin this call's cwd for the guards below.
+	defer withScreenCwd(cwd)()
+
+	// Role guards (role_guards.go): run_task is a build/test entry point, so a
+	// strict read-only role may not call it at all; every sub-agent caller's
+	// constructed argv is screened for nested dispatch (a `custom` argv could
+	// otherwise name an agent executable). Recorded as screen block + error.
+	guard := currentGuardCall()
+	if guard.strictReadonly {
+		audit.setScreen(shellBlock, ruleReadonlyWrite)
+		return nil, nil, guardBlockedError(ruleReadonlyWrite, "run_task")
+	}
+	// Caller-supplied env overrides get the same execution-hook screen as
+	// ctx_run execute (GIT_PAGER=/tmp/x etc. must not arm the task child).
+	if grule, detail := guard.guardCtxRunEnv(args.Env); grule != "" {
+		audit.setScreen(shellBlock, grule)
+		return nil, nil, guardBlockedError(grule, detail)
+	}
 
 	// Env allowlist (same as ctx_run action=execute / P1).
 	filteredEnv, err := filterExecEnv(args.Env)
@@ -119,6 +138,10 @@ func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args r
 	audit.setScreen(verdict, rule)
 	if serr != nil {
 		return nil, nil, serr
+	}
+	if grule, detail := guard.guardCtxRunArgv(argv); grule != "" {
+		audit.setScreen(shellBlock, grule)
+		return nil, nil, guardBlockedError(grule, detail)
 	}
 
 	// custom (and any path-like argv[0]) go through validateArgv, which now only

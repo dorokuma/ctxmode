@@ -45,6 +45,10 @@ func shellQuote(s string) string {
 
 // runFragment writes the extracted fragment into a temp copy with BUILD_OUT /
 // BINARY injected, runs it with bash, and returns combined output + error.
+// CTXMODE_SKIP_IMMUTABLE_LOCK=1 is injected by default: these tests run as
+// root on ext4 under t.TempDir(), where a real `chattr +i` would survive the
+// test and make the temp-dir cleanup fail with "operation not permitted".
+// The lock logic itself is covered by TestDeployScript_StaticConstraints.
 func runFragment(t *testing.T, buildOut, binary string) (string, error) {
 	t.Helper()
 	script := filepath.Join(t.TempDir(), "deploy-fragment.sh")
@@ -55,6 +59,7 @@ func runFragment(t *testing.T, buildOut, binary string) (string, error) {
 		t.Fatalf("write fragment copy: %v", err)
 	}
 	cmd := exec.Command("bash", script)
+	cmd.Env = append(os.Environ(), "CTXMODE_SKIP_IMMUTABLE_LOCK=1")
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -138,6 +143,32 @@ func TestDeployScript_StaticConstraints(t *testing.T) {
 	if strings.Contains(frag, `"$TMP_FILE" 2>/dev/null`) || strings.Contains(frag, `"$BUILD_OUT" 2>/dev/null`) {
 		t.Error("fragment must not swallow initialize stderr with 2>/dev/null")
 	}
+	// The staged file is read+execute only: a deployed binary must not be
+	// writable through the ordinary DAC path.
+	if !strings.Contains(frag, `install -m 0555 "$BUILD_OUT" "$TMP_FILE"`) {
+		t.Error(`fragment must stage the binary read+execute only: install -m 0555 "$BUILD_OUT" "$TMP_FILE"`)
+	}
+	// Immutable-lock protection: unlock the live target before the rename,
+	// re-lock it after, with an explicit opt-out for tests.
+	if !strings.Contains(frag, "CTXMODE_SKIP_IMMUTABLE_LOCK") {
+		t.Error("fragment must honour CTXMODE_SKIP_IMMUTABLE_LOCK so tests can skip chattr")
+	}
+	if !strings.Contains(frag, `chattr -i "$1"`) || !strings.Contains(frag, `chattr +i "$1"`) {
+		t.Error(`fragment must guard the target with chattr -i / chattr +i`)
+	}
+	unlockAt := strings.Index(frag, `unlock_immutable "$BINARY"`)
+	mvAt = strings.Index(frag, `mv -f -- "$TMP_FILE" "$BINARY"`)
+	if unlockAt < 0 || mvAt < 0 || unlockAt > mvAt {
+		t.Error("fragment must chattr -i the target before mv")
+	}
+	// (searched after the rename so the `unlock_immutable` spelling, which
+	// contains this substring, cannot satisfy it by accident)
+	if mvAt < 0 || !strings.Contains(frag[mvAt:], `lock_immutable "$BINARY"`) {
+		t.Error("fragment must chattr +i the target after a successful mv")
+	}
+	if prevAt := strings.Index(frag, `unlock_immutable "${BINARY}.prev"`); prevAt < 0 || prevAt > strings.Index(frag, `cp -- "$BINARY" "${BINARY}.prev"`) {
+		t.Error("fragment must clear an existing +i on ${BINARY}.prev before backing up")
+	}
 	// every variable use must be double-quoted (BINARY may contain spaces).
 	for _, v := range []string{"$BINARY", "$BUILD_OUT", "$TMP_FILE", "$TARGET_DIR"} {
 		for i := 0; ; {
@@ -155,6 +186,124 @@ func TestDeployScript_StaticConstraints(t *testing.T) {
 	// the real script must at least parse cleanly (never executed here).
 	if out, err := exec.Command("bash", "-n", deployScript).CombinedOutput(); err != nil {
 		t.Errorf("bash -n %s failed: %v\n%s", deployScript, err, out)
+	}
+}
+
+// ---------- behavior: second deploy over a read-only .prev ----------
+
+func TestDeployFragment_SecondDeployOverReadonlyPrevSucceeds(t *testing.T) {
+	// The work dir must sit directly under /tmp: when run as root the second
+	// deploy is re-executed as an unprivileged uid, and t.TempDir() parents
+	// are 0700 root-owned — a non-root child could not even traverse into
+	// the directory. /tmp is world-traversable on every supported host.
+	dir, err := os.MkdirTemp("/tmp", "ctxmode-deploy-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		// The unprivileged deploy may leave files root must remove; the dir
+		// itself is already writable by the test user.
+		if err := os.RemoveAll(dir); err != nil {
+			t.Logf("cleanup %s: %v", dir, err)
+		}
+	}()
+	binary := filepath.Join(dir, "ctxmode")
+	prev := binary + ".prev"
+
+	// First deploy stages the old binary into .prev.
+	buildOut := filepath.Join(t.TempDir(), "ctxmode-build")
+	writeStubBinary(t, buildOut, stubInitializeJSON, "", 0)
+	if err := os.WriteFile(binary, []byte("OLDV1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runFragment(t, buildOut, binary)
+	if err != nil {
+		t.Fatalf("first deploy failed: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(prev); err != nil {
+		t.Fatalf("first deploy must leave a .prev backup: %v", err)
+	}
+	// Second deploy: make .prev read-only — a leftover 0444/0555 backup must
+	// not break the next deploy's backup step. Run as an unprivileged user
+	// when possible: as root cp over a 0444 file succeeds anyway, so only a
+	// non-root run actually exercises the rm -f fix.
+	if err := os.Chmod(prev, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	// The second stub also lives under dir so the unprivileged child can
+	// read it (a t.TempDir() parent would again be 0700 root-owned).
+	buildOut2 := filepath.Join(dir, "ctxmode-build2")
+	writeStubBinary(t, buildOut2, stubInitializeJSON, "", 0)
+	stub2, err := os.ReadFile(buildOut2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.Getuid() == 0 {
+		// Hand the directory to an unprivileged user and re-run the
+		// fragment as them: without rm -f the cp over the read-only
+		// .prev is a real Permission denied.
+		if err := os.Chown(dir, 65534, 65534); err != nil {
+			t.Skipf("cannot chown temp dir for unprivileged re-deploy: %v", err)
+		}
+		if err := os.Chown(binary, 65534, 65534); err != nil {
+			t.Skipf("cannot chown binary for unprivileged re-deploy: %v", err)
+		}
+		if err := os.Chown(prev, 65534, 65534); err != nil {
+			t.Skipf("cannot chown .prev for unprivileged re-deploy: %v", err)
+		}
+		// dir lives under /tmp (world-traversable) so the unprivileged child
+		// can reach and write into it once it owns it.
+		if err := os.Chmod(dir, 0o777); err != nil {
+			t.Skipf("cannot chmod temp dir for unprivileged re-deploy: %v", err)
+		}
+		if _, err := exec.LookPath("setpriv"); err != nil {
+			t.Skip("setpriv not available for unprivileged re-deploy")
+		}
+		// Feed the fragment through bash's stdin so the unprivileged uid
+		// never needs execute/search permission on a script file or its
+		// root-owned parent dirs.
+		header := "set -euo pipefail\nBUILD_OUT=" + shellQuote(buildOut2) +
+			"\nBINARY=" + shellQuote(binary) + "\n"
+		content := header + extractDeployFragment(t, readDeployScript(t))
+		cmd := exec.Command("setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "bash", "-s")
+		cmd.Stdin = strings.NewReader(content)
+		// The child needs a cwd it can still chdir back into after setpriv
+		// drops privileges (bash probes it at startup), and TMPDIR must be
+		// dropped so bash/mktemp fall back to world-writable /tmp instead
+		// of the inherited root-owned test dir.
+		env := []string{"CTXMODE_SKIP_IMMUTABLE_LOCK=1"}
+		for _, e := range os.Environ() {
+			if !strings.HasPrefix(e, "TMPDIR=") && !strings.HasPrefix(e, "CTXMODE_SKIP_IMMUTABLE_LOCK=") {
+				env = append(env, e)
+			}
+		}
+		cmd.Env = env
+		cmd.Dir = dir
+		var outBytes []byte
+		outBytes, err = cmd.CombinedOutput()
+		out = string(outBytes)
+	} else {
+		out, err = runFragment(t, buildOut2, binary)
+	}
+	if err != nil {
+		t.Fatalf("second deploy over read-only .prev failed: %v\n%s", err, out)
+	}
+	prevData, err := os.ReadFile(prev)
+	if err != nil {
+		t.Fatalf("second deploy must refresh .prev: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(prevData), "9.9.9") {
+		t.Errorf(".prev must hold the previous (stub) binary, got %q", prevData)
+	}
+	got, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(stub2) {
+		t.Errorf("deployed content = %q, want second stub", got)
+	}
+	if tmp := listTempFiles(t, dir); len(tmp) != 0 {
+		t.Errorf("temp files left behind after second deploy: %v", tmp)
 	}
 }
 
@@ -194,8 +343,8 @@ func TestDeployFragment_SuccessReplacesTargetAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o755 {
-		t.Errorf("deployed mode = %v, want 0755", info.Mode().Perm())
+	if info.Mode().Perm() != 0o555 {
+		t.Errorf("deployed mode = %v, want 0555 (read+execute only)", info.Mode().Perm())
 	}
 	if tmp := listTempFiles(t, dir); len(tmp) != 0 {
 		t.Errorf("temp files left behind after success: %v", tmp)
@@ -352,6 +501,8 @@ func extractRollbackFragment(t *testing.T, src string) string {
 
 // runRollbackFragment runs the rollback section in a temp copy with BINARY
 // injected and argv[1]=rollback (rollback never compiles, no BUILD_OUT).
+// CTXMODE_SKIP_IMMUTABLE_LOCK=1 mirrors runFragment: a real chattr +i under
+// t.TempDir() would break the temp-dir cleanup when the tests run as root.
 func runRollbackFragment(t *testing.T, binary string) (string, error) {
 	t.Helper()
 	script := filepath.Join(t.TempDir(), "deploy-rollback.sh")
@@ -361,6 +512,7 @@ func runRollbackFragment(t *testing.T, binary string) (string, error) {
 		t.Fatalf("write rollback copy: %v", err)
 	}
 	cmd := exec.Command("bash", script, "rollback")
+	cmd.Env = append(os.Environ(), "CTXMODE_SKIP_IMMUTABLE_LOCK=1")
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -388,6 +540,21 @@ func TestDeployScript_RollbackStaticConstraints(t *testing.T) {
 	}
 	if !strings.Contains(frag, `timeout 5 "$PREV"`) {
 		t.Error("rollback must initialize the staged backup with timeout")
+	}
+	// The restored binary stays under the same protection as a deployed one:
+	// read+execute mode and the immutable lock (after unlocking the target,
+	// which a rename over an immutable file could not otherwise replace).
+	if !strings.Contains(frag, `chmod 0555 "$PREV"`) {
+		t.Error(`rollback must restore the read+execute mode: chmod 0555 "$PREV"`)
+	}
+	if !strings.Contains(frag, "CTXMODE_SKIP_IMMUTABLE_LOCK") || !strings.Contains(frag, "chattr +i") {
+		t.Error("rollback must re-apply the immutable lock (honouring CTXMODE_SKIP_IMMUTABLE_LOCK)")
+	}
+	if unlockAt := strings.Index(frag, `unlock_immutable "$BINARY"`); unlockAt < 0 || unlockAt > strings.Index(frag, `mv -f -- "$PREV" "$BINARY"`) {
+		t.Error("rollback must clear the target's +i lock before the rename")
+	}
+	if mvAt := strings.Index(frag, `mv -f -- "$PREV" "$BINARY"`); mvAt < 0 || !strings.Contains(frag[mvAt:], `lock_immutable "$BINARY"`) {
+		t.Error("rollback must re-lock the restored binary after the rename")
 	}
 	if !strings.Contains(src, "rollback") || !strings.Contains(src, "用法") {
 		t.Error("deploy.sh must document rollback usage")

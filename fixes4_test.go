@@ -166,7 +166,7 @@ func TestExecuteFile_HardlinkToSensitiveFile_Refused(t *testing.T) {
 		Code:     "console.log(FILE_CONTENT.length);",
 	})
 	// If node runtime is available, it should succeed; if not, language executor error is fine, but path check passed
-	if err != nil && !strings.Contains(err.Error(), "executable file not found") && !strings.Contains(err.Error(), "exec:") {
+	if err != nil && !strings.Contains(err.Error(), "executable file not found") && !strings.Contains(err.Error(), "exec:") && !strings.Contains(err.Error(), "is not available") {
 		t.Fatalf("unexpected path error for normal file: %v", err)
 	}
 	if res != nil {

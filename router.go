@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -206,7 +207,23 @@ type ctxKbArgs struct {
 }
 
 func (s *server) toolCtxKb(ctx context.Context, req *mcp.CallToolRequest, args ctxKbArgs) (*mcp.CallToolResult, any, error) {
-	switch strings.ToLower(strings.TrimSpace(args.Action)) {
+	action := strings.ToLower(strings.TrimSpace(args.Action))
+	// Role guard (role_guards.go): ctx_kb index/purge mutate the shared KB, so
+	// every read-only role — verifier included — is refused. fetch feeds the
+	// researcher tool-cache exception, so it stays open only for the
+	// researcher role; scout/planner/reviewer/oracle/verifier and bare
+	// CTXMODE_READONLY=1 callers are refused (it writes fetched content into
+	// the shared KB). search/stats/doctor stay open for everyone (ctx_fs rg
+	// auto-index does not pass through this handler).
+	if auditCallerIsReadonly() {
+		if action == "index" || action == "purge" {
+			return nil, nil, fmt.Errorf("blocked by role guard (%s): ctx_kb %s", ruleReadonlyWrite, action)
+		}
+		if action == "fetch" && strings.ToLower(strings.TrimSpace(os.Getenv(auditEnvRole))) != "researcher" {
+			return nil, nil, fmt.Errorf("blocked by role guard (%s): ctx_kb %s", ruleReadonlyWrite, action)
+		}
+	}
+	switch action {
 	case "index":
 		return s.toolIndex(ctx, req, indexArgs{Path: args.Path})
 	case "search":
@@ -253,6 +270,12 @@ func (s *server) toolCtxBg(ctx context.Context, req *mcp.CallToolRequest, args c
 	case "list", "status":
 		return s.toolBackgroundList(ctx, req, backgroundListArgs{})
 	case "kill":
+		// Role guard (role_guards.go): kill terminates a process, so strict
+		// read-only roles may not call it. verifier keeps it (its /tmp
+		// verification jobs need reaping).
+		if auditCallerIsStrictReadonly() {
+			return nil, nil, fmt.Errorf("blocked by role guard (%s): ctx_bg kill", ruleReadonlyWrite)
+		}
 		return s.toolBackgroundKill(ctx, req, backgroundKillArgs{ID: args.ID, PID: args.PID})
 	case "log", "output":
 		return s.toolBackgroundLog(ctx, req, backgroundLogArgs{

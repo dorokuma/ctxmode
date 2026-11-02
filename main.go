@@ -113,6 +113,16 @@ func main() {
 	}
 	flag.Parse()
 
+	// Zero-side-effect pre-rejection: `ctxmode index` writes the shared KB,
+	// so a read-only role must be refused BEFORE ensureDBDir/NewStore/
+	// migrateFromJSONOrWarn/excludeFromGit create the DB directory or touch
+	// .git/info/exclude (the same rule as ctx_kb action=index, which
+	// runCLI's own check below keeps for direct unit calls).
+	if len(flag.Args()) > 0 && flag.Args()[0] == "index" && auditCallerIsReadonly() {
+		fmt.Fprintln(os.Stderr, guardBlockedError(ruleReadonlyWrite, "ctxmode index"))
+		os.Exit(1)
+	}
+
 	// Load workdirs from config file (or fall back to cwd).
 	cfg, err := loadConfig(configPath)
 	if err != nil {
@@ -383,6 +393,9 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		cwd = resolved
 	}
 	audit.rec.CWD = cwd
+	// Role-guard head screening resolves relative/aliased command names the way
+	// the child process will; pin this call's cwd for the guards below.
+	defer withScreenCwd(cwd)()
 
 	// Validate env allowlist and stdin size.
 	filteredEnv, err := filterExecEnv(args.Env)
@@ -397,6 +410,19 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		opts = &runOptions{Env: filteredEnv, Stdin: args.Stdin}
 	}
 
+	// Role guards (role_guards.go): nested agent dispatch is blocked for every
+	// sub-agent caller; write/destructive heads and file redirects are blocked
+	// for strict read-only roles. Runs after startAudit so the blocked call is
+	// still recorded (exit_code -1, screen_verdict block).
+	guard := currentGuardCall()
+	// Caller-supplied env overrides get the execution-hook screen too: an
+	// envHookVars value (GIT_PAGER=/tmp/x, NODE_OPTIONS=...) handed via
+	// args.Env arms a child process exactly like an `env KEY=VAL` prefix.
+	if grule, detail := guard.guardCtxRunEnv(args.Env); grule != "" {
+		audit.setScreen(shellBlock, grule)
+		return nil, nil, guardBlockedError(grule, detail)
+	}
+
 	// Execute: argv mode (no shell) takes priority over command string.
 	if useArgv {
 		audit.setArgv(args.Argv, cwd)
@@ -409,6 +435,17 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		audit.setScreen(verdict, rule)
 		if serr != nil {
 			return nil, nil, serr
+		}
+		if grule, detail := guard.guardCtxRunArgv(args.Argv); grule != "" {
+			audit.setScreen(shellBlock, grule)
+			return nil, nil, guardBlockedError(grule, detail)
+		}
+		// stdin payload: if the argv's peeled head is a shell or scripting
+		// interpreter and carries no inline-code flag, the stdin IS the
+		// program — screen it the same way.
+		if grule, detail := guard.guardCtxRunStdin(args.Argv, args.Stdin); grule != "" {
+			audit.setScreen(shellBlock, grule)
+			return nil, nil, guardBlockedError(grule, detail)
 		}
 		argv, aerr := s.validateArgv(args.Argv, cwd)
 		if aerr != nil {
@@ -428,9 +465,25 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 			} else if verdict == shellWarn {
 				logShellScreen(rule, args.Command)
 			}
+			if grule, detail := guard.guardCtxRunShell(args.Command); grule != "" {
+				audit.setScreen(shellBlock, grule)
+				return nil, nil, guardBlockedError(grule, detail)
+			}
+			// stdin payload: when a peeled command head is a shell or scripting
+			// interpreter reading its program from stdin, screen the payload.
+			if grule, detail := guard.guardCtxRunStdinForCommand(args.Command, args.Stdin); grule != "" {
+				audit.setScreen(shellBlock, grule)
+				return nil, nil, guardBlockedError(grule, detail)
+			}
 		} else if rt, ok := runtimes[language]; ok {
-			// Non-shell language: record the interpreter that will run the code.
+			// Non-shell language: record the interpreter that will run the code
+			// and screen the code itself for the role guards (spawn/write
+			// primitives in the interpreter's own language).
 			audit.setInterpreter(rt.Exe)
+			if grule, detail := guard.guardCtxRunCode(language, args.Command); grule != "" {
+				audit.setScreen(shellBlock, grule)
+				return nil, nil, guardBlockedError(grule, detail)
+			}
 		}
 		result, err = runCodeOpts(ctx, language, args.Command, cwd, timeout, args.Background, opts)
 	}
@@ -1001,6 +1054,9 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		cwd = resolved
 	}
 	audit.setCommand(auditFileCommand(target, language, args.Code), cwd)
+	// Role-guard head screening resolves relative/aliased command names the way
+	// the child process will; pin this call's cwd for the guards below.
+	defer withScreenCwd(cwd)()
 	if rt, ok := runtimes[language]; ok {
 		audit.setInterpreter(rt.Exe)
 	}
@@ -1012,6 +1068,20 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		// function), so recording it here reports the same verdict the runner
 		// will apply. Other languages run from a temp file and are not screened.
 		audit.setScreen(screenShellBlock(injectedCode))
+		// Role guards apply to the CALLER's code only: injectedCode also
+		// embeds FILE_CONTENT, which is data — scanning it would flag source
+		// files (like role_guards.go itself) that merely name guard tokens.
+		if grule, detail := currentGuardCall().guardCtxRunShell(args.Code); grule != "" {
+			audit.setScreen(shellBlock, grule)
+			return nil, nil, guardBlockedError(grule, detail)
+		}
+	} else {
+		// Non-shell execute_file: FILE_CONTENT is data; the caller's code is
+		// what the interpreter runs, so it gets the code guard.
+		if grule, detail := currentGuardCall().guardCtxRunCode(language, args.Code); grule != "" {
+			audit.setScreen(shellBlock, grule)
+			return nil, nil, guardBlockedError(grule, detail)
+		}
 	}
 
 	// Execute the injected code.

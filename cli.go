@@ -27,6 +27,12 @@ func runCLI(s *server, args []string, stdout io.Writer) error {
 	}
 	switch args[0] {
 	case "index":
+		// Same rule as ctx_kb action=index (router.go): a read-only role
+		// — verifier included — may not write the shared KB, whether it
+		// reaches it over MCP or the CLI entry point.
+		if auditCallerIsReadonly() {
+			return guardBlockedError(ruleReadonlyWrite, "ctxmode index")
+		}
 		if len(args) != 2 || strings.TrimSpace(args[1]) == "" {
 			return fmt.Errorf("usage: ctxmode index <path>")
 		}
