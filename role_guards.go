@@ -5761,6 +5761,68 @@ func pythonMask(code string) string {
 // jsMask produces a JS/TS lexical mask: // and /* */ comments and the
 // bodies of '...'/"..." literals are blanked; template literals `...`
 // blank except ${...} expression slices (real code kept).
+// jsScanExpr advances i through a JS expression until braceDepth reaches 0,
+// counting nested { }, skipping string/template contents so braces inside
+// them do not affect depth. i starts just after `${` with braceDepth 1;
+// the return value is the index just past the closing `}`.
+func jsScanExpr(b []byte, i, end, braceDepth int) int {
+	for i < end && braceDepth > 0 {
+		switch b[i] {
+		case '\\':
+			i++
+			if i < end {
+				i++
+			}
+		case '\'', '"':
+			q := b[i]
+			i++
+			for i < end && b[i] != q {
+				if b[i] == '\n' {
+					break
+				}
+				if b[i] == '\\' {
+					i++
+				}
+				i++
+			}
+			if i < end && b[i] == q {
+				i++
+			}
+		case '`':
+			// Nested template: keep scanning until its closing `, and recurse
+			// into any ${...} so nested braces stay balanced.
+			i++
+			for i < end {
+				if b[i] == '\\' {
+					i++
+					if i < end {
+						i++
+					}
+					continue
+				}
+				if b[i] == '`' {
+					i++
+					break
+				}
+				if b[i] == '$' && i+1 < end && b[i+1] == '{' {
+					i = jsScanExpr(b, i+2, end, 1)
+					continue
+				}
+				i++
+			}
+		case '{':
+			braceDepth++
+			i++
+		case '}':
+			braceDepth--
+			i++
+		default:
+			i++
+		}
+	}
+	return i
+}
+
 func jsMask(code string) string {
 	b := []byte(code)
 	n := len(b)
@@ -5810,6 +5872,8 @@ func jsMask(code string) string {
 			}
 		case c == '`':
 			// Template literal: blank body but keep ${...} expressions.
+			// Expression braces (object literals, nested templates, strings)
+			// must not close the ${} early.
 			bodyStart := i + 1
 			j := bodyStart
 			for j < n && b[j] != '`' {
@@ -5825,21 +5889,12 @@ func jsMask(code string) string {
 			i = minInt(j+1, n)
 			k := bodyStart
 			segStart := k
-			depth := 0
 			for k < bodyEnd {
 				if b[k] == '$' && k+1 < bodyEnd && b[k+1] == '{' {
-					if depth == 0 {
-						blank(segStart, k)
-					}
-					depth++
-					k += 2
+					blank(segStart, k)
+					k = jsScanExpr(b, k+2, bodyEnd, 1)
+					segStart = k
 					continue
-				}
-				if b[k] == '}' && depth > 0 {
-					depth--
-					if depth == 0 {
-						segStart = k + 1
-					}
 				}
 				k++
 			}
