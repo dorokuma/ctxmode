@@ -130,3 +130,57 @@ func TestGuard_R4_SqliteConnectViaCode(t *testing.T) {
 		})
 	}
 }
+// TestGuard_R4_ExecDashA peels bash exec -a/-c/-l so the real command head
+// is screened for nested-agent dispatch.
+func TestGuard_R4_ExecDashA(t *testing.T) {
+	t.Setenv(auditEnvRole, "worker")
+	t.Setenv(auditEnvReadonly, "")
+
+	cases := []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{name: "bash -c exec -a benign pig", argv: []string{"bash", "-c", "exec -a benign pig"}, want: "pig"},
+		{name: "exec -a name pig direct", argv: []string{"exec", "-a", "benign", "pig"}, want: "pig"},
+		{name: "exec -cl -a name agy", argv: []string{"exec", "-c", "-l", "-a", "x", "agy"}, want: "agy"},
+		{name: "exec -a name ls ok", argv: []string{"exec", "-a", "benign", "ls"}, want: ""},
+		{name: "bash -c exec ls ok", argv: []string{"bash", "-c", "exec ls /tmp"}, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := guardArgvSubagent(tc.argv)
+			if got != tc.want {
+				t.Fatalf("guardArgvSubagent(%v) = %q, want %q", tc.argv, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGuard_R4_XargsEof treats bare --eof as a flag that does not consume
+// the next argv (GNU optional value must use --eof=STR).
+func TestGuard_R4_XargsEof(t *testing.T) {
+	t.Setenv(auditEnvRole, "worker")
+	t.Setenv(auditEnvReadonly, "")
+
+	cases := []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{name: "xargs --eof pig", argv: []string{"xargs", "--eof", "pig"}, want: "pig"},
+		{name: "xargs --eof -- pig", argv: []string{"xargs", "--eof", "--", "pig"}, want: "pig"},
+		{name: "xargs --eof=STOP pig", argv: []string{"xargs", "--eof=STOP", "pig"}, want: "pig"},
+		{name: "xargs -E STOP pig", argv: []string{"xargs", "-E", "STOP", "pig"}, want: "pig"},
+		{name: "xargs --eof ls ok", argv: []string{"xargs", "--eof", "ls"}, want: ""},
+		{name: "xargs -0 ls ok", argv: []string{"xargs", "-0", "ls"}, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := guardArgvSubagent(tc.argv)
+			if got != tc.want {
+				t.Fatalf("guardArgvSubagent(%v) = %q, want %q", tc.argv, got, tc.want)
+			}
+		})
+	}
+}
