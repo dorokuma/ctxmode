@@ -1213,6 +1213,54 @@ var guardTaintVars = map[string]bool{
 // `--` terminators. Recursion is bounded by peelWrapperMaxSteps (bare KEY=VAL
 // prefixes do not consume steps); a chain that never resolves returns an
 // index past the end.
+
+// skipExecArgs advances past bash `exec` options matching internal_getopt
+// optstring "cla:": -c/-l are boolean; -a takes a name (separate argv,
+// glued -aNAME, or trailing letter in a short cluster like -la/-ca/-cla).
+// i is the index just after the "exec" word. Returns the index of the
+// command head (or len(argv) when exhausted).
+func skipExecArgs(argv []string, i int) int {
+	for i < len(argv) {
+		a := argv[i]
+		if a == "--" {
+			return i + 1
+		}
+		if a == "-" || !strings.HasPrefix(a, "-") {
+			return i
+		}
+		if strings.HasPrefix(a, "--") {
+			// bash exec has no long options; treat as the command head.
+			return i
+		}
+		if a == "-a" {
+			i += 2 // -a name
+			continue
+		}
+		if a == "-c" || a == "-l" {
+			i++
+			continue
+		}
+		// Short cluster: -cl, -la, -ca, -cla, -abenign, ...
+		cluster := a[1:]
+		i++ // consume the cluster argv slot
+		for ci := 0; ci < len(cluster); ci++ {
+			switch cluster[ci] {
+			case 'c', 'l':
+				// boolean
+			case 'a':
+				if cluster[ci+1:] == "" {
+					i++ // name is the next argv
+				}
+				// else name is the glued remainder; either way cluster is done
+				ci = len(cluster)
+			default:
+				ci = len(cluster)
+			}
+		}
+	}
+	return i
+}
+
 func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssignments, exhausted bool) {
 	i := 0
 	depth := 0
@@ -1284,30 +1332,8 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 			}
 			i = skipDashDash(argv, i)
 		case "exec":
-			// bash exec [-cl] [-a name] [--] command: skip option run so
-			// `exec -a benign pig` peels to `pig`.
-			i++
-			for i < len(argv) {
-				a := argv[i]
-				if a == "--" {
-					i++
-					break
-				}
-				if a == "-a" {
-					i += 2 // -a name
-					continue
-				}
-				if a == "-c" || a == "-l" {
-					i++
-					continue
-				}
-				// Glued clusters like -cl: all boolean; -aNAME is not used by bash.
-				if strings.HasPrefix(a, "-") && a != "-" && !strings.HasPrefix(a, "--") {
-					i++
-					continue
-				}
-				break
-			}
+			// bash exec [-cl] [-a name] [--] command (internal_getopt "cla:").
+			i = skipExecArgs(argv, i+1)
 		case "nohup":
 			i++
 			i = skipDashDash(argv, i)
@@ -2437,30 +2463,8 @@ func wrapperWriteOpHit(argv []string) string {
 			}
 			i = skipDashDash(argv, i)
 		case "exec":
-			// bash exec [-cl] [-a name] [--] command: skip option run so
-			// `exec -a benign pig` peels to `pig`.
-			i++
-			for i < len(argv) {
-				a := argv[i]
-				if a == "--" {
-					i++
-					break
-				}
-				if a == "-a" {
-					i += 2 // -a name
-					continue
-				}
-				if a == "-c" || a == "-l" {
-					i++
-					continue
-				}
-				// Glued clusters like -cl: all boolean; -aNAME is not used by bash.
-				if strings.HasPrefix(a, "-") && a != "-" && !strings.HasPrefix(a, "--") {
-					i++
-					continue
-				}
-				break
-			}
+			// bash exec [-cl] [-a name] [--] command (internal_getopt "cla:").
+			i = skipExecArgs(argv, i+1)
 		case "nohup":
 			i++
 			i = skipDashDash(argv, i)
@@ -3508,6 +3512,10 @@ func screenReadonlyWriteAlias(headArgv []string, base string, args []string) str
 			return hit
 		}
 		return screenGitWrite(args)
+	case "git-fsck":
+		// Dashed form /usr/lib/git-core/git-fsck → symlink to git with implicit
+		// "fsck" subcommand; screen as git fsck <args>.
+		return screenGitWrite(append([]string{"fsck"}, args...))
 	case "tar", "bsdtar", "gtar":
 		return screenTarWrite(args, base)
 	case "unzip":
@@ -3933,7 +3941,7 @@ func sedExecCommands(s string) []string {
 			atCmdStart = true
 			i++
 		case c == '/':
-			// Regex address: skip to the unquoted closing /.
+			// Regex address: skip to the unquoted closing /, tracking [...].
 			i++
 			for i < n {
 				if s[i] == '\\' {
@@ -3944,8 +3952,37 @@ func sedExecCommands(s string) []string {
 					}
 					continue
 				}
+				if s[i] == '[' {
+					// Character class: delimiters inside [...] are literal.
+					i++
+					if i < n && s[i] == '^' {
+						i++
+					}
+					if i < n && s[i] == ']' { // ] as first (data) char is literal
+						i++
+					}
+					for i < n && s[i] != ']' {
+						if s[i] == '\\' {
+							if i+1 < n {
+								i += 2
+							} else {
+								i = n
+							}
+							continue
+						}
+						i++
+					}
+					if i < n {
+						i++ // closing ]
+					}
+					continue
+				}
 				if s[i] == '/' {
 					i++
+					// GNU sed allows I/M (and i/m) regex flags after the close.
+					for i < n && (s[i] == 'I' || s[i] == 'M' || s[i] == 'i' || s[i] == 'm') {
+						i++
+					}
 					break
 				}
 				i++
@@ -4046,8 +4083,37 @@ func sedExecCommands(s string) []string {
 					}
 					continue
 				}
+				if s[i] == '[' {
+					// Character class: delimiters inside [...] are literal.
+					i++
+					if i < n && s[i] == '^' {
+						i++
+					}
+					if i < n && s[i] == ']' { // ] as first (data) char is literal
+						i++
+					}
+					for i < n && s[i] != ']' {
+						if s[i] == '\\' {
+							if i+1 < n {
+								i += 2
+							} else {
+								i = n
+							}
+							continue
+						}
+						i++
+					}
+					if i < n {
+						i++ // closing ]
+					}
+					continue
+				}
 				if s[i] == delim {
 					i++
+					// GNU sed allows I/M (and i/m) regex flags after the close.
+					for i < n && (s[i] == 'I' || s[i] == 'M' || s[i] == 'i' || s[i] == 'm') {
+						i++
+					}
 					break
 				}
 				i++
@@ -4209,75 +4275,221 @@ func ctxmodeCLIAction(args []string) string {
 
 // screenWgetWrite allows only explicit no-disk spellings (-O -, -O /dev/null,
 // --spider); every other wget invocation downloads to disk by default.
+
+// wgetSafeOutput reports destinations that do not create a payload file.
+func wgetSafeOutput(t string) bool {
+	switch t {
+	case "-", "/dev/null", "/dev/stdout", "/dev/stderr":
+		return true
+	}
+	return false
+}
+
+// wgetLongPrefix reports whether arg (without leading --) uniquely matches
+// one of the candidate long option names (GNU getopt_long unique-prefix).
+// Returns the matched full name or "".
+func wgetLongPrefix(arg string, candidates []string) string {
+	name, _, _ := strings.Cut(arg, "=")
+	var hit string
+	for _, c := range candidates {
+		if name == c || (len(name) >= 1 && strings.HasPrefix(c, name)) {
+			if hit != "" {
+				return "" // ambiguous
+			}
+			hit = c
+		}
+	}
+	return hit
+}
+
 func screenWgetWrite(args []string) string {
-	// Default wget writes the payload to a local file. --spider and
-	// -O - / -O /dev/null avoid that, but log-to-disk flags (-o/-a/
-	// --output-file/--append-output) are independent and still write.
+	// Model GNU wget getopt_long: short clusters, glued values, value slots,
+	// unique long-option prefixes, and disk-writing side channels
+	// (logs/cookies/warc/hsts/background/execute logfile=).
 	okDownload := false
+	onlyQuery := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if a == "--" {
+			continue
+		}
+		if a == "--help" || a == "--version" || a == "-h" || a == "-V" {
+			onlyQuery = true
+			continue
+		}
 		if a == "--spider" {
 			okDownload = true
 			continue
 		}
-		if a == "-O" || a == "--output-document" {
-			if i+1 < len(args) {
-				dest := args[i+1]
-				i++
-				if dest == "-" || dest == "/dev/null" {
-					okDownload = true
-				} else {
+
+		// Long options (exact or unique prefix), with optional =value.
+		if strings.HasPrefix(a, "--") {
+			body := strings.TrimPrefix(a, "--")
+			name, val, hasEq := strings.Cut(body, "=")
+
+			// Disk-writing long options.
+			diskLong := []string{
+				"output-file", "append-output", "rejected-log",
+				"save-cookies", "warc-file", "hsts-file",
+				"output-document",
+			}
+			if hit := wgetLongPrefix(name, diskLong); hit != "" {
+				dest := val
+				if !hasEq {
+					if i+1 >= len(args) {
+						return "wget"
+					}
+					i++
+					dest = args[i]
+				}
+				if hit == "output-document" {
+					if wgetSafeOutput(dest) {
+						okDownload = true
+						continue
+					}
 					return "wget"
 				}
-			}
-			continue
-		}
-		if strings.HasPrefix(a, "-O") && len(a) > 2 {
-			dest := a[2:]
-			if dest == "-" || dest == "/dev/null" {
-				okDownload = true
-			} else {
-				return "wget"
-			}
-			continue
-		}
-		if strings.HasPrefix(a, "--output-document=") {
-			dest := a[len("--output-document="):]
-			if dest == "-" || dest == "/dev/null" {
-				okDownload = true
-			} else {
-				return "wget"
-			}
-			continue
-		}
-		// Log file destinations: stdout /dev/null stay free.
-		if a == "-o" || a == "-a" || a == "--output-file" || a == "--append-output" {
-			if i+1 < len(args) {
-				dest := args[i+1]
-				i++
-				if dest != "-" && dest != "/dev/null" {
+				if !wgetSafeOutput(dest) {
 					return "wget"
 				}
+				continue
 			}
-			continue
-		}
-		if strings.HasPrefix(a, "--output-file=") {
-			if dest := a[len("--output-file="):]; dest != "-" && dest != "/dev/null" {
-				return "wget"
+			if hit := wgetLongPrefix(name, []string{"background"}); hit != "" {
+				return "wget" // -b/--background writes wget-log
 			}
-			continue
+			if hit := wgetLongPrefix(name, []string{"execute"}); hit != "" {
+				cmd := val
+				if !hasEq {
+					if i+1 >= len(args) {
+						return "wget"
+					}
+					i++
+					cmd = args[i]
+				}
+				if wgetExecuteWrites(cmd) {
+					return "wget"
+				}
+				continue
+			}
+			// Value-taking long options that must consume the next argv so a
+			// following --spider is not mistaken for a flag.
+			valueLong := []string{
+				"user-agent", "header", "referer", "proxy-user", "proxy-password",
+				"user", "password", "base", "directory-prefix", "input-file",
+				"bind-address", "tries", "timeout", "dns-timeout", "connect-timeout",
+				"read-timeout", "wait", "waitretry", "limit-rate", "quota",
+				"level", "load-cookies", "certificate", "ca-certificate",
+				"private-key", "random-file", "egd-file", "secure-protocol",
+				"post-data", "post-file", "method", "body-data", "body-file",
+				"regex-type", "accept", "reject", "include-directories",
+				"exclude-directories", "domains", "exclude-domains",
+			}
+			if hit := wgetLongPrefix(name, valueLong); hit != "" {
+				if !hasEq {
+					i++ // consume value slot
+				}
+				continue
+			}
+			continue // other long boolean flags
 		}
-		if strings.HasPrefix(a, "--append-output=") {
-			if dest := a[len("--append-output="):]; dest != "-" && dest != "/dev/null" {
-				return "wget"
+
+		// Short options / clusters.
+		if strings.HasPrefix(a, "-") && a != "-" && !strings.HasPrefix(a, "--") {
+			cluster := a[1:]
+			for j := 0; j < len(cluster); j++ {
+				switch cluster[j] {
+				case 'O':
+					rest := cluster[j+1:]
+					var dest string
+					if rest != "" {
+						dest = rest
+						j = len(cluster)
+					} else if i+1 < len(args) {
+						i++
+						dest = args[i]
+						j = len(cluster)
+					} else {
+						return "wget"
+					}
+					if wgetSafeOutput(dest) {
+						okDownload = true
+					} else {
+						return "wget"
+					}
+				case 'o', 'a':
+					rest := cluster[j+1:]
+					var dest string
+					if rest != "" {
+						dest = rest
+						j = len(cluster)
+					} else if i+1 < len(args) {
+						i++
+						dest = args[i]
+						j = len(cluster)
+					} else {
+						return "wget"
+					}
+					if !wgetSafeOutput(dest) {
+						return "wget"
+					}
+				case 'b':
+					return "wget" // background → wget-log
+				case 'e':
+					rest := cluster[j+1:]
+					var cmd string
+					if rest != "" {
+						cmd = rest
+						j = len(cluster)
+					} else if i+1 < len(args) {
+						i++
+						cmd = args[i]
+						j = len(cluster)
+					} else {
+						return "wget"
+					}
+					if wgetExecuteWrites(cmd) {
+						return "wget"
+					}
+				case 'U', 'P', 'i', 'B', 't', 'T', 'w', 'Q', 'l':
+					// Value-taking shorts that shift subsequent argv slots.
+					rest := cluster[j+1:]
+					if rest != "" {
+						j = len(cluster)
+					} else {
+						i++ // consume next argv as value
+						j = len(cluster)
+					}
+				case 'h', 'V':
+					onlyQuery = true
+				default:
+					// boolean short (q, n, c, ...)
+				}
 			}
 			continue
 		}
 	}
-	if okDownload {
+	if okDownload || onlyQuery {
 		return ""
 	}
 	return "wget"
+}
+
+// wgetExecuteWrites reports whether an -e/--execute COMMAND writes a logfile
+// (wgetrc `logfile=PATH`).
+func wgetExecuteWrites(cmd string) bool {
+	for _, part := range strings.Split(cmd, ",") {
+		part = strings.TrimSpace(part)
+		key, val, hasEq := strings.Cut(part, "=")
+		if !hasEq {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(key), "logfile") {
+			if !wgetSafeOutput(strings.TrimSpace(val)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // firstNonFlagArg returns the first argument that is not a -flag.
@@ -4406,6 +4618,21 @@ var gitConfigReadFlags = map[string]bool{
 // first, then the subcommand decides. Read-only subcommands must not carry a
 // file-writing --output; worktree/branch/tag/config/remote/stash get
 // dual-mode flag checks; every other subcommand is a write for strict roles.
+
+// gitFsckLostFoundOpt reports whether a is a unique prefix of --lost-found
+// (Git parse-options accepts unambiguous abbreviations; fsck has no other
+// --l* option, so --l / --lo / --lost / --lost-f all mean --lost-found).
+func gitFsckLostFoundOpt(a string) bool {
+	const full = "--lost-found"
+	if a == full {
+		return true
+	}
+	if !strings.HasPrefix(a, "--") || len(a) < 3 || strings.Contains(a, "=") {
+		return false
+	}
+	return strings.HasPrefix(full, a)
+}
+
 func screenGitWrite(args []string) string {
 	i := 0
 	for i < len(args) {
@@ -4637,9 +4864,9 @@ subFound:
 		return "git reflog " + rest[0]
 	case "fsck":
 		// Plain fsck / connectivity checks are read-only; --lost-found
-		// writes dangling objects into .git/lost-found/.
+		// (and unique prefixes --l/--lo/--lost/...) write into .git/lost-found/.
 		for _, a := range rest {
-			if a == "--lost-found" {
+			if gitFsckLostFoundOpt(a) {
 				return "git fsck --lost-found"
 			}
 		}
@@ -5177,7 +5404,7 @@ func sedScriptHasWrite(s string) string {
 		case c == ' ' || c == '\t' || c == '\n' || c == ';':
 			i++
 		case c == '/':
-			// Regex address: skip to the unquoted closing /.
+			// Regex address: skip to the unquoted closing /, tracking [...].
 			i++
 			for i < n {
 				if s[i] == '\\' {
@@ -5188,8 +5415,37 @@ func sedScriptHasWrite(s string) string {
 					}
 					continue
 				}
+				if s[i] == '[' {
+					// Character class: delimiters inside [...] are literal.
+					i++
+					if i < n && s[i] == '^' {
+						i++
+					}
+					if i < n && s[i] == ']' { // ] as first (data) char is literal
+						i++
+					}
+					for i < n && s[i] != ']' {
+						if s[i] == '\\' {
+							if i+1 < n {
+								i += 2
+							} else {
+								i = n
+							}
+							continue
+						}
+						i++
+					}
+					if i < n {
+						i++ // closing ]
+					}
+					continue
+				}
 				if s[i] == '/' {
 					i++
+					// GNU sed allows I/M (and i/m) regex flags after the close.
+					for i < n && (s[i] == 'I' || s[i] == 'M' || s[i] == 'i' || s[i] == 'm') {
+						i++
+					}
 					break
 				}
 				i++
@@ -5215,8 +5471,37 @@ func sedScriptHasWrite(s string) string {
 					}
 					continue
 				}
+				if s[i] == '[' {
+					// Character class: delimiters inside [...] are literal.
+					i++
+					if i < n && s[i] == '^' {
+						i++
+					}
+					if i < n && s[i] == ']' { // ] as first (data) char is literal
+						i++
+					}
+					for i < n && s[i] != ']' {
+						if s[i] == '\\' {
+							if i+1 < n {
+								i += 2
+							} else {
+								i = n
+							}
+							continue
+						}
+						i++
+					}
+					if i < n {
+						i++ // closing ]
+					}
+					continue
+				}
 				if s[i] == delim {
 					i++
+					// GNU sed allows I/M (and i/m) regex flags after the close.
+					for i < n && (s[i] == 'I' || s[i] == 'M' || s[i] == 'i' || s[i] == 'm') {
+						i++
+					}
 					break
 				}
 				i++
@@ -5764,6 +6049,20 @@ func pythonMask(code string) string {
 // them do not affect depth. i starts just after `${` with braceDepth 1;
 // the return value is the index just past the closing `}`.
 func jsScanExpr(b []byte, i, end, braceDepth int) int {
+	blank := func(lo, hi int) {
+		if hi > end {
+			hi = end
+		}
+		if hi > len(b) {
+			hi = len(b)
+		}
+		for k := lo; k < hi; k++ {
+			if b[k] != '\n' {
+				b[k] = ' '
+			}
+		}
+	}
+	prevOperand := false
 	for i < end && braceDepth > 0 {
 		switch b[i] {
 		case '\\':
@@ -5771,8 +6070,66 @@ func jsScanExpr(b []byte, i, end, braceDepth int) int {
 			if i < end {
 				i++
 			}
+			prevOperand = true
+		case '/':
+			if i+1 < end && b[i+1] == '/' {
+				// Line comment: blank through newline; '}' here must not close.
+				lo := i
+				for i < end && b[i] != '\n' {
+					i++
+				}
+				blank(lo, i)
+				prevOperand = false
+				continue
+			}
+			if i+1 < end && b[i+1] == '*' {
+				lo := i
+				i += 2
+				for i+1 < end && !(b[i] == '*' && b[i+1] == '/') {
+					i++
+				}
+				if i+1 < end {
+					i += 2
+				} else {
+					i = end
+				}
+				blank(lo, i)
+				prevOperand = false
+				continue
+			}
+			if !prevOperand {
+				// Regex literal: skip body so /}/ does not close the expression.
+				i++
+				for i < end {
+					if b[i] == '\\' {
+						i++
+						if i < end {
+							i++
+						}
+						continue
+					}
+					if b[i] == '/' {
+						i++
+						break
+					}
+					if b[i] == '\n' {
+						break
+					}
+					i++
+				}
+				// optional regex flags
+				for i < end && ((b[i] >= 'a' && b[i] <= 'z') || (b[i] >= 'A' && b[i] <= 'Z')) {
+					i++
+				}
+				prevOperand = true
+				continue
+			}
+			// Division operator.
+			i++
+			prevOperand = false
 		case '\'', '"':
 			q := b[i]
+			lo := i
 			i++
 			for i < end && b[i] != q {
 				if b[i] == '\n' {
@@ -5780,16 +6137,21 @@ func jsScanExpr(b []byte, i, end, braceDepth int) int {
 				}
 				if b[i] == '\\' {
 					i++
+					if i >= end {
+						break
+					}
 				}
 				i++
 			}
 			if i < end && b[i] == q {
 				i++
 			}
+			blank(lo, i)
+			prevOperand = true
 		case '`':
-			// Nested template: keep scanning until its closing `, and recurse
-			// into any ${...} so nested braces stay balanced.
+			// Nested template: blank static text; recurse into ${...}.
 			i++
+			seg := i
 			for i < end {
 				if b[i] == '\\' {
 					i++
@@ -5799,24 +6161,47 @@ func jsScanExpr(b []byte, i, end, braceDepth int) int {
 					continue
 				}
 				if b[i] == '`' {
+					blank(seg, i)
 					i++
 					break
 				}
 				if b[i] == '$' && i+1 < end && b[i+1] == '{' {
+					blank(seg, i)
 					i = jsScanExpr(b, i+2, end, 1)
+					seg = i
 					continue
 				}
 				i++
 			}
+			prevOperand = true
 		case '{':
 			braceDepth++
 			i++
+			prevOperand = false
 		case '}':
 			braceDepth--
 			i++
+			prevOperand = true
+		case ' ', '\t', '\n', '\r':
+			i++
+			// whitespace does not change prevOperand
+		case ')', ']', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+			prevOperand = true
+			i++
 		default:
+			if (b[i] >= 'a' && b[i] <= 'z') || (b[i] >= 'A' && b[i] <= 'Z') || b[i] == '_' || b[i] == '$' {
+				for i < end && (isIdentByte(b[i]) || b[i] == '$') {
+					i++
+				}
+				prevOperand = true
+				continue
+			}
+			prevOperand = false
 			i++
 		}
+	}
+	if i > end {
+		i = end
 	}
 	return i
 }
@@ -5869,34 +6254,35 @@ func jsMask(code string) string {
 				i = n
 			}
 		case c == '`':
-			// Template literal: blank body but keep ${...} expressions.
-			// Expression braces (object literals, nested templates, strings)
-			// must not close the ${} early.
-			bodyStart := i + 1
-			j := bodyStart
-			for j < n && b[j] != '`' {
-				if b[j] == '\\' {
-					j++
-				}
-				j++
-			}
-			// A trailing lone backslash (`x = \`abc\`) walks j to n+1; the
-			// expression-slice loop below indexes b[k] for k < bodyEnd, so both
-			// bounds have to be clamped to the buffer.
-			bodyEnd := minInt(j, n)
-			i = minInt(j+1, n)
-			k := bodyStart
-			segStart := k
-			for k < bodyEnd {
-				if b[k] == '$' && k+1 < bodyEnd && b[k+1] == '{' {
-					blank(segStart, k)
-					k = jsScanExpr(b, k+2, bodyEnd, 1)
-					segStart = k
+			// Template literal: walk character-by-character (no pre-scan to
+			// the next backtick — nested templates and backtick-bearing
+			// strings live inside ${...} and must not truncate the body).
+			i++
+			segStart := i
+			for i < n {
+				if b[i] == '\\' {
+					i++
+					if i < n {
+						i++
+					}
 					continue
 				}
-				k++
+				if b[i] == '`' {
+					blank(segStart, i)
+					i++
+					break
+				}
+				if b[i] == '$' && i+1 < n && b[i+1] == '{' {
+					blank(segStart, i)
+					i = jsScanExpr(b, i+2, n, 1)
+					segStart = i
+					continue
+				}
+				i++
 			}
-			blank(segStart, bodyEnd)
+			if i >= n {
+				blank(segStart, n)
+			}
 		default:
 			i++
 		}
@@ -5960,7 +6346,7 @@ var codeSpawnPrims = []string{
 // codeAgentNames are the blocked nested-agent identifiers inside code.
 // Derived from the same list as blockedAgentExecutables so argv and code
 // screens stay aligned.
-var codeAgentNames = blockedAgentExecutableList
+var codeAgentNames = append([]string(nil), blockedAgentExecutableList...)
 
 // codeWritePrims are file write/delete/mutate primitives for strict
 // read-only, matched with identifier-boundary edges. Call sites that take a
@@ -6002,6 +6388,104 @@ var codeCompileToDiskLangs = map[string]bool{
 // it blocks code that both spawns processes AND names a blocked agent or a
 // herdr/herdsman mutation. For strict read-only it blocks spawn primitives,
 // file-write primitives, and compile-to-disk languages outright.
+
+// codeHasAgentCmdWord reports whether name appears as a shell-style command
+// word inside a string literal of code (start of string or after a shell
+// metacharacter/whitespace, with a non-identifier boundary after it). Used
+// for short false-positive-prone names like "at"/"su" that must not match
+// comments, prose ("failed at line 3"), or property calls (arr.at(-1)).
+func codeHasAgentCmdWord(code, name string) bool {
+	n := len(code)
+	i := 0
+	for i < n {
+		c := code[i]
+		switch {
+		case c == '#' && (i == 0 || code[i-1] == '\n' || code[i-1] == ' ' || code[i-1] == '\t' || code[i-1] == ';'):
+			// Python/shell line comment — skip (JS // handled below).
+			for i < n && code[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < n && code[i+1] == '/':
+			i += 2
+			for i < n && code[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < n && code[i+1] == '*':
+			i += 2
+			for i+1 < n && !(code[i] == '*' && code[i+1] == '/') {
+				i++
+			}
+			if i+1 < n {
+				i += 2
+			}
+		case c == '\'' || c == '"' || c == '`':
+			q := c
+			i++
+			start := i
+			for i < n && code[i] != q {
+				if code[i] == '\\' {
+					i++
+				}
+				if i < n {
+					i++
+				}
+			}
+			lit := code[start:i]
+			if stringHasCmdWord(lit, name) {
+				return true
+			}
+			if i < n {
+				i++ // closing quote
+			}
+		default:
+			i++
+		}
+	}
+	return false
+}
+
+// stringHasCmdWord reports whether name is the first token of a shell
+// command segment inside s (start of string or after ;|&\\n(), not mid-prose
+// like "failed at line 3" and not a ".at" property access).
+func stringHasCmdWord(s, name string) bool {
+	atCmd := true
+	i := 0
+	n := len(s)
+	for i < n {
+		for i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r') {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		if atCmd {
+			if strings.HasPrefix(s[i:], name) {
+				end := i + len(name)
+				if end >= n || !isIdentByte(s[end]) {
+					return true
+				}
+			}
+			atCmd = false
+		}
+		c := s[i]
+		switch c {
+		case ';', '|', '&', '\n', '(', ')':
+			atCmd = true
+			i++
+		default:
+			// Skip the rest of this token.
+			for i < n && s[i] != ' ' && s[i] != '\t' && s[i] != '\n' &&
+				s[i] != ';' && s[i] != '|' && s[i] != '&' && s[i] != '(' && s[i] != ')' {
+				i++
+			}
+			for i < n && (s[i] == ' ' || s[i] == '\t') {
+				i++
+			}
+		}
+	}
+	return false
+}
+
 func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) {
 	if !g.subagent && !g.strictReadonly {
 		return "", "" // main agent: no role guard runs at all
@@ -6131,6 +6615,15 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 			}
 			if !allResolved {
 				for _, name := range codeAgentNames {
+					// Short false-positive-prone names: only treat as a spawn
+					// target when they appear as a command word inside a
+					// string literal (not comments, prose, or .at( calls).
+					if name == "at" || name == "su" {
+						if codeHasAgentCmdWord(code, name) {
+							return ruleSubagentNestedAgent, "code spawns " + name
+						}
+						continue
+					}
 					if rawToks.hasIdent(name) {
 						return ruleSubagentNestedAgent, "code spawns " + name
 					}
@@ -7578,6 +8071,12 @@ func sqliteConnectReadonly(maskedInner, rawInner string) bool {
 // mode=ro query pair (file:...?mode=ro / &mode=ro, with optional further
 // params after it).
 func sqliteURIModeRO(uri string) bool {
+	// RFC 3986 / sqlite3ParseUri: '#' terminates path and query; fragment
+	// content is ignored. Truncate before looking for '?' so a forged
+	// fragment like file:x.db#?mode=ro cannot fake read-only mode.
+	if hash := strings.IndexByte(uri, '#'); hash >= 0 {
+		uri = uri[:hash]
+	}
 	// mode=ro is only meaningful in the URI query segment after '?'.
 	// A bare 'file:/tmp/x.db&mode=ro' (no '?') keeps &mode=ro as path text.
 	q := strings.IndexByte(uri, '?')

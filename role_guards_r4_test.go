@@ -145,7 +145,8 @@ func TestGuard_R4_ExecDashA(t *testing.T) {
 	}{
 		{name: "bash -c exec -a benign pig", argv: []string{"bash", "-c", "exec -a benign pig"}, want: "pig"},
 		{name: "exec -a name pig direct", argv: []string{"exec", "-a", "benign", "pig"}, want: "pig"},
-		{name: "exec -cl -a name agy", argv: []string{"exec", "-c", "-l", "-a", "x", "agy"}, want: "agy"},
+		{name: "exec -c -l -a name agy", argv: []string{"exec", "-c", "-l", "-a", "x", "agy"}, want: "agy"},
+		{name: "exec -cl -a name agy", argv: []string{"exec", "-cl", "-a", "x", "agy"}, want: "agy"},
 		{name: "exec -a name ls ok", argv: []string{"exec", "-a", "benign", "ls"}, want: ""},
 		{name: "bash -c exec ls ok", argv: []string{"bash", "-c", "exec ls /tmp"}, want: ""},
 	}
