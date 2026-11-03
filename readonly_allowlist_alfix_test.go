@@ -316,3 +316,181 @@ func TestReadonlyAllowlist_ToolsDescriptionSync(t *testing.T) {
 		t.Fatalf("ctxRunDescription must include readonly tools blurb; got %q", full)
 	}
 }
+
+// Round-2 Must Fix: bare make/compiler must be denied by the allowlist itself
+// (not only by the legacy fsWriteHeads fallback).
+func TestReadonlyAllowlist_BareMakeCompiler(t *testing.T) {
+	t.Setenv(auditEnvRole, "scout")
+	t.Setenv(auditEnvReadonly, "")
+
+	block := []struct {
+		name string
+		argv []string
+	}{
+		{name: "make bare", argv: []string{"make"}},
+		{name: "gmake bare", argv: []string{"gmake"}},
+		{name: "make all", argv: []string{"make", "all"}},
+		{name: "make -C", argv: []string{"make", "-C", "/tmp"}},
+		{name: "gcc bare", argv: []string{"gcc"}},
+		{name: "g++ bare", argv: []string{"g++"}},
+		{name: "cc bare", argv: []string{"cc"}},
+		{name: "clang bare", argv: []string{"clang"}},
+		{name: "clang++ bare", argv: []string{"clang++"}},
+	}
+	for _, tc := range block {
+		t.Run(tc.name, func(t *testing.T) {
+			// Assert the allowlist layer itself (legacy write-head fallback
+			// also blocks make/gcc; the hole was in checkCompilerQuery).
+			if got := screenReadonlyAllowlist(tc.argv); got == "" {
+				t.Fatalf("screenReadonlyAllowlist(%v) must block bare/non-query", tc.argv)
+			}
+			if got := guardArgvReadonly(tc.argv); got == "" {
+				t.Fatalf("guardArgvReadonly(%v) must block", tc.argv)
+			}
+		})
+	}
+	allow := []struct {
+		name string
+		argv []string
+	}{
+		{name: "make --version", argv: []string{"make", "--version"}},
+		{name: "make -v", argv: []string{"make", "-v"}},
+		{name: "make --help", argv: []string{"make", "--help"}},
+		{name: "make -h", argv: []string{"make", "-h"}},
+		{name: "gmake --version", argv: []string{"gmake", "--version"}},
+		{name: "gcc --version", argv: []string{"gcc", "--version"}},
+		{name: "gcc -dumpversion", argv: []string{"gcc", "-dumpversion"}},
+		{name: "clang --help", argv: []string{"clang", "--help"}},
+	}
+	for _, tc := range allow {
+		t.Run("allow/"+tc.name, func(t *testing.T) {
+			if got := screenReadonlyAllowlist(tc.argv); got != "" {
+				t.Fatalf("screenReadonlyAllowlist(%v) = %q, want allow", tc.argv, got)
+			}
+			if got := guardArgvReadonly(tc.argv); got != "" {
+				t.Fatalf("guardArgvReadonly(%v) = %q, want allow", tc.argv, got)
+			}
+		})
+	}
+}
+
+// Round-2 Must Fix: curl option values that begin with @ read local files.
+func TestReadonlyAllowlist_CurlAtFileValues(t *testing.T) {
+	t.Setenv(auditEnvRole, "reviewer")
+	t.Setenv(auditEnvReadonly, "")
+
+	block := []struct {
+		name string
+		argv []string
+	}{
+		{name: "-H @file", argv: []string{"curl", "-s", "-H", "@/etc/passwd", "https://x"}},
+		{name: "-H@file", argv: []string{"curl", "-s", "-H@/etc/passwd", "https://x"}},
+		{name: "--header @file", argv: []string{"curl", "-s", "--header", "@/etc/passwd", "https://x"}},
+		{name: "--header=@file", argv: []string{"curl", "-s", "--header=@/etc/passwd", "https://x"}},
+		{name: "-b @file", argv: []string{"curl", "-s", "-b", "@/etc/passwd", "https://x"}},
+		{name: "--cookie=@file", argv: []string{"curl", "-s", "--cookie=@/tmp/c", "https://x"}},
+		{name: "-u @file", argv: []string{"curl", "-s", "-u", "@/etc/passwd", "https://x"}},
+		{name: "-A @file", argv: []string{"curl", "-s", "-A", "@/etc/passwd", "https://x"}},
+		{name: "--user-agent=@file", argv: []string{"curl", "-s", "--user-agent=@/tmp/ua", "https://x"}},
+		{name: "--referer @file", argv: []string{"curl", "-s", "--referer", "@/tmp/r", "https://x"}},
+		{name: "-K config", argv: []string{"curl", "-K", "/tmp/curlrc", "https://x"}},
+		{name: "--config", argv: []string{"curl", "--config", "/tmp/curlrc", "https://x"}},
+	}
+	for _, tc := range block {
+		t.Run("block/"+tc.name, func(t *testing.T) {
+			got := guardArgvReadonly(tc.argv)
+			if got == "" {
+				t.Fatalf("expected block for %v", tc.argv)
+			}
+			if !strings.Contains(got, "@") && !strings.Contains(got, "config") &&
+				!strings.Contains(got, "-K") && !strings.Contains(got, "curl") {
+				t.Fatalf("expected @file/config in detail, got %q", got)
+			}
+		})
+	}
+	// Non-@ header values still allowed.
+	if got := guardArgvReadonly([]string{"curl", "-s", "-H", "Accept: application/json", "https://x"}); got != "" {
+		t.Fatalf("plain -H value must allow, got %q", got)
+	}
+	if got := guardArgvReadonly([]string{"curl", "-s", "--header=Accept: text/plain", "https://x"}); got != "" {
+		t.Fatalf("plain --header= value must allow, got %q", got)
+	}
+}
+
+// Round-2 Must Fix: sqlite3 fail-closed on any dot-command; only SELECT/WITH/
+// EXPLAIN/PRAGMA(no assign). Should Fix: --version/--help alone allowed.
+func TestReadonlyAllowlist_SqliteDotFailClosed(t *testing.T) {
+	t.Setenv(auditEnvRole, "scout")
+	t.Setenv(auditEnvReadonly, "")
+
+	allow := []struct {
+		name string
+		argv []string
+	}{
+		{name: "SELECT", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "SELECT 1"}},
+		{name: "select lower", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "select 1"}},
+		{name: "WITH", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "WITH c AS (SELECT 1) SELECT * FROM c"}},
+		{name: "EXPLAIN", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "EXPLAIN SELECT 1"}},
+		{name: "EXPLAIN QUERY PLAN", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "EXPLAIN QUERY PLAN SELECT 1"}},
+		{name: "PRAGMA info", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "PRAGMA table_info(t)"}},
+		{name: "--version alone", argv: []string{"sqlite3", "--version"}},
+		{name: "-version alone", argv: []string{"sqlite3", "-version"}},
+		{name: "--help alone", argv: []string{"sqlite3", "--help"}},
+		{name: "-help alone", argv: []string{"sqlite3", "-help"}},
+	}
+	for _, tc := range allow {
+		t.Run("allow/"+tc.name, func(t *testing.T) {
+			if got := guardArgvReadonly(tc.argv); got != "" {
+				t.Fatalf("expected allow for %v, got %q", tc.argv, got)
+			}
+		})
+	}
+
+	block := []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{name: ".read", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", ".read evil.sql"}, want: "dot"},
+		{name: ".READ upper", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", ".READ evil.sql"}, want: "dot"},
+		{name: ".load", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", ".load evil.so"}, want: "dot"},
+		{name: ".LOAD", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", ".LOAD /tmp/x.so"}, want: "dot"},
+		{name: ".shell", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", ".shell id"}, want: "dot"},
+		{name: "multi stmt dot", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "SELECT 1; .shell id"}, want: "dot"},
+		{name: "newline dot", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "SELECT 1\n.read x"}, want: "dot"},
+		{name: "leading ws dot", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "  .read x"}, want: "dot"},
+		{name: "INSERT", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "INSERT INTO t VALUES(1)"}, want: "sql"},
+		{name: "DELETE", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "DELETE FROM t"}, want: "sql"},
+		{name: "ATTACH", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "ATTACH 'x' AS o"}, want: "sql"},
+		{name: "PRAGMA assign", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "PRAGMA soft_heap_limit=1000"}, want: "pragma"},
+		{name: "version with db needs ro", argv: []string{"sqlite3", "--version", "/tmp/x.db"}, want: "readonly"},
+		{name: "help with db needs ro", argv: []string{"sqlite3", "-help", "/tmp/x.db"}, want: "readonly"},
+	}
+	for _, tc := range block {
+		t.Run("block/"+tc.name, func(t *testing.T) {
+			got := guardArgvReadonly(tc.argv)
+			if got == "" {
+				t.Fatalf("expected block for %v", tc.argv)
+			}
+			low := strings.ToLower(got)
+			if !strings.Contains(low, tc.want) && !strings.Contains(low, "sqlite") {
+				t.Fatalf("expected %q in %q", tc.want, got)
+			}
+		})
+	}
+}
+
+// Nice to Have: git config block hint points at --get / -l.
+func TestReadonlyAllowlist_GitConfigHint(t *testing.T) {
+	t.Setenv(auditEnvRole, "scout")
+	t.Setenv(auditEnvReadonly, "")
+
+	got := guardArgvReadonly([]string{"git", "config", "user.name"})
+	if got == "" {
+		t.Fatal("expected git config write block")
+	}
+	hinted := readonlyBlockWithHint(got)
+	if !strings.Contains(hinted, "--get") && !strings.Contains(hinted, "-l") {
+		t.Fatalf("expected --get/-l hint in %q", hinted)
+	}
+}

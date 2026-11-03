@@ -1055,6 +1055,9 @@ func checkCurlReadonly(argv []string) string {
 					i++
 					val = args[i]
 				}
+				if strings.HasPrefix(val, "@") {
+					return "curl @file"
+				}
 				if name == "request" {
 					m := strings.ToUpper(val)
 					if m != "GET" && m != "HEAD" && m != "OPTIONS" {
@@ -1072,8 +1075,16 @@ func checkCurlReadonly(argv []string) string {
 				continue
 			}
 			if longValue[name] {
-				if valGlued == "" {
+				val := valGlued
+				if val == "" {
+					if i+1 >= len(args) {
+						return "curl --" + name + " missing"
+					}
 					i++
+					val = args[i]
+				}
+				if strings.HasPrefix(val, "@") {
+					return "curl @file"
 				}
 				continue
 			}
@@ -1094,6 +1105,9 @@ func checkCurlReadonly(argv []string) string {
 					j = len(a)
 				} else {
 					return "curl -" + string(ch) + " missing"
+				}
+				if strings.HasPrefix(val, "@") {
+					return "curl @file"
 				}
 				switch ch {
 				case 'X':
@@ -1128,6 +1142,8 @@ func checkSqliteReadonly(argv []string) string {
 	var sqlParts []string
 	endOpts := false
 	sawDB := false
+	sawMeta := false // --version / --help
+	onlyMeta := true // no DB / SQL / other operational flags
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if !endOpts {
@@ -1137,12 +1153,16 @@ func checkSqliteReadonly(argv []string) string {
 				continue
 			case a == "-readonly" || a == "-read-only":
 				hasRO = true
+				onlyMeta = false
 				continue
-			case a == "-version" || a == "--version" || a == "-help" || a == "--help" ||
-				a == "-bail" || a == "-batch" || a == "-csv" || a == "-html" || a == "-json" ||
+			case a == "-version" || a == "--version" || a == "-help" || a == "--help":
+				sawMeta = true
+				continue
+			case a == "-bail" || a == "-batch" || a == "-csv" || a == "-html" || a == "-json" ||
 				a == "-list" || a == "-line" || a == "-markdown" || a == "-table" || a == "-box" ||
 				a == "-ascii" || a == "-noheader" || a == "-header" || a == "-tabs" ||
 				a == "-stats" || a == "-echo":
+				onlyMeta = false
 				continue
 			case a == "-separator" || a == "-nullvalue" || a == "-cmd" || a == "-init":
 				return "sqlite3 " + a
@@ -1152,6 +1172,7 @@ func checkSqliteReadonly(argv []string) string {
 		}
 		if !sawDB {
 			sawDB = true
+			onlyMeta = false
 			if strings.HasPrefix(a, "file:") {
 				if !sqliteURIModeRO(a) || sqliteURIHasRW(a) {
 					return "sqlite3 uri not ro"
@@ -1160,6 +1181,11 @@ func checkSqliteReadonly(argv []string) string {
 			continue
 		}
 		sqlParts = append(sqlParts, a)
+		onlyMeta = false
+	}
+	// Should Fix: version/help alone (no DB operand) needs no -readonly.
+	if sawMeta && onlyMeta && !sawDB && len(sqlParts) == 0 {
+		return ""
 	}
 	if !hasRO {
 		return "sqlite3 missing -readonly"
@@ -1169,21 +1195,65 @@ func checkSqliteReadonly(argv []string) string {
 	if len(sqlParts) == 0 {
 		return "sqlite3 missing sql"
 	}
-	sql := strings.Join(sqlParts, " ")
-	upper := strings.ToUpper(sql)
-	for _, bad := range []string{".SHELL", ".SYSTEM", ".OUTPUT", ".ONCE", ".IMPORT",
-		".BACKUP", ".RESTORE", ".DUMP", ".CLONE", ".LOG", ".SESSION", ".OPEN"} {
-		if strings.Contains(upper, bad) {
+	return sqliteSQLReadonlyAllow(strings.Join(sqlParts, " "))
+}
+
+// sqliteSQLReadonlyAllow fail-closes on any dot-command statement and only
+// allows statements that begin with SELECT / WITH / EXPLAIN / PRAGMA
+// (PRAGMA without '=' assignment). Case-insensitive; statements are split
+// on ';' and newlines after trimming leading whitespace.
+func sqliteSQLReadonlyAllow(sql string) string {
+	for _, raw := range splitSQLiteStatements(sql) {
+		stmt := strings.TrimSpace(raw)
+		if stmt == "" {
+			continue
+		}
+		if strings.HasPrefix(stmt, ".") {
 			return "sqlite3 dot-command"
 		}
-	}
-	for _, bad := range []string{"ATTACH", "DETACH", "INSERT", "UPDATE", "DELETE", "DROP",
-		"CREATE", "ALTER", "REPLACE", "VACUUM", "REINDEX"} {
-		if containsSQLKeyword(upper, bad) {
-			return "sqlite3 " + bad
+		upper := strings.ToUpper(stmt)
+		switch {
+		case sqliteStmtHasPrefix(upper, "SELECT"),
+			sqliteStmtHasPrefix(upper, "WITH"),
+			sqliteStmtHasPrefix(upper, "EXPLAIN"):
+			continue
+		case sqliteStmtHasPrefix(upper, "PRAGMA"):
+			if strings.Contains(stmt, "=") {
+				return "sqlite3 pragma assign"
+			}
+			continue
+		default:
+			return "sqlite3 sql not readonly"
 		}
 	}
 	return ""
+}
+
+func splitSQLiteStatements(sql string) []string {
+	var out []string
+	var cur strings.Builder
+	for _, r := range sql {
+		if r == ';' || r == '\n' {
+			out = append(out, cur.String())
+			cur.Reset()
+			continue
+		}
+		cur.WriteRune(r)
+	}
+	if cur.Len() > 0 {
+		out = append(out, cur.String())
+	}
+	return out
+}
+
+func sqliteStmtHasPrefix(upper, kw string) bool {
+	if !strings.HasPrefix(upper, kw) {
+		return false
+	}
+	if len(upper) == len(kw) {
+		return true
+	}
+	return !isSQLIdentChar(rune(upper[len(kw)]))
 }
 
 func sqliteURIHasRW(uri string) bool {
@@ -1631,8 +1701,23 @@ func checkKillReadonly(argv []string) string {
 func checkCompilerQuery(argv []string) string {
 	args := argv[1:]
 	base := filepath.Base(argv[0])
-	if len(args) == 0 {
+	// make/gmake: bare runs the default target — always deny unless the
+	// argv is solely a version/help query flag.
+	if base == "make" || base == "gmake" {
+		if len(args) == 0 {
+			return "make"
+		}
+		for _, a := range args {
+			if a == "--version" || a == "-v" || a == "--help" || a == "-h" {
+				continue
+			}
+			return "make"
+		}
 		return ""
+	}
+	// Other compilers/builders: bare argv is denied; only pure query flags.
+	if len(args) == 0 {
+		return base + " bare"
 	}
 	queryOK := func(a string) bool {
 		switch a {
@@ -1644,15 +1729,6 @@ func checkCompilerQuery(argv []string) string {
 			return true
 		}
 		return false
-	}
-	if base == "make" || base == "gmake" {
-		for _, a := range args {
-			if a == "--version" || a == "-v" || a == "--help" || a == "-h" {
-				continue
-			}
-			return "make"
-		}
-		return ""
 	}
 	for _, a := range args {
 		if !queryOK(a) {
@@ -1962,6 +2038,8 @@ func readonlyHintFor(detail string) string {
 		strings.Contains(d, "perl") && strings.Contains(d, "interpreter"),
 		strings.Contains(d, "ruby") && strings.Contains(d, "interpreter"):
 		return "for JSON use jq; for text/files use rg / rg --files; for file view use cat/head/sed -n"
+	case strings.Contains(d, "git config"):
+		return "use git config --get <key> or git config -l"
 	case strings.Contains(d, "sqlite") && strings.Contains(d, "readonly"):
 		return "add -readonly and pass SQL as a positional argument"
 	case strings.Contains(d, "sqlite") && strings.Contains(d, "sql"):
