@@ -1956,34 +1956,32 @@ func unwrapInterpreterInline(argv []string) (lang, code string, ok bool) {
 
 // ---------- rule 1: sub-agent nested-dispatch guard ----------
 
+// blockedAgentExecutableList is the canonical list of executables a
+// sub-agent must never spawn. blockedAgentExecutables (argv heads) and
+// codeAgentNames (in-code identifier scan) are both derived from it so the
+// two screens cannot drift.
+var blockedAgentExecutableList = []string{
+	"pig", "pi", "agy", "dispatch-agent", "dispatch-agent-go", "grok",
+	// Detached session managers let a sub-agent spawn an agent outside the
+	// audited ctx_run surface.
+	"tmux", "screen",
+	// Privilege / namespace / scheduler / remote wrappers whose inner command
+	// escapes the caller's role context or scheduling control.
+	"sudo", "doas", "su", "pkexec", "nsenter", "unshare", "chroot",
+	"systemd-run", "at", "ssh",
+}
+
 // blockedAgentExecutables are the agent executables a sub-agent must never
 // spawn from ctx_run. Matching is on filepath.Base of each command head, so a
 // bare name, an absolute path, or a worktree-relative path are all caught
 // while `echo pig` (pig is an argument, not a head) is not.
-var blockedAgentExecutables = map[string]bool{
-	"pig":               true,
-	"pi":                true,
-	"agy":               true,
-	"dispatch-agent":    true,
-	"dispatch-agent-go": true,
-	"grok":              true,
-	// Detached session managers let a sub-agent spawn an agent outside the
-	// audited ctx_run surface.
-	"tmux":   true,
-	"screen": true,
-	// Privilege / namespace / scheduler / remote wrappers whose inner command
-	// escapes the caller's role context or scheduling control.
-	"sudo":        true,
-	"doas":        true,
-	"su":          true,
-	"pkexec":      true,
-	"nsenter":     true,
-	"unshare":     true,
-	"chroot":      true,
-	"systemd-run": true,
-	"at":          true,
-	"ssh":         true,
-}
+var blockedAgentExecutables = func() map[string]bool {
+	m := make(map[string]bool, len(blockedAgentExecutableList))
+	for _, n := range blockedAgentExecutableList {
+		m[n] = true
+	}
+	return m
+}()
 
 // herdrReadonlySubs is the explicit whitelist of read-only herdr
 // invocations for a sub-agent: every entry is the exact subcommand WORD
@@ -5960,10 +5958,9 @@ var codeSpawnPrims = []string{
 }
 
 // codeAgentNames are the blocked nested-agent identifiers inside code.
-var codeAgentNames = []string{
-	"pig", "pi", "agy", "dispatch-agent", "dispatch-agent-go", "grok",
-	"tmux", "screen",
-}
+// Derived from the same list as blockedAgentExecutables so argv and code
+// screens stay aligned.
+var codeAgentNames = blockedAgentExecutableList
 
 // codeWritePrims are file write/delete/mutate primitives for strict
 // read-only, matched with identifier-boundary edges. Call sites that take a
