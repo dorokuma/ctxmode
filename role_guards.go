@@ -7403,10 +7403,17 @@ func sqliteConnectReadonly(maskedInner, rawInner string) bool {
 				} else {
 					dbLit = lit
 				}
+			case "timeout", "detect_types", "isolation_level", "check_same_thread", "cached_statements":
+				// Known sqlite3.connect kwargs that do not grant write access.
+			default:
+				return false // unknown keyword: fail closed
 			}
 			continue // keyword arg
 		}
 		positional++
+		if positional > 1 {
+			return false // second+ positional args are not vetted
+		}
 		if positional == 1 {
 			if sawDB {
 				return false // database given twice
@@ -7426,10 +7433,17 @@ func sqliteConnectReadonly(maskedInner, rawInner string) bool {
 // mode=ro query pair (file:...?mode=ro / &mode=ro, with optional further
 // params after it).
 func sqliteURIModeRO(uri string) bool {
+	// mode=ro is only meaningful in the URI query segment after '?'.
+	// A bare 'file:/tmp/x.db&mode=ro' (no '?') keeps &mode=ro as path text.
+	q := strings.IndexByte(uri, '?')
+	if q < 0 {
+		return false
+	}
+	query := uri[q:] // includes leading '?'
 	for _, sep := range []string{"?mode=ro", "&mode=ro"} {
-		if k := strings.Index(uri, sep); k >= 0 {
-			rest := uri[k+len(sep):]
-			if rest == "" || rest[0] == '&' {
+		if k := strings.Index(query, sep); k >= 0 {
+			rest := query[k+len(sep):]
+			if rest == "" || rest[0] == '&' || rest[0] == '#' {
 				return true
 			}
 		}
