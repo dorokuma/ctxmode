@@ -294,9 +294,10 @@ func (s *server) toolCtxBg(ctx context.Context, req *mcp.CallToolRequest, args c
 
 // ctxRunDescription is the registered description of the ctx_run tool.
 // The kind list must match validRunTaskKinds (run_task.go).
-const ctxRunDescription = "PRIMARY for commands/tests/builds. action=execute (shell/code; prefer argv; background is only valid here, returns immediately without proactive push—use ctx_bg action=wait once with id or pid), " +
+var ctxRunDescription = "PRIMARY for commands/tests/builds. action=execute (shell/code; prefer argv; background is only valid here, returns immediately without proactive push—use ctx_bg action=wait once with id or pid), " +
 	"execute_file (code over FILE_CONTENT), batch (many commands + optional queries), " +
-	"run_task (go_test|go_build|go_vet|npm_test|npm_run_build|cargo_test|cargo_build|make|custom; fixed argv). Large output auto-indexed."
+	"run_task (go_test|go_build|go_vet|npm_test|npm_run_build|cargo_test|cargo_build|make|custom; fixed argv). Large output auto-indexed.\n" +
+	readonlyToolsDescription()
 
 // boolPtr returns a distinct *bool so ToolAnnotations hints are not aliased.
 func boolPtr(v bool) *bool { return &v }

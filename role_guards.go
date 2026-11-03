@@ -115,6 +115,11 @@ type shellSegment struct {
 	// $(...)/`...` substitutions are scanned because the shell expands them
 	// unless the word was single-quoted.
 	hereString string
+	// processSubst marks that this segment used bash process substitution
+	// `<(...)` or `>(...)`. Strict read-only allowlist rejects these: the
+	// lexer previously mistook them for plain redirects and skipped the
+	// inner command, letting bash execute it unguarded.
+	processSubst bool
 	// depthExceeded marks a synthetic segment emitted when $(...)/`...`/(...)
 	// nesting exceeds shellSplitMaxDepth: the inner commands could not be
 	// parsed, so the guards must fail closed instead of silently dropping
@@ -688,6 +693,17 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 				i = next
 				continue
 			}
+			// Process substitution <(...): mark and skip the balanced group.
+			// Do NOT treat the `(...)` as a plain subshell — bash runs it as
+			// an anonymous fd producer for this command. Strict readonly rejects
+			// the parent segment via processSubst; inners are not emitted as
+			// sibling segments (that would surface unrelated allowlist hits).
+			if nlt == 1 && j < len(code) && code[j] == '(' {
+				flushWord()
+				cur.processSubst = true
+				i = skipBalanced(code, j, '(', ')')
+				continue
+			}
 			// `<`, `<<&`, `<&` input redirections: the target word is skipped
 			// (never a command head, never a write) but any $(...)/`...`
 			// inside it still runs — scan it like an output target does.
@@ -697,6 +713,13 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 		case '>':
 			if condDepth > 0 {
 				i++
+				continue
+			}
+			// Process substitution >(...): same as <( — mark and skip.
+			if i+1 < len(code) && code[i+1] == '(' {
+				flushWord()
+				cur.processSubst = true
+				i = skipBalanced(code, i+1, '(', ')')
 				continue
 			}
 			// Output redirect. The digits that may precede it (2>) were already
@@ -5948,7 +5971,7 @@ func guardShellReadonlyDepth(code string, depth int, caller callerIdentity) stri
 			if strings.HasPrefix(hit, "> ") || hit == depthExceededHit {
 				return hit
 			}
-			return allowlistDetail(hit)
+			return readonlyBlockWithHint(allowlistDetail(hit))
 		}
 		if hit := screenSegmentHeredocsDepth(seg, 'r', depth, caller); hit != "" {
 			return hit
@@ -9238,6 +9261,9 @@ func (g guardCall) guardCtxRunEnv(env map[string]string) (rule, detail string) {
 // wording names the rule and the matched head so an operator can pair the
 // error with the audit record's screen_rule mechanically.
 func guardBlockedError(rule, detail string) error {
+	if rule == ruleReadonlyWrite {
+		detail = readonlyBlockWithHint(detail)
+	}
 	return fmt.Errorf("blocked by role guard (%s): %s", rule, detail)
 }
 
