@@ -3346,7 +3346,8 @@ var gitReadonlySubs = map[string]bool{
 	"var": true, "version": true, "help": true,
 	"diff-tree": true, "diff-files": true, "diff-index": true,
 	"verify-commit": true, "verify-tag": true, "whatchanged": true,
-	"cherry": true, "count-objects": true, "fsck": true,
+	"cherry": true, "count-objects": true,
+	// fsck is dual-mode: plain checks are free, --lost-found writes.
 	// Dual-mode subcommands are handled in screenGitWrite and deliberately
 	// absent here: worktree, branch, tag, config, remote, stash.
 }
@@ -4137,17 +4138,72 @@ func ctxmodeCLIAction(args []string) string {
 // screenWgetWrite allows only explicit no-disk spellings (-O -, -O /dev/null,
 // --spider); every other wget invocation downloads to disk by default.
 func screenWgetWrite(args []string) string {
+	// Default wget writes the payload to a local file. --spider and
+	// -O - / -O /dev/null avoid that, but log-to-disk flags (-o/-a/
+	// --output-file/--append-output) are independent and still write.
+	okDownload := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--spider" {
-			return ""
+			okDownload = true
+			continue
 		}
-		if a == "-O" && i+1 < len(args) && (args[i+1] == "-" || args[i+1] == "/dev/null") {
-			return ""
+		if a == "-O" || a == "--output-document" {
+			if i+1 < len(args) {
+				dest := args[i+1]
+				i++
+				if dest == "-" || dest == "/dev/null" {
+					okDownload = true
+				} else {
+					return "wget"
+				}
+			}
+			continue
 		}
-		if strings.HasPrefix(a, "-O") && len(a) > 2 && (a[2:] == "-" || a[2:] == "/dev/null") {
-			return ""
+		if strings.HasPrefix(a, "-O") && len(a) > 2 {
+			dest := a[2:]
+			if dest == "-" || dest == "/dev/null" {
+				okDownload = true
+			} else {
+				return "wget"
+			}
+			continue
 		}
+		if strings.HasPrefix(a, "--output-document=") {
+			dest := a[len("--output-document="):]
+			if dest == "-" || dest == "/dev/null" {
+				okDownload = true
+			} else {
+				return "wget"
+			}
+			continue
+		}
+		// Log file destinations: stdout /dev/null stay free.
+		if a == "-o" || a == "-a" || a == "--output-file" || a == "--append-output" {
+			if i+1 < len(args) {
+				dest := args[i+1]
+				i++
+				if dest != "-" && dest != "/dev/null" {
+					return "wget"
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "--output-file=") {
+			if dest := a[len("--output-file="):]; dest != "-" && dest != "/dev/null" {
+				return "wget"
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "--append-output=") {
+			if dest := a[len("--append-output="):]; dest != "-" && dest != "/dev/null" {
+				return "wget"
+			}
+			continue
+		}
+	}
+	if okDownload {
+		return ""
 	}
 	return "wget"
 }
@@ -4507,6 +4563,15 @@ subFound:
 			return ""
 		}
 		return "git reflog " + rest[0]
+	case "fsck":
+		// Plain fsck / connectivity checks are read-only; --lost-found
+		// writes dangling objects into .git/lost-found/.
+		for _, a := range rest {
+			if a == "--lost-found" {
+				return "git fsck --lost-found"
+			}
+		}
+		return ""
 	case "submodule":
 		// Bare `git submodule`, `status`, `summary`, --help inspect; init/
 		// update/add/deinit/sync/set-url/set-branch/foreach/absorbgitdirs
