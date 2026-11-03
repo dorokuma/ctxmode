@@ -1283,7 +1283,32 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 				i++
 			}
 			i = skipDashDash(argv, i)
-		case "exec", "nohup":
+		case "exec":
+			// bash exec [-cl] [-a name] [--] command: skip option run so
+			// `exec -a benign pig` peels to `pig`.
+			i++
+			for i < len(argv) {
+				a := argv[i]
+				if a == "--" {
+					i++
+					break
+				}
+				if a == "-a" {
+					i += 2 // -a name
+					continue
+				}
+				if a == "-c" || a == "-l" {
+					i++
+					continue
+				}
+				// Glued clusters like -cl: all boolean; -aNAME is not used by bash.
+				if strings.HasPrefix(a, "-") && a != "-" && !strings.HasPrefix(a, "--") {
+					i++
+					continue
+				}
+				break
+			}
+		case "nohup":
 			i++
 			i = skipDashDash(argv, i)
 		case "setsid":
@@ -2413,7 +2438,32 @@ func wrapperWriteOpHit(argv []string) string {
 				i++
 			}
 			i = skipDashDash(argv, i)
-		case "exec", "nohup":
+		case "exec":
+			// bash exec [-cl] [-a name] [--] command: skip option run so
+			// `exec -a benign pig` peels to `pig`.
+			i++
+			for i < len(argv) {
+				a := argv[i]
+				if a == "--" {
+					i++
+					break
+				}
+				if a == "-a" {
+					i += 2 // -a name
+					continue
+				}
+				if a == "-c" || a == "-l" {
+					i++
+					continue
+				}
+				// Glued clusters like -cl: all boolean; -aNAME is not used by bash.
+				if strings.HasPrefix(a, "-") && a != "-" && !strings.HasPrefix(a, "--") {
+					i++
+					continue
+				}
+				break
+			}
+		case "nohup":
 			i++
 			i = skipDashDash(argv, i)
 		case "setsid":
@@ -2909,7 +2959,9 @@ func screenUnsetArgs(args []string, kind byte) string {
 func xargsTargetIndex(argv []string) int {
 	i := 1
 	longWithValue := map[string]bool{
-		"--arg-file": true, "--delimiter": true, "--eof": true,
+		"--arg-file": true, "--delimiter": true,
+		// GNU --eof takes an optional value only via --eof=STR; bare --eof
+		// must NOT consume the next argv (unlike -E which requires a value).
 		"--max-args": true, "--max-lines": true, "--max-procs": true,
 		"--max-chars": true, "--process-slot-var": true,
 	}
