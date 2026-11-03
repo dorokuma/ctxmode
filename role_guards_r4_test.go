@@ -231,3 +231,55 @@ func TestGuard_R4_SedNegationAndCustomAddr(t *testing.T) {
 		})
 	}
 }
+// TestGuard_R4_JSTemplateBraceDepth keeps ${} expressions intact when they
+// contain nested object literals, strings, or nested templates so write
+// primitives inside the expression are still visible to the screen.
+func TestGuard_R4_JSTemplateBraceDepth(t *testing.T) {
+	strict := guardCall{strictReadonly: true}
+	cases := []struct {
+		name string
+		code string
+		want bool // blocked?
+	}{
+		{
+			name: "object literal in ${}",
+			code: "`${({a:1}, fs.writeFileSync('/tmp/x','a'))}`",
+			want: true,
+		},
+		{
+			name: "nested braces variant",
+			code: "`${({a:{b:2}}, fs.appendFileSync('/tmp/y','b'))}`",
+			want: true,
+		},
+		{
+			name: "string with braces in ${}",
+			code: "`${(fs.writeFileSync('/tmp/z','{not}'), 1)}`",
+			want: true,
+		},
+		{
+			name: "nested template in ${}",
+			code: "`${(fs.writeFileSync('/tmp/n',`{x}`), 1)}`",
+			want: true,
+		},
+		{
+			name: "template body mention only ok",
+			code: "`hello fs.writeFileSync ignored ${1+1}`",
+			want: false,
+		},
+		{
+			name: "plain read in ${} ok",
+			code: "`${fs.readFileSync('/tmp/x')}`",
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rule, detail := strict.guardCtxRunCode("javascript", tc.code)
+			blocked := rule == ruleReadonlyWrite
+			if blocked != tc.want {
+				t.Fatalf("guardCtxRunCode(%q) rule=%q detail=%q, want blocked=%v",
+					tc.code, rule, detail, tc.want)
+			}
+		})
+	}
+}
