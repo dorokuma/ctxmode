@@ -283,3 +283,46 @@ func TestGuard_R4_JSTemplateBraceDepth(t *testing.T) {
 		})
 	}
 }
+// TestGuard_R4_CodeAgentNamesAlign checks codeAgentNames covers every
+// argv-side blockedAgentExecutables entry (at least ssh/sudo) and that
+// unresolved code spawns naming those targets are blocked.
+func TestGuard_R4_CodeAgentNamesAlign(t *testing.T) {
+	names := map[string]bool{}
+	for _, n := range codeAgentNames {
+		names[n] = true
+	}
+	for n := range blockedAgentExecutables {
+		if !names[n] {
+			t.Errorf("codeAgentNames missing argv-blocked %q", n)
+		}
+	}
+	for _, need := range []string{"ssh", "sudo"} {
+		if !names[need] {
+			t.Errorf("codeAgentNames must include %q", need)
+		}
+	}
+
+	sub := guardCall{subagent: true}
+	cases := []struct {
+		name string
+		code string
+		want bool
+	}{
+		{name: "dynamic spawn ssh", code: "import subprocess; subprocess.run(cmd)  # ssh", want: true},
+		{name: "dynamic spawn sudo", code: "import os; os.system(x)  # sudo -u root id", want: true},
+		{name: "static ssh argv", code: "import subprocess; subprocess.run(['ssh','host'])", want: true},
+		{name: "static sudo argv", code: "import subprocess; subprocess.run(['sudo','id'])", want: true},
+		{name: "mention ssh no spawn ok", code: "x = 'ssh'; print(x)", want: false},
+		{name: "static ls ok", code: "import subprocess; subprocess.run(['ls'])", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rule, detail := sub.guardCtxRunCode("python", tc.code)
+			blocked := rule == ruleSubagentNestedAgent
+			if blocked != tc.want {
+				t.Fatalf("guardCtxRunCode(%q) rule=%q detail=%q, want blocked=%v",
+					tc.code, rule, detail, tc.want)
+			}
+		})
+	}
+}
