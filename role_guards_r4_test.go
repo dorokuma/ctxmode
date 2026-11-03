@@ -23,7 +23,7 @@ func TestGuard_R4_FsckLostFound(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := guardArgvReadonly(tc.argv)
-			if got != tc.want {
+			if !readonlyWantMatch(got, tc.want) {
 				t.Fatalf("guardArgvReadonly(%v) = %q, want %q", tc.argv, got, tc.want)
 			}
 		})
@@ -45,14 +45,14 @@ func TestGuard_R4_WgetLogFile(t *testing.T) {
 		{name: "wget -O - -o log", argv: []string{"wget", "-O", "-", "-o", "/tmp/log", "https://x"}, want: "wget"},
 		{name: "wget --spider --output-file", argv: []string{"wget", "--spider", "--output-file=/tmp/log", "https://x"}, want: "wget"},
 		{name: "wget -O - -a log", argv: []string{"wget", "-O", "-", "-a", "/tmp/log", "https://x"}, want: "wget"},
-		{name: "wget -O - ok", argv: []string{"wget", "-O", "-", "https://x"}, want: ""},
-		{name: "wget --spider ok", argv: []string{"wget", "--spider", "https://x"}, want: ""},
-		{name: "wget -O - -o - ok", argv: []string{"wget", "-O", "-", "-o", "-", "https://x"}, want: ""},
+		{name: "wget -O - ok", argv: []string{"wget", "-O", "-", "https://x"}, want: "unknown command wget"},
+		{name: "wget --spider ok", argv: []string{"wget", "--spider", "https://x"}, want: "unknown command wget"},
+		{name: "wget -O - -o - ok", argv: []string{"wget", "-O", "-", "-o", "-", "https://x"}, want: "unknown command wget"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := guardArgvReadonly(tc.argv)
-			if got != tc.want {
+			if !readonlyWantMatch(got, tc.want) {
 				t.Fatalf("guardArgvReadonly(%v) = %q, want %q", tc.argv, got, tc.want)
 			}
 		})
@@ -210,7 +210,7 @@ func TestGuard_R4_SedNegationAndCustomAddr(t *testing.T) {
 	for _, tc := range roCases {
 		t.Run("ro/"+tc.name, func(t *testing.T) {
 			got := guardArgvReadonly(tc.argv)
-			if got != tc.want {
+			if !readonlyWantMatch(got, tc.want) {
 				t.Fatalf("guardArgvReadonly(%v) = %q, want %q", tc.argv, got, tc.want)
 			}
 		})

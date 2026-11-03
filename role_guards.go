@@ -106,6 +106,9 @@ type shellSegment struct {
 	// (it follows a bare `|`). A shell/interpreter head with pipedStdin reads
 	// its PROGRAM from the pipe — the upstream bytes are code, not data.
 	pipedStdin bool
+	// backgrounded marks a segment terminated by a bare `&` (background job).
+	// Strict read-only allowlist policy rejects background execution.
+	backgrounded bool
 	// hereString is the `<<< word` payload this command consumed: the bytes
 	// it reads on stdin. Like heredoc bodies it is screened as code when the
 	// head is a shell/interpreter reading its program from stdin, and its
@@ -474,11 +477,13 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 				continue
 			}
 			flushWord()
-			flushSeg()
 			if i+1 < len(code) && code[i+1] == '&' {
+				flushSeg()
 				segPipeIn = false // &&: no pipe relationship
 				i += 2
 			} else {
+				cur.backgrounded = true
+				flushSeg()
 				segPipeIn = false // & backgrounds: no pipe relationship
 				i++
 			}
@@ -2565,6 +2570,10 @@ func peelResolvedDepth(argv []string, kind byte, depth int, caller callerIdentit
 		if hit := wrapperWriteOpHit(argv); hit != "" {
 			return hit
 		}
+		// Reject exec/eval/source before peelWrappers strips them.
+		if hit := readonlyPrePeelHit(argv); hit != "" {
+			return allowlistDetail(hit)
+		}
 	}
 	i, splitPayloads, envAs, exhausted := peelWrappers(argv)
 	if exhausted {
@@ -2637,14 +2646,16 @@ func peelResolvedDepth(argv []string, kind byte, depth int, caller callerIdentit
 	}
 	if lang, code, has := unwrapInterpreterInline(head); has {
 		if lang == "python-module" {
-			// `python -m MOD` runs MOD, not the interpreter's own code path:
-			// a strict read-only caller gets the default-deny module model
-			// (http.server, compileall, venv, a local evil_mod and every other
-			// unvetted module block; only a pure --help and the side-effect-free
-			// text filters stay free), a sub-agent gets the nested-dispatch
-			// screen on MOD and its operands (`python -m pip install pig`).
+			// Strict read-only: only safe modules (json.tool/pprint) and
+			// pure --help queries pass; everything else is denied.
 			if kind == 'r' {
-				return screenReadonlyWrite(head)
+				if hit, has := pythonModuleHit(head[1:]); has {
+					if hit != "" {
+						return allowlistDetail(hit)
+					}
+					return ""
+				}
+				return allowlistDetail("python interpreter")
 			}
 			if modArgv := pythonModuleArgvFrom(head); len(modArgv) > 0 {
 				if hit := screenNestedDispatch(modArgv); hit != "" {
@@ -2652,6 +2663,10 @@ func peelResolvedDepth(argv []string, kind byte, depth int, caller callerIdentit
 				}
 			}
 			return ""
+		}
+		// Strict read-only: any interpreter inline program text is denied.
+		if kind == 'r' {
+			return allowlistDetail(lang + " program text")
 		}
 		g := guardCall{}
 		if kind == 's' {
@@ -2676,6 +2691,9 @@ func peelResolvedDepth(argv []string, kind byte, depth int, caller callerIdentit
 	}
 	// eval: join remaining args and screen as shell text.
 	if base == "eval" && len(head) > 1 {
+		if kind == 'r' {
+			return allowlistDetail("eval")
+		}
 		text := strings.Join(head[1:], " ")
 		if kind == 's' {
 			return guardShellSubagentDepth(text, depth+1, caller)
@@ -2692,6 +2710,12 @@ func peelResolvedDepth(argv []string, kind byte, depth int, caller callerIdentit
 	// find: scan for -exec/-execdir/-ok/-okdir (inner command recursion, all
 	// callers) and -delete/-fprint* (strict read-only only).
 	if base == "find" {
+		if kind == 'r' {
+			if hit := screenReadonlyAllowlist(typedHead); hit != "" {
+				return allowlistDetail(hit)
+			}
+			return screenFindArgs(head[1:], kind, depth+1, caller)
+		}
 		return screenFindArgs(head[1:], kind, depth+1, caller)
 	}
 	// trap: a non-print action argument is shell text to screen.
@@ -2781,6 +2805,10 @@ func peelResolvedDepth(argv []string, kind byte, depth int, caller callerIdentit
 	// alike (headBaseAliasHits walks both inside each screen).
 	if kind == 's' {
 		return screenNestedDispatch(typedHead)
+	}
+	// Primary: default-deny allowlist. Secondary: legacy blacklist.
+	if hit := screenReadonlyAllowlist(typedHead); hit != "" {
+		return allowlistDetail(hit)
 	}
 	return screenReadonlyWrite(typedHead)
 }
@@ -5915,8 +5943,12 @@ func guardShellReadonlyDepth(code string, depth int, caller callerIdentity) stri
 		if seg.depthExceeded {
 			return depthExceededHit
 		}
-		if seg.redirectFile != "" {
-			return "> " + seg.redirectFile
+		// Allowlist structural gate runs before the legacy blacklist layer.
+		if hit := allowlistShellStructuralHit(seg); hit != "" {
+			if strings.HasPrefix(hit, "> ") || hit == depthExceededHit {
+				return hit
+			}
+			return allowlistDetail(hit)
 		}
 		if hit := screenSegmentHeredocsDepth(seg, 'r', depth, caller); hit != "" {
 			return hit
