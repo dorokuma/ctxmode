@@ -4027,12 +4027,34 @@ func sedExecCommands(s string) []string {
 			}
 			out = append(out, strings.TrimSpace(s[i:j]))
 			i = j
-		case c >= '0' && c <= '9' || c == '$' || c == ',' || c == '~' || c == '+' || c == '!' || c == '\\':
-			// Address components / negation / escapes: skip one byte.
+		case c >= '0' && c <= '9' || c == '$' || c == ',' || c == '~' || c == '+' || c == '!':
+			// Address components / negation: keep atCmdStart so the following
+			// letter is still read as a command (1!e cmd).
 			i++
-			if c == '\\' && i < n {
+		case c == '\\':
+			// Custom-delimiter regex address \c...c (e.g. \|root|e pig).
+			if i+1 >= n {
+				i = n
+				break
+			}
+			delim := s[i+1]
+			i += 2
+			for i < n {
+				if s[i] == '\\' {
+					if i+1 < n {
+						i += 2
+					} else {
+						i = n
+					}
+					continue
+				}
+				if s[i] == delim {
+					i++
+					break
+				}
 				i++
 			}
+			atCmdStart = true // an address precedes a command
 		default:
 			// Any other command letter consumes the rest of its command.
 			atCmdStart = false
@@ -5176,11 +5198,30 @@ func sedScriptHasWrite(s string) string {
 			}
 		case c == '$' || c >= '0' && c <= '9' || c == '~' || c == '+' || c == ',':
 			i++ // address components
+		case c == '!':
+			i++ // address negation: 1!w / /pat/!w
 		case c == '\\':
-			if i+1 < n {
-				i += 2
-			} else {
+			// Custom-delimiter regex address \c...c (e.g. \|root|w).
+			if i+1 >= n {
 				i = n
+				break
+			}
+			delim := s[i+1]
+			i += 2
+			for i < n {
+				if s[i] == '\\' {
+					if i+1 < n {
+						i += 2
+					} else {
+						i = n
+					}
+					continue
+				}
+				if s[i] == delim {
+					i++
+					break
+				}
+				i++
 			}
 		case c == 's':
 			// s<delim><pat><delim><repl><delim><flags>
