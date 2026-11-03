@@ -184,3 +184,50 @@ func TestGuard_R4_XargsEof(t *testing.T) {
 		})
 	}
 }
+// TestGuard_R4_SedNegationAndCustomAddr covers sed address negation (!)
+// and \c...\c custom-delimiter addresses before w/e commands.
+func TestGuard_R4_SedNegationAndCustomAddr(t *testing.T) {
+	t.Setenv(auditEnvRole, "reviewer")
+	t.Setenv(auditEnvReadonly, "")
+
+	roCases := []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{name: "sed 1!w", argv: []string{"sed", "1!w /tmp/out"}, want: "sed w"},
+		{name: "sed /pat/!w", argv: []string{"sed", "/root/!w /tmp/out"}, want: "sed w"},
+		{name: "sed custom delim w", argv: []string{"sed", `\|root|w /tmp/out`}, want: "sed w"},
+		{name: "sed custom delim W", argv: []string{"sed", `\#root#W /tmp/out`}, want: "sed W"},
+		{name: "sed plain w still", argv: []string{"sed", "w /tmp/out"}, want: "sed w"},
+		{name: "sed -n p ok", argv: []string{"sed", "-n", "1!p"}, want: ""},
+		{name: "sed custom delim p ok", argv: []string{"sed", `-n`, `\|root|p`}, want: ""},
+	}
+	for _, tc := range roCases {
+		t.Run("ro/"+tc.name, func(t *testing.T) {
+			got := guardArgvReadonly(tc.argv)
+			if got != tc.want {
+				t.Fatalf("guardArgvReadonly(%v) = %q, want %q", tc.argv, got, tc.want)
+			}
+		})
+	}
+
+	t.Setenv(auditEnvRole, "worker")
+	subCases := []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{name: "sed custom delim e pig", argv: []string{"sed", `\|root|e pig`}, want: "pig"},
+		{name: "sed 1!e agy", argv: []string{"sed", "1!e agy"}, want: "agy"},
+		{name: "sed custom delim e ls", argv: []string{"sed", `\|root|e ls`}, want: "sed e"},
+	}
+	for _, tc := range subCases {
+		t.Run("sub/"+tc.name, func(t *testing.T) {
+			got := guardArgvSubagent(tc.argv)
+			if got != tc.want {
+				t.Fatalf("guardArgvSubagent(%v) = %q, want %q", tc.argv, got, tc.want)
+			}
+		})
+	}
+}
