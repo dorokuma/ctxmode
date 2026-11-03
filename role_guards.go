@@ -3409,7 +3409,9 @@ func screenGoWrite(args []string) string {
 			if !seenEnv {
 				continue
 			}
-			if a == "-w" || a == "-u" || strings.HasPrefix(a, "-w") || strings.HasPrefix(a, "-u") {
+			if a == "-w" || a == "-u" || a == "--w" || a == "--u" ||
+				strings.HasPrefix(a, "-w") || strings.HasPrefix(a, "-u") ||
+				strings.HasPrefix(a, "--w=") || strings.HasPrefix(a, "--u=") {
 				return "go env " + a
 			}
 		}
@@ -5823,14 +5825,7 @@ func pythonModuleHit(args []string) (hit string, hasModule bool) {
 	if strings.Contains(mod, cmdSubPlaceholder) {
 		return "python -m <dynamic>", true // module name generated at run time
 	}
-	// `--` ends the module's option run: after it everything is positional
-	// data, so `python -m json.tool -- -o` cannot carry an output flag.
-	for j, a := range rest {
-		if a == "--" {
-			rest = rest[:j]
-			break
-		}
-	}
+	// `--` ends options; positionals after it still count (outfile path).
 	switch {
 	case allQueryArgs(rest):
 		return "", true // `python -m x --help`
@@ -5864,23 +5859,46 @@ func allQueryArgs(args []string) bool {
 // take. Any spelling that names an output file (-o/--out/--inplace) blocks.
 var pythonSafeModules = map[string]bool{
 	"json.tool": true,
-	"pprint":    true,
 }
 
 // moduleWritesOutput reports whether a `python -m` module run carries an
-// output-file flag: `-o FILE`/`--out FILE` (json.tool), the glued
-// `--out=FILE`/`-oFILE` forms, or an in-place flag. `--outdir`-style options
-// that merely START with a flag name are not matches.
+// output-file flag OR a second positional output path. json.tool takes
+// `[infile [outfile]]` — two positionals overwrite outfile. After `--`,
+// every operand is positional (`python -m json.tool -- -o` is infile "-o").
 func moduleWritesOutput(args []string) bool {
+	pos := 0
+	endOpts := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if endOpts {
+			pos++
+			if pos > 1 {
+				return true
+			}
+			continue
+		}
 		switch {
+		case a == "--":
+			endOpts = true
 		case a == "-o" || a == "--out" || a == "--output" || a == "--outfile" || a == "-O" || a == "--inplace" || a == "--in-place":
 			return true
 		case strings.HasPrefix(a, "--out="), strings.HasPrefix(a, "--output="), strings.HasPrefix(a, "--outfile="):
 			return true
-		case strings.HasPrefix(a, "-o") && len(a) > 2:
+		case strings.HasPrefix(a, "-o") && len(a) > 2 && a != "-o":
 			return true
+		case a == "--indent":
+			if i+1 < len(args) {
+				i++
+			}
+		case strings.HasPrefix(a, "--indent="):
+			// glued
+		case strings.HasPrefix(a, "-") && a != "-":
+			// other module flags
+		default:
+			pos++
+			if pos > 1 {
+				return true
+			}
 		}
 	}
 	return false

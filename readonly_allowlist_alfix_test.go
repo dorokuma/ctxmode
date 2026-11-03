@@ -63,10 +63,7 @@ func TestReadonlyAllowlist_CurlOptionAllowlist(t *testing.T) {
 		{name: "curl -m", argv: []string{"curl", "-s", "-m", "10", "https://example.com"}},
 		{name: "curl --max-time", argv: []string{"curl", "-s", "--max-time", "10", "https://example.com"}},
 		{name: "curl --connect-timeout", argv: []string{"curl", "-s", "--connect-timeout", "5", "https://example.com"}},
-		{name: "curl -w", argv: []string{"curl", "-s", "-w", "%{http_code}", "https://example.com"}},
 		{name: "curl -X GET", argv: []string{"curl", "-s", "-X", "GET", "https://example.com"}},
-		{name: "curl -o dash", argv: []string{"curl", "-s", "-o", "-", "https://example.com"}},
-		{name: "curl -o /dev/null", argv: []string{"curl", "-s", "-o", "/dev/null", "https://example.com"}},
 		{name: "curl --head", argv: []string{"curl", "--head", "https://example.com"}},
 	}
 	for _, tc := range allow {
@@ -120,7 +117,7 @@ func TestReadonlyAllowlist_SqliteStrict(t *testing.T) {
 	t.Setenv(auditEnvReadonly, "")
 
 	t.Run("allow with sql", func(t *testing.T) {
-		got := guardArgvReadonly([]string{"sqlite3", "-readonly", "/tmp/x.db", "SELECT 1"})
+		got := guardArgvReadonly([]string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "SELECT 1"})
 		if got != "" {
 			t.Fatalf("expected allow, got %q", got)
 		}
@@ -131,12 +128,12 @@ func TestReadonlyAllowlist_SqliteStrict(t *testing.T) {
 		code string
 		want string
 	}{
-		{name: "no sql argv", argv: []string{"sqlite3", "-readonly", "/tmp/x.db"}, want: "sql"},
-		{name: "piped stdin", code: `echo '.shell id' | sqlite3 -readonly /tmp/x.db`, want: "sql"},
-		{name: "heredoc", code: "sqlite3 -readonly /tmp/x.db <<'EOF'\n.shell id\nEOF", want: "sql"},
-		{name: "here string", code: `sqlite3 -readonly /tmp/x.db <<< '.shell id'`, want: "sql"},
-		{name: "missing readonly", argv: []string{"sqlite3", "/tmp/x.db", "SELECT 1"}, want: "readonly"},
-		{name: "dot shell in sql", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", ".shell id"}, want: "dot-command"},
+		{name: "no sql argv", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db"}, want: "sql"},
+		{name: "piped stdin", code: `echo '.shell id' | sqlite3 -readonly -safe /tmp/x.db`, want: "sql"},
+		{name: "heredoc", code: "sqlite3 -readonly -safe /tmp/x.db <<'EOF'\n.shell id\nEOF", want: "sql"},
+		{name: "here string", code: `sqlite3 -readonly -safe /tmp/x.db <<< '.shell id'`, want: "sql"},
+		{name: "missing safe", argv: []string{"sqlite3", "/tmp/x.db", "SELECT 1"}, want: "safe"},
+		{name: "dot shell in sql", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", ".shell id"}, want: "dot-command"},
 	}
 	for _, tc := range block {
 		t.Run(tc.name, func(t *testing.T) {
@@ -244,7 +241,7 @@ func TestReadonlyAllowlist_BlockHints(t *testing.T) {
 	}{
 		{name: "python -c", argv: []string{"python3", "-c", "print(1)"}, hint: "jq"},
 		{name: "node -e", argv: []string{"node", "-e", "1"}, hint: "jq"},
-		{name: "sqlite no ro", argv: []string{"sqlite3", "/tmp/x.db", "SELECT 1"}, hint: "-readonly"},
+		{name: "sqlite no safe", argv: []string{"sqlite3", "/tmp/x.db", "SELECT 1"}, hint: "-safe"},
 		{name: "go test", argv: []string{"go", "test", "./..."}, hint: "verifier"},
 		{name: "process subst", code: `cat <(echo hi)`, hint: "pipe"},
 	}
@@ -427,12 +424,12 @@ func TestReadonlyAllowlist_SqliteDotFailClosed(t *testing.T) {
 		name string
 		argv []string
 	}{
-		{name: "SELECT", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "SELECT 1"}},
-		{name: "select lower", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "select 1"}},
-		{name: "WITH", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "WITH c AS (SELECT 1) SELECT * FROM c"}},
-		{name: "EXPLAIN", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "EXPLAIN SELECT 1"}},
-		{name: "EXPLAIN QUERY PLAN", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "EXPLAIN QUERY PLAN SELECT 1"}},
-		{name: "PRAGMA info", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "PRAGMA table_info(t)"}},
+		{name: "SELECT", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "SELECT 1"}},
+		{name: "select lower", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "select 1"}},
+		{name: "WITH", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "WITH c AS (SELECT 1) SELECT * FROM c"}},
+		{name: "EXPLAIN", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "EXPLAIN SELECT 1"}},
+		{name: "EXPLAIN QUERY PLAN", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "EXPLAIN QUERY PLAN SELECT 1"}},
+		{name: "PRAGMA info", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "PRAGMA table_info(t)"}},
 		{name: "--version alone", argv: []string{"sqlite3", "--version"}},
 		{name: "-version alone", argv: []string{"sqlite3", "-version"}},
 		{name: "--help alone", argv: []string{"sqlite3", "--help"}},
@@ -451,20 +448,20 @@ func TestReadonlyAllowlist_SqliteDotFailClosed(t *testing.T) {
 		argv []string
 		want string
 	}{
-		{name: ".read", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", ".read evil.sql"}, want: "dot"},
-		{name: ".READ upper", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", ".READ evil.sql"}, want: "dot"},
-		{name: ".load", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", ".load evil.so"}, want: "dot"},
-		{name: ".LOAD", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", ".LOAD /tmp/x.so"}, want: "dot"},
-		{name: ".shell", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", ".shell id"}, want: "dot"},
-		{name: "multi stmt dot", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "SELECT 1; .shell id"}, want: "dot"},
-		{name: "newline dot", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "SELECT 1\n.read x"}, want: "dot"},
-		{name: "leading ws dot", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "  .read x"}, want: "dot"},
-		{name: "INSERT", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "INSERT INTO t VALUES(1)"}, want: "sql"},
-		{name: "DELETE", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "DELETE FROM t"}, want: "sql"},
-		{name: "ATTACH", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "ATTACH 'x' AS o"}, want: "sql"},
-		{name: "PRAGMA assign", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "PRAGMA soft_heap_limit=1000"}, want: "pragma"},
-		{name: "version with db needs ro", argv: []string{"sqlite3", "--version", "/tmp/x.db"}, want: "readonly"},
-		{name: "help with db needs ro", argv: []string{"sqlite3", "-help", "/tmp/x.db"}, want: "readonly"},
+		{name: ".read", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", ".read evil.sql"}, want: "dot"},
+		{name: ".READ upper", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", ".READ evil.sql"}, want: "dot"},
+		{name: ".load", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", ".load evil.so"}, want: "dot"},
+		{name: ".LOAD", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", ".LOAD /tmp/x.so"}, want: "dot"},
+		{name: ".shell", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", ".shell id"}, want: "dot"},
+		{name: "multi stmt dot", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "SELECT 1; .shell id"}, want: "dot"},
+		{name: "newline dot", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "SELECT 1\n.read x"}, want: "dot"},
+		{name: "leading ws dot", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "  .read x"}, want: "dot"},
+		{name: "INSERT", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "INSERT INTO t VALUES(1)"}, want: "sql"},
+		{name: "DELETE", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "DELETE FROM t"}, want: "sql"},
+		{name: "ATTACH", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "ATTACH 'x' AS o"}, want: "sql"},
+		{name: "PRAGMA assign", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "PRAGMA soft_heap_limit=1000"}, want: "pragma"},
+		{name: "version with db needs safe", argv: []string{"sqlite3", "--version", "/tmp/x.db"}, want: "safe"},
+		{name: "help with db needs safe", argv: []string{"sqlite3", "-help", "/tmp/x.db"}, want: "safe"},
 	}
 	for _, tc := range block {
 		t.Run("block/"+tc.name, func(t *testing.T) {
