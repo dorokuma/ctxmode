@@ -58,6 +58,7 @@ func TestGuard_R4_WgetLogFile(t *testing.T) {
 		})
 	}
 }
+
 // TestGuard_R4_SqliteURIModeRO requires mode=ro to live in the URI query
 // segment after '?', not as a raw '&mode=ro' glued onto the path.
 func TestGuard_R4_SqliteURIModeRO(t *testing.T) {
@@ -130,6 +131,7 @@ func TestGuard_R4_SqliteConnectViaCode(t *testing.T) {
 		})
 	}
 }
+
 // TestGuard_R4_ExecDashA peels bash exec -a/-c/-l so the real command head
 // is screened for nested-agent dispatch.
 func TestGuard_R4_ExecDashA(t *testing.T) {
@@ -184,6 +186,7 @@ func TestGuard_R4_XargsEof(t *testing.T) {
 		})
 	}
 }
+
 // TestGuard_R4_SedNegationAndCustomAddr covers sed address negation (!)
 // and \c...\c custom-delimiter addresses before w/e commands.
 func TestGuard_R4_SedNegationAndCustomAddr(t *testing.T) {
@@ -231,6 +234,7 @@ func TestGuard_R4_SedNegationAndCustomAddr(t *testing.T) {
 		})
 	}
 }
+
 // TestGuard_R4_JSTemplateBraceDepth keeps ${} expressions intact when they
 // contain nested object literals, strings, or nested templates so write
 // primitives inside the expression are still visible to the screen.
@@ -283,6 +287,7 @@ func TestGuard_R4_JSTemplateBraceDepth(t *testing.T) {
 		})
 	}
 }
+
 // TestGuard_R4_CodeAgentNamesAlign checks codeAgentNames covers every
 // argv-side blockedAgentExecutables entry (at least ssh/sudo) and that
 // unresolved code spawns naming those targets are blocked.
