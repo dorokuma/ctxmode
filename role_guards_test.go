@@ -1267,6 +1267,7 @@ func TestGuard_SSHPeel(t *testing.T) {
 		{name: "-f bg cluster", code: "ssh -qf dmit uptime", want: "ssh -f"},
 		{name: "-G config dump", code: "ssh -G dmit", want: "ssh -G"},
 		{name: "-E logfile", code: "ssh -E /tmp/log dmit uptime", want: "ssh -E"},
+		{name: "-I pkcs11", code: "ssh -I /tmp/x.so dmit uptime", want: "ssh -I"},
 		// -o screening: exec/forward/config keys refuse by name; the
 		// connection-hygiene whitelist stays free in every spelling.
 		{name: "proxycommand", code: "ssh -o ProxyCommand=/tmp/x dmit uptime", want: "ssh -o proxycommand"},
@@ -1288,6 +1289,14 @@ func TestGuard_SSHPeel(t *testing.T) {
 		{name: "safe -o separate", code: "ssh -o BatchMode=yes -o ConnectTimeout=5 dmit uptime", want: ""},
 		{name: "safe -o glued", code: "ssh -oBatchMode=yes -o 'StrictHostKeyChecking no' dmit uptime", want: ""},
 		{name: "controlmaster=no ok", code: "ssh -o ControlMaster=no -o ControlPath=none dmit uptime", want: ""},
+		// Post-<destination> options: without `--`, OpenSSH re-enters getopt
+		// after <destination>, so trailing options are still ssh's own —
+		// screened here — and the remote command starts at the SECOND
+		// non-option word. NBSP is not ASCII blank for readconf.c: a
+		// `none ` value is a real local filename, never the none sink.
+		{name: "post-dest -q remote pig", code: "ssh dmit -q pig", want: "pig"},
+		{name: "post-dest -o proxycommand", code: "ssh dmit -o ProxyCommand=/tmp/x uptime", want: "ssh -o proxycommand"},
+		{name: "knownhosts nbsp value", code: "ssh -o 'UserKnownHostsFile=none\u00a0' dmit uptime", want: "ssh -o userknownhostsfile"},
 		// Option parsing shapes: clusters, glued and separate values, --.
 		{name: "cluster -qT", code: "ssh -qT dmit uptime", want: ""},
 		{name: "-tt -vvv", code: "ssh -tt -vvv dmit uptime", want: ""},
@@ -1339,6 +1348,7 @@ func TestGuard_SSHPeel(t *testing.T) {
 			}
 			for _, code := range []string{
 				`ssh dmit "rm -rf /tmp/x"`,
+				`ssh dmit -q rm -rf /tmp/x`, // post-dest option is ssh's; rm is the remote cmd
 				`ssh dmit "git -C /root/wechatbridge pull"`,
 				`ssh dmit "echo a > /tmp/b"`,
 				`ssh dmit "systemctl restart wechatbridge@default"`,

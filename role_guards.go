@@ -2818,7 +2818,7 @@ func sshShortTakesValue(c byte) bool {
 // never reach a role-guarded ssh: they arm a config file, a jump host
 // (same reach as -o ProxyJump), a control socket, a forwarding channel or
 // a local side effect the guards cannot see.
-const sshBannedShorts = "FSMOLRDWwNfGQsEJ"
+const sshBannedShorts = "FSMOLRDWwNfGQsEJI"
 
 // sshBannedLongs are long-option names rejected outright (value or not).
 var sshBannedLongs = map[string]bool{
@@ -2881,13 +2881,17 @@ func sshOValueOK(key, val string) bool {
 // The key (lowercased for the lookup) must appear in sshSafeOKeys and pass
 // the value-sensitive check; every other key is refused by name so
 // proxycommand/proxyjump/localcommand/remotecommand/match/include and
-// friends can never reach the client config.
+// friends can never reach the client config. Trimming is ASCII-blank only
+// (" \t\r\n") — matching OpenSSH readconf.c, which treats a non-ASCII
+// blank like U+00A0 as part of the word rather than whitespace, so
+// `UserKnownHostsFile=none ` stays a literal path instead of being
+// trimmed into a `none` that the sink-value gate would admit.
 func screenSSHOpt(optText string) string {
 	key, val := optText, ""
 	if k := strings.IndexAny(optText, "= \t"); k >= 0 {
-		key, val = optText[:k], strings.TrimSpace(optText[k+1:])
+		key, val = optText[:k], strings.Trim(optText[k+1:], " \t\r\n")
 	}
-	key = strings.ToLower(strings.TrimSpace(key))
+	key = strings.ToLower(strings.Trim(key, " \t\r\n"))
 	if key == "" {
 		return "-o" // empty option text: unvetted, fail closed
 	}
@@ -2907,12 +2911,17 @@ func screenSSHOpt(optText string) string {
 // value-taking letter ends its cluster and may carry a glued tail or the
 // next argv) and double-dash long options; a value-taking option whose
 // operand never arrives is malformed and fails closed. The first
-// non-option operand is <destination>; an empty destination or a missing
-// remote command both block (bare `ssh host` drops the caller into an
-// unaudited interactive login shell).
+// non-option operand is <destination>; WITHOUT a `--` terminator OpenSSH
+// (ssh.c `optind = optreset = 1; goto again`) keeps parsing options after
+// it until the SECOND non-option word — so `ssh dmit -q pig` names the
+// remote command `pig`, not `-q pig` — while after `--` the word
+// following <destination> already starts the remote command. An empty
+// destination or a missing remote command both block (bare `ssh host`
+// drops the caller into an unaudited interactive login shell).
 func parseSSHInvocation(head []string) (remoteCmd, hit string) {
 	i := 1
 	endOpts := false
+	sawDest := false
 	for i < len(head) {
 		a := head[i]
 		if !endOpts && a == "--" {
@@ -2980,10 +2989,20 @@ func parseSSHInvocation(head []string) (remoteCmd, hit string) {
 		if a == "" {
 			return "", "ssh" // empty <destination> word
 		}
-		// First non-option operand: <destination>; everything after it is the
-		// remote command OpenSSH joins and hands to the login shell.
-		remote := strings.Join(head[i+1:], " ")
-		if strings.TrimSpace(remote) == "" {
+		if !sawDest {
+			// First non-option operand: <destination>. When `--` has not
+			// ended options, OpenSSH re-enters getopt after it, so any
+			// `-x`/`--x` words that follow are still ssh's own options and
+			// continue through the screening above until the SECOND
+			// non-option word — the real remote command head.
+			sawDest = true
+			i++
+			continue
+		}
+		// Second non-option operand: everything from here is the remote
+		// command OpenSSH joins and hands to the login shell.
+		remote := strings.Join(head[i:], " ")
+		if strings.Trim(remote, " \t\r\n") == "" {
 			return "", "ssh"
 		}
 		return remote, ""
