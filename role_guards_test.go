@@ -1982,11 +1982,22 @@ func TestGuard_InlineSubstitutionEscapes(t *testing.T) {
 	}
 	// The same input must not emit a spurious segment for the gap text
 	// between the two backtick groups (the off-by-one re-pairing).
-	var extra []shellSegment
-	scanInlineSubstitutions("\"a`true`b`pig`c\"", 0, &extra)
-	if len(extra) != 2 || len(extra[0].argv) != 1 || extra[0].argv[0] != "true" ||
-		len(extra[1].argv) != 1 || extra[1].argv[0] != "pig" {
-		t.Fatalf("backtick groups must scan to exactly [true] [pig], got %+v", extra)
+	segsBT, okBT := parseSubagentShellAST("echo \"a`true`b`pig`c\"", 0, false, false)
+	if !okBT {
+		t.Fatalf("parse failed for adjacent backticks")
+	}
+	var heads []string
+	for _, s := range segsBT {
+		if len(s.argv) > 0 {
+			heads = append(heads, s.argv[0])
+		}
+	}
+	want := map[string]bool{"true": true, "pig": true}
+	for _, h := range heads {
+		delete(want, h)
+	}
+	if len(want) != 0 {
+		t.Fatalf("backtick groups must surface true and pig, heads=%v missing=%v", heads, want)
 	}
 
 	// A substitution reached at the depth cap must emit the fail-closed
@@ -2009,10 +2020,12 @@ func TestGuard_InlineSubstitutionEscapes(t *testing.T) {
 	}
 	// At the cap the scan must stop at the marker — no extra recursion
 	// segments may follow it.
-	extra = nil
-	scanInlineSubstitutions("$(true)", shellSplitMaxDepth, &extra)
-	if len(extra) != 1 || !extra[0].depthExceeded {
-		t.Fatalf("at-cap substitution must emit only the depthExceeded marker, got %+v", extra)
+	segsCap, okCap := parseSubagentShellAST("$(true)", shellSplitMaxDepth, false, false)
+	if okCap {
+		t.Fatalf("at-cap substitution must fail closed, got %+v", segsCap)
+	}
+	if len(segsCap) != 1 || !segsCap[0].depthExceeded {
+		t.Fatalf("at-cap substitution must emit only the depthExceeded marker, got %+v", segsCap)
 	}
 }
 

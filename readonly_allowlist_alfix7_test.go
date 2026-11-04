@@ -96,30 +96,17 @@ func main() {
 // (non-empty argv, not depth-exceeded markers). Nested substitution segments are
 // included because dash executes them too.
 func collectGoCmdArgvs(code string) (argvs [][]string, depthExceeded bool) {
+	// Nested CmdSubst/heredoc commands are already sibling segments from the AST parser.
 	segs := splitShellSegments(code)
-	var add func(s shellSegment)
-	add = func(s shellSegment) {
+	for _, s := range segs {
 		if s.depthExceeded {
 			depthExceeded = true
-			return
+			continue
 		}
 		if len(s.argv) > 0 {
 			cp := append([]string(nil), s.argv...)
 			argvs = append(argvs, cp)
 		}
-		for _, hb := range s.heredocText {
-			if hb.quoted {
-				continue
-			}
-			var extra []shellSegment
-			scanHeredocSubstitutions(hb.text, 0, &extra)
-			for _, s2 := range extra {
-				add(s2)
-			}
-		}
-	}
-	for _, s := range segs {
-		add(s)
 	}
 	return argvs, depthExceeded
 }

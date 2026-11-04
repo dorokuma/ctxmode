@@ -297,6 +297,27 @@ func rawSlice(code string, pos, end syntax.Pos) (string, bool) {
 	return code[lo:hi], true
 }
 
+// rawHasLineContCmdsubst reports $ followed by backslash-newline then (,
+// which dash folds into $(...) but mvdan may leave as adjacent Lits.
+func rawHasLineContCmdsubst(raw string) bool {
+	for i := 0; i+1 < len(raw); i++ {
+		if raw[i] != '$' {
+			continue
+		}
+		j := i + 1
+		for j+1 < len(raw) && raw[j] == '\\' && raw[j+1] == '\n' {
+			j += 2
+		}
+		for j < len(raw) && (raw[j] == ' ' || raw[j] == '\t') {
+			j++
+		}
+		if j < len(raw) && raw[j] == '(' {
+			return true
+		}
+	}
+	return false
+}
+
 // parseSubagentShellAST parses code into shellSegments for subagent guards.
 // ok=false means fail-closed (caller treats as depthExceeded).
 func parseSubagentShellAST(code string, depth int, pipeIn bool, useBashVariant bool) ([]shellSegment, bool) {
@@ -402,6 +423,10 @@ func (c *subCollector) failClosedFile(f *syntax.File) bool {
 		}
 		switch x := n.(type) {
 		case *syntax.DblQuoted:
+			if raw, okRaw := rawSlice(c.code, x.Pos(), x.End()); okRaw && rawHasLineContCmdsubst(raw) {
+				ok = false
+				return false
+			}
 			for _, p := range x.Parts {
 				pe, is := p.(*syntax.ParamExp)
 				if !is {
@@ -429,6 +454,28 @@ func (c *subCollector) failClosedFile(f *syntax.File) bool {
 				if !c.heredocDelimOK(x) {
 					ok = false
 					return false
+				}
+				// Unquoted heredoc: dash expands $(...) / line-cont $\\n( even when
+				// mvdan left the body as plain Lits.
+				if x.Hdoc != nil && !isQuotedHeredocDelim(x.Word) {
+					if raw, okRaw := rawSlice(c.code, x.Hdoc.Pos(), x.Hdoc.End()); okRaw {
+						if rawHasLineContCmdsubst(raw) || strings.Contains(raw, "$(") || strings.Contains(raw, "`") {
+							// Only fail-closed when mvdan did not emit CmdSubst nodes
+							// for the body (otherwise Walk already covers them).
+							hasCS := false
+							syntax.Walk(x.Hdoc, func(n syntax.Node) bool {
+								if _, is := n.(*syntax.CmdSubst); is {
+									hasCS = true
+									return false
+								}
+								return true
+							})
+							if !hasCS {
+								ok = false
+								return false
+							}
+						}
+					}
 				}
 			}
 		case *syntax.ArithmExp:
@@ -727,6 +774,10 @@ func (c *subCollector) setWriteRedirect(seg *shellSegment, r *syntax.Redirect) {
 
 func (c *subCollector) emitNestedFromWord(w *syntax.Word) {
 	if w == nil {
+		return
+	}
+	if raw, ok := rawSlice(c.code, w.Pos(), w.End()); ok && rawHasLineContCmdsubst(raw) {
+		c.reject()
 		return
 	}
 	c.emitNestedFromNode(w)

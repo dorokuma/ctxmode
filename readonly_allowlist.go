@@ -865,10 +865,13 @@ func gitBranchAllow(rest []string) string {
 			i = ni
 			continue
 		}
+		if strings.HasPrefix(a, "--color=") {
+			continue
+		}
 		if strings.HasPrefix(a, "--contains=") || strings.HasPrefix(a, "--no-contains=") ||
 			strings.HasPrefix(a, "--merged=") || strings.HasPrefix(a, "--no-merged=") ||
 			strings.HasPrefix(a, "--points-at=") || strings.HasPrefix(a, "--sort=") ||
-			strings.HasPrefix(a, "--format=") || strings.HasPrefix(a, "--color=") {
+			strings.HasPrefix(a, "--format=") {
 			ni, isQ, ok := gitConsumeRefListOpt(rest, i)
 			if !ok {
 				return "git branch unknown " + a
@@ -931,6 +934,9 @@ func gitTagAllow(rest []string) string {
 			listish = true
 			continue
 		}
+		if strings.HasPrefix(a, "--color=") {
+			continue
+		}
 		if strings.HasPrefix(a, "--contains=") || strings.HasPrefix(a, "--no-contains=") ||
 			strings.HasPrefix(a, "--merged=") || strings.HasPrefix(a, "--no-merged=") ||
 			strings.HasPrefix(a, "--points-at=") || strings.HasPrefix(a, "--sort=") ||
@@ -939,7 +945,7 @@ func gitTagAllow(rest []string) string {
 			if !ok {
 				return "git tag unknown " + a
 			}
-			if isQ || true {
+			if isQ {
 				listish = true
 			}
 			_ = ni
@@ -1217,13 +1223,10 @@ func checkHerdsmanReadonly(argv []string) string {
 		return "herdsman " + args[idx]
 	}
 	key := toolSubKey(args[idx:], herdsmanSecondLevel)
-	switch key {
-	case "status", "help",
-		"agent list", "agent get", "agent history", "agent results":
+	if herdsmanReadonlySubs[key] {
 		return ""
-	default:
-		return "herdsman " + key
 	}
+	return "herdsman " + key
 }
 
 func checkMountReadonly(argv []string) string {
@@ -1484,31 +1487,6 @@ func readonlyPrePeelHit(argv []string) string {
 			}
 			return ""
 		}
-	}
-	return ""
-}
-
-// allowlistShellStructuralHit rejects shell features forbidden by policy.
-func allowlistShellStructuralHit(seg shellSegment) string {
-	if seg.backgrounded {
-		return "background &"
-	}
-	if seg.processSubst {
-		return "process substitution"
-	}
-	for _, w := range seg.argv {
-		if strings.Contains(w, cmdSubPlaceholder) {
-			return "command substitution"
-		}
-		if strings.HasPrefix(w, "<(") || strings.HasPrefix(w, ">(") {
-			return "process substitution"
-		}
-	}
-	if seg.redirectFile == dynamicRedirectTarget {
-		return "dynamic redirect"
-	}
-	if seg.redirectFile != "" {
-		return "> " + seg.redirectFile
 	}
 	return ""
 }
