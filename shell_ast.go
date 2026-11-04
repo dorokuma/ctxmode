@@ -62,15 +62,57 @@ func checkShellBytes(code string, strictReadonly bool) string {
 	return ""
 }
 
+// rawHasActiveLineCont reports a backslash-newline that is NOT inside a
+// # comment on its physical line. Comment-trailing \ does not continue
+// (D9 / dash); active continuations are folded away by mvdan before Word
+// spans are recorded, so readonly rejects them at source level.
+func rawHasActiveLineCont(code string) bool {
+	lineStart := 0
+	for i := 0; i < len(code); i++ {
+		if code[i] == '\n' {
+			lineStart = i + 1
+			continue
+		}
+		if code[i] != '\\' || i+1 >= len(code) || code[i+1] != '\n' {
+			continue
+		}
+		line := code[lineStart:i]
+		sq, dq := false, false
+		inComment := false
+		for j := 0; j < len(line); j++ {
+			c := line[j]
+			if !sq && !dq && c == '#' {
+				inComment = true
+				break
+			}
+			if !dq && c == '\'' {
+				sq = !sq
+				continue
+			}
+			if !sq && c == '"' {
+				dq = !dq
+				continue
+			}
+			if !sq && c == '\\' && j+1 < len(line) {
+				j++
+			}
+		}
+		if !inComment {
+			return true
+		}
+	}
+	return false
+}
+
 // parseReadonlyShellAST fail-closed-parses code under LangPOSIX and returns
 // every CallExpr argv, or a reject reason.
 func parseReadonlyShellAST(code string) (argvs [][]string, rejectReason string) {
 	if hit := checkShellBytes(code, true); hit != "" {
 		return nil, hit
 	}
-	// mvdan folds \\n before Word spans are recorded; reject at source level
-	// so agents cannot hide a second command behind a line continuation.
-	if strings.Contains(code, "\\\n") {
+	// Reject active (non-comment) backslash-newline. mvdan folds those away
+	// before Word spans are recorded; comment-trailing \ does not continue (D9).
+	if rawHasActiveLineCont(code) {
 		return nil, "backslash line continuation forbidden"
 	}
 	parser := syntax.NewParser(syntax.Variant(syntax.LangPOSIX))
