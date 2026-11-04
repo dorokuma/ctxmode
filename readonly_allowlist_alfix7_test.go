@@ -131,7 +131,7 @@ func setupPrinterPATH(t *testing.T, names []string) (pathDir, outFile string) {
 		}
 	}
 	// Also provide common shells/builtins that dash may search for.
-	for _, extra := range []string{"true", "false", "echo", "printf", "cat", "test", "[", "printargv", "pig", "rm", "ls", "rg", "nice", "bash", "env", "sh", "head", "tail", "git", "ctxmode", "herdr", "find", "wc"} {
+	for _, extra := range []string{"true", "false", "echo", "printf", "cat", "test", "[", "printargv", "pig", "agy", "rm", "ls", "rg", "nice", "bash", "env", "sh", "head", "tail", "git", "ctxmode", "herdr", "find", "wc", "p1", "p2", "p3", "probe", "xargs", "python3"} {
 		if seen[extra] {
 			continue
 		}
@@ -217,6 +217,20 @@ func fmtArgvs(a [][]string) string {
 		fmt.Fprintf(&b, "  [%d]=%#v\n", i, v)
 	}
 	return b.String()
+}
+
+// isDashBuiltin reports Debian dash builtins measured via `type` (TASK sh8).
+// fc/help/let/bind/typeset/declare are absent on this dash.
+func isDashBuiltin(name string) bool {
+	switch name {
+	case ":", ".", "[", "alias", "bg", "break", "cd", "command", "continue",
+		"echo", "eval", "exec", "exit", "export", "false", "fg", "getopts",
+		"hash", "jobs", "kill", "local", "printf", "pwd", "read", "readonly",
+		"return", "set", "shift", "test", "times", "trap", "true", "type",
+		"ulimit", "umask", "unalias", "unset", "wait":
+		return true
+	}
+	return false
 }
 
 // dashExecutedUnknown reports whether dash ran a command name that Go did not
@@ -360,14 +374,10 @@ func runDashDiffCases(t *testing.T, cases []dashDiffCase) (mismatches []string) 
 			dashArgvs, raw, _ := runDashCollectArgvs(t, c.code, pathDir, outFile)
 
 			if c.expectDashRuns && len(dashArgvs) == 0 {
-				// dash builtins (echo/true/…) bypass PATH symlinks; if Go already
-				// sees command heads and dash produced output, visibility is OK.
-				if len(goArgvs) == 0 {
-					msg := fmt.Sprintf("%s: expected dash to run something; raw=%q go=%s", c.name, raw, fmtArgvs(goArgvs))
-					mismatches = append(mismatches, msg)
-					t.Error(msg)
-					return
-				}
+				msg := fmt.Sprintf("%s: expected dash to run external probe; raw=%q go=%s Hint: replace builtins with p1/p2/pig", c.name, raw, fmtArgvs(goArgvs))
+				mismatches = append(mismatches, msg)
+				t.Error(msg)
+				return
 			}
 
 			miss := dashExecutedUnknown(goArgvs, dashArgvs)
@@ -545,101 +555,131 @@ func TestAlFix7_ShouldFix_Allowlist(t *testing.T) {
 }
 
 func TestAlFix7_FuzzArgvDiff(t *testing.T) {
-	if testing.Short() {
-		t.Skip("short")
-	}
-	if _, err := exec.LookPath("/bin/sh"); err != nil {
-		t.Skip("no /bin/sh")
-	}
-	_ = ensureArgvPrinter(t)
-
-	rng := rand.New(rand.NewSource(20261104))
+	t.Setenv(auditEnvRole, "worker")
+	t.Setenv(auditEnvReadonly, "")
+	const seed = 20261104
+	rng := rand.New(rand.NewSource(seed))
 	N := 20000
 	if raceEnabled {
 		N = 2000
 	}
 
-	atoms := []string{
-		"echo", "true", "false", "pig", "ls", "cat", "a", "b", "x", "1",
-		"\\", "\n", "\r", "#", "'", `"`, "`", "$(", "${", "$((", ")", "|", "&&", ";",
-		"<<EOF", "<<-EOF", "<<'EOF'", "EOF", "case", "in", "esac", ")",
+	// Byte fragments with NO implicit surrounding spaces (PLAN §5.3).
+	frags := []string{
+		"p1", "p2", "pig",
+		" ", "\t", "\n", ";", "|", "&&", "||",
+		"\\\n", "\\\\\n", "\\", "\\\"", "\\$", "\\'",
+		"'a'", "'", "\"", "$(", ")", "$((", "))", "${x:-", "${x:-\"", "}", "`",
+		"cat <<EOF\n", "cat <<'EOF'\n", "cat <<EO\\\nF\n", "cat <<\"\\$EOF\"\n",
+		"\nEOF\n", "\n$EOF\n", "\n)\nEOF\n",
+		"case $? in 0) p1;; esac", "case x in x) pig;; esac",
+		"# \\\np1\n", "2\\\n>/dev/null", "'2'>/dev/null",
 	}
-	safeWord := func() string {
-		const chars = "abcdefghijklmnopqrstuvwxyz0123456789_"
-		n := 1 + rng.Intn(6)
-		b := make([]byte, n)
-		for i := range b {
-			b[i] = chars[rng.Intn(len(chars))]
-		}
-		return string(b)
+	templates := []string{
+		"p1 $(p2)",
+		"p1 ${x:-p2}",
+		"p1 \"${x:-'y'}\"",
+		"cat <<EOF\n$(pig)\nEOF",
+		"cat <<'EOF'\n$(pig)\nEOF",
+		"env -a p1 pig",
+		"echo \"$(case x in x) pig;; esac)\"",
+		"p1; pig",
+		"p1 && pig",
+		"p1 | p2",
+		"# \\\npig",
+		"echo \\\\\npig",
+		"p1 $\\\n(pig)",
+		"echo \"$\\\n(pig)\"",
+		"cat <<EO\\\nF\n$(pig)\nEOF",
+		"env --default-signal pig",
+		"env -S pig",
+		"${UNSET:-pig}",
+		"\"${UNSET:-pig}\"",
+		"eval \"$X\"",
+		"f() { pig; }; p1",
+		"((pig))",
+		"p1 <<EOF\n$\\\n(pig)\nEOF",
+		"echo \"$(echo case in)\" >/dev/null ; pig",
+		"nice -n 1 pig",
+		"p1 `pig`",
+		"p1 `\\`pig\\``",
+		"true; pig",
+		"p1\npig",
+		"cat <<\"\\$EOF\"\n$EOF\npig",
 	}
 
 	mismatches := 0
+	bypasses := 0
 	for i := 0; i < N; i++ {
-		var parts []string
-		nTok := 1 + rng.Intn(8)
-		for k := 0; k < nTok; k++ {
-			switch rng.Intn(10) {
-			case 0:
-				parts = append(parts, atoms[rng.Intn(len(atoms))])
-			case 1:
-				parts = append(parts, safeWord())
-			case 2:
-				parts = append(parts, "'"+safeWord()+"'")
-			case 3:
-				parts = append(parts, `"`+safeWord()+`"`)
-			case 4:
-				parts = append(parts, "# "+safeWord())
-			case 5:
-				parts = append(parts, "echo", safeWord(), ";", "pig")
-			case 6:
-				parts = append(parts, "echo", "$("+safeWord()+")")
-			case 7:
-				parts = append(parts, "# \\", "\n", "pig")
-			case 8:
-				parts = append(parts, "echo", "${"+safeWord()+":-x}")
-			default:
-				parts = append(parts, "true", "&&", safeWord())
+		var code string
+		if rng.Intn(2) == 0 {
+			// Template with random byte inserts.
+			base := templates[rng.Intn(len(templates))]
+			b := []byte(base)
+			inserts := 1 + rng.Intn(3)
+			for k := 0; k < inserts; k++ {
+				frag := frags[rng.Intn(len(frags))]
+				pos := rng.Intn(len(b) + 1)
+				nb := make([]byte, 0, len(b)+len(frag))
+				nb = append(nb, b[:pos]...)
+				nb = append(nb, frag...)
+				nb = append(nb, b[pos:]...)
+				b = nb
 			}
-		}
-		code := strings.Join(parts, " ")
-		// Occasionally force MF1-like shape.
-		if rng.Intn(20) == 0 {
-			code = "# \\\n" + safeWord()
-		}
-		if rng.Intn(25) == 0 {
-			code = "echo \\\\\n" + "pig"
+			code = string(b)
+		} else {
+			// Byte-join 4..12 fragments; sometimes insert space/tab between.
+			nTok := 4 + rng.Intn(9)
+			parts := make([]string, 0, nTok*2)
+			for k := 0; k < nTok; k++ {
+				parts = append(parts, frags[rng.Intn(len(frags))])
+				if rng.Intn(2) == 0 {
+					if rng.Intn(2) == 0 {
+						parts = append(parts, " ")
+					} else {
+						parts = append(parts, "\t")
+					}
+				}
+			}
+			code = strings.Join(parts, "")
 		}
 
+		// Guard first: if worker allows, dash must never execute pig, and every
+		// dash external head must appear in Go AST argv[0] set.
+		hit := guardShellSubagent(code)
 		goArgvs, depthEx := collectGoCmdArgvs(code)
 		names := namesFromGoArgvs(goArgvs)
-		names = append(names, "pig", "echo", "true", "false", "ls", "cat")
+		names = append(names, "p1", "p2", "pig", "agy", "cat", "env", "nice", "printargv")
 		pathDir, outFile := setupPrinterPATH(t, names)
+		_ = os.Remove(outFile)
 		dashArgvs, _, _ := runDashCollectArgvs(t, code, pathDir, outFile)
 
-		miss := dashExecutedUnknown(goArgvs, dashArgvs)
-		bad := false
-		if len(miss) > 0 && !depthEx {
-			bad = true
-		}
-		if len(goArgvs) == 0 && len(dashArgvs) > 0 && !depthEx {
-			bad = true
-		}
-		if bad {
-			mismatches++
-			if mismatches <= 10 {
-				t.Logf("fuzz mismatch i=%d code=%q miss=%v go=%s dash=%s",
-					i, code, miss, fmtArgvs(goArgvs), fmtArgvs(dashArgvs))
+		if hit == "" {
+			for _, a := range dashArgvs {
+				if len(a) > 0 && a[0] == "pig" {
+					bypasses++
+					if bypasses <= 5 {
+						t.Fatalf("BYPASS FOUND: worker guard allowed script that executed pig in dash: %q", code)
+					}
+				}
+			}
+			miss := dashExecutedUnknown(goArgvs, dashArgvs)
+			if len(miss) > 0 && !depthEx {
+				mismatches++
+				if mismatches <= 10 {
+					t.Logf("AST BLINDSPOT i=%d miss=%v code=%q", i, miss, code)
+				}
 			}
 		}
 	}
+	if bypasses > 0 {
+		t.Fatalf("fuzz bypasses: %d / %d", bypasses, N)
+	}
 	if mismatches > 0 {
-		t.Fatalf("fuzz dash/Go command-visibility mismatches: %d / %d (seed=20261104 race=%v)", mismatches, N, raceEnabled)
+		t.Fatalf("fuzz AST blindspots: %d / %d (seed=%d race=%v)", mismatches, N, seed, raceEnabled)
 	}
 }
 
-// BaselineCapture runs the differential suite and writes a machine-readable
-// summary of mismatches (used for the red-test report on 879fea8).
 func TestAlFix7_CaptureBaselineMismatches(t *testing.T) {
 	if os.Getenv("CTXMODE_ALFIX7_CAPTURE") != "1" {
 		t.Skip("set CTXMODE_ALFIX7_CAPTURE=1 to write baseline mismatch report")

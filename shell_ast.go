@@ -297,6 +297,29 @@ func rawSlice(code string, pos, end syntax.Pos) (string, bool) {
 	return code[lo:hi], true
 }
 
+// rawHasCommentLineCont reports a # comment physical line that ends with \.
+// dash always ends comments at newline (D9); mvdan may fold the next line into
+// the preceding statement as an argument — fail closed on this divergence.
+func rawHasCommentLineCont(code string) bool {
+	for i := 0; i < len(code); i++ {
+		if code[i] != '#' {
+			continue
+		}
+		j := i + 1
+		for j < len(code) && code[j] != '\n' {
+			j++
+		}
+		line := strings.TrimRight(code[i:j], " \t")
+		if strings.HasSuffix(line, `\`) {
+			return true
+		}
+		if j < len(code) {
+			i = j
+		}
+	}
+	return false
+}
+
 // rawHasLineContCmdsubst reports $ followed by backslash-newline then (,
 // which dash folds into $(...) but mvdan may leave as adjacent Lits.
 func rawHasLineContCmdsubst(raw string) bool {
@@ -305,8 +328,13 @@ func rawHasLineContCmdsubst(raw string) bool {
 			continue
 		}
 		j := i + 1
+		sawCont := false
 		for j+1 < len(raw) && raw[j] == '\\' && raw[j+1] == '\n' {
 			j += 2
+			sawCont = true
+		}
+		if !sawCont {
+			continue
 		}
 		for j < len(raw) && (raw[j] == ' ' || raw[j] == '\t') {
 			j++
@@ -322,6 +350,9 @@ func rawHasLineContCmdsubst(raw string) bool {
 // ok=false means fail-closed (caller treats as depthExceeded).
 func parseSubagentShellAST(code string, depth int, pipeIn bool, useBashVariant bool) ([]shellSegment, bool) {
 	if hit := checkShellBytes(code, false); hit != "" {
+		return []shellSegment{{depthExceeded: true}}, false
+	}
+	if rawHasCommentLineCont(code) {
 		return []shellSegment{{depthExceeded: true}}, false
 	}
 	if depth >= shellSplitMaxDepth {
@@ -455,25 +486,30 @@ func (c *subCollector) failClosedFile(f *syntax.File) bool {
 					ok = false
 					return false
 				}
-				// Unquoted heredoc: dash expands $(...) / line-cont $\\n( even when
-				// mvdan left the body as plain Lits.
+				// Unquoted heredoc: dash expands $(...) / backticks even when
+				// mvdan left the body as plain Lits (delim mismatch / opaque body).
 				if x.Hdoc != nil && !isQuotedHeredocDelim(x.Word) {
+					body := ""
+					if lit := x.Hdoc.Lit(); lit != "" {
+						body = lit
+					}
 					if raw, okRaw := rawSlice(c.code, x.Hdoc.Pos(), x.Hdoc.End()); okRaw {
-						if rawHasLineContCmdsubst(raw) || strings.Contains(raw, "$(") || strings.Contains(raw, "`") {
-							// Only fail-closed when mvdan did not emit CmdSubst nodes
-							// for the body (otherwise Walk already covers them).
-							hasCS := false
-							syntax.Walk(x.Hdoc, func(n syntax.Node) bool {
-								if _, is := n.(*syntax.CmdSubst); is {
-									hasCS = true
-									return false
-								}
-								return true
-							})
-							if !hasCS {
-								ok = false
+						if body == "" || len(raw) > len(body) {
+							body = raw
+						}
+					}
+					if body != "" && (rawHasLineContCmdsubst(body) || strings.Contains(body, "$(") || strings.Contains(body, "`")) {
+						hasCS := false
+						syntax.Walk(x.Hdoc, func(n syntax.Node) bool {
+							if _, is := n.(*syntax.CmdSubst); is {
+								hasCS = true
 								return false
 							}
+							return true
+						})
+						if !hasCS {
+							ok = false
+							return false
 						}
 					}
 				}
@@ -556,7 +592,16 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 		return
 	}
 	if st.Cmd == nil {
-		// bare redirects — still record if they write
+		// bare redirects — still record if they write; unquoted heredoc bodies
+		// can contain $(...) that dash expands (must emit nested CallExprs).
+		for _, r := range st.Redirs {
+			if r.Word != nil {
+				c.emitNestedFromWord(r.Word)
+			}
+			if r.Hdoc != nil && !isQuotedHeredocDelim(r.Word) {
+				c.emitNestedFromWord(r.Hdoc)
+			}
+		}
 		seg := shellSegment{pipedStdin: pipeIn, backgrounded: st.Background}
 		c.applyRedirs(&seg, st.Redirs)
 		if len(seg.argv) > 0 || seg.redirectFile != "" || len(seg.heredocText) > 0 || seg.hereString != "" || seg.depthExceeded {
@@ -713,6 +758,22 @@ func (c *subCollector) applyRedirs(seg *shellSegment, redirs []*syntax.Redirect)
 					text = raw
 				}
 			}
+			// Opaque unquoted heredoc: $( / backticks present as text but no CmdSubst nodes.
+			if !quoted && text != "" && (strings.Contains(text, "$(") || strings.Contains(text, "`")) {
+				hasCS := false
+				if r.Hdoc != nil {
+					syntax.Walk(r.Hdoc, func(n syntax.Node) bool {
+						if _, ok := n.(*syntax.CmdSubst); ok {
+							hasCS = true
+							return false
+						}
+						return true
+					})
+				}
+				if !hasCS {
+					c.reject()
+				}
+			}
 			seg.heredocText = append(seg.heredocText, heredocBody{text: text, quoted: quoted})
 		case syntax.WordHdoc:
 			if r.Word != nil {
@@ -823,6 +884,25 @@ func (c *subCollector) emitNestedFromNode(n syntax.Node) {
 	})
 }
 
+// posixUnescapeLit applies POSIX unquoted backslash rules to a Lit.Value:
+// each "\X" becomes "X" (line-cont \n is already folded by the parser).
+func posixUnescapeLit(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			b.WriteByte(s[i])
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
 // wordToArg returns the static string form of w, or (cmdSubPlaceholder, false)
 // when the word has dynamic/glob/tilde content.
 func wordToArg(w *syntax.Word) (string, bool) {
@@ -834,13 +914,15 @@ func wordToArg(w *syntax.Word) (string, bool) {
 	for i, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
-			if strings.ContainsAny(p.Value, "*?[") {
+			// POSIX unquoted backslash: dash drops \ and keeps next byte.
+			val := posixUnescapeLit(p.Value)
+			if strings.ContainsAny(val, "*?[") {
 				static = false
 			}
-			if i == 0 && strings.HasPrefix(p.Value, "~") {
+			if i == 0 && strings.HasPrefix(val, "~") {
 				static = false
 			}
-			b.WriteString(p.Value)
+			b.WriteString(val)
 		case *syntax.SglQuoted:
 			if p.Dollar {
 				static = false

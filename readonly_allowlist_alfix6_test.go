@@ -551,30 +551,29 @@ func TestAlFix6_DashArgvDiff(t *testing.T) {
 }
 
 func TestAlFix6_DashArgvDiff_MultiSeg(t *testing.T) {
-	skipArgvPrintUnderRace(t)
-	bin := alfix6TestBin(t)
-	printer := bin
-
-	_ = printer
-	segs := splitShellSegments("true \r#; printargv PWN")
-	if len(segs) < 2 {
-		t.Fatalf("want 2 segs, got %#v", segs)
+	// Full multi-segment scripts fed to /bin/sh -c (no single-segment cheat).
+	cases := []string{
+		"p1; p2",
+		"p1 && p2",
+		"p1 | p2",
+		"p1\np2",
+		"echo x; p1",
 	}
-	// Run only the second segment via dash by constructing equivalent.
-	dashCode := printer + " PWN"
-	dashOut, raw, err := dashArgv(t, "/bin/sh", dashCode)
-	if err != nil {
-		t.Fatalf("dash: %v raw=%q", err, raw)
-	}
-	goArgv := segs[1].argv
-	wantArgs := goArgv[1:]
-	if len(dashOut) != len(wantArgs) {
-		t.Fatalf("len dash=%d go=%d dash=%#v go=%#v", len(dashOut), len(wantArgs), dashOut, wantArgs)
-	}
-	for i := range wantArgs {
-		if dashOut[i] != wantArgs[i] {
-			t.Fatalf("argv[%d] dash=%q go=%q", i, dashOut[i], wantArgs[i])
-		}
+	for _, code := range cases {
+		t.Run(code, func(t *testing.T) {
+			goArgvs, depthEx := collectGoCmdArgvs(code)
+			names := append(namesFromGoArgvs(goArgvs), "p1", "p2", "echo")
+			pathDir, outFile := setupPrinterPATH(t, names)
+			_ = os.Remove(outFile)
+			dashArgvs, _, _ := runDashCollectArgvs(t, code, pathDir, outFile)
+			if depthEx {
+				return
+			}
+			miss := dashExecutedUnknown(goArgvs, dashArgvs)
+			if len(miss) > 0 {
+				t.Fatalf("dash ran %v not seen by AST; go=%s dash=%s", miss, fmtArgvs(goArgvs), fmtArgvs(dashArgvs))
+			}
+		})
 	}
 }
 
