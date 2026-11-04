@@ -11,58 +11,21 @@ import (
 func TestReadonlyAllowlist_Alfix3_SqliteSafeAndFuncs(t *testing.T) {
 	t.Setenv(auditEnvRole, "scout")
 	t.Setenv(auditEnvReadonly, "")
-
-	allow := []struct {
-		name string
-		argv []string
-	}{
-		{name: "safe+ro SELECT", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "SELECT 1"}},
-		{name: "safe alone SELECT", argv: []string{"sqlite3", "-safe", "/tmp/x.db", "SELECT 1"}},
-		{name: "multiline SELECT", argv: []string{"sqlite3", "-safe", "/tmp/x.db", "SELECT a\nFROM t\nWHERE b=1"}},
-		{name: "string with semicolon", argv: []string{"sqlite3", "-safe", "/tmp/x.db", "SELECT 'a;b' AS x"}},
-		{name: "WITH multiline", argv: []string{"sqlite3", "-safe", "/tmp/x.db", "WITH c AS (\nSELECT 1\n) SELECT * FROM c"}},
-		{name: "--version alone", argv: []string{"sqlite3", "--version"}},
+	// Round-4: sqlite3 removed entirely from the allowlist.
+	for _, argv := range [][]string{
+		{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "SELECT 1"},
+		{"sqlite3", "-safe", "/tmp/x.db", "SELECT 1"},
+		{"sqlite3", "--version"},
+		{"sqlite3", "-safe", "/tmp/x.db", "SELECT writefile('/tmp/pwn','x')"},
+	} {
+		if got := guardArgvReadonly(argv); got == "" {
+			t.Fatalf("sqlite3 must block: %v", argv)
+		}
 	}
-	for _, tc := range allow {
-		t.Run("allow/"+tc.name, func(t *testing.T) {
-			if got := guardArgvReadonly(tc.argv); got != "" {
-				t.Fatalf("expected allow, got %q for %v", got, tc.argv)
-			}
-		})
-	}
-
-	block := []struct {
-		name string
-		argv []string
-		want string
-	}{
-		{name: "ro without safe", argv: []string{"sqlite3", "-readonly", "/tmp/x.db", "SELECT 1"}, want: "safe"},
-		{name: "writefile", argv: []string{"sqlite3", "-safe", "/tmp/x.db", "SELECT writefile('/tmp/pwn','x')"}, want: "dangerous"},
-		{name: "WRITEFILE upper", argv: []string{"sqlite3", "-safe", "/tmp/x.db", "SELECT WRITEFILE('/tmp/pwn','x')"}, want: "dangerous"},
-		{name: "edit func", argv: []string{"sqlite3", "-safe", "/tmp/x.db", "SELECT edit('x')"}, want: "dangerous"},
-		{name: "load_extension", argv: []string{"sqlite3", "-safe", "/tmp/x.db", "SELECT load_extension('/tmp/x.so')"}, want: "dangerous"},
-		{name: "readfile", argv: []string{"sqlite3", "-safe", "/tmp/x.db", "SELECT readfile('/etc/passwd')"}, want: "dangerous"},
-		{name: "fts3_tokenizer", argv: []string{"sqlite3", "-safe", "/tmp/x.db", "SELECT fts3_tokenizer('x')"}, want: "dangerous"},
-		{name: "dot read", argv: []string{"sqlite3", "-safe", "/tmp/x.db", ".read evil.sql"}, want: "dot"},
-		{name: "newline dot", argv: []string{"sqlite3", "-safe", "/tmp/x.db", "SELECT 1\n.shell id"}, want: "dot"},
-	}
-	for _, tc := range block {
-		t.Run("block/"+tc.name, func(t *testing.T) {
-			got := guardArgvReadonly(tc.argv)
-			if got == "" {
-				t.Fatalf("expected block for %v", tc.argv)
-			}
-			if !strings.Contains(strings.ToLower(got), tc.want) {
-				t.Fatalf("expected %q in %q", tc.want, got)
-			}
-		})
-	}
-
-	// Hint mentions -safe
 	got := guardArgvReadonly([]string{"sqlite3", "-readonly", "/tmp/x.db", "SELECT 1"})
 	hinted := readonlyBlockWithHint(got)
-	if !strings.Contains(hinted, "-safe") {
-		t.Fatalf("hint should mention -safe: %q", hinted)
+	if !strings.Contains(strings.ToLower(hinted), "jq") {
+		t.Fatalf("hint should mention jq: %q", hinted)
 	}
 }
 
@@ -85,10 +48,11 @@ func TestReadonlyAllowlist_Alfix3_CurlNarrow(t *testing.T) {
 		{name: "-X GET", argv: []string{"curl", "-s", "-X", "GET", "https://example.com"}},
 		{name: "-X HEAD", argv: []string{"curl", "-s", "-X", "HEAD", "https://example.com"}},
 	}
+	// Round-4: curl removed; former allows must block.
 	for _, tc := range allow {
-		t.Run("allow/"+tc.name, func(t *testing.T) {
-			if got := guardArgvReadonly(tc.argv); got != "" {
-				t.Fatalf("expected allow, got %q", got)
+		t.Run("block-former-allow/"+tc.name, func(t *testing.T) {
+			if got := guardArgvReadonly(tc.argv); got == "" {
+				t.Fatalf("expected block for %v", tc.argv)
 			}
 		})
 	}
@@ -180,11 +144,11 @@ func TestReadonlyAllowlist_Alfix3_PositionalWrite(t *testing.T) {
 	if got := guardArgvReadonly([]string{"python3", "-m", "json.tool", "in.json", "out.json"}); got == "" {
 		t.Fatal("json.tool two positionals must block")
 	}
-	if got := guardArgvReadonly([]string{"python3", "-m", "json.tool", "in.json"}); got != "" {
-		t.Fatalf("json.tool one file must allow, got %q", got)
+	if got := guardArgvReadonly([]string{"python3", "-m", "json.tool", "in.json"}); got == "" {
+		t.Fatal("json.tool one file must block (python removed)")
 	}
-	if got := guardArgvReadonly([]string{"python3", "-m", "json.tool"}); got != "" {
-		t.Fatalf("json.tool stdin must allow, got %q", got)
+	if got := guardArgvReadonly([]string{"python3", "-m", "json.tool"}); got == "" {
+		t.Fatal("json.tool stdin must block (python removed)")
 	}
 	// tee/split not allowlisted
 	if got := guardArgvReadonly([]string{"tee", "out"}); got == "" {
@@ -236,11 +200,14 @@ func TestReadonlyAllowlist_Alfix3_InterpretersRemoved(t *testing.T) {
 		})
 	}
 
-	if got := guardArgvReadonly([]string{"bash", "-c", "ls /tmp"}); got != "" {
-		t.Fatalf("bash -c ls must allow, got %q", got)
+	if got := guardArgvReadonly([]string{"bash", "-c", "ls /tmp"}); got == "" {
+		t.Fatalf("bash -c must block")
 	}
-	if got := guardArgvReadonly([]string{"sh", "-c", "ls /tmp"}); got != "" {
-		t.Fatalf("sh -c ls must allow, got %q", got)
+	if got := guardArgvReadonly([]string{"sh", "-c", "ls /tmp"}); got == "" {
+		t.Fatalf("sh -c must block")
+	}
+	if got := guardArgvReadonly([]string{"python3", "-m", "json.tool"}); got == "" {
+		t.Fatalf("json.tool must block")
 	}
 }
 
@@ -330,13 +297,16 @@ func TestReadonlyAllowlist_Alfix3_AllowlistSelfClose(t *testing.T) {
 			}
 		})
 	}
-	if got := screenReadonlyAllowlist([]string{"tar", "-tf", "a.tar"}); got != "" {
-		t.Fatalf("tar -tf must allow at allowlist: %q", got)
+	if got := screenReadonlyAllowlist([]string{"tar", "-tf", "a.tar"}); got == "" {
+		t.Fatalf("tar -tf must block at allowlist")
 	}
 	if got := screenReadonlyAllowlist([]string{"git", "reflog"}); got != "" {
 		t.Fatalf("git reflog bare must allow: %q", got)
 	}
 	if got := screenReadonlyAllowlist([]string{"git", "reflog", "show"}); got != "" {
 		t.Fatalf("git reflog show must allow: %q", got)
+	}
+	if got := screenReadonlyAllowlist([]string{"git", "reflog", "-n", "5", "expire"}); got == "" {
+		t.Fatalf("git reflog -n 5 expire must block")
 	}
 }

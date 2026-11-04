@@ -31,8 +31,8 @@ func TestReadonlyAllowlist_ProcessSubstBlocked(t *testing.T) {
 			if got == "" {
 				t.Fatalf("expected block for %q, got empty", tc.code)
 			}
-			if !strings.Contains(got, "process substitution") {
-				t.Fatalf("expected process substitution in detail, got %q", got)
+			if !strings.Contains(got, "process substitution") && !strings.Contains(got, "bash") {
+				t.Fatalf("expected process substitution or bash block, got %q", got)
 			}
 		})
 	}
@@ -41,8 +41,8 @@ func TestReadonlyAllowlist_ProcessSubstBlocked(t *testing.T) {
 		if got == "" {
 			t.Fatal("expected block")
 		}
-		if !strings.Contains(got, "process substitution") {
-			t.Fatalf("expected process substitution, got %q", got)
+		if !strings.Contains(got, "process substitution") && !strings.Contains(got, "bash") {
+			t.Fatalf("expected process substitution or bash block, got %q", got)
 		}
 	})
 }
@@ -66,10 +66,11 @@ func TestReadonlyAllowlist_CurlOptionAllowlist(t *testing.T) {
 		{name: "curl -X GET", argv: []string{"curl", "-s", "-X", "GET", "https://example.com"}},
 		{name: "curl --head", argv: []string{"curl", "--head", "https://example.com"}},
 	}
+	// Round-4: curl deleted from allowlist.
 	for _, tc := range allow {
-		t.Run("allow/"+tc.name, func(t *testing.T) {
-			if got := guardArgvReadonly(tc.argv); got != "" {
-				t.Fatalf("expected allow, got %q", got)
+		t.Run("block-former-allow/"+tc.name, func(t *testing.T) {
+			if got := guardArgvReadonly(tc.argv); got == "" {
+				t.Fatalf("expected block for %v", tc.argv)
 			}
 		})
 	}
@@ -79,7 +80,7 @@ func TestReadonlyAllowlist_CurlOptionAllowlist(t *testing.T) {
 		argv []string
 		want string
 	}{
-		{name: "stderr", argv: []string{"curl", "--stderr", "/tmp/pwn", "https://x"}, want: "stderr"},
+		{name: "stderr", argv: []string{"curl", "--stderr", "/tmp/pwn", "https://x"}, want: "curl"},
 		{name: "libcurl", argv: []string{"curl", "--libcurl", "/tmp/pwn.c", "https://x"}, want: "libcurl"},
 		{name: "trace", argv: []string{"curl", "--trace", "/tmp/pwn", "https://x"}, want: "trace"},
 		{name: "trace-ascii", argv: []string{"curl", "--trace-ascii", "/tmp/pwn", "https://x"}, want: "trace"},
@@ -104,57 +105,41 @@ func TestReadonlyAllowlist_CurlOptionAllowlist(t *testing.T) {
 			if got == "" {
 				t.Fatalf("expected block for %v", tc.argv)
 			}
-			if !strings.Contains(got, tc.want) && !strings.Contains(got, "curl") {
-				t.Fatalf("expected %q in detail, got %q", tc.want, got)
-			}
 		})
 	}
 }
 
-// Must Fix #3: sqlite3 requires -readonly AND SQL positional; no stdin/pipe.
+// Round-4: sqlite3 removed from allowlist.
 func TestReadonlyAllowlist_SqliteStrict(t *testing.T) {
 	t.Setenv(auditEnvRole, "scout")
 	t.Setenv(auditEnvReadonly, "")
 
-	t.Run("allow with sql", func(t *testing.T) {
+	t.Run("block with sql", func(t *testing.T) {
 		got := guardArgvReadonly([]string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", "SELECT 1"})
-		if got != "" {
-			t.Fatalf("expected allow, got %q", got)
+		if got == "" {
+			t.Fatalf("sqlite3 must block")
 		}
 	})
-	block := []struct {
-		name string
-		argv []string
-		code string
-		want string
-	}{
-		{name: "no sql argv", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db"}, want: "sql"},
-		{name: "piped stdin", code: `echo '.shell id' | sqlite3 -readonly -safe /tmp/x.db`, want: "sql"},
-		{name: "heredoc", code: "sqlite3 -readonly -safe /tmp/x.db <<'EOF'\n.shell id\nEOF", want: "sql"},
-		{name: "here string", code: `sqlite3 -readonly -safe /tmp/x.db <<< '.shell id'`, want: "sql"},
-		{name: "missing safe", argv: []string{"sqlite3", "/tmp/x.db", "SELECT 1"}, want: "safe"},
-		{name: "dot shell in sql", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", ".shell id"}, want: "dot-command"},
+	for _, argv := range [][]string{
+		{"sqlite3", "-readonly", "-safe", "/tmp/x.db"},
+		{"sqlite3", "/tmp/x.db", "SELECT 1"},
+		{"sqlite3", "-readonly", "-safe", "/tmp/x.db", ".shell id"},
+	} {
+		if got := guardArgvReadonly(argv); got == "" {
+			t.Fatalf("expected block for %v", argv)
+		}
 	}
-	for _, tc := range block {
-		t.Run(tc.name, func(t *testing.T) {
-			var got string
-			if tc.code != "" {
-				got = guardShellReadonly(tc.code)
-			} else {
-				got = guardArgvReadonly(tc.argv)
-			}
-			if got == "" {
-				t.Fatalf("expected block")
-			}
-			if !strings.Contains(strings.ToLower(got), tc.want) &&
-				!strings.Contains(got, "sqlite3") {
-				t.Fatalf("expected %q in %q", tc.want, got)
-			}
-		})
+	for _, code := range []string{
+		`echo '.shell id' | sqlite3 -readonly -safe /tmp/x.db`,
+		"sqlite3 -readonly -safe /tmp/x.db <<'EOF'\n.shell id\nEOF",
+		`sqlite3 -readonly -safe /tmp/x.db <<< '.shell id'`,
+	} {
+		if got := guardShellReadonly(code); got == "" {
+			t.Fatalf("expected block for %q", code)
+		}
 	}
 }
 
-// Must Fix #4: go fmt must be denied; gofmt -d/-l stay allowed.
 func TestReadonlyAllowlist_GoFmtBlocked(t *testing.T) {
 	t.Setenv(auditEnvRole, "reviewer")
 	t.Setenv(auditEnvReadonly, "")
@@ -209,12 +194,7 @@ func TestReadonlyAllowlist_SimilarWriteHoles(t *testing.T) {
 		name string
 		argv []string
 	}{
-		{name: "gcc --version", argv: []string{"gcc", "--version"}},
 		{name: "mount -l", argv: []string{"mount", "-l"}},
-		{name: "tar -tf", argv: []string{"tar", "-tf", "a.tar"}},
-		{name: "gzip -l", argv: []string{"gzip", "-l", "file.gz"}},
-		{name: "gzip -dc", argv: []string{"gzip", "-dc", "file.gz"}},
-		{name: "unzip -l", argv: []string{"unzip", "-l", "a.zip"}},
 		{name: "git branch -a", argv: []string{"git", "branch", "-a"}},
 		{name: "git config --get", argv: []string{"git", "config", "--get", "user.name"}},
 		{name: "git stash list", argv: []string{"git", "stash", "list"}},
@@ -225,6 +205,16 @@ func TestReadonlyAllowlist_SimilarWriteHoles(t *testing.T) {
 				t.Fatalf("expected allow, got %q for %v", got, tc.argv)
 			}
 		})
+	}
+	for _, argv := range [][]string{
+		{"gcc", "--version"},
+		{"tar", "-tf", "a.tar"},
+		{"gzip", "-l", "file.gz"},
+		{"unzip", "-l", "a.zip"},
+	} {
+		if got := guardArgvReadonly(argv); got == "" {
+			t.Fatalf("deleted command must block: %v", argv)
+		}
 	}
 }
 
@@ -241,7 +231,7 @@ func TestReadonlyAllowlist_BlockHints(t *testing.T) {
 	}{
 		{name: "python -c", argv: []string{"python3", "-c", "print(1)"}, hint: "jq"},
 		{name: "node -e", argv: []string{"node", "-e", "1"}, hint: "jq"},
-		{name: "sqlite no safe", argv: []string{"sqlite3", "/tmp/x.db", "SELECT 1"}, hint: "-safe"},
+		{name: "sqlite removed", argv: []string{"sqlite3", "/tmp/x.db", "SELECT 1"}, hint: "jq"},
 		{name: "go test", argv: []string{"go", "test", "./..."}, hint: "verifier"},
 		{name: "process subst", code: `cat <(echo hi)`, hint: "pipe"},
 	}
@@ -346,28 +336,17 @@ func TestReadonlyAllowlist_BareMakeCompiler(t *testing.T) {
 			}
 		})
 	}
-	allow := []struct {
-		name string
-		argv []string
-	}{
-		{name: "make --version", argv: []string{"make", "--version"}},
-		{name: "make -v", argv: []string{"make", "-v"}},
-		{name: "make --help", argv: []string{"make", "--help"}},
-		{name: "make -h", argv: []string{"make", "-h"}},
-		{name: "gmake --version", argv: []string{"gmake", "--version"}},
-		{name: "gcc --version", argv: []string{"gcc", "--version"}},
-		{name: "gcc -dumpversion", argv: []string{"gcc", "-dumpversion"}},
-		{name: "clang --help", argv: []string{"clang", "--help"}},
-	}
-	for _, tc := range allow {
-		t.Run("allow/"+tc.name, func(t *testing.T) {
-			if got := screenReadonlyAllowlist(tc.argv); got != "" {
-				t.Fatalf("screenReadonlyAllowlist(%v) = %q, want allow", tc.argv, got)
-			}
-			if got := guardArgvReadonly(tc.argv); got != "" {
-				t.Fatalf("guardArgvReadonly(%v) = %q, want allow", tc.argv, got)
-			}
-		})
+	// Round-4: compilers/make removed entirely (even --version).
+	for _, argv := range [][]string{
+		{"make", "--version"}, {"make", "-v"}, {"make", "--help"}, {"make", "-h"},
+		{"gmake", "--version"}, {"gcc", "--version"}, {"gcc", "-dumpversion"}, {"clang", "--help"},
+	} {
+		if got := screenReadonlyAllowlist(argv); got == "" {
+			t.Fatalf("screenReadonlyAllowlist(%v) must block", argv)
+		}
+		if got := guardArgvReadonly(argv); got == "" {
+			t.Fatalf("guardArgvReadonly(%v) must block", argv)
+		}
 	}
 }
 
@@ -405,12 +384,12 @@ func TestReadonlyAllowlist_CurlAtFileValues(t *testing.T) {
 			}
 		})
 	}
-	// Non-@ header values still allowed.
-	if got := guardArgvReadonly([]string{"curl", "-s", "-H", "Accept: application/json", "https://x"}); got != "" {
-		t.Fatalf("plain -H value must allow, got %q", got)
+	// Round-4: curl removed entirely.
+	if got := guardArgvReadonly([]string{"curl", "-s", "-H", "Accept: application/json", "https://x"}); got == "" {
+		t.Fatalf("curl must block")
 	}
-	if got := guardArgvReadonly([]string{"curl", "-s", "--header=Accept: text/plain", "https://x"}); got != "" {
-		t.Fatalf("plain --header= value must allow, got %q", got)
+	if got := guardArgvReadonly([]string{"curl", "-s", "--header=Accept: text/plain", "https://x"}); got == "" {
+		t.Fatalf("curl must block")
 	}
 }
 
@@ -435,10 +414,11 @@ func TestReadonlyAllowlist_SqliteDotFailClosed(t *testing.T) {
 		{name: "--help alone", argv: []string{"sqlite3", "--help"}},
 		{name: "-help alone", argv: []string{"sqlite3", "-help"}},
 	}
+	// Round-4: sqlite3 removed; former allows must block.
 	for _, tc := range allow {
-		t.Run("allow/"+tc.name, func(t *testing.T) {
-			if got := guardArgvReadonly(tc.argv); got != "" {
-				t.Fatalf("expected allow for %v, got %q", tc.argv, got)
+		t.Run("block-former-allow/"+tc.name, func(t *testing.T) {
+			if got := guardArgvReadonly(tc.argv); got == "" {
+				t.Fatalf("expected block for %v", tc.argv)
 			}
 		})
 	}
@@ -448,7 +428,7 @@ func TestReadonlyAllowlist_SqliteDotFailClosed(t *testing.T) {
 		argv []string
 		want string
 	}{
-		{name: ".read", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", ".read evil.sql"}, want: "dot"},
+		{name: ".read", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", ".read evil.sql"}, want: "sqlite"},
 		{name: ".READ upper", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", ".READ evil.sql"}, want: "dot"},
 		{name: ".load", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", ".load evil.so"}, want: "dot"},
 		{name: ".LOAD", argv: []string{"sqlite3", "-readonly", "-safe", "/tmp/x.db", ".LOAD /tmp/x.so"}, want: "dot"},

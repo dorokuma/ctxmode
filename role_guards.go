@@ -2661,6 +2661,13 @@ func peelResolvedDepth(argv []string, kind byte, depth int, caller callerIdentit
 	if base == "ctxmode" && callerReadonlyRole(caller) && ctxmodeCLIAction(head[1:]) == "index" {
 		return "ctxmode index"
 	}
+	// Strict readonly: allowlist before shell/interpreter unwrap so deleted
+	// heads (bash/python/...) cannot bypass via -c/-m recursion.
+	if kind == 'r' {
+		if hit := screenReadonlyAllowlist(typedHead); hit != "" {
+			return allowlistDetail(hit)
+		}
+	}
 	if text, has := unwrapShellArgv(head); has {
 		if kind == 's' {
 			return guardShellSubagentDepth(text, depth+1, caller)
@@ -2669,15 +2676,8 @@ func peelResolvedDepth(argv []string, kind byte, depth int, caller callerIdentit
 	}
 	if lang, code, has := unwrapInterpreterInline(head); has {
 		if lang == "python-module" {
-			// Strict read-only: only safe modules (json.tool/pprint) and
-			// pure --help queries pass; everything else is denied.
+			// Strict read-only: python removed entirely (use jq .).
 			if kind == 'r' {
-				if hit, has := pythonModuleHit(head[1:]); has {
-					if hit != "" {
-						return allowlistDetail(hit)
-					}
-					return ""
-				}
 				return allowlistDetail("python interpreter")
 			}
 			if modArgv := pythonModuleArgvFrom(head); len(modArgv) > 0 {

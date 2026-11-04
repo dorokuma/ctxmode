@@ -17,8 +17,8 @@ func TestGuard_R4_FsckLostFound(t *testing.T) {
 	}{
 		{name: "fsck --lost-found", argv: []string{"git", "fsck", "--lost-found"}, want: "git fsck --lost-found"},
 		{name: "fsck --lost-found variant order", argv: []string{"git", "fsck", "--unreachable", "--lost-found"}, want: "git fsck --lost-found"},
-		{name: "fsck plain ok", argv: []string{"git", "fsck"}, want: ""},
-		{name: "fsck --unreachable ok", argv: []string{"git", "fsck", "--unreachable"}, want: ""},
+		{name: "fsck plain ok", argv: []string{"git", "fsck"}, want: "fsck"},
+		{name: "fsck --unreachable ok", argv: []string{"git", "fsck", "--unreachable"}, want: "fsck"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -204,8 +204,8 @@ func TestGuard_R4_SedNegationAndCustomAddr(t *testing.T) {
 		{name: "sed custom delim w", argv: []string{"sed", `\|root|w /tmp/out`}, want: "sed w"},
 		{name: "sed custom delim W", argv: []string{"sed", `\#root#W /tmp/out`}, want: "sed W"},
 		{name: "sed plain w still", argv: []string{"sed", "w /tmp/out"}, want: "sed w"},
-		{name: "sed -n p ok", argv: []string{"sed", "-n", "1!p"}, want: ""},
-		{name: "sed custom delim p ok", argv: []string{"sed", `-n`, `\|root|p`}, want: ""},
+		{name: "sed -n p ok", argv: []string{"sed", "-n", "1!p"}, want: "sed"},
+		{name: "sed custom delim p ok", argv: []string{"sed", `-n`, `\|root|p`}, want: "sed"},
 	}
 	for _, tc := range roCases {
 		t.Run("ro/"+tc.name, func(t *testing.T) {

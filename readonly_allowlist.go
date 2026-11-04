@@ -63,54 +63,55 @@ func init() {
 	readonlyAllowlist["ls"] = simple("lahrtR1AUdvX", "",
 		[]string{"all", "almost-all", "human-readable", "reverse", "recursive",
 			"directory", "classify", "group-directories-first",
-			"full-time", "inode", "size", "author", "help", "version"},
-		[]string{"width", "tabsize", "block-size", "format", "sort", "time",
-			"quoting-style", "hide", "ignore", "indicator-style", "color", "time-style"})
+			"full-time", "inode", "size", "author", "help", "version", "color", "time"},
+		[]string{"width", "tabsize", "block-size", "format", "sort",
+			"quoting-style", "hide", "ignore", "indicator-style", "time-style"})
 	readonlyAllowlist["cat"] = simple("nbsAET", "",
 		[]string{"number", "number-nonblank", "squeeze-blank", "show-all",
 			"show-ends", "show-tabs", "show-nonprinting", "help", "version"}, nil)
-	readonlyAllowlist["head"] = simple("nqvz", "nc",
+	readonlyAllowlist["head"] = simple("qvz", "nc",
 		[]string{"quiet", "silent", "verbose", "zero-terminated", "help", "version"},
 		[]string{"bytes", "lines"})
-	readonlyAllowlist["tail"] = simple("nqfvz", "nc",
+	// -f/-F/--follow block forever-follow; keep -n/-c value opts only.
+	readonlyAllowlist["tail"] = simple("qvz", "nc",
 		[]string{"quiet", "silent", "verbose", "zero-terminated", "help", "version"},
-		[]string{"bytes", "lines", "sleep-interval", "max-unchanged-stats", "pid", "follow"})
-	readonlyAllowlist["tail"].longBool["follow"] = true
+		[]string{"bytes", "lines", "sleep-interval", "max-unchanged-stats", "pid"})
 	readonlyAllowlist["wc"] = simple("cmlLw", "",
 		[]string{"bytes", "chars", "lines", "max-line-length", "words", "help", "version"}, nil)
 	// shortBool / shortValue are explicit disjoint tables: boolean shorts must
 	// NEVER appear in shortValue or scanAllowedOpts will swallow the next argv
 	// (e.g. rg -n --pre=... used to skip --pre).
-	readonlyAllowlist["rg"] = simple("ninlFvUHAPcwoqsS", "egmABCtTM",
+	readonlyAllowlist["rg"] = simple("ninlFvUHPcwoqsS", "egmABCtTM",
 		[]string{"ignore-case", "line-number", "files-with-matches", "files-without-match",
 			"fixed-strings", "vimgrep", "json", "pretty", "no-heading", "with-filename",
 			"no-filename", "count", "stats", "help", "version", "hidden", "follow", "multiline",
 			"word-regexp", "column", "only-matching", "quiet", "no-config", "no-ignore",
-			"no-ignore-vcs", "search-zip", "pcre2", "files", "smart-case", "case-sensitive"},
+			"no-ignore-vcs", "pcre2", "files", "smart-case", "case-sensitive", "color"},
 		[]string{"regexp", "file", "glob", "type", "type-add", "type-not", "max-count", "max-depth", "max-filesize",
-			"context", "before-context", "after-context", "color", "colors", "encoding",
+			"context", "before-context", "after-context", "colors", "encoding",
 			"replace", "sort", "sortr", "iglob", "ignore-file", "max-columns"})
 	readonlyAllowlist["grep"] = simple("ninlFvwxqRHEor", "emABC",
 		[]string{"ignore-case", "line-number", "files-with-matches", "files-without-match",
 			"fixed-strings", "word-regexp", "line-regexp", "quiet", "silent", "recursive",
 			"dereference-recursive", "extended-regexp", "perl-regexp", "basic-regexp",
 			"help", "version", "count", "only-matching", "no-filename", "with-filename",
-			"invert-match", "byte-offset", "null"},
+			"invert-match", "byte-offset", "null", "color"},
 		[]string{"regexp", "file", "exclude", "exclude-dir", "include", "max-count",
-			"context", "before-context", "after-context", "color", "binary-files"})
+			"context", "before-context", "after-context", "binary-files"})
 	readonlyAllowlist["egrep"] = readonlyAllowlist["grep"]
 	readonlyAllowlist["fgrep"] = readonlyAllowlist["grep"]
-	readonlyAllowlist["stat"] = simple("cftLq", "c",
+	readonlyAllowlist["stat"] = simple("ftLq", "c",
 		[]string{"file-system", "filesystem", "terse", "dereference", "help", "version"},
 		[]string{"format", "printf"})
-	readonlyAllowlist["file"] = simple("bLszk", "",
-		[]string{"brief", "dereference", "special-files", "compressed", "keep-going",
+	// Deny -s/--special-files/-z/--compressed/-m/--magic-file (side effects / decompressors).
+	readonlyAllowlist["file"] = simple("bLk", "",
+		[]string{"brief", "dereference", "keep-going",
 			"help", "version", "mime", "mime-type", "mime-encoding", "raw"},
-		[]string{"separator", "exclude", "magic-file"})
-	readonlyAllowlist["du"] = simple("ahsdcBHx", "B",
+		[]string{"separator", "exclude"})
+	readonlyAllowlist["du"] = simple("ahsdcHx", "B",
 		[]string{"all", "human-readable", "summarize", "total", "bytes", "si",
-			"dereference", "help", "version"},
-		[]string{"block-size", "max-depth", "exclude", "threshold", "time", "time-style"})
+			"dereference", "help", "version", "time"},
+		[]string{"block-size", "max-depth", "exclude", "threshold", "time-style"})
 	readonlyAllowlist["df"] = simple("ahTih", "",
 		[]string{"all", "human-readable", "print-type", "inodes", "si", "help",
 			"version", "total", "local", "portability"},
@@ -123,40 +124,33 @@ func init() {
 	readonlyAllowlist["which"] = simple("a", "", []string{"all", "help", "version"}, nil)
 	readonlyAllowlist["type"] = simple("afpP", "", nil, nil)
 	readonlyAllowlist["date"] = simple("uR", "dfr",
-		[]string{"utc", "universal", "rfc-email", "help", "version"},
-		[]string{"date", "file", "reference", "rfc-3339", "iso-8601"})
+		[]string{"utc", "universal", "rfc-email", "help", "version", "iso-8601"},
+		[]string{"date", "file", "reference", "rfc-3339"})
 	readonlyAllowlist["date"].check = func(argv []string) string {
+		endOpts := false
 		for _, a := range argv[1:] {
-			if a == "-s" || a == "--set" || strings.HasPrefix(a, "--set=") {
+			if endOpts {
+				if !strings.HasPrefix(a, "+") {
+					return "date set"
+				}
+				continue
+			}
+			if a == "--" {
+				endOpts = true
+				continue
+			}
+			if a == "-s" || a == "--set" || strings.HasPrefix(a, "--set=") ||
+				(strings.HasPrefix(a, "-s") && !strings.HasPrefix(a, "--") && a != "-s") {
+				return "date set"
+			}
+			if strings.HasPrefix(a, "-") && a != "-" {
+				continue
+			}
+			if a != "-" && !strings.HasPrefix(a, "+") {
 				return "date set"
 			}
 		}
 		return ""
-	}
-	readonlyAllowlist["env"] = &cmdAllow{
-		shortBool:  "i0",
-		shortValue: "u",
-		longBool:   longSet("ignore-environment", "help", "version", "null"),
-		longValue:  longSet("unset"),
-		check: func(argv []string) string {
-			for i := 1; i < len(argv); i++ {
-				a := argv[i]
-				if a == "--" {
-					if i+1 < len(argv) {
-						return "env command"
-					}
-					return ""
-				}
-				if strings.HasPrefix(a, "-") {
-					continue
-				}
-				if strings.Contains(a, "=") {
-					return "env assign"
-				}
-				return "env command"
-			}
-			return ""
-		},
 	}
 	readonlyAllowlist["sort"] = simple("nruubczfR", "kt",
 		[]string{"numeric-sort", "reverse", "unique", "ignore-leading-blanks",
@@ -172,10 +166,10 @@ func init() {
 		}
 		return ""
 	}
-	readonlyAllowlist["uniq"] = simple("cudifz", "fws",
+	readonlyAllowlist["uniq"] = simple("cudiz", "fws",
 		[]string{"count", "repeated", "all-repeated", "ignore-case", "unique",
-			"zero-terminated", "help", "version"},
-		[]string{"skip-fields", "skip-chars", "check-chars", "group"})
+			"zero-terminated", "help", "version", "group"},
+		[]string{"skip-fields", "skip-chars", "check-chars"})
 	readonlyAllowlist["uniq"].check = func(argv []string) string {
 		// uniq [INPUT [OUTPUT]]: second positional overwrites OUTPUT.
 		pos := 0
@@ -230,19 +224,19 @@ func init() {
 	readonlyAllowlist["diff"] = simple("urNqbwBy", "",
 		[]string{"unified", "recursive", "new-file", "brief", "ignore-space-change",
 			"ignore-all-space", "ignore-blank-lines", "side-by-side", "help", "version",
-			"report-identical-files", "normal"},
-		[]string{"unified", "context", "exclude", "exclude-from", "label", "color", "width"})
+			"report-identical-files", "normal", "color"},
+		[]string{"context", "exclude", "exclude-from", "label", "width"})
 	readonlyAllowlist["cmp"] = simple("bls", "in",
 		[]string{"print-bytes", "quiet", "silent", "verbose", "help", "version"},
 		[]string{"ignore-initial", "bytes"})
-	readonlyAllowlist["tree"] = simple("adflLnhFC", "L",
+	readonlyAllowlist["tree"] = simple("adflnhFC", "L",
 		[]string{"help", "version", "dirsfirst", "noreport"},
 		[]string{"filelimit", "charset"})
 	readonlyAllowlist["realpath"] = simple("eqzs", "",
 		[]string{"canonicalize-existing", "canonicalize-missing", "quiet", "silent",
 			"strip", "no-symlinks", "zero", "help", "version"},
 		[]string{"relative-to", "relative-base"})
-	readonlyAllowlist["basename"] = simple("azs", "s",
+	readonlyAllowlist["basename"] = simple("az", "s",
 		[]string{"multiple", "zero", "help", "version"}, []string{"suffix"})
 	readonlyAllowlist["dirname"] = simple("z", "", []string{"zero", "help", "version"}, nil)
 	readonlyAllowlist["readlink"] = simple("efmnqsz", "",
@@ -254,7 +248,7 @@ func init() {
 	readonlyAllowlist["sha256sum"] = readonlyAllowlist["md5sum"]
 	readonlyAllowlist["sha1sum"] = readonlyAllowlist["md5sum"]
 	readonlyAllowlist["sha512sum"] = readonlyAllowlist["md5sum"]
-	readonlyAllowlist["strings"] = simple("anot", "ant",
+	readonlyAllowlist["strings"] = simple("o", "ant",
 		[]string{"all", "print-file-name", "help", "version"},
 		[]string{"bytes", "radix", "encoding", "output-separator"})
 	readonlyAllowlist["objdump"] = simple("dshxtrRw", "j",
@@ -276,36 +270,17 @@ func init() {
 		[]string{"all", "numeric", "tcp", "udp", "listening", "processes", "resolve",
 			"extended", "options", "memory", "info", "summary", "help", "version", "ipv4", "ipv6"},
 		[]string{"query", "family", "filter"})
-	readonlyAllowlist["journalctl"] = simple("efxqrb", "unSo",
+	readonlyAllowlist["journalctl"] = simple("exqrb", "unSo",
 		[]string{"no-pager", "catalog", "disk-usage", "help", "version", "list-boots",
-			"reverse", "utc", "quiet", "follow", "pager-end", "merge", "system", "user",
-			"dmesg"},
-		[]string{"unit", "user-unit", "boot", "identifier", "priority", "grep", "output",
+			"reverse", "utc", "quiet", "pager-end", "merge", "system", "user",
+			"dmesg", "boot"},
+		[]string{"unit", "user-unit", "identifier", "priority", "grep", "output",
 			"directory", "since", "until", "lines", "facility"})
 	readonlyAllowlist["systemctl"] = &cmdAllow{
 		shortBool: "qal",
 		longBool:  longSet("no-pager", "no-legend", "all", "full", "failed", "quiet", "help", "version", "user", "system"),
 		longValue: longSet("type", "state", "property"),
 		check:     checkSystemctlReadonly,
-	}
-	readonlyAllowlist["cd"] = &cmdAllow{
-		shortBool: "LP",
-		check: func(argv []string) string {
-			pos := 0
-			for _, a := range argv[1:] {
-				if strings.HasPrefix(a, "-") && a != "-" {
-					if a == "-L" || a == "-P" {
-						continue
-					}
-					return "cd flag " + a
-				}
-				pos++
-				if pos > 1 {
-					return "cd extra args"
-				}
-			}
-			return ""
-		},
 	}
 	readonlyAllowlist["gofmt"] = &cmdAllow{
 		check: func(argv []string) string {
@@ -331,51 +306,13 @@ func init() {
 	readonlyAllowlist["sed"] = &cmdAllow{check: checkSedReadonly}
 	readonlyAllowlist["gsed"] = readonlyAllowlist["sed"]
 	readonlyAllowlist["git"] = &cmdAllow{check: checkGitReadonly}
-	readonlyAllowlist["git-fsck"] = &cmdAllow{check: func(argv []string) string {
-		return checkGitReadonly(append([]string{"git", "fsck"}, argv[1:]...))
-	}}
-	readonlyAllowlist["curl"] = &cmdAllow{check: checkCurlReadonly}
-	readonlyAllowlist["sqlite3"] = &cmdAllow{check: checkSqliteReadonly}
 	readonlyAllowlist["go"] = &cmdAllow{check: checkGoReadonly}
-	for _, sh := range []string{"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash"} {
-		readonlyAllowlist[sh] = &cmdAllow{check: checkShellReadonly}
-	}
 	readonlyAllowlist["herdr"] = &cmdAllow{check: checkHerdrReadonly}
-
-	readonlyAllowlist["read"] = &cmdAllow{check: func(argv []string) string { return "" }}
-	readonlyAllowlist["tar"] = &cmdAllow{check: checkTarReadonly}
-	readonlyAllowlist["gtar"] = readonlyAllowlist["tar"]
-	readonlyAllowlist["bsdtar"] = readonlyAllowlist["tar"]
-	readonlyAllowlist["unzip"] = &cmdAllow{check: checkUnzipReadonly}
-	readonlyAllowlist["gzip"] = &cmdAllow{check: checkGzipReadonly}
-	readonlyAllowlist["gunzip"] = readonlyAllowlist["gzip"]
-	readonlyAllowlist["xz"] = readonlyAllowlist["gzip"]
-	readonlyAllowlist["unxz"] = readonlyAllowlist["gzip"]
-	readonlyAllowlist["zstd"] = readonlyAllowlist["gzip"]
-	readonlyAllowlist["unzstd"] = readonlyAllowlist["gzip"]
-	readonlyAllowlist["bzip2"] = readonlyAllowlist["gzip"]
-	readonlyAllowlist["bunzip2"] = readonlyAllowlist["gzip"]
-	readonlyAllowlist["lz4"] = readonlyAllowlist["gzip"]
 	readonlyAllowlist["mount"] = &cmdAllow{check: checkMountReadonly}
 	readonlyAllowlist["kill"] = &cmdAllow{check: checkKillReadonly}
-	readonlyAllowlist["gcc"] = &cmdAllow{check: checkCompilerQuery}
-	readonlyAllowlist["g++"] = readonlyAllowlist["gcc"]
-	readonlyAllowlist["cc"] = readonlyAllowlist["gcc"]
-	readonlyAllowlist["c++"] = readonlyAllowlist["gcc"]
-	readonlyAllowlist["clang"] = readonlyAllowlist["gcc"]
-	readonlyAllowlist["clang++"] = readonlyAllowlist["gcc"]
-	readonlyAllowlist["make"] = &cmdAllow{check: checkCompilerQuery}
-	readonlyAllowlist["gmake"] = readonlyAllowlist["make"]
-
 	readonlyAllowlist["ctxmode"] = &cmdAllow{check: checkCtxmodeReadonly}
-	readonlyAllowlist["command"] = &cmdAllow{
-		check: func(argv []string) string {
-			if isCommandQuery(argv[1:]) {
-				return ""
-			}
-			return "command execute"
-		},
-	}
+	// Deleted from strict allowlist (prefer misblock): shells, python*, tar/unzip/
+	// compressors, sqlite3, curl, cd/read/((, gcc/make family, git-fsck.
 }
 
 func checkSystemctlReadonly(argv []string) string {
@@ -458,259 +395,78 @@ func checkFindReadonly(argv []string) string {
 }
 
 func checkSedReadonly(argv []string) string {
-	scripts, errReason := collectSedScripts(argv[1:])
-	if errReason != "" {
-		return errReason
+	// Only: sed -n '<digits>p' file...  or  sed -n '<digits>,<digits>p' file...
+	// Script must match ^[0-9]+(,[0-9]+)?p$ ; only -n allowed among options.
+	args := argv[1:]
+	if len(args) == 0 {
+		return "sed"
 	}
-	if len(scripts) == 0 {
-		return "sed missing script"
-	}
-	for _, sc := range scripts {
-		if reason := sedScriptAllowReason(sc); reason != "" {
-			return reason
-		}
-	}
-	return ""
-}
-
-func collectSedScripts(args []string) (scripts []string, reason string) {
-	endOpts := false
-	sawScript := false
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if !endOpts {
-			switch {
-			case a == "--":
-				endOpts = true
-				continue
-			case a == "-e" || a == "--expression":
-				if i+1 >= len(args) {
-					return nil, "sed -e missing"
-				}
-				scripts = append(scripts, args[i+1])
-				sawScript = true
-				i++
-				continue
-			case strings.HasPrefix(a, "--expression="):
-				scripts = append(scripts, a[len("--expression="):])
-				sawScript = true
-				continue
-			case a == "-f" || a == "--file" || strings.HasPrefix(a, "--file="):
-				return nil, "sed -f file"
-			case a == "-i" || strings.HasPrefix(a, "--in-place"):
-				return nil, "sed -i"
-			case a == "-n" || a == "--quiet" || a == "--silent" || a == "-E" || a == "-r" ||
-				a == "--regexp-extended" || a == "-s" || a == "--separate" || a == "-z" ||
-				a == "--null-data" || a == "--help" || a == "--version" || a == "-u" || a == "--unbuffered":
-				continue
-			case strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && len(a) > 1:
-				for j := 1; j < len(a); j++ {
-					switch a[j] {
-					case 'n', 'E', 'r', 's', 'z', 'u':
-						continue
-					case 'e':
-						tail := a[j+1:]
-						if tail != "" {
-							scripts = append(scripts, tail)
-							sawScript = true
-						} else if i+1 < len(args) {
-							scripts = append(scripts, args[i+1])
-							sawScript = true
-							i++
-						} else {
-							return nil, "sed -e missing"
-						}
-						j = len(a)
-					case 'f', 'i':
-						return nil, "sed -" + string(a[j])
-					default:
-						return nil, "sed unknown -" + string(a[j])
-					}
-				}
-				continue
-			case strings.HasPrefix(a, "-"):
-				return nil, "sed unknown " + a
-			}
-		}
-		if !sawScript {
-			scripts = append(scripts, a)
-			sawScript = true
-			continue
-		}
-	}
-	return scripts, ""
-}
-
-func sedScriptAllowReason(script string) string {
-	s := script
 	i := 0
-	for i < len(s) {
-		for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' || s[i] == ';') {
+	sawN := false
+	script := ""
+	for i < len(args) {
+		a := args[i]
+		if a == "--" {
 			i++
-		}
-		if i >= len(s) {
 			break
 		}
-		if s[i] == '#' {
-			for i < len(s) && s[i] != '\n' {
-				i++
-			}
+		if a == "-n" || a == "--quiet" || a == "--silent" {
+			sawN = true
+			i++
 			continue
 		}
-		if s[i] == '{' || s[i] == '}' {
-			return "sed brace"
+		if strings.HasPrefix(a, "-") && a != "-" {
+			return "sed flag " + a
 		}
-		adv, ok := sedConsumeAddress(s, i)
-		if !ok {
-			// bare command with no address is fine — reparse as command
-			adv = i
-		} else {
-			i = adv
-			if i < len(s) && s[i] == ',' {
-				i++
-				adv, ok = sedConsumeAddress(s, i)
-				if !ok {
-					return "sed address range"
-				}
-				i = adv
-			}
+		break
+	}
+	if !sawN {
+		return "sed requires -n"
+	}
+	if i >= len(args) {
+		return "sed missing script"
+	}
+	script = args[i]
+	i++
+	if !sedReadonlyPrintScript(script) {
+		return "sed script"
+	}
+	// remaining must be file operands (no more options)
+	for ; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			continue
 		}
-		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
-			i++
-		}
-		if i < len(s) && s[i] == '!' {
-			i++
-			for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
-				i++
-			}
-		}
-		if i >= len(s) {
-			return "sed missing command"
-		}
-		cmd := s[i]
-		i++
-		switch cmd {
-		case 'p', 'd', '=', 'x', 'h', 'g', 'G', 'H', 'n', 'N', 'P', 'D', 'z':
-			// zero-arg
-		case 'q', 'Q':
-			for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
-				i++
-			}
-			for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-				i++
-			}
-		case 's':
-			flags, next, ok := sedConsumeS(s, i)
-			if !ok {
-				return "sed s parse"
-			}
-			for _, f := range flags {
-				switch f {
-				case 'g', 'p', 'i', 'I', 'm', 'M', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-					continue
-				default:
-					return "sed s flag " + string(f)
-				}
-			}
-			i = next
-		case 'y':
-			return "sed y"
-		case 'a', 'i', 'c', 'r', 'R', 'w', 'W', 'e', 'b', 't', 'T', 'l', 'L', 'F', 'v':
-			return "sed cmd " + string(cmd)
-		default:
-			return "sed cmd " + string(cmd)
+		if strings.HasPrefix(a, "-") && a != "-" {
+			return "sed flag after script"
 		}
 	}
 	return ""
 }
 
-func sedConsumeAddress(s string, i int) (int, bool) {
-	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+func sedReadonlyPrintScript(script string) bool {
+	if script == "" {
+		return false
+	}
+	// ^[0-9]+(,[0-9]+)?p$
+	n := len(script)
+	i := 0
+	if i >= n || script[i] < '0' || script[i] > '9' {
+		return false
+	}
+	for i < n && script[i] >= '0' && script[i] <= '9' {
 		i++
 	}
-	if i >= len(s) {
-		return i, false
-	}
-	if s[i] == '$' {
-		return i + 1, true
-	}
-	if s[i] >= '0' && s[i] <= '9' {
-		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+	if i < n && script[i] == ',' {
+		i++
+		if i >= n || script[i] < '0' || script[i] > '9' {
+			return false
+		}
+		for i < n && script[i] >= '0' && script[i] <= '9' {
 			i++
 		}
-		return i, true
 	}
-	if s[i] == '/' {
-		i++
-		for i < len(s) && s[i] != '/' {
-			if s[i] == '\\' && i+1 < len(s) {
-				i += 2
-				continue
-			}
-			if s[i] == '\n' {
-				return i, false
-			}
-			i++
-		}
-		if i >= len(s) || s[i] != '/' {
-			return i, false
-		}
-		return i + 1, true
-	}
-	if s[i] == '\\' && i+1 < len(s) {
-		delim := s[i+1]
-		if delim == '\n' || delim == '\\' {
-			return i, false
-		}
-		i += 2
-		for i < len(s) && s[i] != delim {
-			if s[i] == '\\' && i+1 < len(s) {
-				i += 2
-				continue
-			}
-			i++
-		}
-		if i >= len(s) {
-			return i, false
-		}
-		return i + 1, true
-	}
-	return i, false
-}
-
-func sedConsumeS(s string, i int) (flags string, next int, ok bool) {
-	if i >= len(s) {
-		return "", i, false
-	}
-	delim := s[i]
-	i++
-	for i < len(s) && s[i] != delim {
-		if s[i] == '\\' && i+1 < len(s) {
-			i += 2
-			continue
-		}
-		i++
-	}
-	if i >= len(s) {
-		return "", i, false
-	}
-	i++
-	for i < len(s) && s[i] != delim {
-		if s[i] == '\\' && i+1 < len(s) {
-			i += 2
-			continue
-		}
-		i++
-	}
-	if i >= len(s) {
-		return "", i, false
-	}
-	i++
-	start := i
-	for i < len(s) && s[i] != ';' && s[i] != '\n' && s[i] != ' ' && s[i] != '\t' && s[i] != '{' && s[i] != '}' {
-		i++
-	}
-	return s[start:i], i, true
+	return i == n-1 && script[i] == 'p'
 }
 
 func checkGitReadonly(argv []string) string {
@@ -781,21 +537,40 @@ sub:
 	}
 	switch sub {
 	case "log", "show", "diff", "status", "blame", "grep", "rev-parse",
-		"ls-files", "ls-tree", "ls-remote", "cat-file", "for-each-ref",
-		"describe", "shortlog", "fsck", "count-objects", "check-ignore",
-		"var", "name-rev", "rev-list", "symbolic-ref", "merge-base":
+		"ls-files", "ls-tree", "cat-file", "for-each-ref",
+		"describe", "shortlog", "count-objects", "check-ignore",
+		"var", "name-rev", "rev-list", "merge-base":
 		return gitOptsAllow(sub, rest)
 	case "reflog":
-		// allowlist-layer close: expire/delete write; bare/show inspect.
-		if len(rest) == 0 {
+		// Skip leading flags; only bare or "show" (help) are read-only.
+		j := 0
+		for j < len(rest) {
+			a := rest[j]
+			if a == "--" {
+				j++
+				break
+			}
+			if !strings.HasPrefix(a, "-") || a == "-" {
+				break
+			}
+			// value-taking shorts commonly used with reflog listing
+			if a == "-n" || a == "--max-count" || strings.HasPrefix(a, "--max-count=") {
+				if !strings.Contains(a, "=") && a != "--max-count=" {
+					j += 2
+					continue
+				}
+			}
+			if strings.HasPrefix(a, "-n") && a != "-n" && !strings.HasPrefix(a, "--") {
+				j++
+				continue
+			}
+			j++
+		}
+		if j >= len(rest) {
 			return gitOptsAllow(sub, rest)
 		}
-		sub2 := rest[0]
+		sub2 := rest[j]
 		if sub2 == "show" || sub2 == "-h" || sub2 == "--help" {
-			return gitOptsAllow(sub, rest)
-		}
-		if strings.HasPrefix(sub2, "-") {
-			// flag-only reflog listing (e.g. -n 5) stays read-only
 			return gitOptsAllow(sub, rest)
 		}
 		return "git reflog " + sub2
@@ -834,6 +609,13 @@ func gitOptsAllow(sub string, rest []string) string {
 			strings.HasPrefix(a, "--exec") {
 			return "git " + sub + " " + a
 		}
+		// git grep -O/--open-files-in-pager executes an external program.
+		if sub == "grep" {
+			if a == "-O" || strings.HasPrefix(a, "-O") && !strings.HasPrefix(a, "--") ||
+				a == "--open-files-in-pager" || strings.HasPrefix(a, "--open-files-in-pager=") {
+				return "git grep open-files-in-pager"
+			}
+		}
 	}
 	return ""
 }
@@ -854,23 +636,29 @@ func gitBranchAllow(rest []string) string {
 		switch a {
 		case "-a", "--all", "-r", "--remotes", "-l", "--list",
 			"--contains", "--no-contains",
-			"--merged", "--no-merged", "--points-at", "--format", "--sort", "-h", "--help",
-			"--column", "--no-column":
+			"--merged", "--no-merged", "--points-at", "-h", "--help":
 			query = true
 			switch a {
-			case "--contains", "--no-contains", "--merged", "--no-merged", "--points-at",
-				"--format", "--sort":
+			case "--contains", "--no-contains", "--merged", "--no-merged", "--points-at":
 				i++
 			}
 			continue
-		case "-v", "-vv", "--verbose", "-q", "--quiet", "--color", "--no-color":
+		case "-v", "-vv", "--verbose", "-q", "--quiet", "--color", "--no-color",
+			"--column", "--no-column", "--sort", "--format":
 			// Modifiers only — do not alone authorize branch creation.
+			if a == "--sort" || a == "--format" {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "--contains=") || strings.HasPrefix(a, "--merged=") ||
+			strings.HasPrefix(a, "--points-at=") {
+			query = true
 			continue
 		}
 		if strings.HasPrefix(a, "--sort=") || strings.HasPrefix(a, "--format=") ||
-			strings.HasPrefix(a, "--contains=") || strings.HasPrefix(a, "--merged=") ||
-			strings.HasPrefix(a, "--points-at=") || strings.HasPrefix(a, "--color=") {
-			query = true
+			strings.HasPrefix(a, "--color=") {
+			// modifiers with values — not query flags
 			continue
 		}
 		if strings.HasPrefix(a, "-") {
@@ -901,14 +689,19 @@ func gitTagAllow(rest []string) string {
 	for _, a := range rest {
 		switch a {
 		case "-l", "--list", "-n", "-n1", "-n2", "-n3", "--contains", "--points-at",
-			"--format", "--sort", "--merged", "--no-merged", "--verify", "-v",
-			"-h", "--help", "--color", "--no-color", "-i", "--ignore-case":
+			"--merged", "--no-merged", "--verify", "-v",
+			"-h", "--help":
+			listish = true
+			continue
+		case "--color", "--no-color", "-i", "--ignore-case", "--format", "--sort":
+			// modifiers only — do not authorize tag creation
+			continue
+		}
+		if strings.HasPrefix(a, "-n") || strings.HasPrefix(a, "--contains=") {
 			listish = true
 			continue
 		}
-		if strings.HasPrefix(a, "-n") || strings.HasPrefix(a, "--format=") ||
-			strings.HasPrefix(a, "--sort=") || strings.HasPrefix(a, "--contains=") {
-			listish = true
+		if strings.HasPrefix(a, "--format=") || strings.HasPrefix(a, "--sort=") {
 			continue
 		}
 		if strings.HasPrefix(a, "-") {
@@ -928,11 +721,12 @@ func gitConfigAllow(rest []string) string {
 		a := rest[i]
 		switch a {
 		case "--get", "--get-all", "--get-regexp", "--get-urlmatch", "-l", "--list",
-			"--name-only", "--show-origin", "--show-scope", "-h", "--help":
+			"-h", "--help":
 			hasGet = true
 			continue
-		case "--global", "--system", "--local", "--worktree", "--includes", "--no-includes":
-			// Scope modifiers only — require an explicit get/list action.
+		case "--global", "--system", "--local", "--worktree", "--includes", "--no-includes",
+			"--name-only", "--show-origin", "--show-scope":
+			// Scope / display modifiers only — require an explicit get/list action.
 			continue
 		case "--get-color", "--get-colorbool":
 			hasGet = true
@@ -973,9 +767,9 @@ func gitRemoteAllow(rest []string) string {
 		}
 	}
 	switch sub {
-	case "show", "get-url", "help":
+	case "get-url", "help":
 		return ""
-	case "add", "remove", "rm", "rename", "set-url", "set-branches", "set-head", "prune", "update":
+	case "show", "add", "remove", "rm", "rename", "set-url", "set-branches", "set-head", "prune", "update":
 		return "git remote " + sub
 	default:
 		return "git remote " + sub
@@ -983,19 +777,28 @@ func gitRemoteAllow(rest []string) string {
 }
 
 func gitWorktreeAllow(rest []string) string {
-	if len(rest) == 0 {
-		return ""
+	j := 0
+	for j < len(rest) {
+		a := rest[j]
+		if a == "--" {
+			j++
+			break
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			break
+		}
+		j++
 	}
-	sub := rest[0]
+	if j >= len(rest) {
+		return "git worktree"
+	}
+	sub := rest[j]
 	switch sub {
 	case "list", "-h", "--help":
 		return ""
 	case "add", "remove", "rm", "prune", "move", "lock", "unlock", "repair":
 		return "git worktree " + sub
 	default:
-		if strings.HasPrefix(sub, "-") {
-			return ""
-		}
 		return "git worktree " + sub
 	}
 }
@@ -1470,23 +1273,35 @@ func checkGoReadonly(argv []string) string {
 		}
 		return ""
 	case "list":
-		deny := []string{
-			"toolexec", "exec", "modfile", "overlay", "go", "sdk",
-			"asmflags", "gcflags", "ldflags", "gccgoflags",
+		// Whitelist only: -f (valued), -json, -m, -u, -versions, -deps, -e, -find.
+		allowBool := map[string]bool{
+			"json": true, "m": true, "u": true, "versions": true,
+			"deps": true, "e": true, "find": true, "h": true, "help": true,
 		}
-		for _, a := range rest {
-			if a == "--" || !strings.HasPrefix(a, "-") {
+		allowVal := map[string]bool{"f": true}
+		for i := 0; i < len(rest); i++ {
+			a := rest[i]
+			if a == "--" || !strings.HasPrefix(a, "-") || a == "-" {
 				continue
 			}
 			name := strings.TrimLeft(a, "-")
+			glued := false
 			if eq := strings.IndexByte(name, '='); eq >= 0 {
 				name = name[:eq]
+				glued = true
 			}
-			for _, d := range deny {
-				if name == d {
-					return "go list -" + d
+			if allowVal[name] {
+				if !glued && !strings.Contains(a, "=") && (strings.HasPrefix(a, "--") || a == "-f") {
+					i++ // consume value
+				} else if !glued && strings.HasPrefix(a, "-f") && a != "-f" && !strings.HasPrefix(a, "--") {
+					// glued -f{{.X}}
 				}
+				continue
 			}
+			if allowBool[name] {
+				continue
+			}
+			return "go list -" + name
 		}
 		return ""
 	case "fmt", "vet", "test", "build", "run", "generate",
@@ -1546,7 +1361,7 @@ func checkHerdrReadonly(argv []string) string {
 			return "herdr pane"
 		}
 		switch args[1] {
-		case "read", "list", "ls", "capture", "dump", "get", "info", "status", "help", "wait-output":
+		case "read", "list", "ls", "capture", "dump", "get", "info", "status", "help":
 			return ""
 		default:
 			return "herdr pane " + args[1]
@@ -1888,7 +1703,7 @@ func checkCompilerQuery(argv []string) string {
 
 func checkCtxmodeReadonly(argv []string) string {
 	args := argv[1:]
-	// Skip global flags (-workdir, -config, etc.)
+	// Readonly roles must not load external -config/--config.
 	i := 0
 	for i < len(args) {
 		a := args[i]
@@ -1897,13 +1712,16 @@ func checkCtxmodeReadonly(argv []string) string {
 			break
 		}
 		if strings.HasPrefix(a, "-") {
-			// value-taking globals commonly used
-			if a == "-workdir" || a == "-config" || a == "-C" || strings.HasPrefix(a, "-workdir=") || strings.HasPrefix(a, "-config=") {
-				if !strings.Contains(a, "=") {
-					i += 2
-				} else {
-					i++
-				}
+			if a == "-config" || a == "--config" || strings.HasPrefix(a, "-config=") || strings.HasPrefix(a, "--config=") {
+				return "ctxmode config"
+			}
+			// value-taking globals: -workdir/--workdir/-C must skip their value
+			if a == "-workdir" || a == "--workdir" || a == "-C" {
+				i += 2
+				continue
+			}
+			if strings.HasPrefix(a, "-workdir=") || strings.HasPrefix(a, "--workdir=") {
+				i++
 				continue
 			}
 			i++
@@ -1934,6 +1752,10 @@ func screenReadonlyAllowlist(argv []string) string {
 	if strings.Contains(argv[0], cmdSubPlaceholder) {
 		return "dynamic command head"
 	}
+	// Reject path-form argv[0] (./ls, /tmp/rg); basename matching alone is unsafe.
+	if strings.Contains(argv[0], "/") {
+		return "path command"
+	}
 	base := filepath.Base(argv[0])
 	base = canonicalResolvedBase(base)
 	switch base {
@@ -1941,8 +1763,10 @@ func screenReadonlyAllowlist(argv []string) string {
 		return base
 	case "function":
 		return "function definition"
-	case "[[", "[", "test", "((":
+	case "[[", "[", "test":
 		return ""
+	case "((":
+		return "arithmetic (("
 	}
 	if strings.HasSuffix(base, "()") {
 		return "function definition"
@@ -1951,10 +1775,7 @@ func screenReadonlyAllowlist(argv []string) string {
 		return hit
 	}
 	if allowlistIsInterpreter(base) {
-		return ""
-	}
-	if allDigits(base) {
-		return ""
+		return "interpreter " + base
 	}
 	entry := readonlyAllowlist[base]
 	if entry == nil {
@@ -1989,26 +1810,17 @@ func allowlistInterpreterHit(argv []string, base string) string {
 	if !allowlistIsInterpreter(base) {
 		return ""
 	}
-	label := "interpreter"
 	isPython := base == "python" || strings.HasPrefix(base, "python2") || strings.HasPrefix(base, "python3")
 	if isPython {
-		label = "python interpreter"
-	} else if base == "node" || base == "nodejs" || base == "ts-node" || base == "tsx" || base == "bun" {
-		label = "node interpreter"
-	} else if base == "awk" || base == "gawk" || base == "mawk" || base == "nawk" {
-		label = "awk program"
-	} else {
-		label = base + " interpreter"
+		return "python interpreter"
 	}
-	// Narrow: interpreters are removed from the strict allowlist except
-	// `python3 -m json.tool` with at most one positional input file.
-	// --version/--help/syntax-check and all other interpreters fail closed.
-	if isPython {
-		if hit, has := pythonModuleHit(argv[1:]); has {
-			return hit
-		}
+	if base == "node" || base == "nodejs" || base == "ts-node" || base == "tsx" || base == "bun" {
+		return "node interpreter"
 	}
-	return label
+	if base == "awk" || base == "gawk" || base == "mawk" || base == "nawk" {
+		return "awk program"
+	}
+	return base + " interpreter"
 }
 
 func scanAllowedOpts(args []string, entry *cmdAllow) string {
@@ -2074,8 +1886,7 @@ func readonlyPrePeelHit(argv []string) string {
 	for i < len(argv) && steps < peelWrapperMaxSteps {
 		a := argv[i]
 		if isAssignWord(a) {
-			i++
-			continue
+			return "env assign"
 		}
 		if shellNoopWords[a] {
 			i++
@@ -2088,35 +1899,12 @@ func readonlyPrePeelHit(argv []string) string {
 		case "function":
 			return "function definition"
 		case "env", "command", "builtin", "nice", "timeout", "stdbuf", "busybox",
-			"ionice", "taskset", "chrt", "strace", "ltrace", "setsid", "time",
-			"if", "then", "elif", "else", "while", "until", "do", "!":
+			"ionice", "taskset", "chrt", "strace", "ltrace", "setsid", "time":
+			// Wrappers removed from readonly peel: fail closed (no strip).
+			return base
+		case "if", "then", "elif", "else", "while", "until", "do", "!":
 			i++
 			steps++
-			if base == "timeout" {
-				i = skipTimeoutArgs(argv, i)
-				continue
-			}
-			for i < len(argv) {
-				x := argv[i]
-				if x == "--" {
-					i++
-					break
-				}
-				if !strings.HasPrefix(x, "-") || x == "-" {
-					break
-				}
-				// value-taking short cuts for common wrappers
-				if base == "env" && (x == "-u" || x == "--unset") {
-					i += 2
-					continue
-				}
-				if (base == "nice" && (x == "-n" || x == "--adjustment")) ||
-					(base == "strace" || base == "ltrace") {
-					i++
-					continue
-				}
-				i++
-			}
 			continue
 		default:
 			if strings.HasSuffix(base, "()") {
@@ -2173,33 +1961,41 @@ func readonlyBlockWithHint(detail string) string {
 func readonlyHintFor(detail string) string {
 	d := strings.ToLower(detail)
 	switch {
-	case strings.Contains(d, "python") && (strings.Contains(d, "program") || strings.Contains(d, "interpreter")),
-		strings.Contains(d, "javascript") || strings.Contains(d, "node"),
-		strings.Contains(d, "perl") && strings.Contains(d, "interpreter"),
-		strings.Contains(d, "ruby") && strings.Contains(d, "interpreter"):
-		return "for JSON use jq; for text/files use rg / rg --files; for file view use cat/head/sed -n"
+	case strings.Contains(d, "python") || strings.Contains(d, "javascript") || strings.Contains(d, "node") ||
+		(strings.Contains(d, "perl") && strings.Contains(d, "interpreter")) ||
+		(strings.Contains(d, "ruby") && strings.Contains(d, "interpreter")) ||
+		strings.Contains(d, "json.tool"):
+		return "for JSON use jq . ; for text/files use rg / rg --files; for file view use cat/head/sed -n 'N,Mp'"
+	case strings.Contains(d, "bash") || strings.Contains(d, "shell") ||
+		strings.Contains(d, "unknown command sh") || strings.Contains(d, "unknown command dash") ||
+		strings.Contains(d, "unknown command zsh"):
+		return "run allowlisted tools directly (rg/jq/cat/head/tail/git); no shell -c"
+	case strings.Contains(d, "sqlite"):
+		return "sqlite3 removed from readonly allowlist; use jq . for JSON or git show/cat for files"
+	case strings.Contains(d, "curl") || strings.Contains(d, "wget"):
+		return "curl removed; for local files use cat/rg/git show/log/diff"
+	case strings.Contains(d, "tar") || strings.Contains(d, "unzip") || strings.Contains(d, "gzip"):
+		return "archives removed; inspect with git show / cat / rg instead"
+	case strings.Contains(d, "sed"):
+		return "only sed -n 'N,Mp' file is allowed; prefer rg / cut / tr"
 	case strings.Contains(d, "git config"):
 		return "use git config --get <key> or git config -l"
-	case strings.Contains(d, "sqlite") && (strings.Contains(d, "safe") || strings.Contains(d, "readonly")):
-		return "add -readonly -safe and pass SQL as a positional argument"
-	case strings.Contains(d, "sqlite") && strings.Contains(d, "sql"):
-		return "pass SQL as a positional arg (stdin/pipe/interactive blocked); keep -readonly -safe"
-	case strings.Contains(d, "sqlite") && strings.Contains(d, "dangerous"):
-		return "add -readonly -safe; avoid writefile/edit/load_extension"
 	case strings.Contains(d, "go test") || strings.Contains(d, "go build") ||
 		strings.Contains(d, "go run") || strings.Contains(d, "go fmt") ||
 		strings.Contains(d, "npm") || strings.Contains(d, "cargo") ||
-		strings.Contains(d, "make"):
+		strings.Contains(d, "make") || strings.Contains(d, "gcc"):
 		return "this is a readonly role; hand write/test/build work to verifier or the main agent"
 	case strings.Contains(d, "process substitution"):
-		return "avoid <(...) / >(...); use a pipe (cmd | other) or temp-free constructs like rg/cat"
-	case strings.Contains(d, "wget") || strings.Contains(d, "unknown command"):
-		return "prefer curl -sS for HTTP GET, or cat/rg/git show for local files"
+		return "avoid <(...) / >(...); use a pipe (cmd | other) or rg/cat"
+	case strings.Contains(d, "env assign") || strings.Contains(d, "strace") ||
+		strings.Contains(d, "busybox") || strings.Contains(d, "timeout") ||
+		strings.Contains(d, "unknown command"):
+		return "use allowlisted read tools (ls/cat/rg/git/jq); no wrappers or VAR=val prefixes"
 	case strings.Contains(d, "command substitution") || strings.Contains(d, "eval") ||
 		strings.Contains(d, "exec") || strings.Contains(d, "source"):
 		return "run allowed commands directly; no eval/source/exec/$(...)"
 	default:
-		return "use allowlisted read tools (ls/cat/rg/git/jq/curl -sS); write/test → verifier"
+		return "use allowlisted read tools (ls/cat/rg/git/jq/sed -n); write/test → verifier"
 	}
 }
 
@@ -2211,11 +2007,9 @@ func readonlyToolsDescription() string {
 Readonly role commands (strict scout/planner/researcher/reviewer/oracle):
 files: ls cat head tail wc stat file du tree realpath basename dirname readlink
 search: rg grep find sed
-text: sort uniq cut tr jq diff cmp echo printf
+text: sort uniq cut tr jq diff cmp echo printf true false
 vcs: git
-http_db: curl sqlite3
 go_meta: go gofmt ctxmode
-ops: ps pgrep ss journalctl systemctl env which date pwd
-archive: tar unzip gzip
+ops: ps pgrep ss journalctl systemctl which date pwd mount kill herdr
 `)
 }

@@ -268,9 +268,9 @@ func TestGuard_R5_FsckPrefixAndDashed(t *testing.T) {
 		{name: "git-fsck dashed", argv: []string{"git-fsck", "--lost-found"}, want: "git fsck --lost-found"},
 		{name: "git-fsck --lost", argv: []string{"git-fsck", "--lost"}, want: "git fsck --lost-found"},
 		{name: "path git-fsck", argv: []string{"/usr/lib/git-core/git-fsck", "--lost-found"}, want: "git fsck --lost-found"},
-		{name: "plain fsck ok", argv: []string{"git", "fsck"}, want: ""},
-		{name: "fsck --unreachable ok", argv: []string{"git", "fsck", "--unreachable"}, want: ""},
-		{name: "git-fsck plain ok", argv: []string{"git-fsck"}, want: ""},
+		{name: "plain fsck ok", argv: []string{"git", "fsck"}, want: "fsck"},
+		{name: "fsck --unreachable ok", argv: []string{"git", "fsck", "--unreachable"}, want: "fsck"},
+		{name: "git-fsck plain ok", argv: []string{"git-fsck"}, want: "fsck"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

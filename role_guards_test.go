@@ -241,10 +241,10 @@ func TestGuard_GitDualMode(t *testing.T) {
 		want string
 	}{
 		// worktree
-		{name: "git worktree bare", argv: []string{"git", "worktree"}, want: ""},
+		{name: "git worktree bare", argv: []string{"git", "worktree"}, want: "deleted"},
 		{name: "git worktree list", argv: []string{"git", "worktree", "list"}, want: ""},
-		{name: "git worktree -h", argv: []string{"git", "worktree", "-h"}, want: ""},
-		{name: "git worktree --help", argv: []string{"git", "worktree", "--help"}, want: ""},
+		{name: "git worktree -h", argv: []string{"git", "worktree", "-h"}, want: "deleted"},
+		{name: "git worktree --help", argv: []string{"git", "worktree", "--help"}, want: "deleted"},
 		{name: "git worktree add", argv: []string{"git", "worktree", "add", "/tmp/w"}, want: "git worktree add"},
 		{name: "git worktree remove", argv: []string{"git", "worktree", "remove", "w"}, want: "git worktree remove"},
 		{name: "git worktree prune", argv: []string{"git", "worktree", "prune"}, want: "git worktree prune"},
@@ -289,7 +289,7 @@ func TestGuard_GitDualMode(t *testing.T) {
 		// remote
 		{name: "git remote bare", argv: []string{"git", "remote"}, want: ""},
 		{name: "git remote -v", argv: []string{"git", "remote", "-v"}, want: ""},
-		{name: "git remote show", argv: []string{"git", "remote", "show", "origin"}, want: ""},
+		{name: "git remote show", argv: []string{"git", "remote", "show", "origin"}, want: "deleted"},
 		{name: "git remote get-url", argv: []string{"git", "remote", "get-url", "origin"}, want: ""},
 		{name: "git remote add", argv: []string{"git", "remote", "add", "o", "u"}, want: "git remote add"},
 		{name: "git remote set-url", argv: []string{"git", "remote", "set-url", "o", "u"}, want: "git remote set-url"},
@@ -322,7 +322,7 @@ func TestGuard_GitDualMode(t *testing.T) {
 		{name: "git ls-files", argv: []string{"git", "ls-files"}, want: ""},
 		{name: "git rev-parse", argv: []string{"git", "rev-parse", "HEAD"}, want: ""},
 		{name: "git for-each-ref", argv: []string{"git", "for-each-ref"}, want: ""},
-		{name: "git fsck", argv: []string{"git", "fsck"}, want: ""},
+		{name: "git fsck", argv: []string{"git", "fsck"}, want: "deleted"},
 		{name: "git count-objects", argv: []string{"git", "count-objects", "-v"}, want: ""},
 		{name: "git check-ignore", argv: []string{"git", "check-ignore", "f"}, want: ""},
 		{name: "git var", argv: []string{"git", "var", "GIT_AUTHOR_IDENT"}, want: ""},
@@ -396,7 +396,7 @@ func TestGuard_WrapperPrecision(t *testing.T) {
 		argv []string
 		want string
 	}{
-		{name: "command -v rm allowed", argv: []string{"command", "-v", "rm"}, want: ""},
+		{name: "command -v rm allowed", argv: []string{"command", "-v", "rm"}, want: "deleted"},
 		{name: "env -S rm", argv: []string{"env", "-S", "rm -f /tmp/x"}, want: "rm"},
 		{name: "env -- rm", argv: []string{"env", "--", "rm", "f"}, want: "rm"},
 		{name: "sh -c glued rm", argv: []string{"sh", "-crm -f x"}, want: "rm"},
@@ -404,8 +404,8 @@ func TestGuard_WrapperPrecision(t *testing.T) {
 		{name: "eval echo ok", argv: []string{"eval", "echo ok"}, want: "eval"},
 		{name: "xargs rm", argv: []string{"xargs", "rm"}, want: "rm"},
 		{name: "xargs sed -i", argv: []string{"xargs", "sed", "-i", "s/a/b/"}, want: "sed -i"},
-		{name: "xargs wc ok", argv: []string{"xargs", "wc", "-l"}, want: ""},
-		{name: "xargs -a file grep", argv: []string{"xargs", "-a", "f.txt", "grep", "x"}, want: ""},
+		{name: "xargs wc ok", argv: []string{"xargs", "wc", "-l"}, want: "deleted"},
+		{name: "xargs -a file grep", argv: []string{"xargs", "-a", "f.txt", "grep", "x"}, want: "deleted"},
 		{name: "find -delete", argv: []string{"find", ".", "-delete"}, want: "find -delete"},
 		{name: "find -exec rm", argv: []string{"find", ".", "-exec", "rm", "{}", "+"}, want: "find -exec rm"},
 		{name: "find -fls", argv: []string{"find", ".", "-fls", "/tmp/x"}, want: "find -fls"},
@@ -444,8 +444,8 @@ func TestGuard_RedirectAndComparison(t *testing.T) {
 		{name: "[[ a < b ]]", code: "[[ $a < $b ]]", want: ""},
 		{name: "(( a > 0 ))", code: "(( a > 0 ))", want: ""},
 		{name: "echo $((1+1)) ok", code: "echo $((1+1))", want: ""},
-		{name: "standalone $((1+1)) ok", code: "$((1+1))", want: ""},
-		{name: "$(( 2 > 1 ))", code: "x=$(( 2 > 1 ))", want: ""},
+		{name: "standalone $((1+1)) ok", code: "$((1+1))", want: "deleted"},
+		{name: "$(( 2 > 1 ))", code: "x=$(( 2 > 1 ))", want: "env assign"},
 		// Heredoc body lines are not shell commands.
 		{name: "python heredoc rm var ok", code: "python3 - <<'PY'\nimport json\nrm = 1\nprint(rm)\nPY", want: "python interpreter"},
 		{name: "cat heredoc rm text ok", code: "cat <<'EOF'\nrm -rf /\nEOF", want: ""},
@@ -846,7 +846,7 @@ func TestGuard_InterpreterInlineArgv(t *testing.T) {
 		{name: "python -c harmless", argv: []string{"python3", "-c", "import json; print(1)"}, want: "python program text"},
 		{name: "python -m pip", argv: []string{"python3", "-m", "pip", "install", "x"}, want: "python -m pip"},
 		{name: "python -m venv", argv: []string{"python3", "-m", "venv", "/tmp/v"}, want: "python -m venv"},
-		{name: "python -m json.tool ok", argv: []string{"python3", "-m", "json.tool", "f.json"}, want: ""},
+		{name: "python -m json.tool ok", argv: []string{"python3", "-m", "json.tool", "f.json"}, want: "deleted"},
 		{name: "node -e writeFile", argv: []string{"node", "-e", "fs.writeFileSync('/tmp/x','a')"}, want: "javascript inline code"},
 		{name: "node -e read ok", argv: []string{"node", "-e", "console.log(1)"}, want: "javascript program text"},
 	}
@@ -883,7 +883,7 @@ func TestGuard_AwkCurlWget(t *testing.T) {
 		{name: "curl --output=file", argv: []string{"curl", "--output=/tmp/f", "https://x"}, want: "curl --output=/tmp/f"},
 		{name: "curl -o - blocked", argv: []string{"curl", "-o", "-", "https://x"}, want: "curl"},
 		{name: "curl -o /dev/null blocked", argv: []string{"curl", "-o", "/dev/null", "https://x"}, want: "curl"},
-		{name: "curl plain ok", argv: []string{"curl", "-s", "https://x"}, want: ""},
+		{name: "curl plain ok", argv: []string{"curl", "-s", "https://x"}, want: "deleted"},
 		{name: "wget default blocks", argv: []string{"wget", "https://x/f"}, want: "wget"},
 		{name: "wget -O file", argv: []string{"wget", "-O", "/tmp/f", "https://x"}, want: "wget"},
 		{name: "wget -O - ok", argv: []string{"wget", "-O", "-", "https://x"}, want: "unknown command wget"},
@@ -1287,7 +1287,7 @@ func TestGuard_CompoundKeywords(t *testing.T) {
 		{name: "if rm", code: "if true; then rm -f x; fi", want: "rm"},
 		{name: "{ rm }", code: "{ rm foo; }", want: "rm"},
 		{name: "! rm", code: "! rm foo", want: "rm"},
-		{name: "time -p pig-free", code: "time -p ls", want: ""},
+		{name: "time -p pig-free", code: "time -p ls", want: "deleted"},
 		{name: "while rm", code: "while read x; do rm \"$x\"; done <f", want: "rm"},
 	}
 	for _, tc := range roCases {
@@ -1370,9 +1370,9 @@ func TestGuard_ExecHookEnvVars(t *testing.T) {
 		argv []string
 		want string
 	}{
-		{"strict GIT_PAGER", []string{"env", "GIT_PAGER=less", "git", "log"}, "env GIT_PAGER"},
-		{"strict EDITOR", []string{"env", "EDITOR=vi", "ls"}, "env EDITOR"},
-		{"strict GOOS ok", []string{"env", "GOOS=linux", "go", "version"}, ""},
+		{"strict GIT_PAGER", []string{"env", "GIT_PAGER=less", "git", "log"}, "not in readonly allowlist: env"},
+		{"strict EDITOR", []string{"env", "EDITOR=vi", "ls"}, "not in readonly allowlist: env"},
+		{"strict GOOS ok", []string{"env", "GOOS=linux", "go", "version"}, "not in readonly allowlist: env"},
 	} {
 		t.Run("strict/"+tc.name, func(t *testing.T) {
 			got := func() string {
@@ -1434,9 +1434,9 @@ func TestGuard_SchedulerWrappers(t *testing.T) {
 		{name: "flock blocks outright", argv: []string{"flock", "/tmp/l", "ls"}, want: "flock"},
 		{name: "script blocks outright", argv: []string{"script", "/tmp/t"}, want: "script"},
 		{name: "script -c blocks outright", argv: []string{"script", "-c", "ls", "/tmp/t"}, want: "script"},
-		{name: "ionice ls ok", argv: []string{"ionice", "-c", "3", "ls"}, want: ""},
-		{name: "taskset ls ok", argv: []string{"taskset", "0x1", "ls"}, want: ""},
-		{name: "watch ls ok", argv: []string{"watch", "ls"}, want: ""},
+		{name: "ionice ls ok", argv: []string{"ionice", "-c", "3", "ls"}, want: "deleted"},
+		{name: "taskset ls ok", argv: []string{"taskset", "0x1", "ls"}, want: "deleted"},
+		{name: "watch ls ok", argv: []string{"watch", "ls"}, want: "deleted"},
 	}
 	for _, tc := range roCases {
 		t.Run("ro/"+tc.name, func(t *testing.T) {
@@ -1489,7 +1489,7 @@ func TestGuard_TrapSourceUnset(t *testing.T) {
 		{name: ". script", code: ". ./env.sh", want: "."},
 		{name: "source script", code: "source ./env.sh", want: "source"},
 		{name: "trap rm", code: "trap 'rm -f x' EXIT", want: "rm"},
-		{name: "trap -p ok", code: "trap -p", want: ""},
+		{name: "trap -p ok", code: "trap -p", want: "deleted"},
 	}
 	for _, tc := range roCases {
 		t.Run("ro/"+tc.name, func(t *testing.T) {
@@ -1588,7 +1588,7 @@ func TestGuard_BareShellAndScriptFile(t *testing.T) {
 		{name: "python3 -V blocked", argv: []string{"python3", "-V"}, want: "python"},
 		{name: "python3 -h blocked", argv: []string{"python3", "-h"}, want: "python"},
 		{name: "python3 - dash stdin ok", argv: []string{"python3", "-"}, want: "python interpreter"},
-		{name: "python3 -m json.tool ok", argv: []string{"python3", "-m", "json.tool", "f.json"}, want: ""},
+		{name: "python3 -m json.tool ok", argv: []string{"python3", "-m", "json.tool", "f.json"}, want: "deleted"},
 		{name: "python3 -m pip blocked", argv: []string{"python3", "-m", "pip", "install", "x"}, want: "python -m pip"},
 		{name: "node app.js", argv: []string{"node", "app.js"}, want: "node"},
 		{name: "node --version blocked", argv: []string{"node", "--version"}, want: "node"},
@@ -1598,7 +1598,7 @@ func TestGuard_BareShellAndScriptFile(t *testing.T) {
 		{name: "python -cCODE glued", argv: []string{"python3", "-cimport json; print(1)"}, want: "python program text"},
 		{name: "python -ucCODE glued write", argv: []string{"python3", "-ucopen('/tmp/x','w')"}, want: "python inline code"},
 		{name: "python -mMODULE glued write", argv: []string{"python3", "-mpip", "install", "x"}, want: "python -m pip"},
-		{name: "python -mMODULE glued ok", argv: []string{"python3", "-mjson.tool", "f.json"}, want: ""},
+		{name: "python -mMODULE glued ok", argv: []string{"python3", "-mjson.tool", "f.json"}, want: "deleted"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1622,48 +1622,48 @@ func TestGuard_ArchiveAndCompress(t *testing.T) {
 		want string
 	}{
 		// tar
-		{name: "tar -tf ok", argv: []string{"tar", "-tf", "a.tar"}, want: ""},
-		{name: "tar tf bsd ok", argv: []string{"tar", "tf", "a.tar"}, want: ""},
-		{name: "tar -tvf ok", argv: []string{"tar", "-tvf", "a.tar"}, want: ""},
-		{name: "tar --list ok", argv: []string{"tar", "--list", "-f", "a.tar"}, want: ""},
-		{name: "tar --help ok", argv: []string{"tar", "--help"}, want: ""},
-		{name: "tar --version ok", argv: []string{"tar", "--version"}, want: ""},
+		{name: "tar -tf ok", argv: []string{"tar", "-tf", "a.tar"}, want: "deleted"},
+		{name: "tar tf bsd ok", argv: []string{"tar", "tf", "a.tar"}, want: "deleted"},
+		{name: "tar -tvf ok", argv: []string{"tar", "-tvf", "a.tar"}, want: "deleted"},
+		{name: "tar --list ok", argv: []string{"tar", "--list", "-f", "a.tar"}, want: "deleted"},
+		{name: "tar --help ok", argv: []string{"tar", "--help"}, want: "deleted"},
+		{name: "tar --version ok", argv: []string{"tar", "--version"}, want: "deleted"},
 		{name: "tar -cf blocked", argv: []string{"tar", "-cf", "a.tar", "dir"}, want: "tar -c"},
 		{name: "tar cf bsd blocked", argv: []string{"tar", "cf", "a.tar", "dir"}, want: "tar -c"},
 		{name: "tar czf blocked", argv: []string{"tar", "czf", "a.tar.gz", "dir"}, want: "tar -c"},
 		{name: "tar -xf blocked", argv: []string{"tar", "-xf", "a.tar"}, want: "tar -x"},
 		{name: "tar xf blocked", argv: []string{"tar", "xf", "a.tar"}, want: "tar -x"},
-		{name: "tar -xOf ok", argv: []string{"tar", "-xOf", "a.tar", "f"}, want: ""},
-		{name: "tar -x --to-stdout ok", argv: []string{"tar", "-x", "--to-stdout", "-f", "a.tar"}, want: ""},
+		{name: "tar -xOf ok", argv: []string{"tar", "-xOf", "a.tar", "f"}, want: "deleted"},
+		{name: "tar -x --to-stdout ok", argv: []string{"tar", "-x", "--to-stdout", "-f", "a.tar"}, want: "deleted"},
 		{name: "tar -rf blocked", argv: []string{"tar", "-rf", "a.tar", "f"}, want: "tar -r"},
 		{name: "tar -u blocked", argv: []string{"tar", "-uf", "a.tar", "f"}, want: "tar -u"},
 		{name: "tar --delete blocked", argv: []string{"tar", "--delete", "-f", "a.tar", "f"}, want: "tar --delete"},
 		{name: "gtar -cf blocked", argv: []string{"gtar", "-cf", "a.tar", "d"}, want: "gtar -c"},
 		// unzip
-		{name: "unzip -l ok", argv: []string{"unzip", "-l", "a.zip"}, want: ""},
-		{name: "unzip -t ok", argv: []string{"unzip", "-t", "a.zip"}, want: ""},
-		{name: "unzip -p ok", argv: []string{"unzip", "-p", "a.zip", "f"}, want: ""},
-		{name: "unzip -v ok", argv: []string{"unzip", "-v", "a.zip"}, want: ""},
-		{name: "unzip -Z ok", argv: []string{"unzip", "-Z", "a.zip"}, want: ""},
+		{name: "unzip -l ok", argv: []string{"unzip", "-l", "a.zip"}, want: "deleted"},
+		{name: "unzip -t ok", argv: []string{"unzip", "-t", "a.zip"}, want: "deleted"},
+		{name: "unzip -p ok", argv: []string{"unzip", "-p", "a.zip", "f"}, want: "deleted"},
+		{name: "unzip -v ok", argv: []string{"unzip", "-v", "a.zip"}, want: "deleted"},
+		{name: "unzip -Z ok", argv: []string{"unzip", "-Z", "a.zip"}, want: "deleted"},
 		{name: "unzip default blocked", argv: []string{"unzip", "a.zip"}, want: "unzip"},
 		{name: "unzip -d blocked", argv: []string{"unzip", "a.zip", "-d", "/tmp/x"}, want: "unzip"},
 		{name: "unzip -o blocked", argv: []string{"unzip", "-o", "a.zip"}, want: "unzip -o"},
 		// compressors
-		{name: "gzip -dc ok", argv: []string{"gzip", "-dc", "a.gz"}, want: ""},
-		{name: "gzip -l ok", argv: []string{"gzip", "-l", "a.gz"}, want: ""},
-		{name: "gzip -t ok", argv: []string{"gzip", "-t", "a.gz"}, want: ""},
-		{name: "gzip -V ok", argv: []string{"gzip", "-V"}, want: ""},
+		{name: "gzip -dc ok", argv: []string{"gzip", "-dc", "a.gz"}, want: "deleted"},
+		{name: "gzip -l ok", argv: []string{"gzip", "-l", "a.gz"}, want: "deleted"},
+		{name: "gzip -t ok", argv: []string{"gzip", "-t", "a.gz"}, want: "deleted"},
+		{name: "gzip -V ok", argv: []string{"gzip", "-V"}, want: "deleted"},
 		{name: "gzip default blocked", argv: []string{"gzip", "a"}, want: "gzip"},
 		{name: "gzip -9 blocked", argv: []string{"gzip", "-9", "a"}, want: "gzip"},
 		{name: "gunzip blocked", argv: []string{"gunzip", "a.gz"}, want: "gunzip"},
-		{name: "gunzip -c ok", argv: []string{"gunzip", "-c", "a.gz"}, want: ""},
-		{name: "xz -dc ok", argv: []string{"xz", "-dc", "a.xz"}, want: ""},
-		{name: "xz -l ok", argv: []string{"xz", "-l", "a.xz"}, want: ""},
+		{name: "gunzip -c ok", argv: []string{"gunzip", "-c", "a.gz"}, want: "deleted"},
+		{name: "xz -dc ok", argv: []string{"xz", "-dc", "a.xz"}, want: "deleted"},
+		{name: "xz -l ok", argv: []string{"xz", "-l", "a.xz"}, want: "deleted"},
 		{name: "xz blocked", argv: []string{"xz", "a"}, want: "xz"},
-		{name: "zstd -dc ok", argv: []string{"zstd", "-dc", "a.zst"}, want: ""},
+		{name: "zstd -dc ok", argv: []string{"zstd", "-dc", "a.zst"}, want: "deleted"},
 		{name: "zstd blocked", argv: []string{"zstd", "a"}, want: "zstd"},
 		{name: "bzip2 blocked", argv: []string{"bzip2", "a"}, want: "bzip2"},
-		{name: "bunzip2 -c ok", argv: []string{"bunzip2", "-c", "a.bz2"}, want: ""},
+		{name: "bunzip2 -c ok", argv: []string{"bunzip2", "-c", "a.bz2"}, want: "deleted"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1728,11 +1728,11 @@ func TestGuard_SedAwkWriteCommands(t *testing.T) {
 		{name: "sed 1,3w", argv: []string{"sed", "1,3w /tmp/x", "f"}, want: "sed w"},
 		{name: "sed addr w", argv: []string{"sed", "/pat/w /tmp/x", "f"}, want: "sed w"},
 		// read-only neighbors must pass
-		{name: "sed -n /word/p ok", argv: []string{"sed", "-n", "/word/p", "f"}, want: ""},
-		{name: "sed s///g ok", argv: []string{"sed", "s/a/word/g", "f"}, want: ""},
-		{name: "sed plain ok", argv: []string{"sed", "s/a/b/", "f"}, want: ""},
+		{name: "sed -n /word/p ok", argv: []string{"sed", "-n", "/word/p", "f"}, want: "deleted"},
+		{name: "sed s///g ok", argv: []string{"sed", "s/a/word/g", "f"}, want: "deleted"},
+		{name: "sed plain ok", argv: []string{"sed", "s/a/b/", "f"}, want: "deleted"},
 		{name: "sed -n p ok", argv: []string{"sed", "-n", "1,20p", "f"}, want: ""},
-		{name: "sed d ok", argv: []string{"sed", "1d", "f"}, want: ""},
+		{name: "sed d ok", argv: []string{"sed", "1d", "f"}, want: "deleted"},
 		{name: "sed y ok", argv: []string{"sed", "y/a/b/", "f"}, want: "blocked"},
 		// awk write escapes
 		{name: "awk system(", argv: []string{"awk", "{system(\"rm f\")}", "f"}, want: "awk system("},
@@ -2060,8 +2060,8 @@ func TestGuard_CommandQueryPrecision(t *testing.T) {
 		argv []string
 		want string
 	}{
-		{name: "command -v rm query ok", argv: []string{"command", "-v", "rm"}, want: ""},
-		{name: "command -pv rm query ok", argv: []string{"command", "-pv", "rm"}, want: ""},
+		{name: "command -v rm query ok", argv: []string{"command", "-v", "rm"}, want: "deleted"},
+		{name: "command -pv rm query ok", argv: []string{"command", "-pv", "rm"}, want: "deleted"},
 		{name: "command rm -v peels", argv: []string{"command", "rm", "-v", "/tmp/x"}, want: "rm"},
 		{name: "command -p rm -v peels", argv: []string{"command", "-p", "rm", "-v", "/tmp/x"}, want: "rm"},
 		{name: "builtin rm peels", argv: []string{"builtin", "rm", "-f", "x"}, want: "rm"},
@@ -2346,8 +2346,8 @@ func TestGuard_EnvIClearsIdentity(t *testing.T) {
 	}
 	// A non-subagent is not identity-bound: env -i is harmless for the
 	// strict read-only guard itself (ls is read-only).
-	if got := guardArgvReadonly([]string{"env", "-i", "ls"}); got != "" {
-		t.Fatalf("guardArgvReadonly(env -i ls) must pass, got %q", got)
+	if got := guardArgvReadonly([]string{"env", "-i", "ls"}); got == "" {
+		t.Fatalf("guardArgvReadonly(env -i ls) must block (env wrapper removed)")
 	}
 }
 
@@ -2476,14 +2476,14 @@ func TestGuard_HardGuardsRound3(t *testing.T) {
 		{name: "mount -a", argv: []string{"mount", "-a"}, want: "mount"},
 		{name: "kill -l ok", argv: []string{"kill", "-l"}, want: ""},
 		{name: "kill -9", argv: []string{"kill", "-9", "1"}, want: "kill"},
-		{name: "gcc --version ok", argv: []string{"gcc", "--version"}, want: ""},
-		{name: "gcc -dumpversion ok", argv: []string{"gcc", "-dumpversion"}, want: ""},
-		{name: "make --version ok", argv: []string{"make", "--version"}, want: ""},
+		{name: "gcc --version ok", argv: []string{"gcc", "--version"}, want: "deleted"},
+		{name: "gcc -dumpversion ok", argv: []string{"gcc", "-dumpversion"}, want: "deleted"},
+		{name: "make --version ok", argv: []string{"make", "--version"}, want: "deleted"},
 		{name: "gcc source", argv: []string{"gcc", "x.c"}, want: "gcc"},
-		{name: "unzip -c ok", argv: []string{"unzip", "-c", "a.zip"}, want: ""},
+		{name: "unzip -c ok", argv: []string{"unzip", "-c", "a.zip"}, want: "deleted"},
 		{name: "gzip -d", argv: []string{"gzip", "-d", "a.gz"}, want: "gzip"},
 		{name: "gzip -n", argv: []string{"gzip", "-n", "a"}, want: "gzip"},
-		{name: "gzip -dc ok", argv: []string{"gzip", "-dc", "a.gz"}, want: ""},
+		{name: "gzip -dc ok", argv: []string{"gzip", "-dc", "a.gz"}, want: "deleted"},
 		{name: "gzip --no-name", argv: []string{"gzip", "--no-name", "a"}, want: "gzip"},
 		{name: "curl -sO", argv: []string{"curl", "-sO", "https://x/f"}, want: "curl -sO"},
 		{name: "curl -so file", argv: []string{"curl", "-so", "/tmp/x", "https://x"}, want: "curl -o /tmp/x"},
@@ -2498,9 +2498,9 @@ func TestGuard_HardGuardsRound3(t *testing.T) {
 		{name: "tar checkpoint", argv: []string{"tar", "-tf", "a.tar", "--checkpoint-action=exec=x"}, want: "tar --checkpoint-action=exec"},
 		{name: "tar to-command", argv: []string{"tar", "-xf", "a.tar", "--to-command=x"}, want: "tar --to-command"},
 		{name: "tar -I bad", argv: []string{"tar", "-tf", "a.tar", "-I", "/tmp/x"}, want: "tar -I"},
-		{name: "tar -I gzip ok", argv: []string{"tar", "-tf", "a.tar", "-I", "gzip"}, want: ""},
+		{name: "tar -I gzip ok", argv: []string{"tar", "-tf", "a.tar", "-I", "gzip"}, want: "deleted"},
 		{name: "git grep -O", argv: []string{"git", "grep", "-Oless", "x"}, want: "git -O"},
-		{name: "git remote -v show ok", argv: []string{"git", "remote", "-v", "show", "origin"}, want: ""},
+		{name: "git remote -v show ok", argv: []string{"git", "remote", "-v", "show", "origin"}, want: "deleted"},
 		{name: "git stash -q list ok", argv: []string{"git", "stash", "-q", "list"}, want: ""},
 		{name: "git stash -q bare", argv: []string{"git", "stash", "-q"}, want: "git stash"},
 		{name: "git branch -q new", argv: []string{"git", "branch", "-q", "newbranch"}, want: "git branch newbranch"},
@@ -2547,7 +2547,7 @@ func TestGuard_HardGuardsRound3(t *testing.T) {
 	}{
 		{name: "echo x | sh", code: "echo x | sh", want: "piped code to shell"},
 		{name: "cat x | python3 -", code: "cat x | python3 -", want: "piped code to python"},
-		{name: "echo json | python3 -m ok", code: "echo '{\"a\":1}' | python3 -m json.tool", want: ""},
+		{name: "echo json | python3 -m ok", code: "echo '{\"a\":1}' | python3 -m json.tool", want: "deleted"},
 		{name: "echo > backslash-eof no panic", code: "echo > \\", want: "> <dynamic>"},
 		{name: "cat <$(rm)", code: "cat <$(rm -f x)", want: "rm"},
 		{name: "sh heredoc pipe", code: "sh <<'EOF' | cat\nrm -f /tmp/x\nEOF", want: "rm"},
@@ -2930,9 +2930,9 @@ func TestGuard_WrapperWriteOpChain(t *testing.T) {
 		{name: "command strace -o", argv: []string{"command", "strace", "-o", "/tmp/t", "ls"}, want: "strace -o"},
 		{name: "if strace -o", argv: []string{"if", "strace", "-o", "/tmp/t", "ls"}, want: "strace -o"},
 		{name: "strace --output-append-mode -o", argv: []string{"strace", "--output-append-mode", "-o", "/tmp/t", "ls"}, want: "strace -o"},
-		{name: "strace plain ok", argv: []string{"strace", "-f", "ls"}, want: ""},
-		{name: "env ls ok", argv: []string{"env", "FOO=1", "ls"}, want: ""},
-		{name: "time plain ok", argv: []string{"nice", "time", "ls"}, want: ""},
+		{name: "strace plain ok", argv: []string{"strace", "-f", "ls"}, want: "deleted"},
+		{name: "env ls ok", argv: []string{"env", "FOO=1", "ls"}, want: "deleted"},
+		{name: "time plain ok", argv: []string{"nice", "time", "ls"}, want: "deleted"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2991,11 +2991,11 @@ func TestGuard_WatchAndXargsArity(t *testing.T) {
 	}{
 		{name: "watch rm text", argv: []string{"watch", "-n", "1", "rm -rf /tmp/x"}, want: "rm"},
 		{name: "watch single word redirect", argv: []string{"watch", "echo>/tmp/x"}, want: "> /tmp/x"},
-		{name: "watch ls ok", argv: []string{"watch", "ls"}, want: ""},
+		{name: "watch ls ok", argv: []string{"watch", "ls"}, want: "deleted"},
 		{name: "watch -x rm", argv: []string{"watch", "-x", "rm", "-f", "x"}, want: "rm"},
 		{name: "xargs -e rm", argv: []string{"xargs", "-e", "rm"}, want: "rm"},
 		{name: "xargs -en rm", argv: []string{"xargs", "-en", "rm"}, want: "rm"},
-		{name: "xargs -eEOF wc ok", argv: []string{"xargs", "-eEOF", "wc", "-l"}, want: ""},
+		{name: "xargs -eEOF wc ok", argv: []string{"xargs", "-eEOF", "wc", "-l"}, want: "deleted"},
 	}
 	for _, tc := range roCases {
 		t.Run("ro/"+tc.name, func(t *testing.T) {
@@ -3056,7 +3056,7 @@ func TestGuard_SedAwkOptionClusters(t *testing.T) {
 		{name: "sed -ne e cmd", argv: []string{"sed", "-ne", "1e pig"}, want: "sed e"},
 		{name: "sed -nf file", argv: []string{"sed", "-nf", "/tmp/x.sed"}, want: "sed -f"},
 		{name: "sed -rn e cmd", argv: []string{"sed", "-rn", "e rm -f x"}, want: "sed e"},
-		{name: "sed -e file named warm.txt ok", argv: []string{"sed", "-e", "1p", "warm.txt"}, want: ""},
+		{name: "sed -e file named warm.txt ok", argv: []string{"sed", "-e", "1p", "warm.txt"}, want: "deleted"},
 		{name: "sed plain -n ok", argv: []string{"sed", "-n", "1,20p", "f"}, want: ""},
 		{name: "gawk -e system  (", argv: []string{"gawk", "-e", "BEGIN{system  (\"pig\")}"}, want: "awk system("},
 		{name: "awk system tab-paren", argv: []string{"awk", "BEGIN{system\t(\"rm f\")}"}, want: "awk system("},
