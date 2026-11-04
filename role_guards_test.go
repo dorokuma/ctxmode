@@ -1218,7 +1218,8 @@ func TestGuard_SessionAndEscalationExecs(t *testing.T) {
 		{name: "systemd-run", argv: []string{"systemd-run", "pig"}, want: "systemd-run"},
 		{name: "crontab -e", argv: []string{"crontab", "-e"}, want: "crontab"},
 		{name: "at now", argv: []string{"at", "now"}, want: "at"},
-		{name: "ssh host", argv: []string{"ssh", "host", "pig"}, want: "ssh"},
+		{name: "ssh remote dispatch", argv: []string{"ssh", "host", "pig"}, want: "pig"},
+		{name: "ssh bare host", argv: []string{"ssh", "host"}, want: "ssh"},
 		// echo ssh is an argument, not a head
 		{name: "echo ssh", argv: []string{"echo", "ssh"}, want: ""},
 	}
@@ -1229,6 +1230,193 @@ func TestGuard_SessionAndEscalationExecs(t *testing.T) {
 				t.Fatalf("guardArgvSubagent(%v) = %q, want %q", tc.argv, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestGuard_SSHPeel covers the ssh transparent-peel model: the option run
+// is parsed with OpenSSH syntax, dangerous options and -o exec/forwarding
+// keys block, a bare interactive `ssh host` blocks, and the remote command
+// inherits the caller's own guard — nested dispatch for every sub-agent,
+// strict read-only writes for all six read-only roles (verifier's /tmp
+// exemption stops at the wire).
+func TestGuard_SSHPeel(t *testing.T) {
+	t.Setenv(auditEnvRole, "worker")
+	t.Setenv(auditEnvReadonly, "")
+
+	sub := []struct {
+		name string
+		code string
+		want string // "" = allowed, hit names the detail
+	}{
+		// Bare / interactive and malformed invocations.
+		{name: "bare host", code: "ssh dmit", want: "ssh"},
+		{name: "flags only", code: "ssh -v", want: "ssh"},
+		{name: "missing -p value", code: "ssh -p", want: "ssh"},
+		{name: "unknown option", code: "ssh -Z dmit uptime", want: "ssh -Z"},
+		// Banned option letters: config file, control socket, forwarding,
+		// no-command/local-side-effect modes.
+		{name: "-F config", code: "ssh -F /tmp/cfg dmit uptime", want: "ssh -F"},
+		{name: "-S socket", code: "ssh -S /tmp/s dmit uptime", want: "ssh -S"},
+		{name: "-O check", code: "ssh -O check dmit uptime", want: "ssh -O"},
+		{name: "-L forward", code: "ssh -L 8080:localhost:80 dmit uptime", want: "ssh -L"},
+		{name: "-R forward", code: "ssh -R 9090:localhost:9 dmit uptime", want: "ssh -R"},
+		{name: "-D socks", code: "ssh -D 1080 dmit uptime", want: "ssh -D"},
+		{name: "-W tunnel", code: "ssh -W host:22 dmit uptime", want: "ssh -W"},
+		{name: "-J jump", code: "ssh -J bastion dmit uptime", want: "ssh -J"},
+		{name: "-N no-cmd", code: "ssh -N dmit uptime", want: "ssh -N"},
+		{name: "-f bg cluster", code: "ssh -qf dmit uptime", want: "ssh -f"},
+		{name: "-G config dump", code: "ssh -G dmit", want: "ssh -G"},
+		{name: "-E logfile", code: "ssh -E /tmp/log dmit uptime", want: "ssh -E"},
+		{name: "-I pkcs11", code: "ssh -I /tmp/x.so dmit uptime", want: "ssh -I"},
+		// -o screening: exec/forward/config keys refuse by name; the
+		// connection-hygiene whitelist stays free in every spelling.
+		{name: "proxycommand", code: "ssh -o ProxyCommand=/tmp/x dmit uptime", want: "ssh -o proxycommand"},
+		{name: "proxyjump", code: "ssh -o ProxyJump=bastion dmit uptime", want: "ssh -o proxyjump"},
+		{name: "localcommand", code: "ssh -o 'LocalCommand /tmp/x' dmit uptime", want: "ssh -o localcommand"},
+		{name: "remotecommand", code: "ssh -o RemoteCommand=bash dmit uptime", want: "ssh -o remotecommand"},
+		{name: "match block", code: "ssh -o 'Match host x exec rm' dmit uptime", want: "ssh -o match"},
+		{name: "include file", code: "ssh -o Include=/tmp/cfg dmit uptime", want: "ssh -o include"},
+		{name: "controlmaster yes", code: "ssh -o ControlMaster=yes dmit uptime", want: "ssh -o controlmaster"},
+		{name: "controlpath sock", code: "ssh -o ControlPath=/tmp/s dmit uptime", want: "ssh -o controlpath"},
+		{name: "knownhosts path write", code: "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/kh dmit uptime", want: "ssh -o userknownhostsfile"},
+		{name: "globalknownhosts path", code: "ssh -o GlobalKnownHostsFile=/etc/kh dmit uptime", want: "ssh -o globalknownhostsfile"},
+		{name: "knownhosts /dev/null ok", code: "ssh -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=none dmit uptime", want: ""},
+		{name: "escape cmdline yes", code: "ssh -o EnableEscapeCommandLine=yes dmit uptime", want: "ssh -o enableescapecommandline"},
+		{name: "escape cmdline no ok", code: "ssh -o EnableEscapeCommandLine=no dmit uptime", want: ""},
+		{name: "unknown long flag", code: "ssh --unknown-flag dmit uptime", want: "ssh --unknown-flag"},
+		{name: "unknown long flag=val", code: "ssh --forward-all=yes dmit uptime", want: "ssh --forward-all=yes"},
+		{name: "--help long fails closed", code: "ssh --help dmit uptime", want: "ssh --help"},
+		{name: "safe -o separate", code: "ssh -o BatchMode=yes -o ConnectTimeout=5 dmit uptime", want: ""},
+		{name: "safe -o glued", code: "ssh -oBatchMode=yes -o 'StrictHostKeyChecking no' dmit uptime", want: ""},
+		{name: "controlmaster=no ok", code: "ssh -o ControlMaster=no -o ControlPath=none dmit uptime", want: ""},
+		// Post-<destination> options: without `--`, OpenSSH re-enters getopt
+		// after <destination>, so trailing options are still ssh's own —
+		// screened here — and the remote command starts at the SECOND
+		// non-option word. NBSP is not ASCII blank for readconf.c: a
+		// `none ` value is a real local filename, never the none sink.
+		{name: "post-dest -q remote pig", code: "ssh dmit -q pig", want: "pig"},
+		{name: "post-dest -o proxycommand", code: "ssh dmit -o ProxyCommand=/tmp/x uptime", want: "ssh -o proxycommand"},
+		{name: "knownhosts nbsp value", code: "ssh -o 'UserKnownHostsFile=none\u00a0' dmit uptime", want: "ssh -o userknownhostsfile"},
+		// Option parsing shapes: clusters, glued and separate values, --.
+		{name: "cluster -qT", code: "ssh -qT dmit uptime", want: ""},
+		{name: "-tt -vvv", code: "ssh -tt -vvv dmit uptime", want: ""},
+		{name: "-p separate", code: "ssh -p 2222 dmit uptime", want: ""},
+		{name: "-p glued", code: "ssh -p2222 dmit uptime", want: ""},
+		{name: "-i glued", code: "ssh -i/root/.ssh/k dmit uptime", want: ""},
+		{name: "-l user", code: "ssh -l root dmit uptime", want: ""},
+		{name: "dashdash", code: "ssh -- dmit uptime", want: ""},
+		{name: "host not option val", code: "ssh -p 2222 -o BatchMode=yes dmit id", want: ""},
+		// Remote command inherits the caller guard: nested dispatch still
+		// blocks through the wire, multi-statement and nested-ssh forms too.
+		{name: "remote pig", code: "ssh dmit pig", want: "pig"},
+		{name: "remote pig compound", code: "ssh dmit 'cd /root && pig run'", want: "pig"},
+		{name: "remote herdr write", code: "ssh dmit 'cd /root && herdr tab create'", want: "herdr tab create"},
+		{name: "remote tmux", code: "ssh dmit 'tmux new-session pig'", want: "tmux"},
+		{name: "remote pipe", code: "ssh dmit 'cat f | agy'", want: "agy"},
+		{name: "nested ssh", code: "ssh hop 'ssh dmit uptime'", want: ""},
+		{name: "nested ssh pig", code: "ssh hop 'ssh dmit pig'", want: "pig"},
+		{name: "nested ssh bare", code: "ssh hop 'ssh dmit'", want: "ssh"},
+		// Legit remote read/write/deploy commands stay free for worker.
+		{name: "deploy pull", code: `ssh -o BatchMode=yes dmit "git -C /root/wechatbridge pull --ff-only && bash deploy/update.sh"`, want: ""},
+		{name: "systemctl restart", code: `ssh -o BatchMode=yes dmit systemctl restart wechatbridge@default.service`, want: ""},
+		{name: "remote rm ok for worker", code: `ssh dmit "rm -f /tmp/x"`, want: ""},
+		// Piped/heredoc stdin reaching a remote program reader: the
+		// here-string and heredoc bodies are screened as shell code; a
+		// pipe's bytes are not visible here so it fails closed.
+		{name: "piped pig", code: "echo pig | ssh dmit sh", want: "piped stdin to ssh"},
+		{name: "piped data ok", code: "cat list | ssh dmit 'xargs touch'", want: ""},
+		{name: "heredoc pig", code: "ssh dmit sh <<'EOF'\npig\nEOF", want: "pig"},
+		{name: "herestring pig", code: "ssh dmit sh <<< 'pig'", want: "pig"},
+	}
+	for _, tc := range sub {
+		t.Run("sub/"+tc.name, func(t *testing.T) {
+			got := guardShellSubagent(tc.code)
+			if got != tc.want {
+				t.Fatalf("guardShellSubagent(%q) = %q, want %q", tc.code, got, tc.want)
+			}
+		})
+	}
+
+	// Read-only roles: a remote read probe is fine, any remote write
+	// blocks as readonly_write_blocked — verifier included.
+	for _, role := range []string{"scout", "reviewer", "oracle", "verifier"} {
+		t.Run("ro/"+role, func(t *testing.T) {
+			t.Setenv(auditEnvRole, role)
+			g := currentGuardCall()
+			if rule, _ := g.guardCtxRunShell(`ssh dmit "git -C /root/wechatbridge status && systemctl is-active wechatbridge@default"`); rule != "" {
+				t.Fatalf("%s: remote read probe must pass, got %q", role, rule)
+			}
+			for _, code := range []string{
+				`ssh dmit "rm -rf /tmp/x"`,
+				`ssh dmit -q rm -rf /tmp/x`, // post-dest option is ssh's; rm is the remote cmd
+				`ssh dmit "git -C /root/wechatbridge pull"`,
+				`ssh dmit "echo a > /tmp/b"`,
+				`ssh dmit "systemctl restart wechatbridge@default"`,
+			} {
+				if rule, _ := g.guardCtxRunShell(code); rule != ruleReadonlyWrite {
+					t.Fatalf("%s: %q rule = %q, want %s", role, code, rule, ruleReadonlyWrite)
+				}
+			}
+			// Remote nested dispatch still reports the sub-agent rule.
+			if rule, _ := g.guardCtxRunShell(`ssh dmit pig`); rule != ruleSubagentNestedAgent {
+				t.Fatalf("%s: remote pig rule = %q, want %s", role, rule, ruleSubagentNestedAgent)
+			}
+			// Stdin reaching a remote program reader is unscreenable code
+			// for a read-only role and blocks — a remote `sh`/`python3`
+			// reading its program from the pipe/heredoc/here-string is the
+			// same verdict the local stdin-program model gives.
+			for _, code := range []string{
+				`echo uptime | ssh dmit sh`,
+				"ssh dmit sh <<'EOF'\nls -la /tmp\nEOF",
+				"ssh dmit sh <<< 'ls -la /tmp'",
+			} {
+				if rule, _ := g.guardCtxRunShell(code); rule != ruleReadonlyWrite {
+					t.Fatalf("%s: %q rule = %q, want %s", role, code, rule, ruleReadonlyWrite)
+				}
+			}
+			// A read-only command receiving a heredoc as DATA (remote cat)
+			// stays free.
+			if rule, _ := g.guardCtxRunShell("ssh dmit cat <<'EOF'\nls -la /tmp\nEOF"); rule != "" {
+				t.Fatalf("%s: data heredoc must pass, got %q", role, rule)
+			}
+			// A remote command mixing a write with a nested dispatch reports
+			// the dispatch first (sub-agent before strict read-only).
+			if rule, _ := g.guardCtxRunShell(`ssh dmit "rm -rf /tmp/x && pig"`); rule != ruleSubagentNestedAgent {
+				t.Fatalf("%s: remote write+pig rule = %q, want %s", role, rule, ruleSubagentNestedAgent)
+			}
+		})
+	}
+
+	// ctx_run stdin payloads forwarded through ssh to a remote program
+	// reader are remote code: a worker's nested dispatch still blocks, and
+	// a verifier's /tmp exemption ends at the wire (strict screen applies
+	// to both shell and remote-interpreter payloads).
+	t.Setenv(auditEnvRole, "worker")
+	g := currentGuardCall()
+	if rule, _ := g.guardCtxRunStdin([]string{"ssh", "dmit", "sh"}, "pig"); rule != ruleSubagentNestedAgent {
+		t.Fatalf("worker ssh-stdin pig rule = %q, want %s", rule, ruleSubagentNestedAgent)
+	}
+	if rule, _ := g.guardCtxRunStdinForCommand("ssh dmit sh", "pig"); rule != ruleSubagentNestedAgent {
+		t.Fatalf("worker ssh-stdin pig (command) rule = %q, want %s", rule, ruleSubagentNestedAgent)
+	}
+	if rule, _ := g.guardCtxRunStdin([]string{"ssh", "dmit", "cat"}, "pig"); rule != "" {
+		t.Fatalf("ssh-stdin data head must pass, got %q", rule)
+	}
+	t.Setenv(auditEnvRole, "verifier")
+	g = currentGuardCall()
+	for _, stdin := range []string{"rm -rf /tmp/x", "pig"} {
+		if rule, _ := g.guardCtxRunStdin([]string{"ssh", "dmit", "sh"}, stdin); rule != ruleReadonlyWrite && rule != ruleSubagentNestedAgent {
+			t.Fatalf("verifier ssh-stdin %q rule = %q, want a block", stdin, rule)
+		}
+	}
+	if rule, _ := g.guardCtxRunStdin([]string{"ssh", "dmit", "sh"}, "rm -rf /tmp/x"); rule != ruleReadonlyWrite {
+		t.Fatalf("verifier ssh-stdin rm rule = %q, want %s", rule, ruleReadonlyWrite)
+	}
+	if rule, _ := g.guardCtxRunStdinForCommand("ssh dmit sh", "rm -rf /tmp/x"); rule != ruleReadonlyWrite {
+		t.Fatalf("verifier ssh-stdin rm (command) rule = %q, want %s", rule, ruleReadonlyWrite)
+	}
+	if rule, _ := g.guardCtxRunStdin([]string{"ssh", "dmit", "python3", "-"}, "import os; os.remove('/tmp/x')"); rule != ruleReadonlyWrite {
+		t.Fatalf("verifier ssh-stdin python rule = %q, want %s", rule, ruleReadonlyWrite)
 	}
 }
 
