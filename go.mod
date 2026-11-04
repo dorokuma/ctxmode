@@ -1,6 +1,6 @@
 module github.com/dorokuma/ctxmode
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/JohannesKaufmann/html-to-markdown/v2 v2.5.2
@@ -8,6 +8,7 @@ require (
 	golang.org/x/sync v0.22.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.54.0
+	mvdan.cc/sh/v3 v3.14.1
 )
 
 require (
