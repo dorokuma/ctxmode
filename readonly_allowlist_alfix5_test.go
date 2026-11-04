@@ -32,16 +32,16 @@ func TestReadonlyShellSyntax_Table(t *testing.T) {
 		{"if_kw", "if true; then ls; fi", "control flow"},
 		{"while_kw", "while true; do ls; done", "control flow"},
 		{"for_kw", "for x in a; do ls; done", "control flow"},
-		{"bang", "! ls", "control flow"},
-		{"cond_bracket", "[[ -f a ]]", "control flow"},
+		{"bang", "! ls", "command name"},
+		{"cond_bracket", "[[ -f a ]]", "glob"},
 		{"unclosed_single", "echo 'hi", "unclosed single"},
 		{"unclosed_double", `echo "hi`, "unclosed double"},
 		{"dq_dollar", `echo "hi $HOME"`, "double quotes"},
-		{"line_cont", "echo \\\nls", "continuation"},
+		{"line_cont", "echo \\\nls", "backslash"},
 		{"path_cmd", "/tmp/ls", "path command"},
 		{"empty_pipe", "ls |", "empty"},
 		{"proc_subst", "cat <(ls)", "input redirect"},
-		{"env_assign", "FOO=1 ls", "env assign"},
+		{"env_assign", "FOO=1 ls", "command name"},
 	}
 	for _, tc := range deny {
 		t.Run("deny_"+tc.name, func(t *testing.T) {
@@ -79,7 +79,8 @@ func TestReadonlyShellSyntax_Table(t *testing.T) {
 		{"fd_dup12", "ls 1>&2"},
 		{"pipe_redir", "cmd 2>/dev/null | head -n 5"},
 		{"comment", "ls # ignore $HOME"},
-		{"escape", `echo \*`},
+		// alfix6: unquoted backslash banned; quoted glob is the supported form.
+		{"escape_quoted", `echo "*"`},
 	}
 	for _, tc := range allow {
 		t.Run("allow_"+tc.name, func(t *testing.T) {

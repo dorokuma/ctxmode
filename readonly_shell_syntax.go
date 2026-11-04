@@ -3,28 +3,74 @@ package main
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // checkReadonlyShellSyntax is the fail-closed minimal shell syntax gate for
 // strict read-only roles (scout/planner/researcher/reviewer/oracle). It runs
-// BEFORE splitShellSegments. Anything outside the subset is rejected with a
-// concrete Hint telling the agent how to rewrite.
+// BEFORE splitShellSegments. Design: byte allowlist precheck + two-state
+// lexer aligned with dash token recognition (POSIX blanks = space/tab only).
 //
-// Allowed: bare simple commands (argv[0] has no '/' and no '$'), list/pipe
-// operators | && || ; newline (both sides non-empty), single-quoted literals,
-// double-quoted literals without $ or `, ordinary \c escapes (no line
-// continuation), and only >/dev/null 2>/dev/null 1>/dev/null 2>&1 1>&2.
+// Allowed: bare simple commands, | && || ; newline, single-quoted literals,
+// double-quoted literals without $ or `, and only the five safe redirects
+// >/dev/null 1>/dev/null 2>/dev/null 2>&1 1>&2 (exact, word-bounded).
 //
-// Rejected: any $, backticks, parentheses/braces, process substitution,
-// background &, heredoc/here-string/input redirect, all control-flow
-// reserved words, unclosed quotes, and any other redirection.
+// Rejected: control chars (except \t \n), unquoted $ ` ( ) { } < ~ * ? [,
+// lone &, unquoted backslash, quotes/backslash in command head, redirect
+// before command name, glued redirects inside a word.
 func checkReadonlyShellSyntax(code string) string {
 	if code == "" {
 		return ""
 	}
+	if hit := roByteAllowlist(code); hit != "" {
+		return hit
+	}
 	p := &roShellSyn{code: code}
 	if err := p.parse(); err != "" {
 		return err
+	}
+	return ""
+}
+
+// roByteAllowlist rejects illegal UTF-8, C0 controls (except \t \n), DEL,
+// and Unicode control / special-space code points.
+func roByteAllowlist(code string) string {
+	if !utf8.ValidString(code) {
+		return "illegal UTF-8 Hint: 命令必须是合法 UTF-8"
+	}
+	for i := 0; i < len(code); {
+		b := code[i]
+		if b < 0x20 {
+			if b == '\t' || b == '\n' {
+				i++
+				continue
+			}
+			return "control character forbidden Hint: 禁止控制字符（含 \\r \\v \\f）；匹配回车请写 rg '\\r'"
+		}
+		if b == 0x7f {
+			return "control character forbidden Hint: 禁止 DEL (0x7f)"
+		}
+		if b < 0x80 {
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(code[i:])
+		if r == utf8.RuneError && size == 1 {
+			return "illegal UTF-8 Hint: 命令必须是合法 UTF-8"
+		}
+		if unicode.IsControl(r) || unicode.Is(unicode.Z, r) && r != ' ' {
+			// Reject Unicode controls and non-ASCII spaces (U+00A0, U+2000.., U+2028/9, …).
+			return "unicode control/space forbidden Hint: 禁止 Unicode 控制/特殊空白码点"
+		}
+		switch r {
+		case '\u0085', '\u00a0', '\u1680', '\u180e',
+			'\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005',
+			'\u2006', '\u2007', '\u2008', '\u2009', '\u200a',
+			'\u200b', '\u200c', '\u200d', '\u200e', '\u200f',
+			'\u2028', '\u2029', '\u202f', '\u205f', '\u3000', '\ufeff':
+			return "unicode control/space forbidden Hint: 禁止 Unicode 控制/特殊空白码点"
+		}
+		i += size
 	}
 	return ""
 }
@@ -38,15 +84,20 @@ func (p *roShellSyn) parse() string {
 	segStarted := false
 	needCmd := true
 	sawSep := false
+	inWord := false
 
 	for p.i < len(p.code) {
 		c := p.code[p.i]
-		if c == '#' && (p.i == 0 || isShellWordBreak(p.code[p.i-1])) {
+
+		// Comment only at word start (not inside a word).
+		if c == '#' && !inWord {
 			p.i = skipToLineEnd(p.code, p.i)
 			continue
 		}
+
 		switch c {
-		case ' ', '\t', '\r':
+		case ' ', '\t':
+			inWord = false
 			p.i++
 		case '\n':
 			if needCmd && sawSep && !segStarted {
@@ -57,6 +108,7 @@ func (p *roShellSyn) parse() string {
 				needCmd = true
 				segStarted = false
 			}
+			inWord = false
 			p.i++
 		case ';':
 			if !segStarted {
@@ -65,6 +117,7 @@ func (p *roShellSyn) parse() string {
 			segStarted = false
 			needCmd = true
 			sawSep = true
+			inWord = false
 			p.i++
 		case '|':
 			if !segStarted {
@@ -78,6 +131,7 @@ func (p *roShellSyn) parse() string {
 			segStarted = false
 			needCmd = true
 			sawSep = true
+			inWord = false
 		case '&':
 			if p.i+1 < len(p.code) && p.code[p.i+1] == '&' {
 				if !segStarted {
@@ -87,6 +141,7 @@ func (p *roShellSyn) parse() string {
 				segStarted = false
 				needCmd = true
 				sawSep = true
+				inWord = false
 				continue
 			}
 			if p.i+1 < len(p.code) && p.code[p.i+1] == '>' {
@@ -96,31 +151,35 @@ func (p *roShellSyn) parse() string {
 		case '<':
 			return "input redirect forbidden Hint: 禁止 < << <<- <<<；用 cat/rg 读文件，或把数据放 stdin"
 		case '>':
+			if inWord {
+				return "glued redirect forbidden Hint: 重定向符 > 前必须留空格，如 cmd >/dev/null 或 cmd 2>/dev/null"
+			}
+			if needCmd {
+				return "leading redirect forbidden Hint: 重定向只能写在命令名之后，禁止 2>/dev/null ls"
+			}
 			if hit := p.consumeSafeRedirect(""); hit != "" {
 				return hit
 			}
-		case '\'':
-			if hit := p.consumeSingleQuote(); hit != "" {
-				return hit
+			inWord = false
+		case '\'', '"':
+			if needCmd {
+				return "quoted command name forbidden Hint: 命令名禁止带引号或转义；写裸命令名如 ls/rg/git"
+			}
+			if c == '\'' {
+				if hit := p.consumeSingleQuote(); hit != "" {
+					return hit
+				}
+			} else {
+				if hit := p.consumeDoubleQuote(); hit != "" {
+					return hit
+				}
 			}
 			segStarted = true
 			needCmd = false
-		case '"':
-			if hit := p.consumeDoubleQuote(); hit != "" {
-				return hit
-			}
-			segStarted = true
-			needCmd = false
+			inWord = true
 		case '\\':
-			if p.i+1 >= len(p.code) {
-				return "trailing backslash Hint: 反斜杠只能转义普通字符，禁止续行"
-			}
-			if p.code[p.i+1] == '\n' {
-				return "backslash line continuation forbidden Hint: 禁止 \\+换行续行；写成一行或拆成多次 ctx_run"
-			}
-			p.i += 2
-			segStarted = true
-			needCmd = false
+			// Unquoted backslash is banned entirely for strict readonly.
+			return "unquoted backslash forbidden Hint: 特殊字符请放进引号（例如 find . -name '*.go'）；禁止引号外反斜杠"
 		case '$':
 			return "shell expansion $ forbidden Hint: $ 只能放在单引号里（例如 rg 'a$'）；禁止 $VAR ${} $() $(())"
 		case '`':
@@ -129,28 +188,41 @@ func (p *roShellSyn) parse() string {
 			return "parentheses forbidden Hint: 禁止子 shell / $() / (())；把步骤拆成多次 ctx_run"
 		case '{', '}':
 			return "brace group forbidden Hint: 禁止 { ...; }；把步骤拆成多次 ctx_run"
+		case '~':
+			return "tilde expansion forbidden Hint: 引号外禁止 ~；请写显式路径或给 ~ 加引号"
+		case '*', '?':
+			return "glob metachar forbidden Hint: 引号外禁止 * ? [；通配请加引号，例如 find . -name '*.go'"
+		case '[':
+			// Bare `[` as the test builtin command name is allowed only as a
+			// complete word that we still reject via control-flow / allowlist
+			// later; unquoted `[` anywhere is a glob char — ban it here and
+			// tell agents to quote or use test.
+			return "glob metachar forbidden Hint: 引号外禁止 * ? [；通配请加引号，或改用 test"
 		default:
-			// Glued fd redirect: 2>/dev/null or 2>&1
-			if c >= '0' && c <= '9' {
+			// Bare IO_NUMBER redirect only at word start: 1>/dev/null, 2>&1.
+			if !inWord && c >= '0' && c <= '9' {
 				j := p.i
 				for j < len(p.code) && p.code[j] >= '0' && p.code[j] <= '9' {
 					j++
 				}
 				if j < len(p.code) && p.code[j] == '>' {
+					if needCmd {
+						return "leading redirect forbidden Hint: 重定向只能写在命令名之后，禁止 2>/dev/null ls"
+					}
 					fd := p.code[p.i:j]
 					p.i = j
 					if hit := p.consumeSafeRedirect(fd); hit != "" {
 						return hit
 					}
+					inWord = false
 					continue
 				}
 			}
-			word, hit := p.consumeWord()
+			word, hit := p.consumeBareWord()
 			if hit != "" {
 				return hit
 			}
 			if word == "" {
-				// Should not spin: advance one byte defensively.
 				if p.i < len(p.code) {
 					p.i++
 				}
@@ -163,6 +235,7 @@ func (p *roShellSyn) parse() string {
 			}
 			segStarted = true
 			needCmd = false
+			inWord = true
 		}
 	}
 	if needCmd && sawSep && !segStarted {
@@ -171,8 +244,9 @@ func (p *roShellSyn) parse() string {
 	return ""
 }
 
-// consumeSafeRedirect accepts only >/dev/null, 1>/dev/null, 2>/dev/null,
-// 2>&1, 1>&2. fd is the optional leading descriptor already scanned ("2").
+// consumeSafeRedirect accepts only the five exact forms:
+// >/dev/null, 1>/dev/null, 2>/dev/null, 2>&1, 1>&2.
+// Target must be unquoted/unescaped; after the token a word boundary is required.
 func (p *roShellSyn) consumeSafeRedirect(fd string) string {
 	if p.i >= len(p.code) || p.code[p.i] != '>' {
 		return "redirect forbidden Hint: 只允许 >/dev/null、2>/dev/null、1>/dev/null、2>&1、1>&2"
@@ -185,73 +259,69 @@ func (p *roShellSyn) consumeSafeRedirect(fd string) string {
 		return "redirect >| forbidden Hint: 禁止写文件"
 	}
 	if p.i < len(p.code) && p.code[p.i] == '&' {
+		// 2>&1 / 1>&2 must be fully glued — no spaces.
 		p.i++
-		for p.i < len(p.code) && (p.code[p.i] == ' ' || p.code[p.i] == '\t') {
-			p.i++
+		if p.i >= len(p.code) || p.code[p.i] < '0' || p.code[p.i] > '9' {
+			return "redirect fd dup forbidden Hint: 只允许紧贴的 2>&1 或 1>&2"
 		}
 		tStart := p.i
-		if p.i < len(p.code) && p.code[p.i] == '-' {
-			return "redirect >&- forbidden Hint: 只允许 2>&1 或 1>&2"
-		}
 		for p.i < len(p.code) && p.code[p.i] >= '0' && p.code[p.i] <= '9' {
 			p.i++
 		}
 		target := p.code[tStart:p.i]
-		if (fd == "2" && target == "1") || (fd == "1" && target == "2") {
-			return ""
+		if !((fd == "2" && target == "1") || (fd == "1" && target == "2")) {
+			return "redirect " + fd + ">&" + target + " forbidden Hint: 只允许 2>&1 或 1>&2"
 		}
-		return "redirect " + fd + ">&" + target + " forbidden Hint: 只允许 2>&1 或 1>&2"
+		if !p.atWordBoundary() {
+			return "redirect missing word boundary Hint: 2>&1 / 1>&2 后必须是词边界（空格/分隔符/结尾）"
+		}
+		return ""
 	}
+	// >/dev/null — spaces/tabs allowed between > and /dev/null; target bare.
 	for p.i < len(p.code) && (p.code[p.i] == ' ' || p.code[p.i] == '\t') {
 		p.i++
 	}
-	tStart := p.i
-	if p.i < len(p.code) && (p.code[p.i] == '\'' || p.code[p.i] == '"') {
-		quote := p.code[p.i]
-		p.i++
-		body := p.i
-		for p.i < len(p.code) && p.code[p.i] != quote {
-			if quote == '"' && (p.code[p.i] == '$' || p.code[p.i] == '`') {
-				return "redirect target expansion forbidden Hint: 只允许 >/dev/null"
-			}
-			if p.code[p.i] == '\\' && p.i+1 < len(p.code) {
-				p.i += 2
-				continue
-			}
+	if p.i < len(p.code) && (p.code[p.i] == '\'' || p.code[p.i] == '"' || p.code[p.i] == '\\') {
+		return "redirect target quote/escape forbidden Hint: 只允许裸 >/dev/null，禁止引号或转义目标"
+	}
+	const want = "/dev/null"
+	if p.i+len(want) > len(p.code) || p.code[p.i:p.i+len(want)] != want {
+		tStart := p.i
+		for p.i < len(p.code) && !roIsWordBreak(p.code[p.i]) {
 			p.i++
 		}
-		if p.i >= len(p.code) {
-			return "unclosed quote in redirect Hint: 引号必须闭合"
-		}
-		target := p.code[body:p.i]
-		p.i++
-		if target != "/dev/null" {
-			return "redirect to " + target + " forbidden Hint: 只允许 >/dev/null、2>/dev/null、1>/dev/null"
-		}
-		if fd != "" && fd != "1" && fd != "2" {
-			return "redirect " + fd + ">/dev/null forbidden Hint: 只允许 >/dev/null、1>/dev/null、2>/dev/null"
-		}
-		_ = tStart
-		return ""
-	}
-	for p.i < len(p.code) && !isShellWordBreak(p.code[p.i]) &&
-		p.code[p.i] != ' ' && p.code[p.i] != '\t' {
-		if p.code[p.i] == '$' || p.code[p.i] == '`' {
-			return "redirect target expansion forbidden Hint: 只允许 >/dev/null"
-		}
-		p.i++
-	}
-	target := p.code[tStart:p.i]
-	if target != "/dev/null" {
+		target := p.code[tStart:p.i]
 		if target == "" {
 			return "redirect missing target Hint: 只允许 >/dev/null、2>/dev/null、1>/dev/null、2>&1、1>&2"
 		}
 		return "redirect to " + target + " forbidden Hint: 只允许 >/dev/null、2>/dev/null、1>/dev/null；禁止写任何文件"
 	}
+	p.i += len(want)
 	if fd != "" && fd != "1" && fd != "2" {
 		return "redirect " + fd + ">/dev/null forbidden Hint: 只允许 >/dev/null、1>/dev/null、2>/dev/null"
 	}
+	if !p.atWordBoundary() {
+		return "redirect missing word boundary Hint: >/dev/null 后必须是词边界；禁止 >'/dev/null'foo 等粘连"
+	}
 	return ""
+}
+
+func (p *roShellSyn) atWordBoundary() bool {
+	if p.i >= len(p.code) {
+		return true
+	}
+	return roIsWordBreak(p.code[p.i])
+}
+
+// roIsWordBreak is the readonly lexer word-break set: blank, newline, and
+// list/pipe operators. '&' alone is a break for boundary checks after a
+// finished redirect token (actual lone & is rejected elsewhere).
+func roIsWordBreak(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', ';', '|', '&':
+		return true
+	}
+	return false
 }
 
 func (p *roShellSyn) consumeSingleQuote() string {
@@ -279,10 +349,10 @@ func (p *roShellSyn) consumeDoubleQuote() string {
 		}
 		if c == '\\' {
 			if p.i+1 >= len(p.code) {
-				return "trailing backslash Hint: 反斜杠只能转义普通字符，禁止续行"
+				return "trailing backslash Hint: 双引号内禁止续行"
 			}
 			if p.code[p.i+1] == '\n' {
-				return "backslash line continuation forbidden Hint: 禁止 \\+换行续行"
+				return "backslash line continuation forbidden Hint: 双引号内禁止 \\+换行续行"
 			}
 			p.i += 2
 			continue
@@ -292,36 +362,31 @@ func (p *roShellSyn) consumeDoubleQuote() string {
 	return "unclosed double quote Hint: 双引号必须闭合"
 }
 
-func (p *roShellSyn) consumeWord() (string, string) {
+// consumeBareWord reads an unquoted word. Metacharacters that must be
+// quoted are rejected; backslash is rejected (must use quotes instead).
+func (p *roShellSyn) consumeBareWord() (string, string) {
 	start := p.i
 	for p.i < len(p.code) {
 		c := p.code[p.i]
-		if c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
-			c == ';' || c == '|' || c == '&' || c == '<' || c == '>' ||
-			c == '(' || c == ')' || c == '{' || c == '}' ||
-			c == '\'' || c == '"' {
-			break
-		}
-		if c == '#' && p.i == start {
-			break
-		}
-		if c == '$' {
+		switch c {
+		case ' ', '\t', '\n', ';', '|', '&', '<', '>', '(', ')', '{', '}', '\'', '"':
+			return p.code[start:p.i], ""
+		case '#':
+			// Mid-word '#' is literal.
+			p.i++
+		case '$':
 			return "", "shell expansion $ forbidden Hint: $ 只能放在单引号里（例如 rg 'a$'）；禁止 $VAR ${} $() $(())"
-		}
-		if c == '`' {
+		case '`':
 			return "", "backtick substitution forbidden Hint: 禁止反引号命令替换；把步骤拆成多次 ctx_run"
+		case '\\':
+			return "", "unquoted backslash forbidden Hint: 特殊字符请放进引号（例如 find . -name '*.go'）；禁止引号外反斜杠"
+		case '~':
+			return "", "tilde expansion forbidden Hint: 引号外禁止 ~；请写显式路径或给 ~ 加引号"
+		case '*', '?', '[':
+			return "", "glob metachar forbidden Hint: 引号外禁止 * ? [；通配请加引号，例如 find . -name '*.go'"
+		default:
+			p.i++
 		}
-		if c == '\\' {
-			if p.i+1 >= len(p.code) {
-				return "", "trailing backslash Hint: 反斜杠只能转义普通字符，禁止续行"
-			}
-			if p.code[p.i+1] == '\n' {
-				return "", "backslash line continuation forbidden Hint: 禁止 \\+换行续行；写成一行或拆成多次 ctx_run"
-			}
-			p.i += 2
-			continue
-		}
-		p.i++
 	}
 	return p.code[start:p.i], ""
 }
@@ -335,6 +400,16 @@ func roShellCheckCmdHead(word string) string {
 	}
 	if strings.Contains(word, "$") {
 		return "shell expansion $ forbidden Hint: $ 只能放在单引号里"
+	}
+	// Command head must be plain [A-Za-z0-9_.-] or the test builtin "[".
+	for i := 0; i < len(word); i++ {
+		ch := word[i]
+		ok := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') || ch == '_' || ch == '.' || ch == '-' ||
+			(ch == '[' && word == "[") || (ch == ']' && word == "]")
+		if !ok {
+			return "command name charset Hint: 命令名只能含字母数字 _ . -"
+		}
 	}
 	switch word {
 	case "if", "then", "elif", "else", "fi",

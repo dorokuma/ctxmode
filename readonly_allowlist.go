@@ -2,9 +2,7 @@ package main
 
 import (
 	"path/filepath"
-	"regexp"
 	"strings"
-	"unicode"
 )
 
 // readonly_allowlist.go — default-deny allowlist for strict read-only roles.
@@ -33,6 +31,10 @@ type cmdAllow struct {
 	shortValue string          // bytes of short opts that take a value
 	longBool   map[string]bool // --flag
 	longValue  map[string]bool // --flag VAL / --flag=VAL
+	// longTwoValue: --flag KEY VAL (e.g. jq --arg / --argjson).
+	longTwoValue map[string]bool
+	// allowLegacyNumOpt permits a lone -[0-9]+ token (head -20 / tail -5).
+	allowLegacyNumOpt bool
 	// check, when non-nil, runs after generic option scanning (or alone when
 	// no generic opts are configured) and receives the full argv.
 	check func(argv []string) string
@@ -394,36 +396,24 @@ func checkSystemctlReadonly(argv []string) string {
 
 func checkHeadReadonly(argv []string) string {
 	entry := &cmdAllow{
-		shortBool:  "qvz",
-		shortValue: "nc",
-		longBool:   longSet("quiet", "silent", "verbose", "zero-terminated", "help", "version"),
-		longValue:  longSet("bytes", "lines"),
+		shortBool:         "qvz",
+		shortValue:        "nc",
+		longBool:          longSet("quiet", "silent", "verbose", "zero-terminated", "help", "version"),
+		longValue:         longSet("bytes", "lines"),
+		allowLegacyNumOpt: true,
 	}
-	args := make([]string, 0, len(argv)-1)
-	for _, a := range argv[1:] {
-		if ok, _ := regexp.MatchString(`^-[0-9]+$`, a); ok {
-			continue
-		}
-		args = append(args, a)
-	}
-	return scanAllowedOpts(args, entry)
+	return scanAllowedOpts(argv[1:], entry)
 }
 
 func checkTailReadonly(argv []string) string {
 	entry := &cmdAllow{
-		shortBool:  "qvz",
-		shortValue: "nc",
-		longBool:   longSet("quiet", "silent", "verbose", "zero-terminated", "help", "version"),
-		longValue:  longSet("bytes", "lines", "sleep-interval", "max-unchanged-stats", "pid"),
+		shortBool:         "qvz",
+		shortValue:        "nc",
+		longBool:          longSet("quiet", "silent", "verbose", "zero-terminated", "help", "version"),
+		longValue:         longSet("bytes", "lines", "sleep-interval", "max-unchanged-stats", "pid"),
+		allowLegacyNumOpt: true,
 	}
-	args := make([]string, 0, len(argv)-1)
-	for _, a := range argv[1:] {
-		if ok, _ := regexp.MatchString(`^-[0-9]+$`, a); ok {
-			continue
-		}
-		args = append(args, a)
-	}
-	return scanAllowedOpts(args, entry)
+	return scanAllowedOpts(argv[1:], entry)
 }
 
 func checkJqReadonly(argv []string) string {
@@ -433,21 +423,10 @@ func checkJqReadonly(argv []string) string {
 		longBool: longSet("null-input", "compact-output", "raw-output", "raw-input", "slurp",
 			"seq", "sort-keys", "tab", "ascii-output", "color-output", "monochrome-output",
 			"help", "version", "exit-status"),
-		longValue: longSet("from-file", "indent"),
+		longValue:    longSet("from-file", "indent"),
+		longTwoValue: longSet("arg", "argjson"),
 	}
-	filtered := make([]string, 0, len(argv)-1)
-	for i := 1; i < len(argv); i++ {
-		a := argv[i]
-		if a == "--arg" || a == "--argjson" {
-			if i+2 >= len(argv) {
-				return "jq " + a + " missing args"
-			}
-			i += 2
-			continue
-		}
-		filtered = append(filtered, a)
-	}
-	return scanAllowedOpts(filtered, entry)
+	return scanAllowedOpts(argv[1:], entry)
 }
 
 func checkFindReadonly(argv []string) string {
@@ -800,7 +779,9 @@ func gitBranchAllow(rest []string) string {
 			query = true
 			switch a {
 			case "--contains", "--no-contains", "--merged", "--no-merged", "--points-at":
-				i++
+				if i+1 < len(rest) && !strings.HasPrefix(rest[i+1], "-") {
+					i++
+				}
 			}
 			continue
 		case "-v", "-vv", "--verbose", "-q", "--quiet", "--color", "--no-color",
@@ -1000,228 +981,6 @@ func gitStashAllow(rest []string) string {
 	}
 }
 
-// sqliteDangerousFuncs are SQLite extension / CLI function names that write
-// files or load code even under -readonly. Rejected as a lexical belt-and-
-// suspenders on top of the required -safe flag.
-var sqliteDangerousFuncs = []string{
-	"WRITEFILE", "READFILE", "EDIT", "LOAD_EXTENSION", "FTS3_TOKENIZER",
-}
-
-// sqliteSQLReadonlyAllow fail-closes on any line-leading dot-command and only
-// allows statements that begin with SELECT / WITH / EXPLAIN / PRAGMA
-// (PRAGMA without '=' assignment). Also lexically rejects dangerous function
-// names. Statements are split on ';' outside quotes/comments.
-func sqliteSQLReadonlyAllow(sql string) string {
-	// Dot-commands: only detect at line start (after trim), independent of ';' split.
-	for _, line := range strings.Split(sql, "\n") {
-		trim := strings.TrimSpace(line)
-		if strings.HasPrefix(trim, ".") {
-			return "sqlite3 dot-command"
-		}
-	}
-	for _, raw := range splitSQLiteStatements(sql) {
-		stmt := strings.TrimSpace(raw)
-		if stmt == "" {
-			continue
-		}
-		// Strip leading /* */ and -- comments for prefix check.
-		stmt = sqliteStripLeadingComments(stmt)
-		if stmt == "" {
-			continue
-		}
-		if strings.HasPrefix(stmt, ".") {
-			return "sqlite3 dot-command"
-		}
-		upper := strings.ToUpper(stmt)
-		for _, fn := range sqliteDangerousFuncs {
-			if containsSQLKeyword(upper, fn) {
-				return "sqlite3 dangerous func"
-			}
-		}
-		switch {
-		case sqliteStmtHasPrefix(upper, "SELECT"),
-			sqliteStmtHasPrefix(upper, "WITH"),
-			sqliteStmtHasPrefix(upper, "EXPLAIN"):
-			continue
-		case sqliteStmtHasPrefix(upper, "PRAGMA"):
-			if strings.Contains(stmt, "=") {
-				return "sqlite3 pragma assign"
-			}
-			continue
-		default:
-			return "sqlite3 sql not readonly"
-		}
-	}
-	return ""
-}
-
-func sqliteStripLeadingComments(stmt string) string {
-	for {
-		stmt = strings.TrimSpace(stmt)
-		if strings.HasPrefix(stmt, "--") {
-			if i := strings.IndexByte(stmt, '\n'); i >= 0 {
-				stmt = stmt[i+1:]
-				continue
-			}
-			return ""
-		}
-		if strings.HasPrefix(stmt, "/*") {
-			if i := strings.Index(stmt, "*/"); i >= 0 {
-				stmt = stmt[i+2:]
-				continue
-			}
-			return ""
-		}
-		return stmt
-	}
-}
-
-// splitSQLiteStatements splits on ';' outside quotes, brackets, backticks
-// and outside -- / /* */ comments. Newlines alone do not split (multiline
-// SELECT must stay one statement).
-func splitSQLiteStatements(sql string) []string {
-	var out []string
-	var cur strings.Builder
-	var quote rune // 0 / '\'' / '"' / '`' / '['
-	inLineComment := false
-	inBlockComment := false
-	runes := []rune(sql)
-	for i := 0; i < len(runes); i++ {
-		r := runes[i]
-		if inLineComment {
-			cur.WriteRune(r)
-			if r == '\n' {
-				inLineComment = false
-			}
-			continue
-		}
-		if inBlockComment {
-			cur.WriteRune(r)
-			if r == '*' && i+1 < len(runes) && runes[i+1] == '/' {
-				cur.WriteRune('/')
-				i++
-				inBlockComment = false
-			}
-			continue
-		}
-		if quote != 0 {
-			cur.WriteRune(r)
-			if quote == '[' {
-				if r == ']' {
-					quote = 0
-				}
-				continue
-			}
-			if r == quote {
-				// SQL '' escape inside single quotes
-				if quote == '\'' && i+1 < len(runes) && runes[i+1] == '\'' {
-					cur.WriteRune(runes[i+1])
-					i++
-					continue
-				}
-				quote = 0
-			}
-			continue
-		}
-		switch r {
-		case '\'', '"', '`':
-			quote = r
-			cur.WriteRune(r)
-		case '[':
-			quote = '['
-			cur.WriteRune(r)
-		case '-':
-			if i+1 < len(runes) && runes[i+1] == '-' {
-				inLineComment = true
-				cur.WriteRune(r)
-				continue
-			}
-			cur.WriteRune(r)
-		case '/':
-			if i+1 < len(runes) && runes[i+1] == '*' {
-				inBlockComment = true
-				cur.WriteRune(r)
-				continue
-			}
-			cur.WriteRune(r)
-		case ';':
-			out = append(out, cur.String())
-			cur.Reset()
-		default:
-			cur.WriteRune(r)
-		}
-	}
-	if cur.Len() > 0 {
-		out = append(out, cur.String())
-	}
-	return out
-}
-
-func sqliteStmtHasPrefix(upper, kw string) bool {
-	if !strings.HasPrefix(upper, kw) {
-		return false
-	}
-	if len(upper) == len(kw) {
-		return true
-	}
-	return !isSQLIdentChar(rune(upper[len(kw)]))
-}
-
-func sqliteURIHasRW(uri string) bool {
-	q := uri
-	if i := strings.IndexByte(q, '?'); i >= 0 {
-		q = q[i+1:]
-	} else {
-		return false
-	}
-	if i := strings.IndexByte(q, '#'); i >= 0 {
-		q = q[:i]
-	}
-	for _, part := range strings.Split(q, "&") {
-		kv := strings.SplitN(part, "=", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		key := kv[0]
-		key = strings.ReplaceAll(key, "%6d", "m")
-		key = strings.ReplaceAll(key, "%6D", "m")
-		key = strings.ReplaceAll(key, "%6f", "o")
-		key = strings.ReplaceAll(key, "%6F", "o")
-		key = strings.ReplaceAll(key, "%64", "d")
-		key = strings.ReplaceAll(key, "%65", "e")
-		if !strings.EqualFold(key, "mode") {
-			continue
-		}
-		val := strings.ToLower(kv[1])
-		if val != "ro" && val != "r" {
-			return true
-		}
-	}
-	return false
-}
-
-func containsSQLKeyword(upper, kw string) bool {
-	idx := 0
-	for {
-		j := strings.Index(upper[idx:], kw)
-		if j < 0 {
-			return false
-		}
-		j += idx
-		beforeOK := j == 0 || !isSQLIdentChar(rune(upper[j-1]))
-		after := j + len(kw)
-		afterOK := after >= len(upper) || !isSQLIdentChar(rune(upper[after]))
-		if beforeOK && afterOK {
-			return true
-		}
-		idx = j + len(kw)
-	}
-}
-
-func isSQLIdentChar(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
-}
-
 func checkGoReadonly(argv []string) string {
 	// Narrow: only `go version`, `go env` (no -w/-u/--w/--u), `go list`
 	// (option-table driven; deny -toolexec/-exec/-modfile/-overlay).
@@ -1304,9 +1063,15 @@ func checkGoReadonly(argv []string) string {
 
 func checkHerdrReadonly(argv []string) string {
 	args := argv[1:]
-	idx, _ := skipToolGlobalFlags(args)
+	idx, query := skipToolGlobalFlags(args)
 	if idx >= len(args) {
-		return ""
+		if query {
+			return ""
+		}
+		return "herdr bare"
+	}
+	if strings.HasPrefix(args[idx], "-") {
+		return "herdr " + args[idx]
 	}
 	switch args[idx] {
 	case "--version", "--help", "-h", "help", "version", "list", "ls", "status", "info":
@@ -1330,117 +1095,6 @@ func checkHerdrReadonly(argv []string) string {
 	default:
 		return "herdr " + args[idx]
 	}
-}
-
-func checkUnzipReadonly(argv []string) string {
-	hasRead := false
-	for _, a := range argv[1:] {
-		switch a {
-		case "-l", "-t", "-p", "-v", "-Z", "-c", "--help", "-h", "-hh":
-			hasRead = true
-			continue
-		case "-o", "-f", "-u", "-d":
-			return "unzip " + a
-		}
-		if strings.HasPrefix(a, "-") && a != "-" {
-			if strings.ContainsAny(a, "odf") && a != "-p" {
-				for _, ch := range a[1:] {
-					if ch == 'o' || ch == 'd' || ch == 'f' {
-						return "unzip -" + string(ch)
-					}
-				}
-			}
-			for _, ch := range a[1:] {
-				if strings.ContainsRune("ltpvcZh", ch) {
-					hasRead = true
-				}
-			}
-		}
-	}
-	if !hasRead {
-		return "unzip extract"
-	}
-	return ""
-}
-
-func checkGzipReadonly(argv []string) string {
-	base := filepath.Base(argv[0])
-	args := argv[1:]
-	hasStdout := false
-	hasList := false
-	hasTest := false
-	hasDecompress := false
-	hasVersion := false
-	for _, a := range args {
-		switch a {
-		case "-c", "--stdout", "--to-stdout":
-			hasStdout = true
-			continue
-		case "-l", "--list":
-			hasList = true
-			continue
-		case "-t", "--test":
-			hasTest = true
-			continue
-		case "-d", "--decompress", "--uncompress":
-			hasDecompress = true
-			continue
-		case "-V", "--version", "--help", "-h", "-k", "--keep",
-			"-n", "-N", "-q", "-v", "-f":
-			if a == "-V" || a == "--version" || a == "--help" || a == "-h" {
-				hasVersion = true
-			}
-			continue
-		case "-1", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9":
-			return base + " compress"
-		}
-		if strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") {
-			for _, ch := range a[1:] {
-				switch ch {
-				case 'c':
-					hasStdout = true
-				case 'l':
-					hasList = true
-				case 't':
-					hasTest = true
-				case 'd':
-					hasDecompress = true
-				case 'V', 'h':
-					hasVersion = true
-				case 'k', 'n', 'N', 'q', 'v', 'f':
-					// ok modifiers
-				default:
-					if ch >= '1' && ch <= '9' {
-						return base + " compress"
-					}
-					return base + " unknown -" + string(ch)
-				}
-			}
-			continue
-		}
-		if strings.HasPrefix(a, "-") {
-			return base + " unknown " + a
-		}
-	}
-	// gunzip/bunzip2/unxz without -c write a sibling file — require -c/list/test.
-	switch base {
-	case "gunzip", "bunzip2", "unxz", "unzstd":
-		if hasStdout || hasList || hasTest || hasVersion || len(args) == 0 {
-			return ""
-		}
-		return base + " decompress write"
-	}
-	// gzip -d without -c writes decompressed file and may delete source.
-	if hasDecompress && !hasStdout && !hasList && !hasTest {
-		return base + " -d without -c"
-	}
-	if hasStdout || hasList || hasTest || hasVersion || len(args) == 0 {
-		return ""
-	}
-	if hasDecompress && hasStdout {
-		return ""
-	}
-	return base + " compress"
 }
 
 func checkMountReadonly(argv []string) string {
@@ -1481,6 +1135,7 @@ func checkKillReadonly(argv []string) string {
 func checkCtxmodeReadonly(argv []string) string {
 	args := argv[1:]
 	i := 0
+	sawHelp := false
 	for i < len(args) {
 		a := args[i]
 		if a == "--" {
@@ -1489,6 +1144,7 @@ func checkCtxmodeReadonly(argv []string) string {
 		}
 		if strings.HasPrefix(a, "-") {
 			if a == "-h" || a == "--help" {
+				sawHelp = true
 				i++
 				continue
 			}
@@ -1504,6 +1160,9 @@ func checkCtxmodeReadonly(argv []string) string {
 		break
 	}
 	if i >= len(args) {
+		if sawHelp {
+			return ""
+		}
 		return "ctxmode bare"
 	}
 	sub := args[i]
@@ -1617,12 +1276,22 @@ func scanAllowedOpts(args []string, entry *cmdAllow) string {
 			}
 			continue
 		}
+		if entry.allowLegacyNumOpt && len(a) > 1 && a[0] == '-' && allDigits(a[1:]) {
+			continue
+		}
 		if strings.HasPrefix(a, "--") {
 			name := a[2:]
 			valGlued := false
 			if eq := strings.IndexByte(name, '='); eq >= 0 {
 				name = name[:eq]
 				valGlued = true
+			}
+			if entry.longTwoValue[name] {
+				if valGlued {
+					return "unknown option --" + name + " (glued two-value)"
+				}
+				i += 2 // KEY VAL
+				continue
 			}
 			if entry.longBool[name] || entry.longValue[name] {
 				if entry.longValue[name] && !valGlued {

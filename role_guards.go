@@ -180,7 +180,7 @@ type heredocSpec struct {
 // treats `#` as a comment only at the start of a word, i.e. at the beginning
 // of input or after whitespace or a metacharacter. `echo foo#bar` keeps the
 // `#` inside the word.
-const shellWordBreakBytes = " \t\r\n;|&()<>"
+const shellWordBreakBytes = " \t\n;|&()<>"
 
 func isShellWordBreak(c byte) bool {
 	return strings.IndexByte(shellWordBreakBytes, c) >= 0
@@ -237,8 +237,78 @@ func sliceTo(s string, lo, hi int) string {
 // exactness on the separations that matter; anything it cannot decompose is
 // screened as one opaque segment.
 func splitShellSegments(code string) []shellSegment {
-	segs, _ := splitShellSegmentsDepth(code, 0, false)
+	code = stripLineContinuations(code)
+	segs, ok := splitShellSegmentsDepth(code, 0, false)
+	if !ok {
+		segs = append(segs, shellSegment{depthExceeded: true})
+	}
 	return segs
+}
+
+// stripLineContinuations removes unescaped backslash-newline pairs outside
+// single quotes (POSIX §2.2.1), matching dash/bash token recognition.
+func stripLineContinuations(code string) string {
+	if strings.IndexByte(code, '\\') < 0 {
+		return code
+	}
+	var b strings.Builder
+	b.Grow(len(code))
+	inSingle := false
+	i := 0
+	for i < len(code) {
+		c := code[i]
+		if inSingle {
+			b.WriteByte(c)
+			if c == '\'' {
+				inSingle = false
+			}
+			i++
+			continue
+		}
+		if c == '\'' {
+			inSingle = true
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		if c == '\\' && i+1 < len(code) && code[i+1] == '\n' {
+			i += 2
+			continue
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
+}
+
+// unescapeBacktickBody applies POSIX backtick backslash removal before the
+// body is re-parsed: \$, \`, \\ (and \" when the backtick itself was inside
+// double quotes) become the literal character; \<newline> is dropped.
+func unescapeBacktickBody(s string, inDoubleQuote bool) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			n := s[i+1]
+			switch n {
+			case '$', '`', '\\':
+				b.WriteByte(n)
+				i++
+				continue
+			case '"':
+				if inDoubleQuote {
+					b.WriteByte(n)
+					i++
+					continue
+				}
+			case '\n':
+				i++
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // splitShellSegmentsDepth is the recursive worker; depth counts nesting into
@@ -251,6 +321,7 @@ func splitShellSegments(code string) []shellSegment {
 func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegment, bool) {
 	var segs []shellSegment
 	var cur shellSegment
+	balanced := true
 	// curExtra stages substitution segments parsed inside the CURRENT word
 	// context (word-position $(...)/`...` and the small-slice scans for
 	// arithmetic groups, redirect targets and heredoc bodies). Flushing them
@@ -337,7 +408,7 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 		if i < n && code[i] == '#' {
 			return skipToLineEnd(code, i)
 		}
-		for i < n && code[i] != ' ' && code[i] != '\t' && code[i] != '\n' && code[i] != '\r' {
+		for i < n && code[i] != ' ' && code[i] != '\t' && code[i] != '\n' {
 			switch code[i] {
 			case '\'':
 				i++
@@ -430,7 +501,7 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 			continue
 		}
 		switch c {
-		case ' ', '\t', '\r':
+		case ' ', '\t':
 			flushWord()
 			i++
 		case '\n':
@@ -520,9 +591,16 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 					j = skipBalanced(code, j+1, '(', ')')
 					continue
 				}
+				if code[j] == '$' && j+1 < len(code) && code[j+1] == '{' {
+					if inner, ok := innerBalanced(code, j+1, '{', '}'); ok {
+						scanSubs(inner)
+					}
+					j = skipBalanced(code, j+1, '{', '}')
+					continue
+				}
 				if code[j] == '`' {
 					if k := findBacktickClose(code, j+1); k >= 0 {
-						scanInner(code[j+1 : k])
+						scanInner(unescapeBacktickBody(code[j+1:k], true))
 						j = k + 1
 						continue
 					}
@@ -546,18 +624,30 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 				i++
 			}
 		case '$':
+			if i+1 < len(code) && code[i+1] == '{' {
+				if inner, ok := innerBalanced(code, i+1, '{', '}'); ok {
+					scanSubs(inner)
+				}
+				word.WriteByte('0')
+				wordStarted = true
+				i = skipBalanced(code, i+1, '{', '}')
+				continue
+			}
 			if i+1 < len(code) && code[i+1] == '(' {
 				if i+2 < len(code) && code[i+2] == '(' {
-					// $(( ... )) only when outer group closes with )).
+					// $(( ... )) only when the INNER '(' stays open until end-1.
 					end := skipBalanced(code, i+1, '(', ')')
 					if end >= 2 && end <= len(code) && code[end-1] == ')' && code[end-2] == ')' {
-						scanSubs(sliceTo(code, i+3, end-1))
-						word.WriteByte('0')
-						wordStarted = true
-						i = end
-						continue
+						innerEnd := skipBalanced(code, i+2, '(', ')')
+						if innerEnd == end-1 {
+							scanSubs(sliceTo(code, i+3, end-1))
+							word.WriteByte('0')
+							wordStarted = true
+							i = end
+							continue
+						}
 					}
-					// else fall through: $( (cmd); ... )
+					// else fall through: $( (cmd); ... ) / $((pig); (true))
 				}
 				if inner, ok := innerBalanced(code, i+1, '(', ')'); ok {
 					scanInner(inner)
@@ -574,7 +664,7 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 			}
 		case '`':
 			if j := findBacktickClose(code, i+1); j >= 0 {
-				scanInner(code[i+1 : j])
+				scanInner(unescapeBacktickBody(code[i+1:j], false))
 				wordStarted = true
 				i = j + 1
 			} else {
@@ -600,6 +690,8 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 			segPipeIn = false
 			i = skipBalanced(code, i, '(', ')')
 		case ')':
+			// Orphan ')' at this nesting level: mark unbalanced (C4).
+			balanced = false
 			flushWord()
 			flushSeg()
 			segPipeIn = false
@@ -720,14 +812,9 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 				op += "&"
 				j++
 			}
-			// Strip a pending fd number from the word under construction so
-			// "cmd 2>f" parses argv [cmd] not [cmd 2].
-			if wordStarted {
-				if w := word.String(); allDigits(w) {
-					word.Reset()
-					wordStarted = false
-				}
-			}
+			// Bare IO_NUMBER is handled only in the !wordStarted digit
+			// lookahead below. Quoted/escaped digits that land in word must
+			// stay in argv (dash never treats them as fd prefixes).
 			flushWord()
 			target, next := readOutputRedirectTarget(j)
 			if cur.redirectFile == "" && redirectBlocksWrite(op, target) {
@@ -784,7 +871,7 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 	}
 	flushWord()
 	flushSeg()
-	return segs, true
+	return segs, balanced
 }
 
 // heredocBodyText extracts the body of a heredoc starting at bodyStart (the
@@ -801,7 +888,8 @@ func heredocBodyText(code string, bodyStart int, spec heredocSpec) (string, int)
 	for i < len(code) {
 		if code[i] == '\n' {
 			line := code[lineStart:i]
-			candidate := strings.TrimRight(line, "\r")
+			// dash requires an exact delimiter match; do NOT strip trailing \r.
+			candidate := line
 			if spec.stripTabs {
 				candidate = strings.TrimLeft(candidate, "\t")
 			}
@@ -813,6 +901,17 @@ func heredocBodyText(code string, bodyStart int, spec heredocSpec) (string, int)
 			continue
 		}
 		i++
+	}
+	// Final line without trailing newline may still be the delimiter.
+	if lineStart < len(code) {
+		line := code[lineStart:]
+		candidate := line
+		if spec.stripTabs {
+			candidate = strings.TrimLeft(candidate, "\t")
+		}
+		if candidate == spec.delim {
+			return code[bodyStart:lineStart], len(code)
+		}
 	}
 	return code[bodyStart:], i
 }
@@ -963,6 +1062,7 @@ func scanInlineSubstitutions(text string, depth int, extra *[]shellSegment) {
 // are walked with the shared balanced scanner, which handles nested quotes
 // and substitutions.
 func scanHeredocSubstitutions(text string, depth int, extra *[]shellSegment) {
+	text = stripLineContinuations(text)
 	if depth >= shellSplitMaxDepth {
 		if strings.Contains(text, "$(") || strings.IndexByte(text, '`') >= 0 {
 			*extra = append(*extra, shellSegment{depthExceeded: true})
@@ -983,7 +1083,8 @@ func scanHeredocSubstitutions(text string, depth int, extra *[]shellSegment) {
 			}
 		case '`':
 			if j := findBacktickClose(text, i+1); j >= 0 {
-				sub, _ := splitShellSegmentsDepth(text[i+1:j], depth+1, false)
+				body := unescapeBacktickBody(text[i+1:j], false)
+				sub, _ := splitShellSegmentsDepth(body, depth+1, false)
 				*extra = append(*extra, sub...)
 				i = j
 			}
@@ -1006,7 +1107,7 @@ func readShellWord(code string, i int) string {
 	for i < len(code) {
 		c := code[i]
 		switch c {
-		case ' ', '\t', '\r', '\n', ';', '|', '&', '(', ')', '<', '>':
+		case ' ', '\t', '\n', ';', '|', '&', '(', ')', '<', '>':
 			return b.String()
 		case '\'':
 			j := i + 1
@@ -1044,7 +1145,7 @@ func readShellWord(code string, i int) string {
 				i++
 			}
 		case '$':
-			if i+1 < len(code) && code[i+1] == '(' {
+			if i+1 < len(code) && (code[i+1] == '(' || code[i+1] == '{') {
 				return ""
 			}
 			b.WriteByte(c)
@@ -1147,6 +1248,10 @@ func skipBalanced(code string, open int, openCh, closeCh byte) int {
 					i = skipBalanced(code, i+1, '(', ')')
 					continue
 				}
+				if code[i] == '$' && i+1 < len(code) && code[i+1] == '{' {
+					i = skipBalanced(code, i+1, '{', '}')
+					continue
+				}
 				if code[i] == '`' {
 					if j := findBacktickClose(code, i+1); j >= 0 {
 						i = j + 1
@@ -1160,6 +1265,16 @@ func skipBalanced(code string, open int, openCh, closeCh byte) int {
 			}
 		case '\\':
 			i += 2
+		case '$':
+			if i+1 < len(code) && code[i+1] == '{' {
+				i = skipBalanced(code, i+1, '{', '}')
+				continue
+			}
+			if i+1 < len(code) && code[i+1] == '(' {
+				i = skipBalanced(code, i+1, '(', ')')
+				continue
+			}
+			i++
 		case openCh:
 			depth++
 			i++
@@ -1733,6 +1848,32 @@ func skipDashDash(argv []string, i int) int {
 	return i
 }
 
+const envUnknownLongPrefix = "__ctx_env_unknown__:"
+
+func envSplitLong(a string) (name, val string, hasVal bool) {
+	s := strings.TrimPrefix(a, "--")
+	if eq := strings.IndexByte(s, '='); eq >= 0 {
+		return s[:eq], s[eq+1:], true
+	}
+	return s, "", false
+}
+
+// envMatchLong returns the canonical GNU env long option name for a unique
+// prefix of name, or "" when unknown/ambiguous.
+func envMatchLong(name string) string {
+	candidates := []string{"ignore-environment", "null", "unset", "chdir", "split-string"}
+	var hits []string
+	for _, c := range candidates {
+		if c == name || strings.HasPrefix(c, name) {
+			hits = append(hits, c)
+		}
+	}
+	if len(hits) == 1 {
+		return hits[0]
+	}
+	return ""
+}
+
 // skipEnvOperands consumes env's own arguments (options and NAME=val
 // assignments) starting at i and returns the index of the command env would
 // exec plus any -S/--split-string payloads for the caller to screen (the
@@ -1747,19 +1888,19 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) (int, []string,
 		switch {
 		case a == "--":
 			return i + 1, payloads, envAs
-		case a == "-i" || a == "-0" || a == "--ignore-environment" || a == "--null":
-			if a == "-i" || a == "--ignore-environment" {
+		case a == "-i" || a == "-0" || a == "--null":
+			if a == "-i" {
 				envAs.ops = append(envAs.ops, envOp{kind: 'c'})
 			}
 			i++
-		case a == "-u" || a == "--unset":
+		case a == "-u":
 			if i+1 < len(argv) {
 				envAs.ops = append(envAs.ops, envOp{kind: 'u', key: argv[i+1]})
 			}
 			i += 2
-		case a == "-C" || a == "--chdir":
+		case a == "-C":
 			i += 2
-		case a == "-S" || a == "--split-string":
+		case a == "-S":
 			if i+1 < len(argv) {
 				payloads = append(payloads, argv[i+1])
 			}
@@ -1767,24 +1908,58 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) (int, []string,
 		case strings.HasPrefix(a, "-S") && len(a) > 2 && !strings.HasPrefix(a, "--"):
 			payloads = append(payloads, a[2:])
 			i++
-		case strings.HasPrefix(a, "--split-string="):
-			payloads = append(payloads, a[len("--split-string="):])
-			i++
 		case strings.HasPrefix(a, "-u") && len(a) > 2 && !strings.HasPrefix(a, "--"):
 			envAs.ops = append(envAs.ops, envOp{kind: 'u', key: a[2:]}) // -uVAR bundle
 			i++
 		case strings.HasPrefix(a, "-C") && len(a) > 2 && !strings.HasPrefix(a, "--"):
 			i++ // -CDIR bundle
-		case strings.HasPrefix(a, "--unset="):
-			envAs.ops = append(envAs.ops, envOp{kind: 'u', key: a[len("--unset="):]})
-			i++
-		case strings.HasPrefix(a, "--chdir="):
-			i++
+		case strings.HasPrefix(a, "--"):
+			// GNU unique-prefix long options. Ambiguous/unknown => fail-closed
+			// via envUnknownLong so subagent/readonly guards can reject.
+			name, val, hasVal := envSplitLong(a)
+			switch envMatchLong(name) {
+			case "ignore-environment":
+				envAs.ops = append(envAs.ops, envOp{kind: 'c'})
+				i++
+			case "null":
+				i++
+			case "unset":
+				if hasVal {
+					envAs.ops = append(envAs.ops, envOp{kind: 'u', key: val})
+					i++
+				} else {
+					if i+1 < len(argv) {
+						envAs.ops = append(envAs.ops, envOp{kind: 'u', key: argv[i+1]})
+					}
+					i += 2
+				}
+			case "chdir":
+				if hasVal {
+					i++
+				} else {
+					i += 2
+				}
+			case "split-string":
+				if hasVal {
+					payloads = append(payloads, val)
+					i++
+				} else {
+					if i+1 < len(argv) {
+						payloads = append(payloads, argv[i+1])
+					}
+					i += 2
+				}
+			default:
+				// Unknown or ambiguous long option: record and consume one argv
+				// so the command head is not mistaken; guards see the marker.
+				payloads = append(payloads, envUnknownLongPrefix+a)
+				i++
+			}
 		case strings.HasPrefix(a, "-"):
 			// Generic short cluster: -uVAR/-CDIR/-SSTR glued forms were
 			// handled above; any 'i' letter here is the short form of
 			// --ignore-environment and clears the inherited environment.
-			if !strings.HasPrefix(a, "--") && strings.IndexByte(a[1:], 'i') >= 0 {
+			if strings.IndexByte(a[1:], 'i') >= 0 {
 				envAs.ops = append(envAs.ops, envOp{kind: 'c'})
 			}
 			i++
@@ -2105,21 +2280,26 @@ func skipToolGlobalFlags(args []string) (idx int, query bool) {
 		a := args[idx]
 		switch {
 		case a == "--help" || a == "-h" || a == "--version" || a == "-V":
-			return idx, true
+			query = true
+			idx++
 		case a == "--session" || a == "--socket" || a == "--workspace" || a == "--config":
 			idx += 2
 		case strings.HasPrefix(a, "--session=") || strings.HasPrefix(a, "--socket=") ||
 			strings.HasPrefix(a, "--workspace=") || strings.HasPrefix(a, "--config="):
 			idx++
+		case a == "--json" || a == "--no-color":
+			idx++
 		case a == "--":
 			idx++
+			return idx, query
 		case strings.HasPrefix(a, "-"):
-			idx++ // --json / --no-color / other boolean globals
+			// Unknown global (e.g. --remote / --machine): stop so caller rejects.
+			return idx, query
 		default:
-			return idx, false
+			return idx, query
 		}
 	}
-	return idx, false
+	return idx, query
 }
 
 // toolSubKey returns the subcommand key of a tool argv: when the first
@@ -2157,10 +2337,17 @@ func screenHerdrSubagent(headArgv []string) string {
 	args := headArgv[1:]
 	idx, query := skipToolGlobalFlags(args)
 	if idx >= len(args) {
-		return "" // bare herdr / pure query flag run
+		if query {
+			return ""
+		}
+		return "herdr bare"
 	}
 	if query {
 		return "" // `herdr --help sub` stays a help query
+	}
+	// Unknown globals left at args[idx] (e.g. --remote=) are not subcommands.
+	if strings.HasPrefix(args[idx], "-") {
+		return "herdr " + args[idx]
 	}
 	key := toolSubKey(args[idx:], herdrSecondLevel)
 	if !herdrReadonlySubs[key] {
@@ -2639,6 +2826,9 @@ func peelResolvedDepth(argv []string, kind byte, depth int, caller callerIdentit
 	// env -S and script -c payloads were captured during peeling; screen
 	// each as shell text.
 	for _, payload := range splitPayloads {
+		if strings.HasPrefix(payload, envUnknownLongPrefix) {
+			return "env unknown option " + strings.TrimPrefix(payload, envUnknownLongPrefix)
+		}
 		if kind == 's' {
 			if hit := guardShellSubagentDepth(payload, depth+1, caller); hit != "" {
 				return hit
@@ -4806,7 +4996,9 @@ subFound:
 				switch a {
 				case "--sort", "--format", "--points-at", "--contains",
 					"--no-contains", "--merged", "--no-merged":
-					k++
+					if k+1 < len(rest) && !strings.HasPrefix(rest[k+1], "-") {
+						k++
+					}
 				}
 				continue
 			}
@@ -4856,8 +5048,15 @@ subFound:
 				// Separate-value forms consume the next arg.
 				switch a {
 				case "-n", "--sort", "--points-at", "--contains",
-					"--no-contains", "--merged", "--no-merged", "-l", "--list", "-v", "--verify":
-					k++
+					"--no-contains", "--merged", "--no-merged":
+					if k+1 < len(rest) && !strings.HasPrefix(rest[k+1], "-") {
+						k++
+					}
+				case "-l", "--list", "-v", "--verify":
+					// list/verify take an optional pattern; never swallow a flag.
+					if k+1 < len(rest) && !strings.HasPrefix(rest[k+1], "-") {
+						k++
+					}
 				}
 				continue
 			}
