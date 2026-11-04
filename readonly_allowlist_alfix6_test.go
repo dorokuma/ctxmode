@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,18 +23,12 @@ const argvPrintFlag = "--ctxmode-argv-print"
 
 func skipArgvPrintUnderRace(t *testing.T) {
 	t.Helper()
-	if raceEnabled {
-		t.Skip("argv-print self-exec of the race-instrumented test binary hangs under -race; covered by the non-race AlFix6 dash/fuzz run")
-	}
+	// AlFix7: independent argvprinter binary; no race skip.
 }
 
 func alfix6TestBin(t *testing.T) string {
 	t.Helper()
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable: %v", err)
-	}
-	return exe
+	return ensureArgvPrinter(t)
 }
 
 // replaceCmdHead rewrites the first bare word of a simple shell command with
@@ -63,18 +58,29 @@ func dashArgv(t *testing.T, shell, code string) ([]string, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, shell, "-c", code)
-	cmd.Env = append(os.Environ(), "CTXMODE_ARGV_OUT="+outFile, "CTXMODE_ARGV_PRINT=1")
+	cmd.Env = append(os.Environ(), "CTXMODE_ARGV_OUT="+outFile)
 	out, err := cmd.CombinedOutput()
 	data, rerr := os.ReadFile(outFile)
 	if rerr != nil {
 		return nil, string(out), fmt.Errorf("read argv file: %v; run err=%v raw=%q", rerr, err, out)
 	}
+	// Printer appends JSONL; take the last non-empty line.
+	lines := bytes.Split(data, []byte("\n"))
+	var last []byte
+	for _, ln := range lines {
+		if len(bytes.TrimSpace(ln)) > 0 {
+			last = ln
+		}
+	}
 	var argv []string
-	if jerr := json.Unmarshal(data, &argv); jerr != nil {
+	if jerr := json.Unmarshal(last, &argv); jerr != nil {
 		return nil, string(data), fmt.Errorf("json decode argv: %w; raw=%q", jerr, data)
 	}
+	// Printer includes argv[0] basename.
+	if len(argv) > 0 && argv[0] == "argvprinter" {
+		argv = argv[1:]
+	}
 	if err != nil {
-		// Non-zero exit still OK if we got argv (e.g. command not found after print).
 		return argv, string(out), nil
 	}
 	return argv, string(out), nil
@@ -420,7 +426,7 @@ func TestAlFix6_DashArgvDiff(t *testing.T) {
 		t.Skip("no /bin/sh")
 	}
 	bin := alfix6TestBin(t)
-	printer := bin + " " + argvPrintFlag
+	printer := bin
 
 	type tc struct {
 		name string
@@ -547,7 +553,7 @@ func TestAlFix6_DashArgvDiff(t *testing.T) {
 func TestAlFix6_DashArgvDiff_MultiSeg(t *testing.T) {
 	skipArgvPrintUnderRace(t)
 	bin := alfix6TestBin(t)
-	printer := bin + " " + argvPrintFlag
+	printer := bin
 
 	_ = printer
 	segs := splitShellSegments("true \r#; printargv PWN")
@@ -588,7 +594,7 @@ func TestAlFix6_FuzzArgvDiff(t *testing.T) {
 		t.Skip("short")
 	}
 	bin := alfix6TestBin(t)
-	printer := bin + " " + argvPrintFlag
+	printer := bin
 	rng := rand.New(rand.NewSource(20261104))
 
 	safeChars := []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-+.=/@:")
@@ -599,9 +605,8 @@ func TestAlFix6_FuzzArgvDiff(t *testing.T) {
 	}
 
 	N := 3000
-	// Race-instrumented test binary is heavy to exec thousands of times.
 	if raceEnabled {
-		N = 800
+		N = 500 // alfix7 owns the large race fuzz
 	}
 	mismatches := 0
 	outFile := filepath.Join(t.TempDir(), "fuzz-argv.json")
@@ -634,9 +639,10 @@ func TestAlFix6_FuzzArgvDiff(t *testing.T) {
 		}
 		goArgv := segs[0].argv
 		dashCode := replaceCmdHead(code, printer)
+		_ = os.Remove(outFile)
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		cmd := exec.CommandContext(ctx, "/bin/sh", "-c", dashCode)
-		cmd.Env = append(os.Environ(), "CTXMODE_ARGV_OUT="+outFile, "CTXMODE_ARGV_PRINT=1")
+		cmd.Env = append(os.Environ(), "CTXMODE_ARGV_OUT="+outFile)
 		_, _ = cmd.CombinedOutput()
 		cancel()
 		data, rerr := os.ReadFile(outFile)
@@ -644,8 +650,19 @@ func TestAlFix6_FuzzArgvDiff(t *testing.T) {
 			continue
 		}
 		var dashOut []string
-		if json.Unmarshal(data, &dashOut) != nil {
+		// JSONL: last line
+		lines := bytes.Split(data, []byte("\n"))
+		var last []byte
+		for _, ln := range lines {
+			if len(bytes.TrimSpace(ln)) > 0 {
+				last = ln
+			}
+		}
+		if json.Unmarshal(last, &dashOut) != nil {
 			continue
+		}
+		if len(dashOut) > 0 && dashOut[0] == "argvprinter" {
+			dashOut = dashOut[1:]
 		}
 		wantArgs := goArgv[1:]
 		if len(dashOut) != len(wantArgs) {
@@ -715,8 +732,8 @@ func TestAlFix6_PrinterSelfCheck(t *testing.T) {
 		t.Fatalf("executable not absolute: %q", bin)
 	}
 	outFile := filepath.Join(t.TempDir(), "argv.json")
-	cmd := exec.Command(bin, argvPrintFlag, "a", "b")
-	cmd.Env = append(os.Environ(), "CTXMODE_ARGV_OUT="+outFile, "CTXMODE_ARGV_PRINT=1")
+	cmd := exec.Command(bin, "a", "b")
+	cmd.Env = append(os.Environ(), "CTXMODE_ARGV_OUT="+outFile)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("printer mode failed: %v out=%q", err, out)
 	}
@@ -727,6 +744,9 @@ func TestAlFix6_PrinterSelfCheck(t *testing.T) {
 	var argv []string
 	if err := json.Unmarshal(data, &argv); err != nil {
 		t.Fatalf("json: %v raw=%q", err, data)
+	}
+	if len(argv) == 3 && argv[0] == "argvprinter" {
+		argv = argv[1:]
 	}
 	if len(argv) != 2 || argv[0] != "a" || argv[1] != "b" {
 		t.Fatalf("printer argv=%#v want [a b]", argv)

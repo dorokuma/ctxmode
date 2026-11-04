@@ -6,6 +6,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 ## [Unreleased]
 
 ### Fixed
+- **Readonly shell allowlist alfix7: real dash argv differential + Must Fix 1–6.** Deleted `stripLineContinuations` pre-rewrite; fold `\\n` inside the lexer via `peekAfterLineCont` (comments never continue). Fixed `readHeredocDelim` `\\r`, `"${...}"` single-quote rules + nested `${}`, `scanInlineSubstitutions` backtick unescape, `"$(...)"` case/heredoc in `skipBalanced`, and GNU `env` short clusters/`-a`/`--argv0`/bare `-`. Should Fix: ctxmode `help`/`-- -h` blocked; trailing NL/blank/comment lines; `find -prune`/`-newermt`; git tag/branch `--sort`; herdr/herdsman readonly queries; rg `-a`/`-g`. New independent `testdata/argvprinter` + `readonly_allowlist_alfix7_test.go` (AUDIT3 32 + MF samples + 2000/20000 fuzz, race-safe).
+
+### Fixed
 - **Readonly shell allowlist alfix6: dash-aligned lexer + shared-parser fixes.** `checkReadonlyShellSyntax` rewritten as byte allowlist + two-state lexer (ban bare `\\r`/controls, unquoted `~/*/?/[`, unquoted backslash, quoted command heads, glued redirects). Shared `splitShellSegmentsDepth` drops `\\r` from blanks, deletes quoted-digit IO_NUMBER wipe, tightens `$((` pairing, strips line continuations, unescapes backtick bodies, handles `${...}`, heredoc delimiter without `TrimRight(\\r)`, GNU `env` unique long-opt prefixes, herdr global flag whitelist, git branch/tag optional-value dash swallowing. Adds dash argv differential + fuzz tests (`readonly_allowlist_alfix6_test.go`).
 
 ### Added

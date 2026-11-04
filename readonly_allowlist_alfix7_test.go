@@ -1,0 +1,712 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"math/rand"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// AlFix7: real dash argv differential tests (independent printer, race-safe).
+// ---------------------------------------------------------------------------
+
+var (
+	argvPrinterOnce sync.Once
+	argvPrinterPath string
+	argvPrinterErr  error
+)
+
+func ensureArgvPrinter(t *testing.T) string {
+	t.Helper()
+	argvPrinterOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "ctxmode-argvprinter-*")
+		if err != nil {
+			argvPrinterErr = err
+			return
+		}
+		srcDir := filepath.Join(dir, "src")
+		if err := os.MkdirAll(srcDir, 0o755); err != nil {
+			argvPrinterErr = err
+			return
+		}
+		src := filepath.Join(srcDir, "main.go")
+		// Prefer checked-in testdata; fall back to embedded source.
+		candidates := []string{
+			"testdata/argvprinter/main.go",
+		}
+		var data []byte
+		for _, c := range candidates {
+			data, err = os.ReadFile(c)
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			data = []byte(argvPrinterSource)
+		}
+		if err := os.WriteFile(src, data, 0o644); err != nil {
+			argvPrinterErr = err
+			return
+		}
+		out := filepath.Join(dir, "argvprinter")
+		cmd := exec.Command("go", "build", "-o", out, src)
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+		if b, err := cmd.CombinedOutput(); err != nil {
+			argvPrinterErr = fmt.Errorf("go build argvprinter: %v\n%s", err, b)
+			return
+		}
+		argvPrinterPath = out
+	})
+	if argvPrinterErr != nil {
+		t.Fatalf("argv printer: %v", argvPrinterErr)
+	}
+	return argvPrinterPath
+}
+
+const argvPrinterSource = `package main
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+)
+func main() {
+	out := os.Getenv("CTXMODE_ARGV_OUT")
+	if out == "" { os.Exit(2) }
+	f, err := os.OpenFile(out, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil { os.Exit(2) }
+	argv := make([]string, len(os.Args))
+	copy(argv, os.Args)
+	if len(argv) > 0 { argv[0] = filepath.Base(argv[0]) }
+	if err := json.NewEncoder(f).Encode(argv); err != nil { _ = f.Close(); os.Exit(2) }
+	_ = f.Close()
+}
+`
+
+// collectGoCmdArgvs returns argv slices for segments that look like real commands
+// (non-empty argv, not depth-exceeded markers). Nested substitution segments are
+// included because dash executes them too.
+func collectGoCmdArgvs(code string) (argvs [][]string, depthExceeded bool) {
+	segs := splitShellSegments(code)
+	var add func(s shellSegment)
+	add = func(s shellSegment) {
+		if s.depthExceeded {
+			depthExceeded = true
+			return
+		}
+		if len(s.argv) > 0 {
+			cp := append([]string(nil), s.argv...)
+			argvs = append(argvs, cp)
+		}
+		for _, hb := range s.heredocText {
+			if hb.quoted {
+				continue
+			}
+			var extra []shellSegment
+			scanHeredocSubstitutions(hb.text, 0, &extra)
+			for _, s2 := range extra {
+				add(s2)
+			}
+		}
+	}
+	for _, s := range segs {
+		add(s)
+	}
+	return argvs, depthExceeded
+}
+
+// setupPrinterPATH creates a temp dir containing symlinks named after each
+// command head pointing at the argv printer. Returns (pathDir, outFile).
+func setupPrinterPATH(t *testing.T, names []string) (pathDir, outFile string) {
+	t.Helper()
+	printer := ensureArgvPrinter(t)
+	pathDir = t.TempDir()
+	outFile = filepath.Join(t.TempDir(), "argv.jsonl")
+	seen := map[string]bool{}
+	for _, n := range names {
+		base := filepath.Base(n)
+		if base == "" || base == "." || base == "/" || seen[base] {
+			continue
+		}
+		seen[base] = true
+		link := filepath.Join(pathDir, base)
+		if err := os.Symlink(printer, link); err != nil {
+			t.Fatalf("symlink %s: %v", base, err)
+		}
+	}
+	// Also provide common shells/builtins that dash may search for.
+	for _, extra := range []string{"true", "false", "echo", "printf", "cat", "test", "[", "printargv", "pig", "rm", "ls", "rg", "nice", "bash", "env", "sh", "head", "tail", "git", "ctxmode", "herdr", "find", "wc"} {
+		if seen[extra] {
+			continue
+		}
+		seen[extra] = true
+		_ = os.Symlink(printer, filepath.Join(pathDir, extra))
+	}
+	return pathDir, outFile
+}
+
+func namesFromGoArgvs(argvs [][]string) []string {
+	var names []string
+	for _, a := range argvs {
+		if len(a) > 0 {
+			names = append(names, a[0])
+		}
+	}
+	return names
+}
+
+// runDashCollectArgvs executes code under /bin/sh with PATH limited to the
+// printer directory. Returns the JSONL-decoded argv sequences dash invoked.
+func runDashCollectArgvs(t *testing.T, code, pathDir, outFile string) ([][]string, string, error) {
+	t.Helper()
+	_ = os.Remove(outFile)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", code)
+	cmd.Dir = t.TempDir()
+	cmd.Env = []string{
+		"PATH=" + pathDir,
+		"CTXMODE_ARGV_OUT=" + outFile,
+		"HOME=" + cmd.Dir,
+		"LANG=C",
+	}
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	raw := buf.String()
+	data, rerr := os.ReadFile(outFile)
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return nil, raw, err
+		}
+		return nil, raw, fmt.Errorf("read argv out: %v (run err=%v raw=%q)", rerr, err, raw)
+	}
+	var argvs [][]string
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var a []string
+		if jerr := json.Unmarshal(line, &a); jerr != nil {
+			return argvs, raw, fmt.Errorf("json line %q: %w", line, jerr)
+		}
+		argvs = append(argvs, a)
+	}
+	return argvs, raw, err
+}
+
+func argvsEqual(a, b [][]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if len(a[i]) != len(b[i]) {
+			return false
+		}
+		for j := range a[i] {
+			if a[i][j] != b[i][j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func fmtArgvs(a [][]string) string {
+	var b strings.Builder
+	for i, v := range a {
+		fmt.Fprintf(&b, "  [%d]=%#v\n", i, v)
+	}
+	return b.String()
+}
+
+// dashExecutedUnknown reports whether dash ran a command name that Go did not
+// list in any segment argv[0]. This is the Must-Fix-1 failure shape.
+func dashExecutedUnknown(goArgvs, dashArgvs [][]string) []string {
+	seen := map[string]bool{}
+	for _, a := range goArgvs {
+		if len(a) > 0 {
+			seen[a[0]] = true
+		}
+	}
+	var miss []string
+	for _, a := range dashArgvs {
+		if len(a) == 0 {
+			continue
+		}
+		if !seen[a[0]] {
+			miss = append(miss, a[0])
+		}
+	}
+	return miss
+}
+
+type dashDiffCase struct {
+	name string
+	code string
+	// compareFull: when true, require exact argv sequence match (segment count + bytes).
+	// when false, only fail if dash executed a command Go did not see (or segment-count 0 vs >0).
+	compareFull bool
+	// expectDashRuns: optional; if set, require dash to have invoked at least one command.
+	expectDashRuns bool
+}
+
+func alfix7MustFixSamples() []dashDiffCase {
+	return []dashDiffCase{
+		// Must Fix 1
+		{name: "MF1_comment_cont_rm", code: "# \\\nrm -rf /tmp/pwn", compareFull: false, expectDashRuns: true},
+		{name: "MF1_comment_cont_pig", code: "# \\\npig", compareFull: false, expectDashRuns: true},
+		{name: "MF1_comment_cont_python", code: "# \\\npython3 -c 'import os'", compareFull: false, expectDashRuns: true},
+		{name: "MF1_even_bs_pig", code: "echo \\\\\npig", compareFull: false, expectDashRuns: true},
+		{name: "MF1_dq_sq_contam", code: "echo \"'\" \"$\\\n(pig)\"", compareFull: false, expectDashRuns: true},
+		// Must Fix 2
+		{name: "MF2_heredoc_cr_delim", code: "cat <<'EOF'\r\nEOF\n'\nEOF\r\npig\n# '\n", compareFull: false, expectDashRuns: true},
+		// Must Fix 3
+		{name: "MF3_param_sq_in_dq", code: `echo "${UNSET:-'$(pig)'}"`, compareFull: false, expectDashRuns: true},
+		{name: "MF3_param_brace_sq", code: `echo "${UNSET:-'}"; pig # '}"`, compareFull: false, expectDashRuns: true},
+		{name: "MF3_nested_param", code: `echo ${UNSET1:-"${UNSET2:-"'"}" $(pig)}`, compareFull: false, expectDashRuns: true},
+		{name: "MF3_redir_param", code: `true < "${UNSET:-"'"}" 2>/dev/null ; pig # '`, compareFull: false, expectDashRuns: true},
+		// Must Fix 4
+		{name: "MF4_bt_in_param", code: "echo ${UNSET:-`\\`pig\\``}", compareFull: false, expectDashRuns: true},
+		{name: "MF4_bt_in_arith", code: "echo $(( `\\`pig\\`` + 0 ))", compareFull: false, expectDashRuns: true},
+		// Must Fix 5
+		{name: "MF5_case_in_dq_cmdsub", code: `echo "$(case x in x) pig;; esac)"`, compareFull: false, expectDashRuns: true},
+		{name: "MF5_heredoc_in_dq_cmdsub", code: "echo \"$(cat <<EOF\n)\nEOF\npig)\"", compareFull: false, expectDashRuns: true},
+		// Must Fix 6 (argv-level; also exercised via shell)
+		{name: "MF6_env_a", code: "env -a true pig", compareFull: false, expectDashRuns: true},
+		{name: "MF6_env_argv0", code: "env --argv0 true pig", compareFull: false, expectDashRuns: true},
+		{name: "MF6_env_vS", code: "env -vS 'env pig'", compareFull: false, expectDashRuns: true},
+		{name: "MF6_env_dash", code: "env - sh -c id", compareFull: false, expectDashRuns: true},
+	}
+}
+
+func alfix7Audit3Diff32() []dashDiffCase {
+	// Shell-string cases from AUDIT3 §4 (argv-only cases handled separately).
+	return []dashDiffCase{
+		{name: "A01_cr_comment", code: "true \r#; echo PWN", compareFull: false},
+		{name: "A02_cr_cmdhead", code: "ls\r", compareFull: false},
+		{name: "A03_cr_opt", code: "rg -e \r --pre=/usr/bin/id pat .", compareFull: true},
+		{name: "A04_cr_redir", code: "echo hi >/dev/null\rfoo", compareFull: false},
+		{name: "A05_ctrl_v", code: "ls \v -la", compareFull: true},
+		{name: "A06_sq_digit", code: "rg -e '2'>/dev/null --pre=/usr/bin/id pat .", compareFull: true},
+		{name: "A07_dq_digit", code: `nice -n "2">/dev/null pig`, compareFull: false, expectDashRuns: true},
+		{name: "A08_bs_digit", code: `rg -e \2>/dev/null --pre=/usr/bin/id pat .`, compareFull: true},
+		{name: "A09_empty_q_digit", code: `rg -e ""2>/dev/null --pre=/usr/bin/id pat .`, compareFull: true},
+		{name: "A10_midword_digit", code: "echo a2>/dev/null b", compareFull: false},
+		{name: "A11_bare_io", code: "ls 2>/dev/null", compareFull: true},
+		{name: "A12_digit_space", code: "echo 2 >/dev/null", compareFull: false},
+		{name: "A13_redir_glue", code: "echo hi >'/dev/null'foo", compareFull: false},
+		{name: "A14_fd_glue", code: "echo hi 2>&1foo", compareFull: false},
+		{name: "A15_leading_redir", code: "2>/dev/null ls -la", compareFull: true},
+		{name: "A16_quoted_if", code: "'if' true; then ls; fi", compareFull: false},
+		{name: "A17_tilde", code: "~", compareFull: false},
+		{name: "A18_tilde_arg", code: "ls ~", compareFull: false},
+		{name: "A19_glob", code: "ls *.go", compareFull: false},
+		{name: "A20_fake_arith", code: `bash -c 'echo $((pig); (true))'`, compareFull: false},
+		{name: "A21_arith_nested", code: "echo $(( (1+1) * $(pig) ))", compareFull: false, expectDashRuns: true},
+		{name: "A22_param_dq", code: `echo $(echo "${x:-")"}"; pig)`, compareFull: false, expectDashRuns: true},
+		{name: "A23_param_sq", code: `echo $(echo ${x:-')'}; pig)`, compareFull: false, expectDashRuns: true},
+		{name: "A24_linecont_dollar", code: "echo $\\\n(pig)", compareFull: false, expectDashRuns: true},
+		{name: "A25_dq_linecont", code: "echo \"$\\\n(pig)\"", compareFull: false, expectDashRuns: true},
+		{name: "A26_linecont_heredoc", code: "cat <\\\n<EOF\n$(pig)\nEOF", compareFull: false, expectDashRuns: true},
+		{name: "A27_bt_escape", code: "echo `\\`pig\\``", compareFull: false, expectDashRuns: true},
+		{name: "A28_bt_dbs", code: "echo `echo a\\\\` ; pig ; #`", compareFull: false, expectDashRuns: true},
+		{name: "A29_heredoc_cr", code: "cat <<'EOF'\nEOF\r\n'; pig; '\nEOF", compareFull: false},
+	}
+}
+
+func alfix7ShouldFixSamples() []dashDiffCase {
+	return []dashDiffCase{
+		{name: "SF_comment_cont_ls", code: "# \\\nls", compareFull: false, expectDashRuns: true},
+		{name: "SF_heredoc_phys_line", code: "cat <<'EOF' >/dev/null\nEO\\\nF\n'\nEOF\npig\n# '\n", compareFull: false, expectDashRuns: true},
+	}
+}
+
+func alfix7ReportTableSamples() []dashDiffCase {
+	// From REPORT §2 excerpt table (shell forms).
+	return []dashDiffCase{
+		{name: "R_cr_pwn", code: "true \r#; echo PWN", compareFull: false},
+		{name: "R_rg_cr_pre", code: "rg -e \r --pre=/usr/bin/id pat .", compareFull: true},
+		{name: "R_sq_digit_pre", code: "rg -e '2'>/dev/null --pre=/usr/bin/id pat .", compareFull: true},
+		{name: "R_bs_digit", code: `rg -e \2>/dev/null --pre=/usr/bin/id pat .`, compareFull: true},
+		{name: "R_fd_glue", code: "echo hi 2>&1foo", compareFull: false},
+		{name: "R_fake_arith", code: `bash -c 'echo $((pig); (true))'`, compareFull: false},
+		{name: "R_comment_cont_pwn", code: "# \\\npig", compareFull: false, expectDashRuns: true},
+		{name: "R_comment_cont_pig", code: "# \\\npig", compareFull: false, expectDashRuns: true},
+		{name: "R_comment_cont_ls", code: "# \\\nls", compareFull: false, expectDashRuns: true},
+		{name: "R_comment_cont_cat", code: "# \\\ncat", compareFull: false, expectDashRuns: true},
+	}
+}
+
+func runDashDiffCases(t *testing.T, cases []dashDiffCase) (mismatches []string) {
+	t.Helper()
+	if _, err := exec.LookPath("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh")
+	}
+	_ = ensureArgvPrinter(t)
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			goArgvs, depthEx := collectGoCmdArgvs(c.code)
+			// Always install printer names for expected dash heads + common set.
+			names := namesFromGoArgvs(goArgvs)
+			// Seed likely heads from the code text for MF1 (Go may see 0 segs).
+			for _, h := range []string{"rm", "pig", "python3", "echo", "true", "ls", "cat", "env", "sh", "bash", "nice", "rg"} {
+				if strings.Contains(c.code, h) {
+					names = append(names, h)
+				}
+			}
+			pathDir, outFile := setupPrinterPATH(t, names)
+			dashArgvs, raw, _ := runDashCollectArgvs(t, c.code, pathDir, outFile)
+
+			if c.expectDashRuns && len(dashArgvs) == 0 {
+				// dash builtins (echo/true/…) bypass PATH symlinks; if Go already
+				// sees command heads and dash produced output, visibility is OK.
+				if len(goArgvs) == 0 {
+					msg := fmt.Sprintf("%s: expected dash to run something; raw=%q go=%s", c.name, raw, fmtArgvs(goArgvs))
+					mismatches = append(mismatches, msg)
+					t.Error(msg)
+					return
+				}
+			}
+
+			miss := dashExecutedUnknown(goArgvs, dashArgvs)
+			if len(miss) > 0 && !depthEx {
+				msg := fmt.Sprintf("%s: dash ran cmds Go missed: %v\ncode=%q\ngo:\n%sdash:\n%sraw=%q",
+					c.name, miss, c.code, fmtArgvs(goArgvs), fmtArgvs(dashArgvs), raw)
+				mismatches = append(mismatches, msg)
+				t.Error(msg)
+				return
+			}
+			// Segment count mismatch when Go sees 0 but dash ran ≥1 (MF1 shape).
+			if len(goArgvs) == 0 && len(dashArgvs) > 0 && !depthEx {
+				msg := fmt.Sprintf("%s: Go 0 segs but dash ran %d\ncode=%q\ndash:\n%s",
+					c.name, len(dashArgvs), c.code, fmtArgvs(dashArgvs))
+				mismatches = append(mismatches, msg)
+				t.Error(msg)
+				return
+			}
+			if c.compareFull && !depthEx {
+				if !argvsEqual(goArgvs, dashArgvs) {
+					msg := fmt.Sprintf("%s: argv sequence mismatch\ncode=%q\ngo:\n%sdash:\n%sraw=%q",
+						c.name, c.code, fmtArgvs(goArgvs), fmtArgvs(dashArgvs), raw)
+					mismatches = append(mismatches, msg)
+					t.Error(msg)
+				}
+			}
+		})
+	}
+	return mismatches
+}
+
+func TestAlFix7_DashDiff_MustFix(t *testing.T) {
+	runDashDiffCases(t, alfix7MustFixSamples())
+}
+
+func TestAlFix7_DashDiff_Audit3_32(t *testing.T) {
+	runDashDiffCases(t, alfix7Audit3Diff32())
+}
+
+func TestAlFix7_DashDiff_ShouldFixSamples(t *testing.T) {
+	runDashDiffCases(t, alfix7ShouldFixSamples())
+}
+
+func TestAlFix7_DashDiff_ReportTable(t *testing.T) {
+	runDashDiffCases(t, alfix7ReportTableSamples())
+}
+
+// Guard-level red tests for Must Fix samples (subagent must see nested agent).
+func TestAlFix7_MustFix_SubagentBlocks(t *testing.T) {
+	t.Setenv(auditEnvRole, "worker")
+	t.Setenv(auditEnvReadonly, "")
+	cases := []struct {
+		name string
+		code string
+		argv []string
+	}{
+		{name: "MF1_comment_cont_pig", code: "# \\\npig"},
+		{name: "MF1_even_bs", code: "echo \\\\\npig"},
+		{name: "MF1_dq_sq", code: "echo \"'\" \"$\\\n(pig)\""},
+		{name: "MF2_heredoc_cr", code: "cat <<'EOF'\r\nEOF\n'\nEOF\r\npig\n# '\n"},
+		{name: "MF3_param_sq", code: `echo "${UNSET:-'$(pig)'}"`},
+		{name: "MF3_brace", code: `echo "${UNSET:-'}"; pig # '}"`},
+		{name: "MF3_nested", code: `echo ${UNSET1:-"${UNSET2:-"'"}" $(pig)}`},
+		{name: "MF4_bt_param", code: "echo ${UNSET:-`\\`pig\\``}"},
+		{name: "MF4_bt_arith", code: "echo $(( `\\`pig\\`` + 0 ))"},
+		{name: "MF5_case", code: `echo "$(case x in x) pig;; esac)"`},
+		{name: "MF5_heredoc", code: "echo \"$(cat <<EOF\n)\nEOF\npig)\""},
+		{name: "MF6_env_a", argv: []string{"env", "-a", "true", "pig"}},
+		{name: "MF6_env_argv0", argv: []string{"env", "--argv0", "true", "pig"}},
+		{name: "MF6_env_vS", argv: []string{"env", "-vS", "env pig"}},
+		{name: "MF6_env_vC", argv: []string{"env", "-vC", "/tmp", "pig"}},
+		{name: "MF6_env_vu", argv: []string{"env", "-vu", "CTXMODE_ROLE", "pig"}},
+		{name: "MF6_env_dash", argv: []string{"env", "-", "sh", "-c", "id"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var hit string
+			if len(c.argv) > 0 {
+				hit = guardArgvSubagent(c.argv)
+			} else {
+				hit = guardShellSubagent(c.code)
+			}
+			if hit == "" {
+				t.Fatalf("expected subagent block for %s code=%q argv=%v", c.name, c.code, c.argv)
+			}
+		})
+	}
+}
+
+func TestAlFix7_MustFix_ReadonlyBlocks(t *testing.T) {
+	t.Setenv(auditEnvRole, "scout")
+	t.Setenv(auditEnvReadonly, "")
+	cases := []struct {
+		name string
+		code string
+	}{
+		{name: "MF1_comment_cont_pig", code: "# \\\npig"},
+		{name: "MF1_comment_cont_rm", code: "# \\\nrm -rf /tmp/pwn"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if hit := guardShellReadonly(c.code); hit == "" {
+				t.Fatalf("expected readonly block for %q", c.code)
+			}
+		})
+	}
+	// After the parse fix, comment-continuation + allowlisted cmd is visible and allowed.
+	t.Run("MF1_comment_cont_ls_allow", func(t *testing.T) {
+		if hit := guardShellReadonly("# \\\nls"); hit != "" {
+			t.Fatalf("expected allow for comment-cont + ls, got %q", hit)
+		}
+	})
+}
+
+// Should Fix / Nice to Have allow/block expectations.
+func TestAlFix7_ShouldFix_Allowlist(t *testing.T) {
+	t.Setenv(auditEnvRole, "scout")
+	t.Setenv(auditEnvReadonly, "")
+
+	allow := []struct {
+		name string
+		argv []string
+		code string
+	}{
+		{name: "trailing_nl", code: "ls -la\n"},
+		{name: "blank_line", code: "git status\n\ngit log -n 5"},
+		{name: "comment_line", code: "# 查看状态\ngit status"},
+		{name: "trailing_comment", code: "git status\n# 备注"},
+		{name: "find_prune", argv: []string{"find", ".", "-path", "./.git", "-prune", "-o", "-name", "*.go", "-print"}},
+		{name: "find_newermt", argv: []string{"find", ".", "-newermt", "2026-01-01"}},
+		{name: "git_tag_sort_desc", argv: []string{"git", "tag", "-l", "--sort", "-creatordate"}},
+		{name: "herdr_pane_current", argv: []string{"herdr", "pane", "current"}},
+		{name: "herdr_pane_help", argv: []string{"herdr", "pane", "--help"}},
+		{name: "herdr_skill", argv: []string{"herdr", "--skill"}},
+		{name: "herdr_default_config", argv: []string{"herdr", "--default-config"}},
+		{name: "herdsman_status", argv: []string{"herdsman", "status"}},
+		{name: "herdsman_agent_list", argv: []string{"herdsman", "agent", "list"}},
+		{name: "git_reflog_n", argv: []string{"git", "reflog", "-n", "10"}},
+		{name: "ctxmode_h", argv: []string{"ctxmode", "-h"}},
+		{name: "ctxmode_help_flag", argv: []string{"ctxmode", "--help"}},
+		{name: "rg_a", argv: []string{"rg", "-a", "pat", "."}},
+		{name: "rg_c", argv: []string{"rg", "-c", "pat", "."}},
+		{name: "rg_g", argv: []string{"rg", "-g", "*.go", "pat"}},
+	}
+	for _, c := range allow {
+		t.Run("allow_"+c.name, func(t *testing.T) {
+			var hit string
+			if len(c.argv) > 0 {
+				hit = guardArgvReadonly(c.argv)
+			} else {
+				hit = guardShellReadonly(c.code)
+			}
+			if hit != "" {
+				t.Fatalf("expected allow, got %q for %s", hit, c.name)
+			}
+		})
+	}
+
+	block := []struct {
+		name string
+		argv []string
+	}{
+		{name: "ctxmode_help_sub", argv: []string{"ctxmode", "help"}},
+		{name: "ctxmode_ddash_h", argv: []string{"ctxmode", "--", "-h"}},
+		{name: "git_tag_delete", argv: []string{"git", "tag", "-l", "-d", "foo"}},
+		{name: "git_branch_sort_D", argv: []string{"git", "branch", "-l", "--sort", "-D", "foo"}},
+	}
+	for _, c := range block {
+		t.Run("block_"+c.name, func(t *testing.T) {
+			if hit := guardArgvReadonly(c.argv); hit == "" {
+				t.Fatalf("expected block for %v", c.argv)
+			}
+		})
+	}
+}
+
+func TestAlFix7_FuzzArgvDiff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short")
+	}
+	if _, err := exec.LookPath("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh")
+	}
+	_ = ensureArgvPrinter(t)
+
+	rng := rand.New(rand.NewSource(20261104))
+	N := 20000
+	if raceEnabled {
+		N = 2000
+	}
+
+	atoms := []string{
+		"echo", "true", "false", "pig", "ls", "cat", "a", "b", "x", "1",
+		"\\", "\n", "\r", "#", "'", `"`, "`", "$(", "${", "$((", ")", "|", "&&", ";",
+		"<<EOF", "<<-EOF", "<<'EOF'", "EOF", "case", "in", "esac", ")",
+	}
+	safeWord := func() string {
+		const chars = "abcdefghijklmnopqrstuvwxyz0123456789_"
+		n := 1 + rng.Intn(6)
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = chars[rng.Intn(len(chars))]
+		}
+		return string(b)
+	}
+
+	mismatches := 0
+	for i := 0; i < N; i++ {
+		var parts []string
+		nTok := 1 + rng.Intn(8)
+		for k := 0; k < nTok; k++ {
+			switch rng.Intn(10) {
+			case 0:
+				parts = append(parts, atoms[rng.Intn(len(atoms))])
+			case 1:
+				parts = append(parts, safeWord())
+			case 2:
+				parts = append(parts, "'"+safeWord()+"'")
+			case 3:
+				parts = append(parts, `"`+safeWord()+`"`)
+			case 4:
+				parts = append(parts, "# "+safeWord())
+			case 5:
+				parts = append(parts, "echo", safeWord(), ";", "pig")
+			case 6:
+				parts = append(parts, "echo", "$("+safeWord()+")")
+			case 7:
+				parts = append(parts, "# \\", "\n", "pig")
+			case 8:
+				parts = append(parts, "echo", "${"+safeWord()+":-x}")
+			default:
+				parts = append(parts, "true", "&&", safeWord())
+			}
+		}
+		code := strings.Join(parts, " ")
+		// Occasionally force MF1-like shape.
+		if rng.Intn(20) == 0 {
+			code = "# \\\n" + safeWord()
+		}
+		if rng.Intn(25) == 0 {
+			code = "echo \\\\\n" + "pig"
+		}
+
+		goArgvs, depthEx := collectGoCmdArgvs(code)
+		names := namesFromGoArgvs(goArgvs)
+		names = append(names, "pig", "echo", "true", "false", "ls", "cat")
+		pathDir, outFile := setupPrinterPATH(t, names)
+		dashArgvs, _, _ := runDashCollectArgvs(t, code, pathDir, outFile)
+
+		miss := dashExecutedUnknown(goArgvs, dashArgvs)
+		bad := false
+		if len(miss) > 0 && !depthEx {
+			bad = true
+		}
+		if len(goArgvs) == 0 && len(dashArgvs) > 0 && !depthEx {
+			bad = true
+		}
+		if bad {
+			mismatches++
+			if mismatches <= 10 {
+				t.Logf("fuzz mismatch i=%d code=%q miss=%v go=%s dash=%s",
+					i, code, miss, fmtArgvs(goArgvs), fmtArgvs(dashArgvs))
+			}
+		}
+	}
+	if mismatches > 0 {
+		t.Fatalf("fuzz dash/Go command-visibility mismatches: %d / %d (seed=20261104 race=%v)", mismatches, N, raceEnabled)
+	}
+}
+
+// BaselineCapture runs the differential suite and writes a machine-readable
+// summary of mismatches (used for the red-test report on 879fea8).
+func TestAlFix7_CaptureBaselineMismatches(t *testing.T) {
+	if os.Getenv("CTXMODE_ALFIX7_CAPTURE") != "1" {
+		t.Skip("set CTXMODE_ALFIX7_CAPTURE=1 to write baseline mismatch report")
+	}
+	outPath := os.Getenv("CTXMODE_ALFIX7_CAPTURE_OUT")
+	if outPath == "" {
+		outPath = "/tmp/alfix7-baseline-mismatches.txt"
+	}
+	var all []dashDiffCase
+	all = append(all, alfix7MustFixSamples()...)
+	all = append(all, alfix7Audit3Diff32()...)
+	all = append(all, alfix7ShouldFixSamples()...)
+	all = append(all, alfix7ReportTableSamples()...)
+
+	var report strings.Builder
+	report.WriteString("alfix7 baseline dash/Go mismatches\n")
+	report.WriteString("HEAD capture mode\n\n")
+
+	nFail := 0
+	for _, c := range all {
+		goArgvs, depthEx := collectGoCmdArgvs(c.code)
+		names := namesFromGoArgvs(goArgvs)
+		for _, h := range []string{"rm", "pig", "python3", "echo", "true", "ls", "cat", "env", "sh", "bash", "nice", "rg"} {
+			if strings.Contains(c.code, h) {
+				names = append(names, h)
+			}
+		}
+		pathDir, outFile := setupPrinterPATH(t, names)
+		dashArgvs, raw, _ := runDashCollectArgvs(t, c.code, pathDir, outFile)
+		miss := dashExecutedUnknown(goArgvs, dashArgvs)
+		fail := false
+		reason := ""
+		if len(goArgvs) == 0 && len(dashArgvs) > 0 && !depthEx {
+			fail = true
+			reason = "Go0_dashN"
+		} else if len(miss) > 0 && !depthEx {
+			fail = true
+			reason = "dash_unknown:" + strings.Join(miss, ",")
+		} else if c.compareFull && !depthEx && !argvsEqual(goArgvs, dashArgvs) {
+			fail = true
+			reason = "argv_mismatch"
+		} else if c.expectDashRuns && len(dashArgvs) == 0 {
+			fail = true
+			reason = "dash_no_run"
+		}
+		if fail {
+			nFail++
+			fmt.Fprintf(&report, "FAIL %s reason=%s\ncode=%q\ngo_segs=%d dash_segs=%d depthEx=%v\ngo:\n%sdash:\n%sraw=%q\n\n",
+				c.name, reason, c.code, len(goArgvs), len(dashArgvs), depthEx, fmtArgvs(goArgvs), fmtArgvs(dashArgvs), raw)
+		}
+	}
+	fmt.Fprintf(&report, "TOTAL_FAIL=%d TOTAL=%d\n", nFail, len(all))
+	if err := os.WriteFile(outPath, []byte(report.String()), 0o644); err != nil {
+		t.Fatalf("write report: %v", err)
+	}
+	t.Logf("wrote %s fail=%d/%d", outPath, nFail, len(all))
+}

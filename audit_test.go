@@ -21,30 +21,6 @@ import (
 // It uses os.Setenv rather than t.Setenv on purpose: TestMain has no *testing.T,
 // and t.Setenv only works inside a test (it registers a cleanup with that test).
 func TestMain(m *testing.M) {
-	// Argv-print mode for dash differential tests: when invoked as
-	// `<testbin> --ctxmode-argv-print ...`, emit remaining os.Args as JSON
-	// and exit. No packages installed; self-call only.
-	// Argv-print mode for dash differential tests. Prefer env trigger so a
-	// nested `go test` re-entry cannot happen if argv is reshaped by the shell.
-	if os.Getenv("CTXMODE_ARGV_PRINT") == "1" || (len(os.Args) >= 2 && os.Args[1] == "--ctxmode-argv-print") {
-		args := os.Args[1:]
-		if len(os.Args) >= 2 && os.Args[1] == "--ctxmode-argv-print" {
-			args = os.Args[2:]
-		}
-		if p := os.Getenv("CTXMODE_ARGV_OUT"); p != "" {
-			f, err := os.Create(p)
-			if err != nil {
-				os.Exit(2)
-			}
-			enc := json.NewEncoder(f)
-			_ = enc.Encode(args)
-			_ = f.Close()
-		} else {
-			enc := json.NewEncoder(os.Stderr)
-			_ = enc.Encode(args)
-		}
-		os.Exit(0)
-	}
 	dir, err := os.MkdirTemp("", "ctxmode-audit-test")
 	if err != nil {
 		os.Exit(1)

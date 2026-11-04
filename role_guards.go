@@ -237,7 +237,6 @@ func sliceTo(s string, lo, hi int) string {
 // exactness on the separations that matter; anything it cannot decompose is
 // screened as one opaque segment.
 func splitShellSegments(code string) []shellSegment {
-	code = stripLineContinuations(code)
 	segs, ok := splitShellSegmentsDepth(code, 0, false)
 	if !ok {
 		segs = append(segs, shellSegment{depthExceeded: true})
@@ -245,40 +244,16 @@ func splitShellSegments(code string) []shellSegment {
 	return segs
 }
 
-// stripLineContinuations removes unescaped backslash-newline pairs outside
-// single quotes (POSIX §2.2.1), matching dash/bash token recognition.
-func stripLineContinuations(code string) string {
-	if strings.IndexByte(code, '\\') < 0 {
-		return code
+// peekAfterLineCont advances i past unescaped backslash-newline pairs
+// (POSIX §2.2.1). Call only outside single quotes and outside comments;
+// those contexts must never fold continuations. Processing left-to-right
+// means an escaped backslash (\\) is consumed before a following
+// newline, so even-count backslashes correctly yield a real newline.
+func peekAfterLineCont(code string, i int) int {
+	for i+1 < len(code) && code[i] == '\\' && code[i+1] == '\n' {
+		i += 2
 	}
-	var b strings.Builder
-	b.Grow(len(code))
-	inSingle := false
-	i := 0
-	for i < len(code) {
-		c := code[i]
-		if inSingle {
-			b.WriteByte(c)
-			if c == '\'' {
-				inSingle = false
-			}
-			i++
-			continue
-		}
-		if c == '\'' {
-			inSingle = true
-			b.WriteByte(c)
-			i++
-			continue
-		}
-		if c == '\\' && i+1 < len(code) && code[i+1] == '\n' {
-			i += 2
-			continue
-		}
-		b.WriteByte(c)
-		i++
-	}
-	return b.String()
+	return i
 }
 
 // unescapeBacktickBody applies POSIX backtick backslash removal before the
@@ -422,7 +397,25 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 				i++
 				for i < len(code) && code[i] != '"' {
 					if code[i] == '\\' && i+1 < len(code) {
-						i++
+						i += 2
+						continue
+					}
+					if code[i] == '$' {
+						k := peekAfterLineCont(code, i+1)
+						if k < len(code) && code[k] == '(' {
+							i = skipBalanced(code, k, '(', ')')
+							continue
+						}
+						if k < len(code) && code[k] == '{' {
+							i = skipBalancedCtx(code, k, '{', '}', true)
+							continue
+						}
+					}
+					if code[i] == '`' {
+						if j := findBacktickClose(code, i+1); j >= 0 {
+							i = j + 1
+							continue
+						}
 					}
 					i++
 				}
@@ -437,8 +430,11 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 				}
 				i += 2
 			case '$':
-				if i+1 < len(code) && code[i+1] == '(' {
-					i = skipBalanced(code, i+1, '(', ')')
+				k := peekAfterLineCont(code, i+1)
+				if k < len(code) && code[k] == '(' {
+					i = skipBalanced(code, k, '(', ')')
+				} else if k < len(code) && code[k] == '{' {
+					i = skipBalanced(code, k, '{', '}')
 				} else {
 					i++
 				}
@@ -584,19 +580,24 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 						continue
 					}
 				}
-				if code[j] == '$' && j+1 < len(code) && code[j+1] == '(' {
-					if inner, ok := innerBalanced(code, j+1, '(', ')'); ok {
-						scanInner(inner)
+				if code[j] == '$' {
+					k := peekAfterLineCont(code, j+1)
+					if k < len(code) && code[k] == '(' {
+						if inner, ok := innerBalanced(code, k, '(', ')'); ok {
+							scanInner(inner)
+						}
+						j = skipBalanced(code, k, '(', ')')
+						continue
 					}
-					j = skipBalanced(code, j+1, '(', ')')
-					continue
-				}
-				if code[j] == '$' && j+1 < len(code) && code[j+1] == '{' {
-					if inner, ok := innerBalanced(code, j+1, '{', '}'); ok {
-						scanSubs(inner)
+					if k < len(code) && code[k] == '{' {
+						if inner, ok := innerBalancedCtx(code, k, '{', '}', true); ok {
+							scanInlineSubstitutionsCtx(inner, depth, &curExtra, true)
+						} else {
+							curExtra = append(curExtra, shellSegment{depthExceeded: true})
+						}
+						j = skipBalancedCtx(code, k, '{', '}', true)
+						continue
 					}
-					j = skipBalanced(code, j+1, '{', '}')
-					continue
 				}
 				if code[j] == '`' {
 					if k := findBacktickClose(code, j+1); k >= 0 {
@@ -624,23 +625,27 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 				i++
 			}
 		case '$':
-			if i+1 < len(code) && code[i+1] == '{' {
-				if inner, ok := innerBalanced(code, i+1, '{', '}'); ok {
+			k := peekAfterLineCont(code, i+1)
+			if k < len(code) && code[k] == '{' {
+				if inner, ok := innerBalanced(code, k, '{', '}'); ok {
 					scanSubs(inner)
+				} else {
+					curExtra = append(curExtra, shellSegment{depthExceeded: true})
 				}
 				word.WriteByte('0')
 				wordStarted = true
-				i = skipBalanced(code, i+1, '{', '}')
+				i = skipBalanced(code, k, '{', '}')
 				continue
 			}
-			if i+1 < len(code) && code[i+1] == '(' {
-				if i+2 < len(code) && code[i+2] == '(' {
+			if k < len(code) && code[k] == '(' {
+				k2 := peekAfterLineCont(code, k+1)
+				if k2 < len(code) && code[k2] == '(' {
 					// $(( ... )) only when the INNER '(' stays open until end-1.
-					end := skipBalanced(code, i+1, '(', ')')
+					end := skipBalanced(code, k, '(', ')')
 					if end >= 2 && end <= len(code) && code[end-1] == ')' && code[end-2] == ')' {
-						innerEnd := skipBalanced(code, i+2, '(', ')')
+						innerEnd := skipBalanced(code, k2, '(', ')')
 						if innerEnd == end-1 {
-							scanSubs(sliceTo(code, i+3, end-1))
+							scanSubs(sliceTo(code, k2+1, end-1))
 							word.WriteByte('0')
 							wordStarted = true
 							i = end
@@ -649,14 +654,14 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 					}
 					// else fall through: $( (cmd); ... ) / $((pig); (true))
 				}
-				if inner, ok := innerBalanced(code, i+1, '(', ')'); ok {
+				if inner, ok := innerBalanced(code, k, '(', ')'); ok {
 					scanInner(inner)
 				} else {
 					curExtra = append(curExtra, shellSegment{depthExceeded: true})
 					word.WriteString(cmdSubPlaceholder)
 				}
 				wordStarted = true
-				i = skipBalanced(code, i+1, '(', ')')
+				i = skipBalanced(code, k, '(', ')')
 			} else {
 				word.WriteByte(c)
 				wordStarted = true
@@ -708,10 +713,16 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 			// here-string whose single-word payload is skipped like any
 			// other input redirect.
 			j := i
-			for j < len(code) && code[j] == '<' {
-				j++
+			nlt := 0
+			for {
+				j = peekAfterLineCont(code, j)
+				if j < len(code) && code[j] == '<' {
+					nlt++
+					j++
+					continue
+				}
+				break
 			}
-			nlt := j - i
 			if j < len(code) && code[j] == '&' {
 				j++
 			}
@@ -752,12 +763,13 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 			if nlt == 2 {
 				// << / <<- heredoc: read the terminator word and queue the body
 				// against the CURRENT segment (owner resolved at next flush).
-				k := j
+				k := peekAfterLineCont(code, j)
 				stripTabs := false
 				if k < len(code) && code[k] == '-' {
 					stripTabs = true
 					k++
 				}
+				k = peekAfterLineCont(code, k)
 				delim, quoted, next := readHeredocDelim(code, k)
 				if delim != "" {
 					heredocs = append(heredocs, heredocSpec{delim: delim, quoted: quoted, stripTabs: stripTabs, pending: true})
@@ -932,7 +944,7 @@ func readHeredocDelim(code string, i int) (string, bool, int) {
 	for i < len(code) {
 		c := code[i]
 		switch c {
-		case ' ', '\t', '\r', '\n', ';', '|', '&', '<', '>', '(', ')':
+		case ' ', '\t', '\n', ';', '|', '&', '<', '>', '(', ')':
 			return b.String(), quoted, i
 		case '\'':
 			quoted = true
@@ -948,6 +960,14 @@ func readHeredocDelim(code string, i int) (string, bool, int) {
 			quoted = true
 			i++
 			for i < len(code) && code[i] != '"' {
+				if code[i] == '\\' && i+1 < len(code) {
+					switch code[i+1] {
+					case '"', '\\':
+						b.WriteByte(code[i+1])
+						i += 2
+						continue
+					}
+				}
 				b.WriteByte(code[i])
 				i++
 			}
@@ -982,9 +1002,10 @@ func readHeredocDelim(code string, i int) (string, bool, int) {
 // together with the segment that owns them. At the depth cap it appends a
 // fail-closed marker segment instead of recursing any further.
 func scanInlineSubstitutions(text string, depth int, extra *[]shellSegment) {
-	// The depth cap only fires when a substitution is actually present — a
-	// plain word (e.g. a redirect target like >/dev/null) at max depth
-	// must not trip the fail-closed marker.
+	scanInlineSubstitutionsCtx(text, depth, extra, false)
+}
+
+func scanInlineSubstitutionsCtx(text string, depth int, extra *[]shellSegment, inDoubleQuote bool) {
 	overDepth := depth >= shellSplitMaxDepth
 	failClosed := func() {
 		if overDepth {
@@ -992,37 +1013,109 @@ func scanInlineSubstitutions(text string, depth int, extra *[]shellSegment) {
 		}
 	}
 	for i := 0; i < len(text); i++ {
-		switch text[i] {
-		case '\'':
+		c := text[i]
+		// Inside "${...}" single quotes are literal — never open a quote span.
+		if c == '\'' && !(inDoubleQuote) {
 			i++
 			for i < len(text) && text[i] != '\'' {
 				i++
 			}
+			continue
+		}
+		if c == '\'' && inDoubleQuote {
+			continue
+		}
+		switch c {
 		case '"':
+			if inDoubleQuote {
+				// Nested " inside "${...}" still toggles a local double-quote
+				// span for finding closers, but $() / ${} / ` still expand.
+				i++
+				for i < len(text) && text[i] != '"' {
+					if text[i] == '\\' && i+1 < len(text) {
+						i += 2
+						continue
+					}
+					if text[i] == '$' {
+						k := peekAfterLineCont(text, i+1)
+						if k < len(text) && text[k] == '(' {
+							failClosed()
+							if !overDepth {
+								if inner, ok := innerBalancedCtx(text, k, '(', ')', true); ok {
+									sub, _ := splitShellSegmentsDepth(inner, depth+1, false)
+									*extra = append(*extra, sub...)
+								} else {
+									*extra = append(*extra, shellSegment{depthExceeded: true})
+								}
+							}
+							i = skipBalancedCtx(text, k, '(', ')', true)
+							continue
+						}
+						if k < len(text) && text[k] == '{' {
+							if inner, ok := innerBalancedCtx(text, k, '{', '}', true); ok {
+								scanInlineSubstitutionsCtx(inner, depth, extra, true)
+							} else {
+								*extra = append(*extra, shellSegment{depthExceeded: true})
+							}
+							i = skipBalancedCtx(text, k, '{', '}', true)
+							continue
+						}
+					}
+					if text[i] == '`' {
+						if j := findBacktickClose(text, i+1); j >= 0 {
+							failClosed()
+							if !overDepth {
+								sub, _ := splitShellSegmentsDepth(unescapeBacktickBody(text[i+1:j], true), depth+1, false)
+								*extra = append(*extra, sub...)
+							}
+							i = j + 1
+							continue
+						}
+					}
+					i++
+				}
+				continue
+			}
 			i++
 			for i < len(text) && text[i] != '"' {
 				if text[i] == '\\' && i+1 < len(text) {
 					i += 2
 					continue
 				}
-				if text[i] == '$' && i+1 < len(text) && text[i+1] == '(' {
-					failClosed()
-					if !overDepth {
-						if inner, ok := innerBalanced(text, i+1, '(', ')'); ok {
-							sub, _ := splitShellSegmentsDepth(inner, depth+1, false)
-							*extra = append(*extra, sub...)
+				if text[i] == '$' {
+					k := peekAfterLineCont(text, i+1)
+					if k < len(text) && text[k] == '(' {
+						failClosed()
+						if !overDepth {
+							if inner, ok := innerBalancedCtx(text, k, '(', ')', true); ok {
+								sub, _ := splitShellSegmentsDepth(inner, depth+1, false)
+								*extra = append(*extra, sub...)
+							} else {
+								*extra = append(*extra, shellSegment{depthExceeded: true})
+							}
 						}
+						i = skipBalancedCtx(text, k, '(', ')', true)
+						continue
 					}
-					i = skipBalanced(text, i+1, '(', ')') - 1
+					if k < len(text) && text[k] == '{' {
+						if inner, ok := innerBalancedCtx(text, k, '{', '}', true); ok {
+							scanInlineSubstitutionsCtx(inner, depth, extra, true)
+						} else {
+							*extra = append(*extra, shellSegment{depthExceeded: true})
+						}
+						i = skipBalancedCtx(text, k, '{', '}', true)
+						continue
+					}
 				}
 				if text[i] == '`' {
 					if j := findBacktickClose(text, i+1); j >= 0 {
 						failClosed()
 						if !overDepth {
-							sub, _ := splitShellSegmentsDepth(text[i+1:j], depth+1, false)
+							sub, _ := splitShellSegmentsDepth(unescapeBacktickBody(text[i+1:j], true), depth+1, false)
 							*extra = append(*extra, sub...)
 						}
-						i = j
+						i = j + 1
+						continue
 					}
 				}
 				i++
@@ -1030,21 +1123,31 @@ func scanInlineSubstitutions(text string, depth int, extra *[]shellSegment) {
 		case '\\':
 			i++
 		case '$':
-			if i+1 < len(text) && text[i+1] == '(' {
+			k := peekAfterLineCont(text, i+1)
+			if k < len(text) && text[k] == '(' {
 				failClosed()
 				if !overDepth {
-					if inner, ok := innerBalanced(text, i+1, '(', ')'); ok {
+					if inner, ok := innerBalancedCtx(text, k, '(', ')', inDoubleQuote); ok {
 						sub, _ := splitShellSegmentsDepth(inner, depth+1, false)
 						*extra = append(*extra, sub...)
+					} else {
+						*extra = append(*extra, shellSegment{depthExceeded: true})
 					}
 				}
-				i = skipBalanced(text, i+1, '(', ')') - 1
+				i = skipBalancedCtx(text, k, '(', ')', inDoubleQuote) - 1
+			} else if k < len(text) && text[k] == '{' {
+				if inner, ok := innerBalancedCtx(text, k, '{', '}', inDoubleQuote); ok {
+					scanInlineSubstitutionsCtx(inner, depth, extra, inDoubleQuote)
+				} else {
+					*extra = append(*extra, shellSegment{depthExceeded: true})
+				}
+				i = skipBalancedCtx(text, k, '{', '}', inDoubleQuote) - 1
 			}
 		case '`':
 			if j := findBacktickClose(text, i+1); j >= 0 {
 				failClosed()
 				if !overDepth {
-					sub, _ := splitShellSegmentsDepth(text[i+1:j], depth+1, false)
+					sub, _ := splitShellSegmentsDepth(unescapeBacktickBody(text[i+1:j], inDoubleQuote), depth+1, false)
 					*extra = append(*extra, sub...)
 				}
 				i = j
@@ -1053,16 +1156,7 @@ func scanInlineSubstitutions(text string, depth int, extra *[]shellSegment) {
 	}
 }
 
-// scanHeredocSubstitutions is scanInlineSubstitutions for the body of an
-// UNQUOTED heredoc (`<<EOF` / `<<-EOF`). The shell performs expansion on
-// those lines line-by-line, where single and double quotes carry no
-// syntactic meaning — `echo '$(rm -f x)' <<EOF` still runs `rm`. So the
-// scanner anchors on `$(` and a backtick anywhere in the text and only
-// honours a backslash escape (`\$(` / “ \` “ stay literal); `$(...)` groups
-// are walked with the shared balanced scanner, which handles nested quotes
-// and substitutions.
 func scanHeredocSubstitutions(text string, depth int, extra *[]shellSegment) {
-	text = stripLineContinuations(text)
 	if depth >= shellSplitMaxDepth {
 		if strings.Contains(text, "$(") || strings.IndexByte(text, '`') >= 0 {
 			*extra = append(*extra, shellSegment{depthExceeded: true})
@@ -1217,19 +1311,132 @@ func findBacktickClose(code string, from int) int {
 }
 
 func skipBalanced(code string, open int, openCh, closeCh byte) int {
+	return skipBalancedCtx(code, open, openCh, closeCh, false)
+}
+
+// skipBalancedCtx is skipBalanced with an inDoubleQuote flag: when the
+// balanced group is a ${...} that itself sits inside "...", single quotes
+// inside the braces are literal (POSIX). Unbalanced groups return len(code)
+// so callers can fail closed.
+func skipBalancedCtx(code string, open int, openCh, closeCh byte, inDoubleQuote bool) int {
 	depth := 0
 	i := open
+	// caseArms > 0: between `case ... in` and matching `esac`. A bare `)` at
+	// depth==1 closes a pattern, not the enclosing $(...).
+	caseArms := 0
+	sawCase := false
+
+	isBareStart := func(c byte) bool {
+		return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+	}
+	isBareCont := func(c byte) bool {
+		return isBareStart(c) || (c >= '0' && c <= '9')
+	}
+	readBare := func() string {
+		if i >= len(code) || !isBareStart(code[i]) {
+			return ""
+		}
+		j := i + 1
+		for j < len(code) && isBareCont(code[j]) {
+			j++
+		}
+		w := code[i:j]
+		i = j
+		return w
+	}
+	skipOneWord := func(j int) int {
+		for j < len(code) && (code[j] == ' ' || code[j] == '\t') {
+			j++
+		}
+		for j < len(code) && code[j] != ' ' && code[j] != '\t' && code[j] != '\n' &&
+			code[j] != ';' && code[j] != '|' && code[j] != '&' && code[j] != ')' && code[j] != '(' {
+			if code[j] == '\\' {
+				j += 2
+				continue
+			}
+			if code[j] == '\'' {
+				j++
+				for j < len(code) && code[j] != '\'' {
+					j++
+				}
+				if j < len(code) {
+					j++
+				}
+				continue
+			}
+			if code[j] == '"' {
+				j++
+				for j < len(code) && code[j] != '"' {
+					if code[j] == '\\' && j+1 < len(code) {
+						j += 2
+						continue
+					}
+					j++
+				}
+				if j < len(code) {
+					j++
+				}
+				continue
+			}
+			j++
+		}
+		return j
+	}
+
 	for i < len(code) {
 		c := code[i]
-		if c == '#' && (i == open || isShellWordBreak(code[i-1]) || code[i-1] == ' ' || code[i-1] == '\t') {
+		if c == '#' && (i == open || isShellWordBreak(code[i-1]) || code[i-1] == ' ' || code[i-1] == '\t' || code[i-1] == '\n') {
 			i = skipToLineEnd(code, i)
 			if i < len(code) && code[i] == '\n' {
 				i++
 			}
 			continue
 		}
+
+		// Heredoc inside $(...): skip the physical body so a ")" line cannot
+		// close the substitution early (Must Fix 5).
+		if openCh == '(' && c == '<' {
+			j := peekAfterLineCont(code, i)
+			if j < len(code) && code[j] == '<' {
+				j++ // first <
+				j = peekAfterLineCont(code, j)
+				if j < len(code) && code[j] == '<' {
+					j++ // second <
+					j = peekAfterLineCont(code, j)
+					if j < len(code) && code[j] == '<' {
+						// <<< here-string
+						i = skipOneWord(j + 1)
+						continue
+					}
+					stripTabs := false
+					if j < len(code) && code[j] == '-' {
+						stripTabs = true
+						j++
+					}
+					delim, _, after := readHeredocDelim(code, j)
+					lineEnd := after
+					for lineEnd < len(code) && code[lineEnd] != '\n' {
+						lineEnd++
+					}
+					bodyStart := lineEnd
+					if bodyStart < len(code) && code[bodyStart] == '\n' {
+						bodyStart++
+					}
+					if delim != "" {
+						_, bodyAfter := heredocBodyText(code, bodyStart, heredocSpec{delim: delim, stripTabs: stripTabs})
+						i = bodyAfter
+						continue
+					}
+				}
+			}
+		}
+
 		switch c {
 		case '\'':
+			if inDoubleQuote && openCh == '{' {
+				i++
+				continue
+			}
 			i++
 			for i < len(code) && code[i] != '\'' {
 				i++
@@ -1244,13 +1451,16 @@ func skipBalanced(code string, open int, openCh, closeCh byte) int {
 					i += 2
 					continue
 				}
-				if code[i] == '$' && i+1 < len(code) && code[i+1] == '(' {
-					i = skipBalanced(code, i+1, '(', ')')
-					continue
-				}
-				if code[i] == '$' && i+1 < len(code) && code[i+1] == '{' {
-					i = skipBalanced(code, i+1, '{', '}')
-					continue
+				if code[i] == '$' {
+					k := peekAfterLineCont(code, i+1)
+					if k < len(code) && code[k] == '(' {
+						i = skipBalancedCtx(code, k, '(', ')', true)
+						continue
+					}
+					if k < len(code) && code[k] == '{' {
+						i = skipBalancedCtx(code, k, '{', '}', true)
+						continue
+					}
 				}
 				if code[i] == '`' {
 					if j := findBacktickClose(code, i+1); j >= 0 {
@@ -1264,14 +1474,19 @@ func skipBalanced(code string, open int, openCh, closeCh byte) int {
 				i++
 			}
 		case '\\':
-			i += 2
-		case '$':
-			if i+1 < len(code) && code[i+1] == '{' {
-				i = skipBalanced(code, i+1, '{', '}')
+			if i+1 < len(code) && code[i+1] == '\n' {
+				i += 2
 				continue
 			}
-			if i+1 < len(code) && code[i+1] == '(' {
-				i = skipBalanced(code, i+1, '(', ')')
+			i += 2
+		case '$':
+			k := peekAfterLineCont(code, i+1)
+			if k < len(code) && code[k] == '{' {
+				i = skipBalancedCtx(code, k, '{', '}', inDoubleQuote)
+				continue
+			}
+			if k < len(code) && code[k] == '(' {
+				i = skipBalancedCtx(code, k, '(', ')', inDoubleQuote)
 				continue
 			}
 			i++
@@ -1279,22 +1494,51 @@ func skipBalanced(code string, open int, openCh, closeCh byte) int {
 			depth++
 			i++
 		case closeCh:
+			if closeCh == ')' && caseArms > 0 && depth == 1 {
+				i++
+				continue
+			}
 			depth--
 			i++
 			if depth == 0 {
 				return i
 			}
 		default:
+			if isBareStart(c) {
+				w := readBare()
+				switch w {
+				case "case":
+					sawCase = true
+				case "in":
+					if sawCase {
+						caseArms++
+						sawCase = false
+					}
+				case "esac":
+					if caseArms > 0 {
+						caseArms--
+					}
+					sawCase = false
+				}
+				continue
+			}
+			if c == ' ' || c == '\t' || c == '\n' || c == ';' || c == '|' || c == '&' {
+				i++
+				continue
+			}
+			sawCase = false
 			i++
 		}
 	}
 	return len(code)
 }
 
-// innerBalanced returns the text inside the balanced group opened at
-// code[open], or ok=false when unbalanced.
 func innerBalanced(code string, open int, openCh, closeCh byte) (string, bool) {
-	end := skipBalanced(code, open, openCh, closeCh)
+	return innerBalancedCtx(code, open, openCh, closeCh, false)
+}
+
+func innerBalancedCtx(code string, open int, openCh, closeCh byte, inDoubleQuote bool) (string, bool) {
+	end := skipBalancedCtx(code, open, openCh, closeCh, inDoubleQuote)
 	if end > len(code) || end == 0 || code[end-1] != closeCh {
 		return "", false
 	}
@@ -1861,7 +2105,11 @@ func envSplitLong(a string) (name, val string, hasVal bool) {
 // envMatchLong returns the canonical GNU env long option name for a unique
 // prefix of name, or "" when unknown/ambiguous.
 func envMatchLong(name string) string {
-	candidates := []string{"ignore-environment", "null", "unset", "chdir", "split-string"}
+	candidates := []string{
+		"ignore-environment", "null", "unset", "chdir", "split-string",
+		"argv0", "block-signal", "default-signal", "ignore-signal",
+		"list-signal-handling", "debug", "help", "version",
+	}
 	var hits []string
 	for _, c := range candidates {
 		if c == name || strings.HasPrefix(c, name) {
@@ -1879,8 +2127,8 @@ func envMatchLong(name string) string {
 // exec plus any -S/--split-string payloads for the caller to screen (the
 // text is itself a shell-ish command line). NAME=val assignments and
 // -u/--unset operands are recorded into envAs for the execution-hook env
-// screen. `-uVAR`/`-CVAR`/`--unset=*`/`--chdir=*` bundles and `--` are
-// handled.
+// screen. Short clusters are scanned character-by-character; bare "-" is
+// treated as -i; unknown shorts/longs fail closed via envUnknownLongPrefix.
 func skipEnvOperands(argv []string, i int, envAs envAssignments) (int, []string, envAssignments) {
 	var payloads []string
 	for i < len(argv) {
@@ -1888,31 +2136,10 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) (int, []string,
 		switch {
 		case a == "--":
 			return i + 1, payloads, envAs
-		case a == "-i" || a == "-0" || a == "--null":
-			if a == "-i" {
-				envAs.ops = append(envAs.ops, envOp{kind: 'c'})
-			}
+		case a == "-":
+			// GNU: a mere "-" implies -i (clear inherited environment).
+			envAs.ops = append(envAs.ops, envOp{kind: 'c'})
 			i++
-		case a == "-u":
-			if i+1 < len(argv) {
-				envAs.ops = append(envAs.ops, envOp{kind: 'u', key: argv[i+1]})
-			}
-			i += 2
-		case a == "-C":
-			i += 2
-		case a == "-S":
-			if i+1 < len(argv) {
-				payloads = append(payloads, argv[i+1])
-			}
-			i += 2
-		case strings.HasPrefix(a, "-S") && len(a) > 2 && !strings.HasPrefix(a, "--"):
-			payloads = append(payloads, a[2:])
-			i++
-		case strings.HasPrefix(a, "-u") && len(a) > 2 && !strings.HasPrefix(a, "--"):
-			envAs.ops = append(envAs.ops, envOp{kind: 'u', key: a[2:]}) // -uVAR bundle
-			i++
-		case strings.HasPrefix(a, "-C") && len(a) > 2 && !strings.HasPrefix(a, "--"):
-			i++ // -CDIR bundle
 		case strings.HasPrefix(a, "--"):
 			// GNU unique-prefix long options. Ambiguous/unknown => fail-closed
 			// via envUnknownLong so subagent/readonly guards can reject.
@@ -1921,7 +2148,7 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) (int, []string,
 			case "ignore-environment":
 				envAs.ops = append(envAs.ops, envOp{kind: 'c'})
 				i++
-			case "null":
+			case "null", "list-signal-handling", "debug", "help", "version":
 				i++
 			case "unset":
 				if hasVal {
@@ -1933,7 +2160,7 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) (int, []string,
 					}
 					i += 2
 				}
-			case "chdir":
+			case "chdir", "argv0":
 				if hasVal {
 					i++
 				} else {
@@ -1949,6 +2176,16 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) (int, []string,
 					}
 					i += 2
 				}
+			case "block-signal", "default-signal", "ignore-signal":
+				// Optional SIG: attached via =val, or next argv when it does
+				// not look like another option; otherwise flag alone.
+				if hasVal {
+					i++
+				} else if i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
+					i += 2
+				} else {
+					i++
+				}
 			default:
 				// Unknown or ambiguous long option: record and consume one argv
 				// so the command head is not mistaken; guards see the marker.
@@ -1956,13 +2193,55 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) (int, []string,
 				i++
 			}
 		case strings.HasPrefix(a, "-"):
-			// Generic short cluster: -uVAR/-CDIR/-SSTR glued forms were
-			// handled above; any 'i' letter here is the short form of
-			// --ignore-environment and clears the inherited environment.
-			if strings.IndexByte(a[1:], 'i') >= 0 {
-				envAs.ops = append(envAs.ops, envOp{kind: 'c'})
+			// Character-by-character short-option cluster scan (GNU env).
+			// Boolean: i/0/v; value: u/C/S/a (rest of cluster or next argv).
+			consumedNext := false
+			unknown := false
+			for j := 1; j < len(a); j++ {
+				switch a[j] {
+				case 'i':
+					envAs.ops = append(envAs.ops, envOp{kind: 'c'})
+				case '0', 'v':
+					// boolean
+				case 'u', 'C', 'S', 'a':
+					opt := a[j]
+					var optVal string
+					hasOptVal := false
+					if j+1 < len(a) {
+						optVal = a[j+1:]
+						hasOptVal = true
+						j = len(a) // consume rest of cluster as value
+					} else if i+1 < len(argv) {
+						optVal = argv[i+1]
+						hasOptVal = true
+						consumedNext = true
+					}
+					switch opt {
+					case 'u':
+						if hasOptVal {
+							envAs.ops = append(envAs.ops, envOp{kind: 'u', key: optVal})
+						}
+					case 'S':
+						if hasOptVal {
+							payloads = append(payloads, optVal)
+						}
+					}
+					// 'C' (chdir) and 'a' (argv0): value consumed only
+				default:
+					// Unknown short letter: fail-closed; do not silently skip.
+					payloads = append(payloads, envUnknownLongPrefix+a)
+					unknown = true
+					j = len(a)
+				}
 			}
-			i++
+			if consumedNext {
+				i += 2
+			} else {
+				i++
+			}
+			if unknown {
+				return i, payloads, envAs
+			}
 		case isAssignWord(a):
 			envAs.addAssign(a)
 			i++
@@ -2267,6 +2546,7 @@ var herdsmanReadonlySubs = map[string]bool{
 	"status": true, "help": true,
 	"daemon status": true,
 	"agent list":    true, "agent get": true, "agent read": true,
+	"agent history": true, "agent results": true,
 }
 
 // skipToolGlobalFlags consumes the global option run that precedes a
@@ -2280,6 +2560,10 @@ func skipToolGlobalFlags(args []string) (idx int, query bool) {
 		a := args[idx]
 		switch {
 		case a == "--help" || a == "-h" || a == "--version" || a == "-V":
+			query = true
+			idx++
+		case a == "--skill" || a == "--default-config":
+			// Pure query globals: print skill/config info and exit.
 			query = true
 			idx++
 		case a == "--session" || a == "--socket" || a == "--workspace" || a == "--config":
@@ -5148,14 +5432,42 @@ subFound:
 		}
 		return "git stash " + sub2
 	case "reflog":
-		// `git reflog`, `reflog show`, --help inspect; expire/delete write.
-		if len(rest) == 0 {
+		// `git reflog`, `reflog show`, --help / -n listing inspect; expire/delete write.
+		j := 0
+		for j < len(rest) {
+			a := rest[j]
+			if a == "--" {
+				j++
+				break
+			}
+			if !strings.HasPrefix(a, "-") || a == "-" {
+				break
+			}
+			if a == "-n" || a == "--max-count" || strings.HasPrefix(a, "--max-count=") {
+				if !strings.Contains(a, "=") {
+					j += 2
+					continue
+				}
+				j++
+				continue
+			}
+			if strings.HasPrefix(a, "-n") && a != "-n" && !strings.HasPrefix(a, "--") {
+				j++
+				continue
+			}
+			if a == "-h" || a == "--help" {
+				return ""
+			}
+			j++
+		}
+		if j >= len(rest) {
 			return ""
 		}
-		if rest[0] == "show" || rest[0] == "-h" || rest[0] == "--help" {
+		sub2 := rest[j]
+		if sub2 == "show" || sub2 == "-h" || sub2 == "--help" {
 			return ""
 		}
-		return "git reflog " + rest[0]
+		return "git reflog " + sub2
 	case "fsck":
 		// Plain fsck / connectivity checks are read-only; --lost-found
 		// (and unique prefixes --l/--lo/--lost/...) write into .git/lost-found/.

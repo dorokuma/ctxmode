@@ -83,7 +83,7 @@ type roShellSyn struct {
 func (p *roShellSyn) parse() string {
 	segStarted := false
 	needCmd := true
-	sawSep := false
+	needRight := false // set by | || &&; must see a command before EOF
 	inWord := false
 
 	for p.i < len(p.code) {
@@ -100,11 +100,10 @@ func (p *roShellSyn) parse() string {
 			inWord = false
 			p.i++
 		case '\n':
-			if needCmd && sawSep && !segStarted {
-				return "empty command around separator Hint: 多步请拆成多次 ctx_run；分隔符两侧都必须有命令"
-			}
+			// Newlines separate commands but do not alone require a following
+			// command (trailing NL, blank lines, comment-only lines are fine).
+			// |/||/&& still require a right-hand command via needRight.
 			if segStarted {
-				sawSep = true
 				needCmd = true
 				segStarted = false
 			}
@@ -116,7 +115,7 @@ func (p *roShellSyn) parse() string {
 			}
 			segStarted = false
 			needCmd = true
-			sawSep = true
+			needRight = false
 			inWord = false
 			p.i++
 		case '|':
@@ -130,7 +129,7 @@ func (p *roShellSyn) parse() string {
 			}
 			segStarted = false
 			needCmd = true
-			sawSep = true
+			needRight = true
 			inWord = false
 		case '&':
 			if p.i+1 < len(p.code) && p.code[p.i+1] == '&' {
@@ -140,7 +139,7 @@ func (p *roShellSyn) parse() string {
 				p.i += 2
 				segStarted = false
 				needCmd = true
-				sawSep = true
+				needRight = true
 				inWord = false
 				continue
 			}
@@ -176,6 +175,7 @@ func (p *roShellSyn) parse() string {
 			}
 			segStarted = true
 			needCmd = false
+			needRight = false
 			inWord = true
 		case '\\':
 			// Unquoted backslash is banned entirely for strict readonly.
@@ -235,10 +235,11 @@ func (p *roShellSyn) parse() string {
 			}
 			segStarted = true
 			needCmd = false
+			needRight = false
 			inWord = true
 		}
 	}
-	if needCmd && sawSep && !segStarted {
+	if needRight {
 		return "empty command around separator Hint: 多步请拆成多次 ctx_run；分隔符两侧都必须有命令"
 	}
 	return ""

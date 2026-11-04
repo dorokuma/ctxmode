@@ -80,7 +80,7 @@ func init() {
 	// shortBool / shortValue are explicit disjoint tables: boolean shorts must
 	// NEVER appear in shortValue or scanAllowedOpts will swallow the next argv
 	// (e.g. rg -n --pre=... used to skip --pre).
-	readonlyAllowlist["rg"] = simple("ninlFvUHPcwoqsS", "egmABCtTM",
+	readonlyAllowlist["rg"] = simple("ninlFvUHPcwoqsSa", "egmABCtTMg",
 		[]string{"ignore-case", "line-number", "files-with-matches", "files-without-match",
 			"fixed-strings", "vimgrep", "json", "pretty", "no-heading", "with-filename",
 			"no-filename", "count", "stats", "help", "version", "hidden", "follow", "multiline",
@@ -347,6 +347,7 @@ func init() {
 	readonlyAllowlist["git"] = &cmdAllow{check: checkGitReadonly}
 	readonlyAllowlist["go"] = &cmdAllow{check: checkGoReadonly}
 	readonlyAllowlist["herdr"] = &cmdAllow{check: checkHerdrReadonly}
+	readonlyAllowlist["herdsman"] = &cmdAllow{check: checkHerdsmanReadonly}
 	readonlyAllowlist["mount"] = &cmdAllow{check: checkMountReadonly}
 	readonlyAllowlist["kill"] = &cmdAllow{check: checkKillReadonly}
 	readonlyAllowlist["ctxmode"] = &cmdAllow{check: checkCtxmodeReadonly}
@@ -451,6 +452,8 @@ func checkFindReadonly(argv []string) string {
 		"samefile": true, "inum": true, "used": true, "xtype": true, "lname": true, "ilname": true,
 		"nouser": true, "nogroup": true, "fstype": true, "cnewer": true, "anewer": true,
 		"wholename": true, "iwholename": true, "warn": true, "nowarn": true,
+		"prune":   true,
+		"newermt": true, "newerat": true, "newerct": true,
 		"H": true, "L": true, "P": true, "D": true, "O": true, "a": true, "o": true,
 	}
 	singleVal := map[string]bool{
@@ -460,6 +463,7 @@ func checkFindReadonly(argv []string) string {
 		"uid": true, "gid": true, "user": true, "group": true, "perm": true, "links": true,
 		"newer": true, "anewer": true, "cnewer": true, "samefile": true, "inum": true, "used": true,
 		"fstype": true, "maxdepth": true, "mindepth": true, "regextype": true, "printf": true, "D": true,
+		"newermt": true, "newerat": true, "newerct": true,
 	}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -758,6 +762,76 @@ func gitGrepOptsAllow(rest []string) string {
 	return ""
 }
 
+// gitSortKeyOK reports whether s is a safe --sort value: optional leading
+// reverse "-", then a letter-led key matching ^-?[a-zA-Z][a-zA-Z0-9:._-]*$
+// with at least two key characters so single-letter write flags (-D/-d/-f/-m)
+// are never swallowed as sort keys.
+func gitSortKeyOK(s string) bool {
+	if s == "" {
+		return false
+	}
+	key := s
+	if key[0] == '-' {
+		key = key[1:]
+	}
+	if len(key) < 2 {
+		return false
+	}
+	c0 := key[0]
+	if !((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z')) {
+		return false
+	}
+	for i := 1; i < len(key); i++ {
+		c := key[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == ':' || c == '.' || c == '_' || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// gitConsumeRefListOpt advances i past a shared git branch/tag list option.
+// Returns (newIndex, isQuery, ok). ok=false means unknown/blocked option form.
+func gitConsumeRefListOpt(rest []string, i int) (int, bool, bool) {
+	a := rest[i]
+	switch a {
+	case "--contains", "--no-contains", "--merged", "--no-merged", "--points-at":
+		if i+1 < len(rest) && !strings.HasPrefix(rest[i+1], "-") {
+			return i + 1, true, true
+		}
+		return i, true, true
+	case "--sort":
+		if i+1 < len(rest) && gitSortKeyOK(rest[i+1]) {
+			return i + 1, false, true
+		}
+		// Missing/invalid sort key: leave for caller to reject as unknown.
+		return i, false, false
+	case "--format":
+		if i+1 < len(rest) && !strings.HasPrefix(rest[i+1], "-") {
+			return i + 1, false, true
+		}
+		return i, false, false
+	}
+	if strings.HasPrefix(a, "--contains=") || strings.HasPrefix(a, "--no-contains=") ||
+		strings.HasPrefix(a, "--merged=") || strings.HasPrefix(a, "--no-merged=") ||
+		strings.HasPrefix(a, "--points-at=") {
+		return i, true, true
+	}
+	if strings.HasPrefix(a, "--sort=") {
+		val := a[len("--sort="):]
+		if gitSortKeyOK(val) {
+			return i, false, true
+		}
+		return i, false, false
+	}
+	if strings.HasPrefix(a, "--format=") {
+		return i, false, true
+	}
+	return i, false, false
+}
+
 func gitBranchAllow(rest []string) string {
 	writeFlags := map[string]bool{
 		"-d": true, "-D": true, "-m": true, "-M": true, "-c": true, "-C": true,
@@ -773,33 +847,36 @@ func gitBranchAllow(rest []string) string {
 		}
 		switch a {
 		case "-a", "--all", "-r", "--remotes", "-l", "--list",
-			"--contains", "--no-contains",
-			"--merged", "--no-merged", "--points-at", "-h", "--help",
-			"--show-current":
+			"-h", "--help", "--show-current":
 			query = true
-			switch a {
-			case "--contains", "--no-contains", "--merged", "--no-merged", "--points-at":
-				if i+1 < len(rest) && !strings.HasPrefix(rest[i+1], "-") {
-					i++
-				}
-			}
 			continue
 		case "-v", "-vv", "--verbose", "-q", "--quiet", "--color", "--no-color",
-			"--column", "--no-column", "--sort", "--format":
-			// Modifiers only — do not alone authorize branch creation.
-			if a == "--sort" || a == "--format" {
-				i++
+			"--column", "--no-column":
+			continue
+		case "--contains", "--no-contains", "--merged", "--no-merged", "--points-at",
+			"--sort", "--format":
+			ni, isQ, ok := gitConsumeRefListOpt(rest, i)
+			if !ok {
+				return "git branch unknown " + a
 			}
+			if isQ {
+				query = true
+			}
+			i = ni
 			continue
 		}
-		if strings.HasPrefix(a, "--contains=") || strings.HasPrefix(a, "--merged=") ||
-			strings.HasPrefix(a, "--points-at=") {
-			query = true
-			continue
-		}
-		if strings.HasPrefix(a, "--sort=") || strings.HasPrefix(a, "--format=") ||
-			strings.HasPrefix(a, "--color=") {
-			// modifiers with values — not query flags
+		if strings.HasPrefix(a, "--contains=") || strings.HasPrefix(a, "--no-contains=") ||
+			strings.HasPrefix(a, "--merged=") || strings.HasPrefix(a, "--no-merged=") ||
+			strings.HasPrefix(a, "--points-at=") || strings.HasPrefix(a, "--sort=") ||
+			strings.HasPrefix(a, "--format=") || strings.HasPrefix(a, "--color=") {
+			ni, isQ, ok := gitConsumeRefListOpt(rest, i)
+			if !ok {
+				return "git branch unknown " + a
+			}
+			if isQ {
+				query = true
+			}
+			_ = ni
 			continue
 		}
 		if strings.HasPrefix(a, "-") {
@@ -827,22 +904,45 @@ func gitTagAllow(rest []string) string {
 	}
 	listish := false
 	hasOperand := false
-	for _, a := range rest {
+	for i := 0; i < len(rest); i++ {
+		a := rest[i]
 		switch a {
-		case "-l", "--list", "-n", "-n1", "-n2", "-n3", "--contains", "--points-at",
-			"--merged", "--no-merged", "--verify", "-v",
+		case "-l", "--list", "-n", "-n1", "-n2", "-n3", "--verify", "-v",
 			"-h", "--help":
 			listish = true
 			continue
-		case "--color", "--no-color", "-i", "--ignore-case", "--format", "--sort":
-			// modifiers only — do not authorize tag creation
+		case "--color", "--no-color", "-i", "--ignore-case":
+			continue
+		case "--contains", "--no-contains", "--merged", "--no-merged", "--points-at",
+			"--sort", "--format":
+			ni, isQ, ok := gitConsumeRefListOpt(rest, i)
+			if !ok {
+				return "git tag unknown " + a
+			}
+			if isQ || a == "--sort" || a == "--format" || a == "--contains" ||
+				a == "--no-contains" || a == "--merged" || a == "--no-merged" ||
+				a == "--points-at" {
+				listish = true
+			}
+			i = ni
 			continue
 		}
-		if strings.HasPrefix(a, "-n") || strings.HasPrefix(a, "--contains=") {
+		if strings.HasPrefix(a, "-n") {
 			listish = true
 			continue
 		}
-		if strings.HasPrefix(a, "--format=") || strings.HasPrefix(a, "--sort=") {
+		if strings.HasPrefix(a, "--contains=") || strings.HasPrefix(a, "--no-contains=") ||
+			strings.HasPrefix(a, "--merged=") || strings.HasPrefix(a, "--no-merged=") ||
+			strings.HasPrefix(a, "--points-at=") || strings.HasPrefix(a, "--sort=") ||
+			strings.HasPrefix(a, "--format=") {
+			ni, isQ, ok := gitConsumeRefListOpt(rest, i)
+			if !ok {
+				return "git tag unknown " + a
+			}
+			if isQ || true {
+				listish = true
+			}
+			_ = ni
 			continue
 		}
 		if strings.HasPrefix(a, "-") {
@@ -1070,6 +1170,9 @@ func checkHerdrReadonly(argv []string) string {
 		}
 		return "herdr bare"
 	}
+	if query {
+		return ""
+	}
 	if strings.HasPrefix(args[idx], "-") {
 		return "herdr " + args[idx]
 	}
@@ -1087,13 +1190,39 @@ func checkHerdrReadonly(argv []string) string {
 			return "herdr pane"
 		}
 		switch rest[0] {
-		case "read", "list", "ls", "capture", "dump", "get", "info", "status", "help":
+		case "read", "list", "ls", "capture", "dump", "get", "info", "status", "help",
+			"current", "--help", "-h":
 			return ""
 		default:
 			return "herdr pane " + rest[0]
 		}
 	default:
 		return "herdr " + args[idx]
+	}
+}
+
+func checkHerdsmanReadonly(argv []string) string {
+	args := argv[1:]
+	idx, query := skipToolGlobalFlags(args)
+	if idx >= len(args) {
+		if query {
+			return ""
+		}
+		return "herdsman bare"
+	}
+	if query {
+		return ""
+	}
+	if strings.HasPrefix(args[idx], "-") {
+		return "herdsman " + args[idx]
+	}
+	key := toolSubKey(args[idx:], herdsmanSecondLevel)
+	switch key {
+	case "status", "help",
+		"agent list", "agent get", "agent history", "agent results":
+		return ""
+	default:
+		return "herdsman " + key
 	}
 }
 
@@ -1167,7 +1296,7 @@ func checkCtxmodeReadonly(argv []string) string {
 	}
 	sub := args[i]
 	switch sub {
-	case "search", "help", "-h", "--help":
+	case "search":
 		return ""
 	default:
 		return "ctxmode " + sub
@@ -1453,6 +1582,6 @@ search: rg grep find sed
 text: sort uniq cut tr jq diff cmp echo printf true false
 vcs: git
 go_meta: go gofmt ctxmode
-ops: ps pgrep ss journalctl systemctl which date pwd mount kill herdr
+ops: ps pgrep ss journalctl systemctl which date pwd mount kill herdr herdsman
 `)
 }
