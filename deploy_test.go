@@ -92,6 +92,13 @@ func writeStubBinary(t *testing.T, path, stdout, stderr string, exitCode int) {
 	if err := os.WriteFile(path, []byte(b.String()), 0o755); err != nil {
 		t.Fatalf("write stub binary: %v", err)
 	}
+	// WriteFile's perm is masked by the process umask: under a strict
+	// umask (0007/0027) the stub lands 0750 and the unprivileged
+	// re-deploy in TestDeployFragment_SecondDeployOverReadonlyPrevSucceeds
+	// cannot read it. Pin the mode the write intended.
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatalf("chmod stub binary: %v", err)
+	}
 }
 
 const stubInitializeJSON = `{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"ctxmode","version":"9.9.9"}}}`
