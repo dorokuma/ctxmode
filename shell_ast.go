@@ -68,6 +68,11 @@ func parseReadonlyShellAST(code string) (argvs [][]string, rejectReason string) 
 	if hit := checkShellBytes(code, true); hit != "" {
 		return nil, hit
 	}
+	// mvdan folds \\n before Word spans are recorded; reject at source level
+	// so agents cannot hide a second command behind a line continuation.
+	if strings.Contains(code, "\\\n") {
+		return nil, "backslash line continuation forbidden"
+	}
 	parser := syntax.NewParser(syntax.Variant(syntax.LangPOSIX))
 	file, err := parser.Parse(strings.NewReader(code), "")
 	if err != nil {
