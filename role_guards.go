@@ -2826,16 +2826,6 @@ var sshBannedLongs = map[string]bool{
 	"permitlocalcommand": true, "controlpersist": true, "configfile": true,
 }
 
-// sshValueLongs are long options that take an operand; the operand is
-// consumed only when the option is NOT banned, so its value can be
-// screened/ignored like any other long option value.
-var sshValueLongs = map[string]bool{
-	"configfile": true, "localforward": true, "remoteforward": true,
-	"dynamicforward": true, "permitlocalcommand": true, "controlpersist": true,
-	"setenv": true, "sendenv": true, "identityfile": true,
-	"certificatefile": true, "logfile": true, "tag": true,
-}
-
 // sshSafeOKeys are the only -o option names (lowercased) a role-guarded ssh
 // may set: pure connection hygiene with no exec, forwarding or config-file
 // reach. controlmaster/controlpath pass only with a hard "no"/"none"
@@ -2863,14 +2853,25 @@ var sshSafeOKeys = map[string]bool{
 }
 
 // sshOValueOK reports whether a whitelisted -o key may carry this value.
-// The only value-sensitive keys are the control-socket pair: everything
-// else accepts its value unchecked (the key whitelist is what vetted it).
+// The value-sensitive keys are the control-socket pair, the known-hosts
+// files (an arbitrary path plus accept-new gives a read-only caller a
+// local file-write side effect) and the interactive ~C escape-command
+// line: everything else accepts its value unchecked (the key whitelist
+// is what vetted it).
 func sshOValueOK(key, val string) bool {
 	switch key {
 	case "controlmaster":
 		return strings.EqualFold(val, "no")
 	case "controlpath":
 		return strings.EqualFold(val, "none")
+	case "userknownhostsfile", "globalknownhostsfile":
+		// Only sink/keep spellings stay: an arbitrary path pairs with
+		// StrictHostKeyChecking=accept-new to write host keys locally.
+		return val == "/dev/null" || strings.EqualFold(val, "none")
+	case "enableescapecommandline":
+		// The interactive ~C command line runs local commands; only the
+		// explicit disable value is allowed through.
+		return strings.EqualFold(val, "no")
 	}
 	return true
 }
@@ -2920,24 +2921,18 @@ func parseSSHInvocation(head []string) (remoteCmd, hit string) {
 			continue
 		}
 		if !endOpts && strings.HasPrefix(a, "--") {
+			// OpenSSH ssh has no double-dash long options at all (even
+			// --help/--version are 4.2BSD spellings that never run a
+			// remote command): every `--name` is unvetted, so any
+			// non-banned long option fails closed by its literal text.
 			name := a[2:]
-			hasVal := false
 			if k := strings.IndexByte(name, '='); k >= 0 {
 				name = name[:k]
-				hasVal = true
 			}
-			name = strings.ToLower(name)
-			switch {
-			case sshBannedLongs[name]:
-				return "", "--" + name
-			case name == "help" || name == "version":
-				// Pure query spellings print and exit without a connection.
-				return "", "ssh " + a
-			case sshValueLongs[name] && !hasVal:
-				i++ // the value operand is consumed below with the option
+			if sshBannedLongs[strings.ToLower(name)] {
+				return "", "--" + strings.ToLower(name)
 			}
-			i++
-			continue
+			return "", "ssh " + a
 		}
 		if !endOpts && len(a) > 1 && a[0] == '-' && a != "-" {
 			// Short cluster: walk the letters; a no-arg letter continues the
