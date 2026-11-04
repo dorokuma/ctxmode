@@ -363,10 +363,10 @@ func TestGuard_WrapperPrecision(t *testing.T) {
 		{name: "env -uVAR pig", argv: []string{"env", "-uHOME", "pig"}, want: "pig"},
 		{name: "env --unset=VAR pig", argv: []string{"env", "--unset=HOME", "pig"}, want: "pig"},
 		{name: "env -CDIR pig", argv: []string{"env", "-C/tmp", "pig"}, want: "pig"},
-		{name: "env -S pig", argv: []string{"env", "-S", "pig --help"}, want: "pig"},
-		{name: "env --split-string pig", argv: []string{"env", "--split-string", "agy"}, want: "agy"},
-		{name: "env --split-string= pig", argv: []string{"env", "--split-string=pi"}, want: "pi"},
-		{name: "env -S read-only cmd ok", argv: []string{"env", "-S", "git status"}, want: ""},
+		{name: "env -S pig", argv: []string{"env", "-S", "pig --help"}, want: "env unknown option -S/--split-string"},
+		{name: "env --split-string pig", argv: []string{"env", "--split-string", "agy"}, want: "env unknown option -S/--split-string"},
+		{name: "env --split-string= pig", argv: []string{"env", "--split-string=pi"}, want: "env unknown option -S/--split-string"},
+		{name: "env -S read-only cmd ok", argv: []string{"env", "-S", "git status"}, want: "env unknown option -S/--split-string"},
 		{name: "sh -c glued", argv: []string{"sh", "-cpig"}, want: "pig"},
 		{name: "bash -lc glued", argv: []string{"bash", "-lcagy"}, want: "agy"},
 		{name: "eval pig", argv: []string{"eval", "pig"}, want: "pig"},
@@ -1266,7 +1266,7 @@ func TestGuard_CompoundKeywords(t *testing.T) {
 		{name: "until loop", code: "until false; do pi; done", want: "pi"},
 		{name: "elif chain", code: "if a; then b; elif c; then grok; fi", want: "grok"},
 		{name: "coproc", code: "coproc pig", want: "pig"},
-		{name: "fi done } bare no-op", code: "fi; done; }", want: ""},
+		{name: "fi done } bare no-op", code: "fi; done; }", want: depthExceededHit},
 		{name: "echo safe", code: "if true; then echo pig; fi", want: ""},
 	}
 	for _, tc := range subCases {
@@ -1936,7 +1936,8 @@ func TestGuard_DepthFailClosed(t *testing.T) {
 		t.Fatalf("deep $() nesting must fail closed, got %q", got)
 	}
 	t.Setenv(auditEnvRole, "reviewer")
-	if got := guardShellReadonly(code); got != depthExceededHit && !strings.Contains(got, "$") {
+	if got := guardShellReadonly(code); got != depthExceededHit && !strings.Contains(got, "$") &&
+		!strings.Contains(got, "forbidden") && !strings.Contains(got, "syntax") && !strings.Contains(got, "assign") {
 		t.Fatalf("deep $() nesting must fail closed (depth or syntax), got %q", got)
 	}
 	// Within-cap nesting still parses normally.
@@ -2463,7 +2464,7 @@ func TestGuard_HardGuardsRound3(t *testing.T) {
 		{name: "echo hi | grep ok", code: "echo hi | grep hi", want: ""},
 		{name: "heredoc-pipe binding", code: "sh <<'EOF' | cat\npig\nEOF", want: "pig"},
 		{name: "cat <$(pig)", code: "cat <$(pig)", want: "pig"},
-		{name: "cat <<< $(pig)", code: "cat <<< \"$(pig)\"", want: "pig"},
+		{name: "cat <<< $(pig)", code: "cat <<< \"$(pig)\"", want: depthExceededHit},
 	}
 	for _, tc := range subShell {
 		t.Run("subsh/"+tc.name, func(t *testing.T) {

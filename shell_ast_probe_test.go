@@ -95,9 +95,9 @@ func TestMvdanDashBehaviorProbe(t *testing.T) {
 
 	t.Run("bash_only_under_LangPOSIX", func(t *testing.T) {
 		cases := []struct {
-			code      string
-			posixErr  bool
-			note      string
+			code     string
+			posixErr bool
+			note     string
 		}{
 			{"true &> /dev/null", true, "&> rejected by LangPOSIX"},
 			{"[[ -f /etc/passwd ]]", false, "[[ parsed as CallExpr words under POSIX"},

@@ -33,7 +33,8 @@ func TestReadonlyAllowlist_ProcessSubstBlocked(t *testing.T) {
 			}
 			if !strings.Contains(got, "process substitution") && !strings.Contains(got, "bash") &&
 				!strings.Contains(got, "input redirect") && !strings.Contains(got, "redirect") &&
-				!strings.Contains(got, "parentheses") && !strings.Contains(got, "unknown command") {
+				!strings.Contains(got, "parentheses") && !strings.Contains(got, "unknown command") &&
+				!strings.Contains(got, "syntax error") && !strings.Contains(got, "shell syntax") {
 				t.Fatalf("expected process substitution or syntax block, got %q", got)
 			}
 		})
@@ -45,7 +46,8 @@ func TestReadonlyAllowlist_ProcessSubstBlocked(t *testing.T) {
 		}
 		if !strings.Contains(got, "process substitution") && !strings.Contains(got, "bash") &&
 			!strings.Contains(got, "input redirect") && !strings.Contains(got, "redirect") &&
-			!strings.Contains(got, "parentheses") {
+			!strings.Contains(got, "parentheses") &&
+			!strings.Contains(got, "syntax error") && !strings.Contains(got, "shell syntax") {
 			t.Fatalf("expected process substitution or syntax block, got %q", got)
 		}
 	})

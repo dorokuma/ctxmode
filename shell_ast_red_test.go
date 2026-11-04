@@ -110,7 +110,6 @@ func runAstGuard(role, code string) string {
 	}
 }
 
-
 // TestAST_MustRed66 is the PLAN §5.1 table. On baseline 897a43e many worker
 // cases are expected RED (guard allows); after mvdan rewrite all must be green.
 func TestAST_MustRed66(t *testing.T) {
