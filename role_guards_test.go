@@ -1361,7 +1361,44 @@ func TestGuard_SSHPeel(t *testing.T) {
 			if rule, _ := g.guardCtxRunShell("ssh dmit cat <<'EOF'\nls -la /tmp\nEOF"); rule != "" {
 				t.Fatalf("%s: data heredoc must pass, got %q", role, rule)
 			}
+			// A remote command mixing a write with a nested dispatch reports
+			// the dispatch first (sub-agent before strict read-only).
+			if rule, _ := g.guardCtxRunShell(`ssh dmit "rm -rf /tmp/x && pig"`); rule != ruleSubagentNestedAgent {
+				t.Fatalf("%s: remote write+pig rule = %q, want %s", role, rule, ruleSubagentNestedAgent)
+			}
 		})
+	}
+
+	// ctx_run stdin payloads forwarded through ssh to a remote program
+	// reader are remote code: a worker's nested dispatch still blocks, and
+	// a verifier's /tmp exemption ends at the wire (strict screen applies
+	// to both shell and remote-interpreter payloads).
+	t.Setenv(auditEnvRole, "worker")
+	g := currentGuardCall()
+	if rule, _ := g.guardCtxRunStdin([]string{"ssh", "dmit", "sh"}, "pig"); rule != ruleSubagentNestedAgent {
+		t.Fatalf("worker ssh-stdin pig rule = %q, want %s", rule, ruleSubagentNestedAgent)
+	}
+	if rule, _ := g.guardCtxRunStdinForCommand("ssh dmit sh", "pig"); rule != ruleSubagentNestedAgent {
+		t.Fatalf("worker ssh-stdin pig (command) rule = %q, want %s", rule, ruleSubagentNestedAgent)
+	}
+	if rule, _ := g.guardCtxRunStdin([]string{"ssh", "dmit", "cat"}, "pig"); rule != "" {
+		t.Fatalf("ssh-stdin data head must pass, got %q", rule)
+	}
+	t.Setenv(auditEnvRole, "verifier")
+	g = currentGuardCall()
+	for _, stdin := range []string{"rm -rf /tmp/x", "pig"} {
+		if rule, _ := g.guardCtxRunStdin([]string{"ssh", "dmit", "sh"}, stdin); rule != ruleReadonlyWrite && rule != ruleSubagentNestedAgent {
+			t.Fatalf("verifier ssh-stdin %q rule = %q, want a block", stdin, rule)
+		}
+	}
+	if rule, _ := g.guardCtxRunStdin([]string{"ssh", "dmit", "sh"}, "rm -rf /tmp/x"); rule != ruleReadonlyWrite {
+		t.Fatalf("verifier ssh-stdin rm rule = %q, want %s", rule, ruleReadonlyWrite)
+	}
+	if rule, _ := g.guardCtxRunStdinForCommand("ssh dmit sh", "rm -rf /tmp/x"); rule != ruleReadonlyWrite {
+		t.Fatalf("verifier ssh-stdin rm (command) rule = %q, want %s", rule, ruleReadonlyWrite)
+	}
+	if rule, _ := g.guardCtxRunStdin([]string{"ssh", "dmit", "python3", "-"}, "import os; os.remove('/tmp/x')"); rule != ruleReadonlyWrite {
+		t.Fatalf("verifier ssh-stdin python rule = %q, want %s", rule, ruleReadonlyWrite)
 	}
 }
 

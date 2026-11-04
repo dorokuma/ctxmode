@@ -2719,7 +2719,8 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 // verdict the local "piped code to shell" check gives). hereStrings and
 // heredoc bodies ARE visible: they are screened as shell text — the
 // sub-agent screen for a worker, the strict read-only screen for a
-// read-only caller.
+// read-only caller — with sub-agent still taking precedence under kind
+// 's', matching the entry-point order.
 const roSSHWriteHit = "ssh remote write"
 
 func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller callerIdentity) string {
@@ -2734,38 +2735,38 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 		}
 		return "piped stdin to ssh"
 	}
-	ro := kind == 'r' || callerReadonlyRole(caller)
+	// The ssh segment's here-string / heredoc bodies ride the ssh stdin
+	// stream to the remote side; when the remote command's head reads its
+	// PROGRAM from that stream the body text is remote code and gets the
+	// caller's own screen (screenSegmentHeredocsDepth only sees the local
+	// `ssh` head, whose stdin is opaque). A remote `cat`/`xargs` head reads
+	// data, so the bodies stay unscreened here.
 	if stdinIsProg {
-		// The remote head reads its program from stdin: the visible
-		// bodies (here-string / heredoc) are shell text and get the
-		// caller's screen. A data head (remote `cat`) leaves them alone.
 		for _, body := range sshStdinTexts(seg) {
-			if ro {
-				if h := guardShellReadonlyDepth(body, depth+1, caller); h != "" {
-					return roSSHWriteHit
-				}
-			}
-			if kind == 's' {
-				if h := guardShellSubagentDepth(body, depth+1, caller); h != "" {
-					return h
-				}
+			if h := screenStdinProgram(body, "", kind, depth, caller); h != "" {
+				return h
 			}
 		}
 	}
-	if ro {
-		if h := guardShellReadonlyDepth(remoteCmd, depth+1, caller); h != "" {
-			return roSSHWriteHit
-		}
-		if kind == 'r' {
-			return ""
-		}
-		// Read-only but not strict (verifier): the nested-dispatch screen
-		// still runs on the remote command below.
-	}
+	// Same ordering for the remote command itself as the entry-point guards
+	// keep ("sub-agent first, then strict read-only"): under kind 's' the
+	// nested-dispatch screen gets first look, and the strict read-only
+	// screen only sees a remote command the sub-agent screen let through.
 	if kind == 's' {
-		return guardShellSubagentDepth(remoteCmd, depth+1, caller)
+		if h := guardShellSubagentDepth(remoteCmd, depth+1, caller); h != "" {
+			return h
+		}
+		if callerReadonlyRole(caller) {
+			if h := guardShellReadonlyDepth(remoteCmd, depth+1, caller); h != "" {
+				return roSSHWriteHit
+			}
+		}
+		return ""
 	}
-	return guardShellReadonlyDepth(remoteCmd, depth+1, caller)
+	if h := guardShellReadonlyDepth(remoteCmd, depth+1, caller); h != "" {
+		return roSSHWriteHit
+	}
+	return ""
 }
 
 // remoteReadsProgramFromStdin reports whether the remote command string
@@ -3298,8 +3299,11 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 	// upstream bytes: for a strict read-only role that is an unreviewable
 	// code stream (block outright); for a sub-agent it is a covert channel
 	// around head screening (same verdict — the upstream text is not part
-	// of this segment and cannot be screened here).
-	if seg.pipedStdin {
+	// of this segment and cannot be screened here). An ssh head whose
+	// REMOTE command reads its program from stdin is left for the ssh
+	// model (screenSSHHead) — it returns the remote-aware roSSHWriteHit /
+	// "piped stdin to ssh" verdict.
+	if seg.pipedStdin && !sshTunnelsStdinProgram(seg.argv) {
 		if lang, isProg := stdinProgramHead(seg.argv); isProg {
 			if lang == "" {
 				return "piped code to shell"
@@ -8605,8 +8609,16 @@ func (g guardCall) guardCtxRunShell(code string) (rule, detail string) {
 // from stdin: a shell with no -c payload (unwrapShellArgv already checked)
 // or a scripting interpreter with no inline-code flag. Returns (lang, true)
 // where lang is "" for a shell head or the guardCtxRunCode language.
+// An ssh head resolves through its option run (parseSSHInvocation) to the
+// remote command, whose own heads inherit the verdict: `argv=["ssh","dmit",
+// "sh"]` forwards the caller's stdin to a remote shell reading its PROGRAM
+// from that stream, so the stdin payload is remote code, not data.
 func stdinProgramHead(argv []string) (lang string, isInterp bool) {
-	if len(argv) == 0 {
+	return stdinProgramHeadDepth(argv, 0)
+}
+
+func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool) {
+	if len(argv) == 0 || depth >= shellSplitMaxDepth {
 		return "", false
 	}
 	i, _, _, _ := peelWrappers(argv)
@@ -8615,6 +8627,26 @@ func stdinProgramHead(argv []string) (lang string, isInterp bool) {
 	}
 	head := argv[i:]
 	base := filepath.Base(head[0])
+	// An ssh head forwards stdin to the remote command's stdin: resolve the
+	// remote invocation and ask whether any remote head reads its program
+	// from that stream. Malformed invocations keep their argv/shell hits;
+	// here only the bare-host/missing-remote shape returns a parse hit, and
+	// with no remote command stdin is pure data for the login shell anyway.
+	if base == "ssh" || resolveHeadBase(head[0]) == "ssh" {
+		remoteCmd, hit := parseSSHInvocation(head)
+		if hit != "" {
+			return "", false
+		}
+		for _, seg := range splitShellSegments(remoteCmd) {
+			if seg.depthExceeded || len(seg.argv) == 0 {
+				continue
+			}
+			if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+				return l, true
+			}
+		}
+		return "", false
+	}
 	// A `shell -c 'code'` argv carries its program inline — stdin is data.
 	if _, has := unwrapShellArgv(head); has {
 		return "", false
@@ -8667,11 +8699,39 @@ func stdinProgramHead(argv []string) (lang string, isInterp bool) {
 	return "", false
 }
 
+// sshTunnelsStdinProgram reports whether the peeled argv head is an ssh
+// invocation whose remote command contains a head that reads its PROGRAM
+// from the forwarded stdin stream (`ssh dmit sh`, `ssh dmit python3 -`).
+// A ctx_run stdin payload then lands as remote CODE on another host: a
+// read-only-but-not-strict caller (verifier, bare CTXMODE_READONLY=1) loses
+// the local /tmp exemption at the wire and the payload gets the strict
+// read-only screen.
+func sshTunnelsStdinProgram(argv []string) bool {
+	i, _, _, _ := peelWrappers(argv)
+	if i >= len(argv) {
+		return false
+	}
+	head := argv[i:]
+	base := filepath.Base(head[0])
+	if base != "ssh" && resolveHeadBase(head[0]) != "ssh" {
+		return false
+	}
+	remoteCmd, hit := parseSSHInvocation(head)
+	if hit != "" {
+		return false
+	}
+	return remoteReadsProgramFromStdin(remoteCmd)
+}
+
 // guardCtxRunStdin screens a ctx_run stdin payload when the argv's resolved
 // head is a shell or interpreter that reads its program from stdin
 // (`argv=["sh"]`, `argv=["python3","-"]`, etc.). Inline-code spellings
 // (`sh -c`, `python3 -c`, `node -e`, `perl -e`, `php -r`, `python -m`) mean
-// stdin is data, not the program, and are not screened here.
+// stdin is data, not the program, and are not screened here. An ssh head
+// whose REMOTE command reads its program from stdin
+// (`argv=["ssh","dmit","sh"]`) counts too — ssh forwards the stream — and
+// additionally upgrades a read-only-but-not-strict caller to the strict
+// screen since the bytes leave this host.
 func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail string) {
 	if stdin == "" || (!g.subagent && !g.strictReadonly) {
 		return "", ""
@@ -8679,6 +8739,9 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 	lang, isProg := stdinProgramHead(argv)
 	if !isProg {
 		return "", ""
+	}
+	if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(argv) {
+		g.strictReadonly = true
 	}
 	if lang == "" {
 		// Shell head: stdin is shell code.
@@ -8689,7 +8752,8 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 
 // guardCtxRunStdinForCommand is the command-string variant of
 // guardCtxRunStdin: it splits the command into segments and checks each
-// peeled head for a shell/interpreter reading stdin.
+// peeled head for a shell/interpreter reading stdin — including a head
+// reached through an ssh remote command.
 func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, detail string) {
 	if stdin == "" || (!g.subagent && !g.strictReadonly) {
 		return "", ""
@@ -8708,6 +8772,9 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 			continue
 		}
 		if lang, isProg := stdinProgramHead(seg.argv); isProg {
+			if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(seg.argv) {
+				g.strictReadonly = true
+			}
 			if lang == "" {
 				return g.guardCtxRunShell(stdin)
 			}
