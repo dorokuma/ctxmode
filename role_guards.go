@@ -294,7 +294,7 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 			segs = append(segs, curExtra...)
 			curExtra = nil
 		}
-		if len(cur.argv) > 0 || cur.redirectFile != "" {
+		if len(cur.argv) > 0 || cur.redirectFile != "" || len(heredocs) > 0 {
 			cur.pipedStdin = segPipeIn
 			segs = append(segs, cur)
 			assignPendingOwners()
@@ -372,14 +372,8 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 					i++
 				}
 			case '`':
-				j := i + 1
-				for j < len(code) && code[j] != '`' {
-					j++
-				}
-				if j >= len(code) {
-					// Unterminated backtick: the word runs to the end of the
-					// input. Clamping to n is what keeps every caller's
-					// code[i:next] slice in range (j+1 would be len+1).
+				j := findBacktickClose(code, i+1)
+				if j < 0 {
 					return n
 				}
 				i = j + 1
@@ -443,6 +437,7 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 			flushWord()
 			flushSeg()
 			segPipeIn = false
+			condDepth = 0
 			i++
 			// Consume each queued heredoc body; attach it to the segment that
 			// DECLARED the redirection (ownerIdx), which is not necessarily
@@ -465,36 +460,27 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 			flushWord()
 			flushSeg()
 			segPipeIn = false
+			condDepth = 0
 			i++
 		case '&':
-			if i+1 < len(code) && code[i+1] == '>' {
-				// &> or &>> redirect: consume, then read the target.
-				j := i + 2
-				if j < len(code) && code[j] == '>' {
-					j++
-				}
-				flushWord()
-				target, next := readOutputRedirectTarget(j)
-				if cur.redirectFile == "" && redirectBlocksWrite("&>", target) {
-					cur.redirectFile = target
-				}
-				i = next
-				continue
-			}
+			// dash: &> is background then a new > command, not bash merge-redirect.
 			flushWord()
 			if i+1 < len(code) && code[i+1] == '&' {
 				flushSeg()
-				segPipeIn = false // &&: no pipe relationship
+				segPipeIn = false
+				condDepth = 0
 				i += 2
 			} else {
 				cur.backgrounded = true
 				flushSeg()
-				segPipeIn = false // & backgrounds: no pipe relationship
+				segPipeIn = false
+				condDepth = 0
 				i++
 			}
 		case '|':
 			flushWord()
 			flushSeg()
+			condDepth = 0
 			if i+1 < len(code) && code[i+1] == '|' {
 				segPipeIn = false // ||: no pipe relationship
 				i += 2
@@ -535,9 +521,9 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 					continue
 				}
 				if code[j] == '`' {
-					if k := strings.IndexByte(code[j+1:], '`'); k >= 0 {
-						scanInner(code[j+1 : j+1+k])
-						j += k + 2
+					if k := findBacktickClose(code, j+1); k >= 0 {
+						scanInner(code[j+1 : k])
+						j = k + 1
 						continue
 					}
 				}
@@ -562,19 +548,22 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 		case '$':
 			if i+1 < len(code) && code[i+1] == '(' {
 				if i+2 < len(code) && code[i+2] == '(' {
-					// $(( ... )) arithmetic: comparisons inside are not
-					// redirections; still scan nested substitutions. A '0'
-					// placeholder keeps the standalone form a non-empty word
-					// (filepath.Base("") would misread as ".").
+					// $(( ... )) only when outer group closes with )).
 					end := skipBalanced(code, i+1, '(', ')')
-					scanSubs(sliceTo(code, i+3, end))
-					word.WriteByte('0')
-					wordStarted = true
-					i = end
-					continue
+					if end >= 2 && end <= len(code) && code[end-1] == ')' && code[end-2] == ')' {
+						scanSubs(sliceTo(code, i+3, end-1))
+						word.WriteByte('0')
+						wordStarted = true
+						i = end
+						continue
+					}
+					// else fall through: $( (cmd); ... )
 				}
 				if inner, ok := innerBalanced(code, i+1, '(', ')'); ok {
 					scanInner(inner)
+				} else {
+					curExtra = append(curExtra, shellSegment{depthExceeded: true})
+					word.WriteString(cmdSubPlaceholder)
 				}
 				wordStarted = true
 				i = skipBalanced(code, i+1, '(', ')')
@@ -584,10 +573,10 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 				i++
 			}
 		case '`':
-			if j := strings.IndexByte(code[i+1:], '`'); j >= 0 {
-				scanInner(code[i+1 : i+1+j])
+			if j := findBacktickClose(code, i+1); j >= 0 {
+				scanInner(code[i+1 : j])
 				wordStarted = true
-				i += j + 2
+				i = j + 1
 			} else {
 				// Unterminated backtick: it is literal text, and the scan must
 				// stop at the end of input (i+2 would overshoot len by one).
@@ -596,22 +585,14 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 				i = len(code)
 			}
 		case '(':
-			if i+1 < len(code) && code[i+1] == '(' {
-				// (( ... )) arithmetic command: skip comparisons inside,
-				// still scan nested command substitutions.
-				end := skipBalanced(code, i+1, '(', ')')
-				scanSubs(sliceTo(code, i+2, end))
-				i = end
-				continue
-			}
-			// A pure ( ... ) subshell group is a full command context, not a
-			// word: the enclosing segment ends here and the group's commands
-			// parse into their own segments appended directly to segs.
+			// dash: (( cmd )) is nested subshells, not arithmetic.
 			flushSeg()
 			if depth < shellSplitMaxDepth {
 				if inner, ok := innerBalanced(code, i, '(', ')'); ok {
 					sub, _ := splitShellSegmentsDepth(inner, depth+1, segPipeIn)
 					segs = append(segs, sub...)
+				} else {
+					segs = append(segs, shellSegment{depthExceeded: true})
 				}
 			} else {
 				segs = append(segs, shellSegment{depthExceeded: true})
@@ -754,9 +735,8 @@ func splitShellSegmentsDepth(code string, depth int, pipeIn bool) ([]shellSegmen
 			}
 			i = next
 		case '[':
-			// [[ ... ]] conditional: < and > inside are comparison operators,
-			// not redirections.
-			if i+1 < len(code) && code[i+1] == '[' {
+			// [[ only at word start; mid-word a[[b must not raise condDepth.
+			if !wordStarted && i+1 < len(code) && code[i+1] == '[' {
 				condDepth++
 				word.WriteString("[[")
 				wordStarted = true
@@ -853,7 +833,7 @@ func readHeredocDelim(code string, i int) (string, bool, int) {
 	for i < len(code) {
 		c := code[i]
 		switch c {
-		case ' ', '\t', '\r', '\n', ';', '|', '&', '<', '>':
+		case ' ', '\t', '\r', '\n', ';', '|', '&', '<', '>', '(', ')':
 			return b.String(), quoted, i
 		case '\'':
 			quoted = true
@@ -877,6 +857,10 @@ func readHeredocDelim(code string, i int) (string, bool, int) {
 			}
 		case '\\':
 			quoted = true // \E counts as quoting in POSIX heredoc delimiters
+			if i+1 < len(code) && code[i+1] == '\n' {
+				i += 2
+				continue
+			}
 			if i+1 < len(code) {
 				b.WriteByte(code[i+1])
 				i += 2
@@ -933,13 +917,13 @@ func scanInlineSubstitutions(text string, depth int, extra *[]shellSegment) {
 					i = skipBalanced(text, i+1, '(', ')') - 1
 				}
 				if text[i] == '`' {
-					if j := strings.IndexByte(text[i+1:], '`'); j >= 0 {
+					if j := findBacktickClose(text, i+1); j >= 0 {
 						failClosed()
 						if !overDepth {
-							sub, _ := splitShellSegmentsDepth(text[i+1:i+1+j], depth+1, false)
+							sub, _ := splitShellSegmentsDepth(text[i+1:j], depth+1, false)
 							*extra = append(*extra, sub...)
 						}
-						i += j + 1
+						i = j
 					}
 				}
 				i++
@@ -958,13 +942,13 @@ func scanInlineSubstitutions(text string, depth int, extra *[]shellSegment) {
 				i = skipBalanced(text, i+1, '(', ')') - 1
 			}
 		case '`':
-			if j := strings.IndexByte(text[i+1:], '`'); j >= 0 {
+			if j := findBacktickClose(text, i+1); j >= 0 {
 				failClosed()
 				if !overDepth {
-					sub, _ := splitShellSegmentsDepth(text[i+1:i+1+j], depth+1, false)
+					sub, _ := splitShellSegmentsDepth(text[i+1:j], depth+1, false)
 					*extra = append(*extra, sub...)
 				}
-				i += j + 1
+				i = j
 			}
 		}
 	}
@@ -998,10 +982,10 @@ func scanHeredocSubstitutions(text string, depth int, extra *[]shellSegment) {
 				i = skipBalanced(text, i+1, '(', ')') - 1
 			}
 		case '`':
-			if j := strings.IndexByte(text[i+1:], '`'); j >= 0 {
-				sub, _ := splitShellSegmentsDepth(text[i+1:i+1+j], depth+1, false)
+			if j := findBacktickClose(text, i+1); j >= 0 {
+				sub, _ := splitShellSegmentsDepth(text[i+1:j], depth+1, false)
 				*extra = append(*extra, sub...)
-				i += j + 1
+				i = j
 			}
 		}
 	}
@@ -1035,7 +1019,18 @@ func readShellWord(code string, i int) string {
 			j := i + 1
 			for j < len(code) && code[j] != '"' {
 				if code[j] == '\\' && j+1 < len(code) {
-					j++
+					switch code[j+1] {
+					case '"', '\\', '$', '`', '\n':
+						if code[j+1] != '\n' {
+							b.WriteByte(code[j+1])
+						}
+						j += 2
+						continue
+					}
+					b.WriteByte('\\')
+					b.WriteByte(code[j+1])
+					j += 2
+					continue
 				}
 				b.WriteByte(code[j])
 				j++
@@ -1105,11 +1100,33 @@ func allDigits(s string) bool {
 // code[open] (code[open] must be the opening rune). Quotes and escapes inside
 // are honoured so ')' inside quotes doesn't end the group. On an unbalanced
 // group it returns len(code).
+// findBacktickClose returns the index of the closing backtick starting the
+// scan at from, skipping escaped backticks. Returns -1 if none.
+func findBacktickClose(code string, from int) int {
+	for i := from; i < len(code); i++ {
+		if code[i] == '\\' && i+1 < len(code) {
+			i++
+			continue
+		}
+		if code[i] == '`' {
+			return i
+		}
+	}
+	return -1
+}
+
 func skipBalanced(code string, open int, openCh, closeCh byte) int {
 	depth := 0
 	i := open
 	for i < len(code) {
 		c := code[i]
+		if c == '#' && (i == open || isShellWordBreak(code[i-1]) || code[i-1] == ' ' || code[i-1] == '\t') {
+			i = skipToLineEnd(code, i)
+			if i < len(code) && code[i] == '\n' {
+				i++
+			}
+			continue
+		}
 		switch c {
 		case '\'':
 			i++
@@ -1123,7 +1140,18 @@ func skipBalanced(code string, open int, openCh, closeCh byte) int {
 			i++
 			for i < len(code) && code[i] != '"' {
 				if code[i] == '\\' && i+1 < len(code) {
-					i++
+					i += 2
+					continue
+				}
+				if code[i] == '$' && i+1 < len(code) && code[i+1] == '(' {
+					i = skipBalanced(code, i+1, '(', ')')
+					continue
+				}
+				if code[i] == '`' {
+					if j := findBacktickClose(code, i+1); j >= 0 {
+						i = j + 1
+						continue
+					}
 				}
 				i++
 			}
@@ -1308,9 +1336,12 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 			depth--
 			continue
 		}
-		switch filepath.Base(a) {
+		switch a {
 		case "if", "then", "elif", "else", "while", "until", "do", "!", "coproc":
 			i++
+			continue
+		}
+		switch filepath.Base(a) {
 		case "time":
 			// Bash reserved word AND /usr/bin/time: peel its options
 			// (-p/-v/--verbose/--portability/-a boolean; -o FILE/--output
@@ -3194,6 +3225,17 @@ func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller c
 				}
 				if kind == 'r' && s2.redirectFile != "" {
 					return "> " + s2.redirectFile
+				}
+				if kind == 'r' {
+					if hit := allowlistShellStructuralHit(s2); hit != "" {
+						if strings.HasPrefix(hit, "> ") {
+							return hit
+						}
+						return allowlistDetail(hit)
+					}
+				}
+				if hit := screenSegmentHeredocsDepth(s2, kind, depth+1, caller); hit != "" {
+					return hit
 				}
 				if hit := screenOneSegmentDepth(s2, kind, depth+1, caller); hit != "" {
 					return hit
@@ -5979,6 +6021,11 @@ func guardShellReadonly(code string) string {
 func guardShellReadonlyDepth(code string, depth int, caller callerIdentity) string {
 	if depth >= peelChainMaxDepth {
 		return depthExceededHit
+	}
+	if depth == 0 {
+		if hit := checkReadonlyShellSyntax(code); hit != "" {
+			return readonlyBlockWithHint(allowlistDetail(hit))
+		}
 	}
 	for _, seg := range splitShellSegments(code) {
 		if seg.depthExceeded {
@@ -9149,8 +9196,17 @@ func stdinProgramHead(argv []string) (lang string, isInterp bool) {
 	}
 	head := argv[i:]
 	base := filepath.Base(head[0])
-	// A `shell -c 'code'` argv carries its program inline — stdin is data.
-	if _, has := unwrapShellArgv(head); has {
+	// shell -c: stdin is data for the outer shell, but recurse into -c text
+	// in case the inner command is a bare interpreter reading THIS stdin.
+	if innerText, has := unwrapShellArgv(head); has {
+		for _, seg := range splitShellSegments(innerText) {
+			if len(seg.argv) == 0 {
+				continue
+			}
+			if lang, ok := stdinProgramHead(seg.argv); ok {
+				return lang, true
+			}
+		}
 		return "", false
 	}
 	// An interpreter with -c/-e/-r/-m/-p inline code likewise.
@@ -9258,6 +9314,17 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 // exactly like an env KEY=VAL prefix would. Values are never reported.
 func (g guardCall) guardCtxRunEnv(env map[string]string) (rule, detail string) {
 	if !g.subagent && !g.strictReadonly {
+		return "", ""
+	}
+	if g.strictReadonly {
+		for k := range env {
+			switch k {
+			case "LANG", "LC_ALL", "TZ":
+				continue
+			default:
+				return ruleReadonlyWrite, "env " + k
+			}
+		}
 		return "", ""
 	}
 	for k, v := range env {

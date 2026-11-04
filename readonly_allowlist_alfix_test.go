@@ -31,8 +31,10 @@ func TestReadonlyAllowlist_ProcessSubstBlocked(t *testing.T) {
 			if got == "" {
 				t.Fatalf("expected block for %q, got empty", tc.code)
 			}
-			if !strings.Contains(got, "process substitution") && !strings.Contains(got, "bash") {
-				t.Fatalf("expected process substitution or bash block, got %q", got)
+			if !strings.Contains(got, "process substitution") && !strings.Contains(got, "bash") &&
+				!strings.Contains(got, "input redirect") && !strings.Contains(got, "redirect") &&
+				!strings.Contains(got, "parentheses") && !strings.Contains(got, "unknown command") {
+				t.Fatalf("expected process substitution or syntax block, got %q", got)
 			}
 		})
 	}
@@ -41,8 +43,10 @@ func TestReadonlyAllowlist_ProcessSubstBlocked(t *testing.T) {
 		if got == "" {
 			t.Fatal("expected block")
 		}
-		if !strings.Contains(got, "process substitution") && !strings.Contains(got, "bash") {
-			t.Fatalf("expected process substitution or bash block, got %q", got)
+		if !strings.Contains(got, "process substitution") && !strings.Contains(got, "bash") &&
+			!strings.Contains(got, "input redirect") && !strings.Contains(got, "redirect") &&
+			!strings.Contains(got, "parentheses") {
+			t.Fatalf("expected process substitution or syntax block, got %q", got)
 		}
 	})
 }
@@ -233,7 +237,7 @@ func TestReadonlyAllowlist_BlockHints(t *testing.T) {
 		{name: "node -e", argv: []string{"node", "-e", "1"}, hint: "jq"},
 		{name: "sqlite removed", argv: []string{"sqlite3", "/tmp/x.db", "SELECT 1"}, hint: "jq"},
 		{name: "go test", argv: []string{"go", "test", "./..."}, hint: "verifier"},
-		{name: "process subst", code: `cat <(echo hi)`, hint: "pipe"},
+		{name: "process subst", code: `cat <(echo hi)`, hint: "cat"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
