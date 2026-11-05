@@ -387,6 +387,12 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 		case "if", "then", "elif", "else", "while", "until", "do", "!", "coproc":
 			i++
 			continue
+		case "--":
+			i++
+			continue
+		}
+		if isDynamicArg(a) {
+			return i, splitPayloads, envAs, true // option/head zone dynamic → exhausted
 		}
 		switch filepath.Base(a) {
 		case "time":
@@ -400,6 +406,9 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 				if a == "--" {
 					i++
 					break
+				}
+				if isDynamicArg(a) {
+					return i, splitPayloads, envAs, true
 				}
 				if !strings.HasPrefix(a, "-") || a == "-" {
 					break
@@ -468,6 +477,9 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 				if a == "--" {
 					i++
 					break
+				}
+				if isDynamicArg(a) {
+					return i, splitPayloads, envAs, true
 				}
 				if !strings.HasPrefix(a, "-") || a == "-" {
 					break
@@ -821,6 +833,10 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) (int, []string,
 	var payloads []string
 	for i < len(argv) {
 		a := argv[i]
+		if isDynamicArg(a) && !isAssignWord(a) {
+			payloads = append(payloads, envUnknownLongPrefix+"dynamic option")
+			return i, payloads, envAs
+		}
 		switch {
 		case a == "--":
 			return i + 1, payloads, envAs
@@ -946,34 +962,61 @@ func unwrapShellArgv(argv []string) (shellText string, has bool) {
 	}
 	for i := 1; i < len(argv); i++ {
 		a := argv[i]
+		if isDynamicArg(a) {
+			return "", false // let hasDynamicInterpOption / peel catch it
+		}
 		if a == "--" {
 			return "", false
 		}
 		if strings.HasPrefix(a, "--") {
-			continue
+			name, val, hasVal := a[2:], "", false
+			if k := strings.IndexByte(name, '='); k >= 0 {
+				name, val, hasVal = name[:k], name[k+1:], true
+			}
+			switch name {
+			case "rcfile", "init-file":
+				if !hasVal {
+					if i+1 >= len(argv) {
+						return "", false
+					}
+					i++
+					val = argv[i]
+				}
+				if val != "/dev/null" {
+					return "", false // external rc is unreviewed code
+				}
+				continue
+			default:
+				continue
+			}
 		}
-		if a == "-o" || a == "+o" {
-			i++ // -o/+o consumes the option NAME as its operand
+		if a == "-o" || a == "+o" || a == "-O" || a == "+O" {
+			i++ // consumes the option NAME
 			continue
 		}
 		if (strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+")) && len(a) > 1 {
 			plus := a[0] == '+'
 			for j := 1; j < len(a); j++ {
-				if a[j] == 'c' && !plus {
+				ch := a[j]
+				if ch == 'c' && !plus {
 					tail := a[j+1:]
 					if i+1 < len(argv) {
-						// The script is the NEXT argv. A tail that is not a
-						// pure-letter flag bundle is glued script text — merge
-						// both so nothing escapes review.
 						if tail != "" && !isLetterOnly(tail) {
 							return tail + "\n" + argv[i+1], true
 						}
 						return argv[i+1], true
 					}
 					if tail != "" {
-						return tail, true // -c"pig" glued, no next argv
+						return tail, true
 					}
 					return "", false
+				}
+				if ch == 'o' || ch == 'O' {
+					// valued at end of cluster
+					if j+1 >= len(a) {
+						i++ // next argv is the option name
+					}
+					break
 				}
 			}
 			continue
@@ -1857,6 +1900,29 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return allowlistDetail(hit)
 		}
 	}
+	if hasDynamicInterpOption(head, base) {
+		return "dynamic code payload"
+	}
+	// export/readonly/declare/typeset/local: screen KEY=VAL args as env assignments
+	switch base {
+	case "export", "readonly", "declare", "typeset", "local":
+		if kind == 's' {
+			var envAs envAssignments
+			for _, a := range head[1:] {
+				if isDynamicArg(a) && !isAssignWord(a) {
+					return "env dynamic export"
+				}
+				if isAssignWord(a) {
+					envAs.addAssign(a)
+				} else if strings.Contains(a, "=") {
+					envAs.addAssign(a)
+				}
+			}
+			if hit := screenEnvAssignments(envAs, kind, caller.role, caller.readonly); hit != "" {
+				return hit
+			}
+		}
+	}
 	if text, has := unwrapShellArgv(head); has {
 		if strings.Contains(text, cmdSubPlaceholder) {
 			return "dynamic code payload"
@@ -2537,6 +2603,9 @@ func screenUnsetArgs(args []string, kind byte) string {
 		if strings.HasPrefix(a, "-") {
 			continue // -v/-f flags
 		}
+		if isDynamicArg(a) {
+			return "unset dynamic"
+		}
 		if guardTaintVars[a] {
 			return "unset " + a
 		}
@@ -2609,8 +2678,29 @@ func xargsTargetIndex(argv []string) int {
 // commands recurse into the argv guards; -delete/-fprint/-fprint0/-fprintf/
 // -fls block under strict read-only.
 func screenFindArgs(args []string, kind byte, depth int, caller callerIdentity) string {
+	expectValue := false
+	pathDone := false
+	valueOpts := map[string]bool{
+		"-name": true, "-iname": true, "-path": true, "-ipath": true,
+		"-wholename": true, "-iwholename": true, "-regex": true, "-iregex": true,
+		"-type": true, "-xtype": true, "-maxdepth": true, "-mindepth": true,
+		"-newermt": true, "-newer": true, "-size": true, "-perm": true,
+		"-mtime": true, "-mmin": true, "-uid": true, "-gid": true,
+		"-user": true, "-group": true, "-printf": true, "-fprintf": true,
+	}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if expectValue {
+			expectValue = false
+			continue
+		}
+		if isDynamicArg(a) {
+			if !pathDone {
+				// still in starting path zone — dynamic path is ok-ish but fail closed
+				return "find dynamic predicate"
+			}
+			return "find dynamic predicate"
+		}
 		if a == "-exec" || a == "-execdir" || a == "-ok" || a == "-okdir" {
 			j := i + 1
 			for j < len(args) && args[j] != ";" && args[j] != "+" {
@@ -2624,7 +2714,16 @@ func screenFindArgs(args []string, kind byte, depth int, caller callerIdentity) 
 				}
 			}
 			i = j
+			pathDone = true
 			continue
+		}
+		if valueOpts[a] {
+			pathDone = true
+			expectValue = true
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			pathDone = true
 		}
 		if kind == 'r' && (a == "-delete" || a == "-fprint" || a == "-fprint0" || a == "-fprintf" || a == "-fls") {
 			return "find " + a
@@ -4559,17 +4658,29 @@ func screenGitGlobalArgs(args []string) (int, string) {
 	i := 0
 	for i < len(args) {
 		a := args[i]
+		if isDynamicArg(a) {
+			return i, "git dynamic global option"
+		}
 		switch {
 		case a == "-C" || a == "--git-dir" || a == "--work-tree" || a == "--namespace":
+			if i+1 < len(args) && isDynamicArg(args[i+1]) {
+				return i, "git dynamic global option"
+			}
 			i += 2
 		case a == "-c":
 			if i+1 < len(args) {
+				if isDynamicArg(args[i+1]) {
+					return i, "git dynamic global option"
+				}
 				if hit := screenGitConfigPair(args[i+1]); hit != "" {
 					return i, hit
 				}
 			}
 			i += 2
 		case strings.HasPrefix(a, "-c") && len(a) > 2:
+			if isDynamicArg(a) || isDynamicArg(a[2:]) {
+				return i, "git dynamic global option"
+			}
 			if hit := screenGitConfigPair(a[2:]); hit != "" {
 				return i, hit
 			}
@@ -8754,6 +8865,54 @@ func shellSegmentsAllSSH(segs []shellSegment) bool {
 // remote command, whose own heads inherit the verdict: `argv=["ssh","dmit",
 // "sh"]` forwards the caller's stdin to a remote shell reading its PROGRAM
 // from that stream, so the stdin payload is remote code, not data.
+
+// hasDynamicInterpOption reports a dynamic word in the shell/interpreter
+// option zone (before -- or the first static script operand).
+func hasDynamicInterpOption(head []string, base string) bool {
+	if len(head) < 2 {
+		return false
+	}
+	shell := shellHeads[base]
+	_, interp := heredocInterpLang(base)
+	if !shell && !interp {
+		return false
+	}
+	valueExact := map[string]bool{
+		"-o": true, "+o": true, "-O": true, "+O": true,
+		"-W": true, "-X": true, "-r": true, "--require": true,
+		"--loader": true, "--import": true, "--experimental-loader": true,
+		"--conditions": true, "-I": true, "-M": true, "-m": true,
+		"-d": true, "-z": true, "--rcfile": true, "--init-file": true,
+	}
+	for i := 1; i < len(head); i++ {
+		a := head[i]
+		if a == "--" {
+			return false
+		}
+		if isDynamicArg(a) {
+			return true
+		}
+		if valueExact[a] {
+			if i+1 < len(head) && isDynamicArg(head[i+1]) {
+				return true
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+") {
+			// short cluster / long flag; glued -cPAYLOAD already checked via isDynamicArg(a)
+			if strings.HasPrefix(a, "--") {
+				continue
+			}
+			// -c / +c clusters: if 'c' present with empty tail, next argv is code (not option zone end)
+			continue
+		}
+		// first static non-option operand = script file → option zone ends
+		return false
+	}
+	return false
+}
+
 func stdinProgramHead(argv []string) (lang string, isInterp bool) {
 	return stdinProgramHeadDepth(argv, 0)
 }
@@ -8798,44 +8957,103 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 	}
 	if shellHeads[base] {
 		// sh/bash/... without -c: commands come from a script file or
-		// stdin. A non-option operand names the script file (stdin is then
-		// data); `--` ends options and a following operand is likewise the
-		// script. Bare flags (`sh -i`, `sh -s`, `sh -`) mean stdin is the
-		// program.
+		// stdin. -s forces stdin even with positional args; -o/+o/-O/+O
+		// and short clusters containing o/O consume a value slot.
 		sawDashDash := false
-		for _, a := range head[1:] {
+		forceStdin := false
+		i := 1
+		for i < len(head) {
+			a := head[i]
+			if isDynamicArg(a) {
+				return "", true // dynamic option/script → treat as stdin-program so heredoc screens
+			}
 			if a == "--" {
 				sawDashDash = true
+				i++
 				continue
 			}
-			if !strings.HasPrefix(a, "-") || (sawDashDash && a == "-") {
-				return "", false // script file operand
+			if sawDashDash {
+				if forceStdin {
+					return "", true
+				}
+				return "", false
 			}
 			if a == "-" {
-				return "", true // `sh -` reads commands from stdin
+				return "", true
 			}
+			if a == "-o" || a == "+o" || a == "-O" || a == "+O" {
+				i += 2
+				continue
+			}
+			if (strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+")) && len(a) > 1 && !strings.HasPrefix(a, "--") {
+				plus := a[0] == '+'
+				for j := 1; j < len(a); j++ {
+					ch := a[j]
+					if ch == 's' && !plus {
+						forceStdin = true
+					}
+					if ch == 'c' && !plus {
+						return "", false // -c means inline, not stdin
+					}
+					if ch == 'o' || ch == 'O' {
+						if j+1 >= len(a) {
+							i++ // consume option name argv
+						}
+						break
+					}
+				}
+				i++
+				continue
+			}
+			if strings.HasPrefix(a, "--") {
+				i++
+				continue
+			}
+			// non-option operand
+			if forceStdin {
+				return "", true // -s arg1 still reads stdin
+			}
+			return "", false // script file
 		}
-		return "", true // bare shell: stdin is the program
+		return "", true // bare shell / only flags
 	}
 	if lang, ok := heredocInterpLang(base); ok {
-		// python3 - / node - / bare interpreter with only flags: stdin is
-		// the program. A non-option operand is a script file — its stdin is
-		// just data (and the file itself blocks for strict read-only via
-		// screenInterpFileRun).
 		sawDashDash := false
-		for _, a := range head[1:] {
+		valueOpts := map[string]bool{
+			"-W": true, "-X": true, "-r": true, "--require": true,
+			"--loader": true, "--import": true, "--experimental-loader": true,
+			"--conditions": true, "-I": true, "-M": true, "-m": true,
+			"-c": true, "-d": true, "-z": true,
+		}
+		i := 1
+		for i < len(head) {
+			a := head[i]
+			if isDynamicArg(a) {
+				return lang, true
+			}
 			if a == "--" {
 				sawDashDash = true
+				i++
 				continue
 			}
 			if a == "-" {
 				return lang, true
 			}
-			if !strings.HasPrefix(a, "-") || sawDashDash {
-				return "", false // script file operand
+			if sawDashDash || !strings.HasPrefix(a, "-") {
+				return "", false
 			}
+			if valueOpts[a] {
+				i += 2
+				continue
+			}
+			if strings.HasPrefix(a, "--") && strings.Contains(a, "=") {
+				i++
+				continue
+			}
+			// bundled short opts: -Wignore / -Xutf8 etc. already single argv
+			i++
 		}
-		return lang, true // bare interpreter with only flags
+		return lang, true
 	}
 	return "", false
 }

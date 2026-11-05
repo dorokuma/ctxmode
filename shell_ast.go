@@ -547,7 +547,7 @@ func parseSubagentShellAST(code string, depth int, pipeIn bool, useBashVariant b
 		}
 	}
 
-	col := &subCollector{code: code, depth: depth}
+	col := &subCollector{code: code, depth: depth, staticVars: map[string]string{}, taintedVars: map[string]bool{}, allowBind: depth == 0}
 	primary := posixFile
 	if useBashVariant {
 		primary = bashFile
@@ -643,10 +643,13 @@ func segEqual(a, b shellSegment) bool {
 }
 
 type subCollector struct {
-	code     string
-	depth    int
-	segs     []shellSegment
-	rejected bool
+	code        string
+	depth       int
+	segs        []shellSegment
+	rejected    bool
+	staticVars  map[string]string
+	taintedVars map[string]bool
+	allowBind   bool // top-level sequential stmts only (R-Allow-2)
 }
 
 func (c *subCollector) reject() {
@@ -1003,24 +1006,42 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 			c.reject()
 		}
 	case *syntax.Subshell:
+		prevBind := c.allowBind
+		c.allowBind = false
 		c.walkStmts(cmd.Stmts, false)
+		c.allowBind = prevBind
 	case *syntax.Block:
+		prevBind := c.allowBind
+		c.allowBind = false
 		c.walkStmts(cmd.Stmts, false)
+		c.allowBind = prevBind
 	case *syntax.IfClause:
+		prevBind := c.allowBind
+		c.allowBind = false
 		for ic := cmd; ic != nil; ic = ic.Else {
 			c.walkStmts(ic.Cond, false)
 			c.walkStmts(ic.Then, false)
 		}
+		c.allowBind = prevBind
 	case *syntax.WhileClause:
+		prevBind := c.allowBind
+		c.allowBind = false
 		c.walkStmts(cmd.Cond, false)
 		c.walkStmts(cmd.Do, false)
+		c.allowBind = prevBind
 	case *syntax.ForClause:
+		prevBind := c.allowBind
+		c.allowBind = false
 		if wi, ok := cmd.Loop.(*syntax.WordIter); ok {
+			if wi.Name != nil {
+				c.noteStaticAssign(wi.Name.Value, "", false) // loop var is tainted for R-Allow-2 head bind
+			}
 			for _, w := range wi.Items {
 				c.emitNestedFromWord(w)
 			}
 		}
 		c.walkStmts(cmd.Do, false)
+		c.allowBind = prevBind
 	case *syntax.CaseClause:
 		c.emitNestedFromWord(cmd.Word)
 		for _, item := range cmd.Items {
@@ -1030,9 +1051,12 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 			c.walkStmts(item.Stmts, false)
 		}
 	case *syntax.FuncDecl:
+		prevBind := c.allowBind
+		c.allowBind = false
 		if cmd.Body != nil {
 			c.walkStmt(cmd.Body, false)
 		}
+		c.allowBind = prevBind
 	case *syntax.TimeClause:
 		if cmd.Stmt != nil {
 			c.walkStmt(cmd.Stmt, pipeIn)
@@ -1105,9 +1129,16 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, pipeIn b
 	argv := make([]string, 0, len(call.Assigns)+len(call.Args))
 	for _, a := range call.Assigns {
 		argv = append(argv, assignToPrefix(a))
+		if a.Name != nil && !a.Naked {
+			val, st := "", false
+			if a.Value != nil {
+				val, st = c.wordToArg(a.Value)
+			}
+			c.noteStaticAssign(a.Name.Value, val, st)
+		}
 	}
 	for _, w := range call.Args {
-		s, _ := wordToArg(w)
+		s, _ := c.wordToArg(w)
 		argv = append(argv, s)
 	}
 
@@ -1245,7 +1276,7 @@ func (c *subCollector) emitNestedFromNode(n syntax.Node) {
 				c.segs = append(c.segs, shellSegment{depthExceeded: true})
 				return false
 			}
-			sub := &subCollector{code: c.code, depth: c.depth + 1}
+			sub := &subCollector{code: c.code, depth: c.depth + 1, staticVars: map[string]string{}, taintedVars: map[string]bool{}, allowBind: false}
 			sub.walkStmts(x.Stmts, false)
 			if sub.rejected {
 				c.reject()
@@ -1258,7 +1289,7 @@ func (c *subCollector) emitNestedFromNode(n syntax.Node) {
 				c.segs = append(c.segs, shellSegment{depthExceeded: true})
 				return false
 			}
-			sub := &subCollector{code: c.code, depth: c.depth + 1}
+			sub := &subCollector{code: c.code, depth: c.depth + 1, staticVars: map[string]string{}, taintedVars: map[string]bool{}, allowBind: false}
 			sub.walkStmts(x.Stmts, false)
 			if sub.rejected {
 				c.reject()
@@ -1292,24 +1323,118 @@ func posixUnescapeLit(s string) string {
 
 // wordToArg returns the static string form of w, or (cmdSubPlaceholder, false)
 // when the word has dynamic/glob/tilde content.
+
+func isSafeAbsPathVal(s string) bool {
+	if s == "" || !strings.HasPrefix(s, "/") {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		ok := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') || ch == '_' || ch == '.' || ch == '/' || ch == '-'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func isSafeIdentOrRelPath(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		ok := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') || ch == '_' || ch == '.' || ch == '/' || ch == '-'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *subCollector) noteStaticAssign(name, val string, static bool) {
+	if c.staticVars == nil {
+		c.staticVars = map[string]string{}
+	}
+	if c.taintedVars == nil {
+		c.taintedVars = map[string]bool{}
+	}
+	if name == "" || !c.allowBind {
+		return
+	}
+	if c.taintedVars[name] {
+		return
+	}
+	if !static || !isSafeAbsPathVal(val) {
+		c.taintedVars[name] = true
+		delete(c.staticVars, name)
+		return
+	}
+	if prev, ok := c.staticVars[name]; ok && prev != val {
+		c.taintedVars[name] = true
+		delete(c.staticVars, name)
+		return
+	}
+	c.staticVars[name] = val
+}
+
+func (c *subCollector) resolveStaticParam(pe *syntax.ParamExp) (string, bool) {
+	if pe == nil || pe.Param == nil || c.staticVars == nil {
+		return "", false
+	}
+	if pe.Exp != nil || pe.Slice != nil || pe.Repl != nil || pe.Index != nil || pe.Length || pe.Excl || pe.Names != 0 {
+		return "", false
+	}
+	v, ok := c.staticVars[pe.Param.Value]
+	return v, ok
+}
+
+func litHasUnquotedGlobOrTilde(rawLit string, isWordStart bool, openBracket *bool) bool {
+	for i := 0; i < len(rawLit); i++ {
+		ch := rawLit[i]
+		if ch == '\\' {
+			i++ // escaped byte is literal
+			continue
+		}
+		if isWordStart && i == 0 && ch == '~' {
+			return true
+		}
+		switch ch {
+		case '*', '?':
+			return true
+		case '[':
+			*openBracket = true
+		case ']':
+			if *openBracket {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// wordToArg returns the static string form of w, or (prefix+placeholder, false)
+// when the word has dynamic/glob/tilde content. Static prefixes such as -c are
+// preserved so option scanners can still see the option letter.
 func wordToArg(w *syntax.Word) (string, bool) {
 	if w == nil || len(w.Parts) == 0 {
 		return "", false
 	}
 	var b strings.Builder
 	static := true
+	openBracket := false
 	for i, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
-			// POSIX unquoted backslash: dash drops \ and keeps next byte.
-			val := posixUnescapeLit(p.Value)
-			if strings.ContainsAny(val, "*?[") {
+			if litHasUnquotedGlobOrTilde(p.Value, i == 0 && b.Len() == 0, &openBracket) {
 				static = false
+				b.WriteString(posixUnescapeLit(p.Value))
+				b.WriteString(cmdSubPlaceholder)
+				continue
 			}
-			if i == 0 && strings.HasPrefix(val, "~") {
-				static = false
-			}
-			b.WriteString(val)
+			b.WriteString(posixUnescapeLit(p.Value))
 		case *syntax.SglQuoted:
 			if p.Dollar {
 				static = false
@@ -1332,7 +1457,13 @@ func wordToArg(w *syntax.Word) (string, bool) {
 				}
 				b.WriteString(decodeDblQuotedLit(lit.Value))
 			}
-		case *syntax.ParamExp, *syntax.CmdSubst, *syntax.ArithmExp,
+		case *syntax.ParamExp:
+			// R-Allow-2 narrow: simple $VAR / ${VAR} may resolve from staticVars
+			// when the collector context provides one; wordToArg itself stays
+			// context-free and treats ParamExp as dynamic (prefix-preserving).
+			static = false
+			b.WriteString(cmdSubPlaceholder)
+		case *syntax.CmdSubst, *syntax.ArithmExp,
 			*syntax.ProcSubst, *syntax.ExtGlob, *syntax.BraceExp:
 			static = false
 			b.WriteString(cmdSubPlaceholder)
@@ -1342,9 +1473,34 @@ func wordToArg(w *syntax.Word) (string, bool) {
 		}
 	}
 	if !static {
-		return cmdSubPlaceholder, false
+		if b.Len() == 0 {
+			return cmdSubPlaceholder, false
+		}
+		return b.String(), false
 	}
 	return b.String(), true
+}
+
+func (c *subCollector) wordToArg(w *syntax.Word) (string, bool) {
+	if w == nil || len(w.Parts) == 0 {
+		return "", false
+	}
+	// Fast path: try full-word simple ParamExp resolve for command heads.
+	if len(w.Parts) == 1 {
+		if pe, ok := w.Parts[0].(*syntax.ParamExp); ok {
+			if v, ok := c.resolveStaticParam(pe); ok {
+				return v, true
+			}
+		}
+		if dq, ok := w.Parts[0].(*syntax.DblQuoted); ok && !dq.Dollar && len(dq.Parts) == 1 {
+			if pe, ok := dq.Parts[0].(*syntax.ParamExp); ok {
+				if v, ok := c.resolveStaticParam(pe); ok {
+					return v, true
+				}
+			}
+		}
+	}
+	return wordToArg(w)
 }
 
 func callHasProcSubst(call *syntax.CallExpr) bool {
