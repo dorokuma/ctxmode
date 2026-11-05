@@ -161,6 +161,12 @@ const dynamicRedirectTarget = "<dynamic>"
 // cannot be vetted); placeholders in argument positions are inert.
 const cmdSubPlaceholder = "__ctx_cmdsub__"
 
+// isDynamicArg reports a word that still carries the dynamic placeholder
+// (static prefix may precede it, e.g. -c__ctx_cmdsub__).
+func isDynamicArg(a string) bool {
+	return strings.Contains(a, cmdSubPlaceholder)
+}
+
 // splitShellSegments parses shell text via mvdan.cc/sh (LangPOSIX + Bash cross-check).
 func splitShellSegments(code string) []shellSegment {
 	segs, ok := parseSubagentShellAST(code, 0, false, false)
@@ -1164,7 +1170,7 @@ var blockedAgentExecutableList = []string{
 	// Privilege / namespace / scheduler / remote wrappers whose inner command
 	// escapes the caller's role context or scheduling control.
 	"sudo", "doas", "su", "pkexec", "nsenter", "unshare", "chroot",
-	"systemd-run", "at", "ssh",
+	"systemd-run", "at",
 }
 
 // blockedAgentExecutables are the agent executables a sub-agent must never
@@ -1742,6 +1748,10 @@ func flockArgHasValue(a string) bool {
 // kind is 's' (subagent) or 'r' (strict read-only); depth bounds recursion
 // and fails closed at peelChainMaxDepth. It returns the guard hit or "".
 func peelResolvedDepth(argv []string, kind byte, depth int, caller callerIdentity) string {
+	return peelResolvedSegDepth(argv, shellSegment{}, kind, depth, caller)
+}
+
+func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int, caller callerIdentity) string {
 	if len(argv) == 0 || depth >= peelChainMaxDepth {
 		if depth >= peelChainMaxDepth {
 			return depthExceededHit
@@ -1822,6 +1832,12 @@ func peelResolvedDepth(argv []string, kind byte, depth int, caller callerIdentit
 	// callers, so verifier needs this branch before it.
 	if base == "ctxmode" && callerReadonlyRole(caller) && ctxmodeCLIAction(head[1:]) == "index" {
 		return "ctxmode index"
+	}
+	// ssh: peel OpenSSH options and screen remote command (before readonly
+	// allowlist — ssh is not on the allowlist table; screenSSHHead itself
+	// recurses into remoteCmd with the caller's guard).
+	if base == "ssh" {
+		return screenSSHHead(head, seg, kind, depth, caller)
 	}
 	// Strict readonly: allowlist before shell/interpreter unwrap so deleted
 	// heads (bash/python/...) cannot bypass via -c/-m recursion.
@@ -2012,6 +2028,320 @@ func peelResolvedDepth(argv []string, kind byte, depth int, caller callerIdentit
 		return allowlistDetail(hit)
 	}
 	return screenReadonlyWrite(typedHead)
+}
+
+// screenSSHHead applies the ssh model to one resolved ssh argv (head[0] is
+// the ssh spelling or its resolved alias): the option run is parsed, banned
+// flags and -o values block, and the joined remote command is screened as
+// shell text under the caller's own guard.
+//
+// Caller model: kind 'r' (strict read-only) screens the remote command with
+// the strict read-only guard — a write on the far side is still a write.
+// kind 's' screens it for nested dispatch, and when the caller is ALSO a
+// read-only role (verifier, or a bare CTXMODE_READONLY=1) the remote command
+// additionally gets the strict read-only screen: verifier's /tmp exemption
+// ends where the wire begins. A read-only remote hit is reported through
+// the roSSHWriteHit sentinel so the entry points can attribute it to
+// ruleReadonlyWrite rather than ruleSubagentNestedAgent.
+//
+// Stdin: a pipe's bytes never reach this segment, so pipedStdin fails
+// closed only when the remote command reads its PROGRAM from stdin
+// (`cat script | ssh host sh` runs unaudited remote code — the same
+// verdict the local "piped code to shell" check gives). hereStrings and
+// heredoc bodies ARE visible: they are screened as shell text — the
+// sub-agent screen for a worker, the strict read-only screen for a
+// read-only caller — with sub-agent still taking precedence under kind
+// 's', matching the entry-point order.
+const roSSHWriteHit = "ssh remote write"
+
+func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller callerIdentity) string {
+	remoteCmd, hit := parseSSHInvocation(head)
+	if hit != "" {
+		return hit
+	}
+	stdinIsProg := remoteReadsProgramFromStdin(remoteCmd)
+	if seg.pipedStdin && stdinIsProg {
+		if kind == 'r' || callerReadonlyRole(caller) {
+			return roSSHWriteHit
+		}
+		return "piped stdin to ssh"
+	}
+	// The ssh segment's here-string / heredoc bodies ride the ssh stdin
+	// stream to the remote side; when the remote command's head reads its
+	// PROGRAM from that stream the body text is remote code and gets the
+	// caller's own screen (screenSegmentHeredocsDepth only sees the local
+	// `ssh` head, whose stdin is opaque). A remote `cat`/`xargs` head reads
+	// data, so the bodies stay unscreened here.
+	if stdinIsProg {
+		for _, body := range sshStdinTexts(seg) {
+			if h := screenStdinProgram(body, "", kind, depth, caller); h != "" {
+				return h
+			}
+		}
+	}
+	// Same ordering for the remote command itself as the entry-point guards
+	// keep ("sub-agent first, then strict read-only"): under kind 's' the
+	// nested-dispatch screen gets first look, and the strict read-only
+	// screen only sees a remote command the sub-agent screen let through.
+	if kind == 's' {
+		if h := guardShellSubagentDepth(remoteCmd, depth+1, caller); h != "" {
+			return h
+		}
+		if callerReadonlyRole(caller) {
+			if h := guardShellReadonlyDepth(remoteCmd, depth+1, caller); h != "" {
+				return roSSHWriteHit
+			}
+		}
+		return ""
+	}
+	if h := guardShellReadonlyDepth(remoteCmd, depth+1, caller); h != "" {
+		return roSSHWriteHit
+	}
+	return ""
+}
+
+// remoteReadsProgramFromStdin reports whether the remote command string
+// contains a head that reads its program from stdin (a bare remote
+// `sh`/`python3 -` with no inline code). Only then are piped bytes
+// unaudited remote CODE rather than data for the remote command.
+func remoteReadsProgramFromStdin(remoteCmd string) bool {
+	for _, seg := range splitShellSegments(remoteCmd) {
+		if len(seg.argv) == 0 {
+			continue
+		}
+		if _, isProg := stdinProgramHead(seg.argv); isProg {
+			return true
+		}
+	}
+	return false
+}
+
+// sshStdinTexts returns the visible stdin payloads attached to the ssh
+// segment: the `<<< word` here-string and every consumed heredoc body.
+func sshStdinTexts(seg shellSegment) []string {
+	var out []string
+	if seg.hereString != "" {
+		out = append(out, seg.hereString)
+	}
+	for _, hb := range seg.heredocText {
+		if hb.text != "" {
+			out = append(out, hb.text)
+		}
+	}
+	return out
+}
+
+// sshNoArgShorts are OpenSSH short options that take no operand.
+const sshNoArgShorts = "46AaCfGgKkMNnqsTtVvXxYy"
+
+// sshArgShortsSet are OpenSSH short options that consume an operand,
+// either glued (-p2222) or as the next argv (-p 2222): -B -b -c -D -E -e
+// -F -I -i -J -L -l -m -O -o -p -Q -R -S -W -w.
+const sshArgShortsSet = "BbcDEeFIiJLlmOopQRSWw"
+
+// sshShortTakesValue reports whether short option letter c consumes an
+// operand.
+func sshShortTakesValue(c byte) bool {
+	return strings.IndexByte(sshArgShortsSet, c) >= 0
+}
+
+// sshBannedShorts are short options (or letters inside a cluster) that must
+// never reach a role-guarded ssh: they arm a config file, a jump host
+// (same reach as -o ProxyJump), a control socket, a forwarding channel or
+// a local side effect the guards cannot see.
+const sshBannedShorts = "FSMOLRDWwNfGQsEJI"
+
+// sshBannedLongs are long-option names rejected outright (value or not).
+var sshBannedLongs = map[string]bool{
+	"localforward": true, "remoteforward": true, "dynamicforward": true,
+	"permitlocalcommand": true, "controlpersist": true, "configfile": true,
+}
+
+// sshSafeOKeys are the only -o option names (lowercased) a role-guarded ssh
+// may set: pure connection hygiene with no exec, forwarding or config-file
+// reach. controlmaster/controlpath pass only with a hard "no"/"none"
+// value — screened separately so `ssh -o ControlPath=/tmp/x` never
+// re-opens the control-socket hole the -S/-M ban closed.
+var sshSafeOKeys = map[string]bool{
+	"batchmode": true, "connecttimeout": true, "stricthostkeychecking": true,
+	"userknownhostsfile": true, "globalknownhostsfile": true,
+	"identitiesonly": true, "identityfile": true, "certificatefile": true,
+	"port": true, "user": true, "hostname": true,
+	"serveraliveinterval": true, "serveralivecountmax": true,
+	"loglevel": true, "connectionattempts": true, "addressfamily": true,
+	"requesttty": true, "compression": true, "ciphers": true, "macs": true,
+	"kexalgorithms": true, "hostkeyalgorithms": true,
+	"pubkeyacceptedalgorithms": true, "pubkeyacceptedkeytypes": true,
+	"pubkeyauthentication": true, "passwordauthentication": true,
+	"kbdinteractiveauthentication": true, "numberofpasswordprompts": true,
+	"forwardagent": true, "ipqos": true, "escapechar": true,
+	"tcpkeepalive": true, "canonicalizehostname": true,
+	"checkhostip": true, "enableescapecommandline": true,
+	// controlmaster/controlpath pass the KEY whitelist but are value-gated
+	// by sshOValueOK: only "no"/"none" is allowed, so the control-socket
+	// hole the -S/-M/-O ban closed cannot re-open through -o.
+	"controlmaster": true, "controlpath": true,
+}
+
+// sshOValueOK reports whether a whitelisted -o key may carry this value.
+// The value-sensitive keys are the control-socket pair, the known-hosts
+// files (an arbitrary path plus accept-new gives a read-only caller a
+// local file-write side effect) and the interactive ~C escape-command
+// line: everything else accepts its value unchecked (the key whitelist
+// is what vetted it).
+func sshOValueOK(key, val string) bool {
+	switch key {
+	case "controlmaster":
+		return strings.EqualFold(val, "no")
+	case "controlpath":
+		return strings.EqualFold(val, "none")
+	case "userknownhostsfile", "globalknownhostsfile":
+		// Only sink/keep spellings stay: an arbitrary path pairs with
+		// StrictHostKeyChecking=accept-new to write host keys locally.
+		return val == "/dev/null" || strings.EqualFold(val, "none")
+	case "enableescapecommandline":
+		// The interactive ~C command line runs local commands; only the
+		// explicit disable value is allowed through.
+		return strings.EqualFold(val, "no")
+	}
+	return true
+}
+
+// screenSSHOpt screens one -o option TEXT (the operand after -o or the
+// glued tail): OpenSSH accepts both `-o key=val` and `-o "key val"`.
+// The key (lowercased for the lookup) must appear in sshSafeOKeys and pass
+// the value-sensitive check; every other key is refused by name so
+// proxycommand/proxyjump/localcommand/remotecommand/match/include and
+// friends can never reach the client config. Trimming is ASCII-blank only
+// (" \t\r\n") — matching OpenSSH readconf.c, which treats a non-ASCII
+// blank like U+00A0 as part of the word rather than whitespace, so
+// `UserKnownHostsFile=none ` stays a literal path instead of being
+// trimmed into a `none` that the sink-value gate would admit.
+func screenSSHOpt(optText string) string {
+	key, val := optText, ""
+	if k := strings.IndexAny(optText, "= \t"); k >= 0 {
+		key, val = optText[:k], strings.Trim(optText[k+1:], " \t\r\n")
+	}
+	key = strings.ToLower(strings.Trim(key, " \t\r\n"))
+	if key == "" {
+		return "-o" // empty option text: unvetted, fail closed
+	}
+	if !sshSafeOKeys[key] {
+		return "-o " + key
+	}
+	if !sshOValueOK(key, val) {
+		return "-o " + key
+	}
+	return ""
+}
+
+// parseSSHInvocation walks an ssh argv after head[0] and returns the
+// remote command text OpenSSH would run (strings.Join of every word after
+// <destination>), or a guard hit naming the offending option. It
+// understands single-dash short clusters (no-arg letters may pack, a
+// value-taking letter ends its cluster and may carry a glued tail or the
+// next argv) and double-dash long options; a value-taking option whose
+// operand never arrives is malformed and fails closed. The first
+// non-option operand is <destination>; WITHOUT a `--` terminator OpenSSH
+// (ssh.c `optind = optreset = 1; goto again`) keeps parsing options after
+// it until the SECOND non-option word — so `ssh dmit -q pig` names the
+// remote command `pig`, not `-q pig` — while after `--` the word
+// following <destination> already starts the remote command. An empty
+// destination or a missing remote command both block (bare `ssh host`
+// drops the caller into an unaudited interactive login shell).
+func parseSSHInvocation(head []string) (remoteCmd, hit string) {
+	i := 1
+	endOpts := false
+	sawDest := false
+	for i < len(head) {
+		a := head[i]
+		if isDynamicArg(a) {
+			return "", "dynamic code payload"
+		}
+		if !endOpts && a == "--" {
+			endOpts = true
+			i++
+			continue
+		}
+		if !endOpts && strings.HasPrefix(a, "--") {
+			// OpenSSH ssh has no double-dash long options at all (even
+			// --help/--version are 4.2BSD spellings that never run a
+			// remote command): every `--name` is unvetted, so any
+			// non-banned long option fails closed by its literal text.
+			name := a[2:]
+			if k := strings.IndexByte(name, '='); k >= 0 {
+				name = name[:k]
+			}
+			if sshBannedLongs[strings.ToLower(name)] {
+				return "", "--" + strings.ToLower(name)
+			}
+			return "", "ssh " + a
+		}
+		if !endOpts && len(a) > 1 && a[0] == '-' && a != "-" {
+			// Short cluster: walk the letters; a no-arg letter continues the
+			// cluster, a value-taking letter ends it (glued tail or next argv
+			// is the operand), a banned letter blocks outright.
+			for j := 1; j < len(a); j++ {
+				c := a[j]
+				switch {
+				case strings.IndexByte(sshBannedShorts, c) >= 0:
+					return "", "ssh -" + string(c)
+				case c == 'o':
+					// -o is value-taking AND its value is screened.
+					var v string
+					if j+1 < len(a) {
+						v = a[j+1:]
+					} else if i+1 < len(head) {
+						i++
+						v = head[i]
+					} else {
+						return "", "ssh"
+					}
+					if h := screenSSHOpt(v); h != "" {
+						return "", "ssh " + h
+					}
+					j = len(a) // option operand ends the cluster
+				case sshShortTakesValue(c):
+					if j+1 < len(a) {
+						// Glued operand: cluster ends here.
+					} else if i+1 < len(head) {
+						i++ // separate operand
+					} else {
+						return "", "ssh"
+					}
+					j = len(a)
+				case strings.IndexByte(sshNoArgShorts, c) >= 0:
+					continue
+				default:
+					// Unknown short letter: unvetted, fail closed.
+					return "", "ssh -" + string(c)
+				}
+			}
+			i++
+			continue
+		}
+		if a == "" {
+			return "", "ssh" // empty <destination> word
+		}
+		if !sawDest {
+			// First non-option operand: <destination>. When `--` has not
+			// ended options, OpenSSH re-enters getopt after it, so any
+			// `-x`/`--x` words that follow are still ssh's own options and
+			// continue through the screening above until the SECOND
+			// non-option word — the real remote command head.
+			sawDest = true
+			i++
+			continue
+		}
+		// Second non-option operand: everything from here is the remote
+		// command OpenSSH joins and hands to the login shell.
+		remote := strings.Join(head[i:], " ")
+		if strings.Trim(remote, " \t\r\n") == "" {
+			return "", "ssh"
+		}
+		return remote, ""
+	}
+	return "", "ssh" // no <destination> at all
 }
 
 // scriptCommandArg returns the `-c cmd` payload of a `script` argv, or "".
@@ -2319,8 +2649,11 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 	// upstream bytes: for a strict read-only role that is an unreviewable
 	// code stream (block outright); for a sub-agent it is a covert channel
 	// around head screening (same verdict — the upstream text is not part
-	// of this segment and cannot be screened here).
-	if seg.pipedStdin {
+	// of this segment and cannot be screened here). An ssh head whose
+	// REMOTE command reads its program from stdin is left for the ssh
+	// model (screenSSHHead) — it returns the remote-aware roSSHWriteHit /
+	// "piped stdin to ssh" verdict.
+	if seg.pipedStdin && !sshTunnelsStdinProgram(seg.argv) {
 		if lang, isProg := stdinProgramHead(seg.argv); isProg {
 			if lang == "" {
 				return "piped code to shell"
@@ -2338,7 +2671,7 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 			return hit
 		}
 	}
-	return peelResolvedDepth(seg.argv, kind, depth, caller)
+	return peelResolvedSegDepth(seg.argv, seg, kind, depth, caller)
 }
 
 // screenSegmentHeredocsDepth screens heredoc bodies that feed a shell/interpreter
@@ -5630,7 +5963,9 @@ var codeSpawnPrims = []string{
 // codeAgentNames are the blocked nested-agent identifiers inside code.
 // Derived from the same list as blockedAgentExecutables so argv and code
 // screens stay aligned.
-var codeAgentNames = append([]string(nil), blockedAgentExecutableList...)
+// ssh stays in codeAgentNames so Python/JS dynamic subprocess.run("ssh ...")
+// remains fail-closed even though shell/argv ssh is peeled via screenSSHHead.
+var codeAgentNames = append(append([]string(nil), blockedAgentExecutableList...), "ssh")
 
 // codeWritePrims are file write/delete/mutate primitives for strict
 // read-only, matched with identifier-boundary edges. Call sites that take a
@@ -8311,7 +8646,7 @@ func (g guardCall) guardCtxRunArgv(argv []string) (rule, detail string) {
 	}
 	if g.subagent {
 		if hit := peelResolvedDepth(argv, 's', 0, currentCallerIdentity()); hit != "" {
-			if hit == "ctxmode index" {
+			if hit == "ctxmode index" || hit == roSSHWriteHit {
 				return ruleReadonlyWrite, hit
 			}
 			return ruleSubagentNestedAgent, hit
@@ -8332,7 +8667,7 @@ func (g guardCall) guardCtxRunShell(code string) (rule, detail string) {
 	}
 	if g.subagent {
 		if hit := guardShellSubagentDepth(code, 0, currentCallerIdentity()); hit != "" {
-			if hit == "ctxmode index" {
+			if hit == "ctxmode index" || hit == roSSHWriteHit {
 				return ruleReadonlyWrite, hit
 			}
 			return ruleSubagentNestedAgent, hit
@@ -8350,8 +8685,16 @@ func (g guardCall) guardCtxRunShell(code string) (rule, detail string) {
 // from stdin: a shell with no -c payload (unwrapShellArgv already checked)
 // or a scripting interpreter with no inline-code flag. Returns (lang, true)
 // where lang is "" for a shell head or the guardCtxRunCode language.
+// An ssh head resolves through its option run (parseSSHInvocation) to the
+// remote command, whose own heads inherit the verdict: `argv=["ssh","dmit",
+// "sh"]` forwards the caller's stdin to a remote shell reading its PROGRAM
+// from that stream, so the stdin payload is remote code, not data.
 func stdinProgramHead(argv []string) (lang string, isInterp bool) {
-	if len(argv) == 0 {
+	return stdinProgramHeadDepth(argv, 0)
+}
+
+func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool) {
+	if len(argv) == 0 || depth >= shellSplitMaxDepth {
 		return "", false
 	}
 	i, _, _, _ := peelWrappers(argv)
@@ -8360,17 +8703,28 @@ func stdinProgramHead(argv []string) (lang string, isInterp bool) {
 	}
 	head := argv[i:]
 	base := filepath.Base(head[0])
-	// shell -c: stdin is data for the outer shell, but recurse into -c text
-	// in case the inner command is a bare interpreter reading THIS stdin.
-	if innerText, has := unwrapShellArgv(head); has {
-		for _, seg := range splitShellSegments(innerText) {
-			if len(seg.argv) == 0 {
+	// An ssh head forwards stdin to the remote command's stdin: resolve the
+	// remote invocation and ask whether any remote head reads its program
+	// from that stream. Malformed invocations keep their argv/shell hits;
+	// here only the bare-host/missing-remote shape returns a parse hit, and
+	// with no remote command stdin is pure data for the login shell anyway.
+	if base == "ssh" || resolveHeadBase(head[0]) == "ssh" {
+		remoteCmd, hit := parseSSHInvocation(head)
+		if hit != "" {
+			return "", false
+		}
+		for _, seg := range splitShellSegments(remoteCmd) {
+			if seg.depthExceeded || len(seg.argv) == 0 {
 				continue
 			}
-			if lang, ok := stdinProgramHead(seg.argv); ok {
-				return lang, true
+			if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+				return l, true
 			}
 		}
+		return "", false
+	}
+	// A `shell -c 'code'` argv carries its program inline — stdin is data.
+	if _, has := unwrapShellArgv(head); has {
 		return "", false
 	}
 	// An interpreter with -c/-e/-r/-m/-p inline code likewise.
@@ -8421,11 +8775,39 @@ func stdinProgramHead(argv []string) (lang string, isInterp bool) {
 	return "", false
 }
 
+// sshTunnelsStdinProgram reports whether the peeled argv head is an ssh
+// invocation whose remote command contains a head that reads its PROGRAM
+// from the forwarded stdin stream (`ssh dmit sh`, `ssh dmit python3 -`).
+// A ctx_run stdin payload then lands as remote CODE on another host: a
+// read-only-but-not-strict caller (verifier, bare CTXMODE_READONLY=1) loses
+// the local /tmp exemption at the wire and the payload gets the strict
+// read-only screen.
+func sshTunnelsStdinProgram(argv []string) bool {
+	i, _, _, _ := peelWrappers(argv)
+	if i >= len(argv) {
+		return false
+	}
+	head := argv[i:]
+	base := filepath.Base(head[0])
+	if base != "ssh" && resolveHeadBase(head[0]) != "ssh" {
+		return false
+	}
+	remoteCmd, hit := parseSSHInvocation(head)
+	if hit != "" {
+		return false
+	}
+	return remoteReadsProgramFromStdin(remoteCmd)
+}
+
 // guardCtxRunStdin screens a ctx_run stdin payload when the argv's resolved
 // head is a shell or interpreter that reads its program from stdin
 // (`argv=["sh"]`, `argv=["python3","-"]`, etc.). Inline-code spellings
 // (`sh -c`, `python3 -c`, `node -e`, `perl -e`, `php -r`, `python -m`) mean
-// stdin is data, not the program, and are not screened here.
+// stdin is data, not the program, and are not screened here. An ssh head
+// whose REMOTE command reads its program from stdin
+// (`argv=["ssh","dmit","sh"]`) counts too — ssh forwards the stream — and
+// additionally upgrades a read-only-but-not-strict caller to the strict
+// screen since the bytes leave this host.
 func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail string) {
 	if stdin == "" || (!g.subagent && !g.strictReadonly) {
 		return "", ""
@@ -8433,6 +8815,9 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 	lang, isProg := stdinProgramHead(argv)
 	if !isProg {
 		return "", ""
+	}
+	if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(argv) {
+		g.strictReadonly = true
 	}
 	if lang == "" {
 		// Shell head: stdin is shell code.
@@ -8443,7 +8828,8 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 
 // guardCtxRunStdinForCommand is the command-string variant of
 // guardCtxRunStdin: it splits the command into segments and checks each
-// peeled head for a shell/interpreter reading stdin.
+// peeled head for a shell/interpreter reading stdin — including a head
+// reached through an ssh remote command.
 func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, detail string) {
 	if stdin == "" || (!g.subagent && !g.strictReadonly) {
 		return "", ""
@@ -8462,6 +8848,9 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 			continue
 		}
 		if lang, isProg := stdinProgramHead(seg.argv); isProg {
+			if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(seg.argv) {
+				g.strictReadonly = true
+			}
 			if lang == "" {
 				return g.guardCtxRunShell(stdin)
 			}
