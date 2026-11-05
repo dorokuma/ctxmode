@@ -19,18 +19,6 @@ import (
 // AlFix6: AUDIT3 red tests + dash differential argv comparison + fuzz.
 // ---------------------------------------------------------------------------
 
-const argvPrintFlag = "--ctxmode-argv-print"
-
-func skipArgvPrintUnderRace(t *testing.T) {
-	t.Helper()
-	// AlFix7: independent argvprinter binary; no race skip.
-}
-
-func alfix6TestBin(t *testing.T) string {
-	t.Helper()
-	return ensureArgvPrinter(t)
-}
-
 // replaceCmdHead rewrites the first bare word of a simple shell command with
 // replacement (used to swap dangerous heads for the test binary).
 func replaceCmdHead(code, replacement string) string {
@@ -413,12 +401,10 @@ func TestAlFix6_WorkerStillAllowsNesting(t *testing.T) {
 // ---------- Real dash / bash differential argv tests ----------
 
 func TestAlFix6_DashArgvDiff(t *testing.T) {
-	skipArgvPrintUnderRace(t)
 	if _, err := exec.LookPath("/bin/sh"); err != nil {
 		t.Skip("no /bin/sh")
 	}
-	bin := alfix6TestBin(t)
-	printer := bin
+	printer := ensureArgvPrinter(t)
 
 	type tc struct {
 		name string
@@ -527,7 +513,7 @@ func TestAlFix6_DashArgvDiff(t *testing.T) {
 				}
 				return
 			}
-			// Printer emits Args[2:] (operands only). Compare to Go argv[1:].
+			// Absolute argvprinter path → argv[0]=argvprinter; compare operands to Go argv[1:].
 			dashCode := replaceCmdHead(c.code, printer)
 			dashOut, raw, err := dashArgv(t, "/bin/sh", dashCode)
 			if err != nil {
@@ -565,7 +551,7 @@ func TestAlFix6_DashArgvDiff_MultiSeg(t *testing.T) {
 			if depthEx {
 				return
 			}
-			miss := dashExecutedUnknown(goArgvs, dashArgvs)
+			miss := dashExecutedUnknown(filterExternalArgvs(goArgvs), dashArgvs)
 			if len(miss) > 0 {
 				t.Fatalf("dash ran %v not seen by AST; go=%s dash=%s", miss, fmtArgvs(goArgvs), fmtArgvs(dashArgvs))
 			}
@@ -584,12 +570,10 @@ func TestAlFix6_BashSubagent_FakeArith(t *testing.T) {
 // ---------- Fuzz / mutation differential (printer only, fixed seed) ----------
 
 func TestAlFix6_FuzzArgvDiff(t *testing.T) {
-	skipArgvPrintUnderRace(t)
 	if testing.Short() {
 		t.Skip("short")
 	}
-	bin := alfix6TestBin(t)
-	printer := bin
+	printer := ensureArgvPrinter(t)
 	rng := rand.New(rand.NewSource(20261104))
 
 	safeChars := []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-+.=/@:")
@@ -721,8 +705,7 @@ func TestAlFix6_SyntaxHints(t *testing.T) {
 
 // Ensure test binary path is absolute for dash.
 func TestAlFix6_PrinterSelfCheck(t *testing.T) {
-	skipArgvPrintUnderRace(t)
-	bin := alfix6TestBin(t)
+	bin := ensureArgvPrinter(t)
 	if !filepath.IsAbs(bin) {
 		t.Fatalf("executable not absolute: %q", bin)
 	}

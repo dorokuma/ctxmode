@@ -456,6 +456,108 @@ func isDashBuiltin(name string) bool {
 	return false
 }
 
+// filterExternalArgvs drops dash builtins (they never hit the printer PATH).
+func filterExternalArgvs(argvs [][]string) [][]string {
+	var out [][]string
+	for _, a := range argvs {
+		if len(a) == 0 || isDashBuiltin(a[0]) {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// isRealWrapper reports wrappers/interpreters that resolve to real binaries.
+func isRealWrapper(name string) bool {
+	for _, w := range realWrapperBins {
+		if name == w {
+			return true
+		}
+	}
+	return false
+}
+
+// staticLeafArgvs keeps argvprinter-leaf commands (not builtins, not real wrappers)
+// for deep argv[0]+argv[1:] matching against dash printer captures.
+func staticLeafArgvs(argvs [][]string) [][]string {
+	var out [][]string
+	for _, a := range argvs {
+		if len(a) == 0 || isDashBuiltin(a[0]) || isRealWrapper(a[0]) {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// argvHasDynamic reports placeholders left by the AST for non-static words.
+func argvHasDynamic(a []string) bool {
+	for _, s := range a {
+		if strings.Contains(s, cmdSubPlaceholder) || strings.Contains(s, dynamicRedirectTarget) ||
+			strings.Contains(s, envUnknownLongPrefix) || strings.HasPrefix(s, "__ctx_") {
+			return true
+		}
+	}
+	return false
+}
+
+// staticConcreteLeafArgvs keeps printer-leaf commands with fully static argv
+// (no __ctx_cmdsub__ / dynamic placeholders) for deep argv[0]+argv[1:] checks.
+func staticConcreteLeafArgvs(argvs [][]string) [][]string {
+	var out [][]string
+	for _, a := range staticLeafArgvs(argvs) {
+		if argvHasDynamic(a) {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// leafArgvDeepAgree reports whether every dash leaf whose argv[0] appears in
+// goLeaves has an exact full argv[0]+argv[1:] match among those Go leaves.
+// Go-only over-parses are ignored; unknown dash heads use dashExecutedUnknown.
+func leafArgvDeepAgree(goLeaves, dashLeaves [][]string) bool {
+	byHead := map[string][][]string{}
+	for _, g := range goLeaves {
+		if len(g) == 0 {
+			continue
+		}
+		byHead[g[0]] = append(byHead[g[0]], g)
+	}
+	for _, d := range dashLeaves {
+		if len(d) == 0 {
+			continue
+		}
+		cands := byHead[d[0]]
+		if len(cands) == 0 {
+			continue
+		}
+		ok := false
+		for _, g := range cands {
+			if len(g) != len(d) {
+				continue
+			}
+			eq := true
+			for k := range g {
+				if g[k] != d[k] {
+					eq = false
+					break
+				}
+			}
+			if eq {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // dashExecutedUnknown reports whether dash ran a command name that Go did not
 // list in any segment argv[0]. This is the Must-Fix-1 failure shape.
 func dashExecutedUnknown(goArgvs, dashArgvs [][]string) []string {
@@ -608,7 +710,8 @@ func runDashDiffCases(t *testing.T, cases []dashDiffCase) (mismatches []string) 
 				return
 			}
 
-			miss := dashExecutedUnknown(goArgvs, dashArgvs)
+			goExt := filterExternalArgvs(goArgvs)
+			miss := dashExecutedUnknown(goExt, dashArgvs)
 			if len(miss) > 0 && !depthEx {
 				msg := fmt.Sprintf("%s: dash ran cmds Go missed: %v\ncode=%q\ngo:\n%sdash:\n%sraw=%q",
 					c.name, miss, c.code, fmtArgvs(goArgvs), fmtArgvs(dashArgvs), raw)
@@ -616,18 +719,19 @@ func runDashDiffCases(t *testing.T, cases []dashDiffCase) (mismatches []string) 
 				t.Error(msg)
 				return
 			}
-			// Segment count mismatch when Go sees 0 but dash ran ≥1 (MF1 shape).
-			if len(goArgvs) == 0 && len(dashArgvs) > 0 && !depthEx {
-				msg := fmt.Sprintf("%s: Go 0 segs but dash ran %d\ncode=%q\ndash:\n%s",
+			// Segment count mismatch when Go sees 0 externals but dash ran ≥1 (MF1 shape).
+			if len(goExt) == 0 && len(dashArgvs) > 0 && !depthEx {
+				msg := fmt.Sprintf("%s: Go 0 external segs but dash ran %d\ncode=%q\ndash:\n%s",
 					c.name, len(dashArgvs), c.code, fmtArgvs(dashArgvs))
 				mismatches = append(mismatches, msg)
 				t.Error(msg)
 				return
 			}
 			if c.compareFull && !depthEx {
-				if !argvsEqual(goArgvs, dashArgvs) {
-					msg := fmt.Sprintf("%s: argv sequence mismatch\ncode=%q\ngo:\n%sdash:\n%sraw=%q",
-						c.name, c.code, fmtArgvs(goArgvs), fmtArgvs(dashArgvs), raw)
+				// Full argv[0]+argv[1:] compare for external commands only.
+				if !argvsEqual(goExt, dashArgvs) {
+					msg := fmt.Sprintf("%s: argv sequence mismatch\ncode=%q\ngoExt:\n%sdash:\n%sraw=%q",
+						c.name, c.code, fmtArgvs(goExt), fmtArgvs(dashArgvs), raw)
 					mismatches = append(mismatches, msg)
 					t.Error(msg)
 				}
@@ -877,30 +981,62 @@ func TestAlFix7_FuzzArgvDiff(t *testing.T) {
 			code = strings.Join(parts, "")
 		}
 
-		// Guard first: if worker allows, dash must never execute pig, and every
-		// dash external head must appear in Go AST argv[0] set.
+		// Guard first: if worker allows, dash must never execute pig/agy, and
+		// static-leaf full argv must agree with Go AST. When parseReadonlyShellAST
+		// allows, also require concrete static-leaf argv[0]+argv[1:] agreement.
 		hit := guardShellSubagent(code)
 		goArgvs, depthEx := collectGoCmdArgvs(code)
+		roArgvs, roReject := parseReadonlyShellAST(code)
 		names := namesFromGoArgvs(goArgvs)
 		names = append(names, "p1", "p2", "pig", "agy", "cat", "env", "nice", "printargv")
 		pathDir, outFile := setupPrinterPATH(t, names)
 		_ = os.Remove(outFile)
 		dashArgvs, _, _ := runDashCollectArgvs(t, code, pathDir, outFile)
 
+		goExt := filterExternalArgvs(goArgvs)
+
 		if hit == "" {
 			for _, a := range dashArgvs {
-				if len(a) > 0 && a[0] == "pig" {
+				if len(a) == 0 {
+					continue
+				}
+				if a[0] == "pig" || a[0] == "agy" {
 					bypasses++
 					if bypasses <= 5 {
-						t.Fatalf("BYPASS FOUND: worker guard allowed script that executed pig in dash: %q", code)
+						t.Fatalf("BYPASS FOUND: worker guard allowed script that executed %s in dash: %q", a[0], code)
 					}
 				}
 			}
-			miss := dashExecutedUnknown(goArgvs, dashArgvs)
+			miss := dashExecutedUnknown(goExt, dashArgvs)
 			if len(miss) > 0 && !depthEx {
 				mismatches++
 				if mismatches <= 10 {
 					t.Logf("AST BLINDSPOT i=%d miss=%v code=%q", i, miss, code)
+				}
+			}
+			// Concrete static-leaf full argv must agree with dash captures.
+			if !depthEx {
+				goLeaves := staticConcreteLeafArgvs(goExt)
+				dashLeaves := staticLeafArgvs(dashArgvs)
+				if !leafArgvDeepAgree(goLeaves, dashLeaves) {
+					mismatches++
+					if mismatches <= 10 {
+						t.Logf("LEAF ARGV MISMATCH i=%d code=%q goLeaves=%s dashLeaves=%s",
+							i, code, fmtArgvs(goLeaves), fmtArgvs(dashLeaves))
+					}
+				}
+			}
+		}
+
+		// Readonly AST allow path: concrete static-leaf full argv must agree with dash.
+		if roReject == "" && !depthEx {
+			roLeaves := staticConcreteLeafArgvs(filterExternalArgvs(roArgvs))
+			dashLeaves := staticLeafArgvs(dashArgvs)
+			if !leafArgvDeepAgree(roLeaves, dashLeaves) {
+				mismatches++
+				if mismatches <= 10 {
+					t.Logf("RO FULL ARGV MISMATCH i=%d code=%q roLeaves=%s dashLeaves=%s",
+						i, code, fmtArgvs(roLeaves), fmtArgvs(dashLeaves))
 				}
 			}
 		}
@@ -942,16 +1078,17 @@ func TestAlFix7_CaptureBaselineMismatches(t *testing.T) {
 		}
 		pathDir, outFile := setupPrinterPATH(t, names)
 		dashArgvs, raw, _ := runDashCollectArgvs(t, c.code, pathDir, outFile)
-		miss := dashExecutedUnknown(goArgvs, dashArgvs)
+		goExt := filterExternalArgvs(goArgvs)
+		miss := dashExecutedUnknown(goExt, dashArgvs)
 		fail := false
 		reason := ""
-		if len(goArgvs) == 0 && len(dashArgvs) > 0 && !depthEx {
+		if len(goExt) == 0 && len(dashArgvs) > 0 && !depthEx {
 			fail = true
 			reason = "Go0_dashN"
 		} else if len(miss) > 0 && !depthEx {
 			fail = true
 			reason = "dash_unknown:" + strings.Join(miss, ",")
-		} else if c.compareFull && !depthEx && !argvsEqual(goArgvs, dashArgvs) {
+		} else if c.compareFull && !depthEx && !argvsEqual(goExt, dashArgvs) {
 			fail = true
 			reason = "argv_mismatch"
 		} else if c.expectDashRuns && len(dashArgvs) == 0 {
