@@ -18,6 +18,8 @@ import (
 
 // ---------------------------------------------------------------------------
 // AlFix7: real dash argv differential tests (independent printer, race-safe).
+// Host-safety hardened: no auto-delete under /, absolute redirects gated,
+// write-dangerous names → argvprinter, fuzz corpus free of /, .., cd, ~.
 // ---------------------------------------------------------------------------
 
 var (
@@ -111,32 +113,87 @@ func collectGoCmdArgvs(code string) (argvs [][]string, depthExceeded bool) {
 	return argvs, depthExceeded
 }
 
-// setupPrinterPATH creates a temp dir containing symlinks named after each
-// command head pointing at the argv printer. Returns (pathDir, outFile).
+// realWrapperBins are wrappers/interpreters that must resolve to real system
+// binaries so MF-6-style env/nice/xargs/find peeling still works under PATH.
+var realWrapperBins = []string{
+	"sh", "dash", "bash", "env", "nice", "timeout", "xargs", "find",
+	"stdbuf", "setsid", "flock", "nohup",
+}
+
+// argvPrinterLeafNames are leaf probes, blocked targets, and write-dangerous
+// command names that must NEVER resolve to real binaries in the test PATH.
+var argvPrinterLeafNames = []string{
+	"p1", "p2", "p3", "probe", "printargv", "pig", "pi", "agy",
+	"dispatch-agent", "dispatch-agent-go", "grok", "tmux", "screen", "sudo",
+	"rg", "ls", "cat", "git", "rm", "mv", "cp", "tee", "dd", "chmod", "ln",
+	"herdr", "herdsman", "ctxmode", "head", "tail", "wc", "sort", "uniq",
+	"cut", "tr", "jq", "diff", "stat", "file", "du", "df",
+	"python3", "node", "perl", "ruby", "php",
+}
+
+func lookRealBin(name string) string {
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
+	for _, d := range []string{"/bin", "/usr/bin"} {
+		cand := filepath.Join(d, name)
+		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+			return cand
+		}
+	}
+	return ""
+}
+
+// setupPrinterPATH creates a temp dir with:
+//   - real symlinks for wrappers/interpreters (sh/env/nice/find/…)
+//   - argvprinter symlinks for leaf probes + write-dangerous names
+//
+// Dash builtins (echo/true/false/test/[) are NOT faked into PATH.
 func setupPrinterPATH(t *testing.T, names []string) (pathDir, outFile string) {
 	t.Helper()
 	printer := ensureArgvPrinter(t)
 	pathDir = t.TempDir()
 	outFile = filepath.Join(t.TempDir(), "argv.jsonl")
 	seen := map[string]bool{}
-	for _, n := range names {
-		base := filepath.Base(n)
+
+	linkPrinter := func(base string) {
 		if base == "" || base == "." || base == "/" || seen[base] {
-			continue
+			return
+		}
+		if isDashBuiltin(base) {
+			return
 		}
 		seen[base] = true
-		link := filepath.Join(pathDir, base)
-		if err := os.Symlink(printer, link); err != nil {
-			t.Fatalf("symlink %s: %v", base, err)
+		if err := os.Symlink(printer, filepath.Join(pathDir, base)); err != nil {
+			t.Fatalf("symlink printer %s: %v", base, err)
 		}
 	}
-	// Also provide common shells/builtins that dash may search for.
-	for _, extra := range []string{"true", "false", "echo", "printf", "cat", "test", "[", "printargv", "pig", "agy", "rm", "ls", "rg", "nice", "bash", "env", "sh", "head", "tail", "git", "ctxmode", "herdr", "find", "wc", "p1", "p2", "p3", "probe", "xargs", "python3"} {
-		if seen[extra] {
-			continue
+	linkReal := func(base string) {
+		if base == "" || seen[base] {
+			return
 		}
-		seen[extra] = true
-		_ = os.Symlink(printer, filepath.Join(pathDir, extra))
+		seen[base] = true
+		target := lookRealBin(base)
+		if target == "" {
+			// Missing wrapper: fall back to printer so PATH stays closed.
+			if err := os.Symlink(printer, filepath.Join(pathDir, base)); err != nil {
+				t.Fatalf("symlink fallback %s: %v", base, err)
+			}
+			return
+		}
+		if err := os.Symlink(target, filepath.Join(pathDir, base)); err != nil {
+			t.Fatalf("symlink real %s -> %s: %v", base, target, err)
+		}
+	}
+
+	for _, n := range realWrapperBins {
+		linkReal(n)
+	}
+	for _, n := range argvPrinterLeafNames {
+		linkPrinter(n)
+	}
+	for _, n := range names {
+		linkPrinter(filepath.Base(n))
 	}
 	return pathDir, outFile
 }
@@ -151,19 +208,185 @@ func namesFromGoArgvs(argvs [][]string) []string {
 	return names
 }
 
+// snapshotRootDir records the set of names present directly under "/".
+func snapshotRootDir(t *testing.T) map[string]struct{} {
+	t.Helper()
+	ents, err := os.ReadDir("/")
+	if err != nil {
+		t.Fatalf("snapshot /: %v", err)
+	}
+	m := make(map[string]struct{}, len(ents))
+	for _, e := range ents {
+		m[e.Name()] = struct{}{}
+	}
+	return m
+}
+
+// assertRootDirUnchanged fails if "/" gained new entries.
+// It NEVER deletes or modifies anything under "/".
+func assertRootDirUnchanged(t *testing.T, before map[string]struct{}) {
+	t.Helper()
+	ents, err := os.ReadDir("/")
+	if err != nil {
+		t.Fatalf("re-read /: %v", err)
+	}
+	var added []string
+	for _, e := range ents {
+		if _, ok := before[e.Name()]; !ok {
+			added = append(added, e.Name())
+		}
+	}
+	if len(added) > 0 {
+		t.Fatalf("host safety: new entries appeared under /: %v (report only; nothing deleted)", added)
+	}
+}
+
+// takeRedirectWord returns the next shell word at s[0:] (quoted or bare) and
+// the number of bytes consumed. Quotes are stripped for the returned value;
+// glued quote/bare tails are concatenated (e.g. '/dev/null'foo → /dev/nullfoo).
+func takeRedirectWord(s string) (word string, n int) {
+	if s == "" {
+		return "", 0
+	}
+	i := 0
+	var b strings.Builder
+	for i < len(s) {
+		switch s[i] {
+		case ' ', '\t', '\n', '\r', ';', '&', '|', '<', '>', '(', ')', '\x00':
+			return b.String(), i
+		case '\'':
+			i++
+			for i < len(s) && s[i] != '\'' {
+				b.WriteByte(s[i])
+				i++
+			}
+			if i < len(s) {
+				i++ // closing '
+			}
+		case '"':
+			i++
+			for i < len(s) && s[i] != '"' {
+				if s[i] == '\\' && i+1 < len(s) {
+					b.WriteByte(s[i+1])
+					i += 2
+					continue
+				}
+				b.WriteByte(s[i])
+				i++
+			}
+			if i < len(s) {
+				i++ // closing "
+			}
+		case '\\':
+			if i+1 < len(s) {
+				b.WriteByte(s[i+1])
+				i += 2
+			} else {
+				b.WriteByte('\\')
+				i++
+			}
+		default:
+			b.WriteByte(s[i])
+			i++
+		}
+	}
+	return b.String(), i
+}
+
+// isSafeRedirectForTestExec reports whether code is safe to feed to /bin/sh.
+// Unsafe = any redirect target that starts with "/" and is not exactly
+// "/dev/null" (word boundary). Heredocs and fd-duplication (>&N) are ignored.
+// On unsafe, callers must NOT exec /bin/sh.
+func isSafeRedirectForTestExec(code string) bool {
+	i := 0
+	for i < len(code) {
+		// Skip single-quoted regions so literal > inside quotes is ignored.
+		if code[i] == '\'' {
+			i++
+			for i < len(code) && code[i] != '\'' {
+				i++
+			}
+			if i < len(code) {
+				i++
+			}
+			continue
+		}
+		if code[i] == '"' {
+			i++
+			for i < len(code) && code[i] != '"' {
+				if code[i] == '\\' && i+1 < len(code) {
+					i += 2
+					continue
+				}
+				i++
+			}
+			if i < len(code) {
+				i++
+			}
+			continue
+		}
+		if code[i] == '\\' && i+1 < len(code) {
+			i += 2
+			continue
+		}
+
+		c := code[i]
+		if c != '>' && c != '<' {
+			i++
+			continue
+		}
+		// Heredoc << / <<- : not a file redirect target we gate.
+		if c == '<' && i+1 < len(code) && code[i+1] == '<' {
+			i += 2
+			continue
+		}
+		j := i + 1
+		if c == '>' && j < len(code) && (code[j] == '>' || code[j] == '|') {
+			j++ // >> or >|
+		}
+		// Fd duplication: >&1 / <&0 — no path target.
+		if j < len(code) && code[j] == '&' {
+			i = j + 1
+			continue
+		}
+		for j < len(code) && (code[j] == ' ' || code[j] == '\t') {
+			j++
+		}
+		if j >= len(code) {
+			return true
+		}
+		target, _ := takeRedirectWord(code[j:])
+		if strings.HasPrefix(target, "/") && target != "/dev/null" {
+			return false
+		}
+		i = j
+	}
+	return true
+}
+
 // runDashCollectArgvs executes code under /bin/sh with PATH limited to the
 // printer directory. Returns the JSONL-decoded argv sequences dash invoked.
+// Host safety: skips exec when redirects target absolute paths other than
+// /dev/null; snapshots "/" around the run and fails on new entries (never deletes).
 func runDashCollectArgvs(t *testing.T, code, pathDir, outFile string) ([][]string, string, error) {
 	t.Helper()
+	if !isSafeRedirectForTestExec(code) {
+		return nil, "", nil
+	}
+	before := snapshotRootDir(t)
+	defer assertRootDirUnchanged(t, before)
+
 	_ = os.Remove(outFile)
+	workDir := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", code)
-	cmd.Dir = t.TempDir()
+	cmd.Dir = workDir
 	cmd.Env = []string{
 		"PATH=" + pathDir,
 		"CTXMODE_ARGV_OUT=" + outFile,
-		"HOME=" + cmd.Dir,
+		"HOME=" + workDir,
+		"TMPDIR=" + workDir,
 		"LANG=C",
 	}
 	var buf bytes.Buffer
@@ -357,10 +580,15 @@ func runDashDiffCases(t *testing.T, cases []dashDiffCase) (mismatches []string) 
 		t.Skip("no /bin/sh")
 	}
 	_ = ensureArgvPrinter(t)
+	rootBefore := snapshotRootDir(t)
+	t.Cleanup(func() { assertRootDirUnchanged(t, rootBefore) })
 
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
+			before := snapshotRootDir(t)
+			t.Cleanup(func() { assertRootDirUnchanged(t, before) })
+
 			goArgvs, depthEx := collectGoCmdArgvs(c.code)
 			// Always install printer names for expected dash heads + common set.
 			names := namesFromGoArgvs(goArgvs)
@@ -557,6 +785,9 @@ func TestAlFix7_ShouldFix_Allowlist(t *testing.T) {
 func TestAlFix7_FuzzArgvDiff(t *testing.T) {
 	t.Setenv(auditEnvRole, "worker")
 	t.Setenv(auditEnvReadonly, "")
+	rootBefore := snapshotRootDir(t)
+	t.Cleanup(func() { assertRootDirUnchanged(t, rootBefore) })
+
 	const seed = 20261104
 	rng := rand.New(rand.NewSource(seed))
 	N := 20000
@@ -565,6 +796,7 @@ func TestAlFix7_FuzzArgvDiff(t *testing.T) {
 	}
 
 	// Byte fragments with NO implicit surrounding spaces (PLAN §5.3).
+	// Host safety: no "/", "..", "cd", or "~" in any frag.
 	frags := []string{
 		"p1", "p2", "pig",
 		" ", "\t", "\n", ";", "|", "&&", "||",
@@ -573,8 +805,9 @@ func TestAlFix7_FuzzArgvDiff(t *testing.T) {
 		"cat <<EOF\n", "cat <<'EOF'\n", "cat <<EO\\\nF\n", "cat <<\"\\$EOF\"\n",
 		"\nEOF\n", "\n$EOF\n", "\n)\nEOF\n",
 		"case $? in 0) p1;; esac", "case x in x) pig;; esac",
-		"# \\\np1\n", "2\\\n>/dev/null", "'2'>/dev/null",
+		"# \\\np1\n", "2\\\n>sink", "'2'>sink",
 	}
+	// Host safety: no "/", "..", "cd", or "~"; redirects use relative sink.
 	templates := []string{
 		"p1 $(p2)",
 		"p1 ${x:-p2}",
@@ -599,7 +832,7 @@ func TestAlFix7_FuzzArgvDiff(t *testing.T) {
 		"f() { pig; }; p1",
 		"((pig))",
 		"p1 <<EOF\n$\\\n(pig)\nEOF",
-		"echo \"$(echo case in)\" >/dev/null ; pig",
+		"echo \"$(echo case in)\" >sink ; pig",
 		"nice -n 1 pig",
 		"p1 `pig`",
 		"p1 `\\`pig\\``",
