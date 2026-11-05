@@ -172,3 +172,98 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "…"
 }
+
+// astMustRedRound9Cases is the PLAN9 must-red table (TASK correction for R9_SF2_01).
+// MF2_01 / MF3_03 restore backtick escapes that markdown stripped from PLAN9.
+func astMustRedRound9Cases() []astRedCase {
+	return []astRedCase{
+		{"R9_MF1_01", "case x in x) echo 'a'#; pig\n;; esac", "worker", true, "MF-1 case arm quote-adjacent #"},
+		{"R9_MF1_02", "(echo $(echo 'a'#) ; pig ; (true\n))", "worker", true, "MF-1 cmdsubst quote-adjacent #"},
+		{"R9_MF1_03", "case x in x) echo 'a'\\\n#; pig\n;; esac", "worker", true, "MF-1 quote then \\\n then #"},
+		{"R9_MF1_04", "echo \\ #; rm -rf /tmp/x", "ro", true, "MF-1 escaped-space before #"},
+		{"R9_MF2_01", "sh -c \"\\`pig\\`\"", "worker", true, "MF-2 dq backtick unescape into sh -c"},
+		{"R9_MF2_02", "sh -c \"echo \\\"\\$(pig)\\\"\"", "worker", true, "MF-2 dq \\$ unescape into sh -c"},
+		{"R9_MF2_03", "eval \"echo \\\"\\$(pig)\\\"\"", "worker", true, "MF-2 dq \\$ unescape into eval"},
+		{"R9_MF2_04", "rg \"\\$foo\" README.md", "ro", false, "MF-2 readonly rg \\$foo argv exact"},
+		{"R9_MF3_01", "sh <<EOF\necho \"\\\\\\\"; pig #\"\nEOF", "worker", true, "MF-3 unquoted heredoc \\\" unescape"},
+		{"R9_MF3_02", "sh <<EOF\ntrue ${UNSET:-; pig}\nEOF", "worker", true, "MF-3 unquoted heredoc param expand"},
+		{"R9_MF3_03", "sh <<EOF\n\\`pig\\`\nEOF", "worker", true, "MF-3 unquoted heredoc backtick unescape"},
+		{"R9_MF3_04", "sh <<EOF\np\\\\\nig\nEOF", "worker", true, "MF-3 unquoted heredoc line-cont splice"},
+		{"R9_MF4_01", "sh \"${UNSET:--c}\" pig", "worker", true, "MF-4 dynamic sh option word"},
+		{"R9_MF4_02", "python3 -c\"${UNSET:-__import__('os').system('pig')}\"", "worker", true, "MF-4 -c glued dynamic payload"},
+		{"R9_MF4_03", "find . \"${UNSET:--exec}\" pig \\;", "worker", true, "MF-4 find predicate dynamic"},
+		{"R9_MF4_04", "git -c\"${UNSET:-core.pager=pig}\" log", "worker", true, "MF-4 git -c glued dynamic"},
+		{"R9_MF4_05", "sh \"${UNSET:--s}\" <<'EOF'\npig\nEOF", "worker", true, "MF-4 dynamic sh -s still screens heredoc"},
+		{"R9_MF4_06", "env \"${UNSET:--a}\" true pig", "worker", true, "MF-4 env option-zone dynamic"},
+		{"R9_MF5_01", "# \\\nls", "ro", false, "MF-5 standalone comment \\ does not continue"},
+		{"R9_MF5_02", "ls # \\\nrm -rf /tmp/pwn", "ro", true, "MF-5 trailing comment ends with \\"},
+		{"R9_MF5_03", "echo a# \\\nls", "ro", true, "MF-5 word-internal a# then real \\\n"},
+		{"R9_MF6_01", "env -a p1 pig", "worker", true, "MF-6 env -a argv0 rewrite"},
+		{"R9_MF6_02", "nice -n 1 sh -c 'pig'", "worker", true, "MF-6 nice+sh nested wrapper"},
+		{"R9_SF1_01", "if [ -d /tmp ]; then echo ok; fi", "worker", false, "SF-1 standalone [ test allow"},
+		{"R9_SF1_02", "for d in /root /tmp; do [ -d \"$d\" ] && echo \"$d\"; done", "worker", false, "SF-1 loop [ test allow"},
+		{"R9_SF1_03", "/usr/bin/[p]ig", "worker", true, "SF-1 char-class glob cmd head"},
+		{"R9_SF2_01", "bash -c 'go version | head -1; echo \"rc=${PIPESTATUS[0]}\"'", "worker", false, "SF-2 TASK fix PIPESTATUS allow"},
+		{"R9_SF2_02", "bash -c '[[ -d /tmp ]] && pig'", "worker", true, "SF-2 bash [[ still catches pig"},
+		{"R9_SF3_01", "echo \"### build ###\" \\\n && echo done", "worker", false, "SF-3 dq # with line cont allow"},
+		{"R9_SF3_02", "sed 's/#foo/bar/' \\\n /tmp/test.txt", "worker", false, "SF-3 sq # with line cont allow"},
+		{"R9_SF4_01", "ls\r", "ro", true, "SF-4 CR byte reject"},
+		{"R9_SF4_02", "rg 'a\n\\\nb' README.md", "ro", false, "SF-4 sq embedded \\\n not cont"},
+		{"R9_AU1_01", "cat <<EOF\n$(true)\n${UNSET:-'$(pig)'}\nEOF", "worker", true, "Audit-1 heredoc param sq cmdsub"},
+		{"R9_AU1_02", "echo $(( ${UNSET:-'$(pig)'} + 0 ))", "worker", true, "Audit-1 arith param sq cmdsub"},
+		{"R9_AU2_01", "bash -O extglob -c 'pig'", "worker", true, "Audit-2 bash -O then -c"},
+		{"R9_AU2_02", "sh -s arg1 <<'EOF'\npig\nEOF", "worker", true, "Audit-2 sh -s reads stdin"},
+		{"R9_AU3_01", "export GIT_PAGER=pig; git log", "worker", true, "Audit-3 export GIT_PAGER"},
+		{"R9_AU3_02", ": $(( CTXMODE_READONLY = 0 ))", "worker", true, "Audit-3 arith assign role var"},
+		{"R9_AU4_01", "bash -c 'eval -- pig'", "worker", true, "Audit-4 eval -- peel"},
+		{"R9_SSH_01", "ssh dmit echo \"${UNSET:-; pig}\"", "worker", true, "SSH dynamic remote payload"},
+	}
+}
+
+// TestAST_MustRed_Round9 is the PLAN9 §must-red table (40 cases; PLAN said 36).
+func TestAST_MustRed_Round9(t *testing.T) {
+	cases := astMustRedRound9Cases()
+	for _, c := range cases {
+		c := c
+		t.Run(c.id, func(t *testing.T) {
+			setAstRole(t, c.role)
+			hit := runAstGuard(c.role, c.code)
+			allowed := hit == ""
+			if c.reject {
+				if allowed {
+					t.Fatalf("expected REJECT (%s) but guard allowed; code=%q", c.reason, c.code)
+				}
+			} else {
+				if !allowed {
+					t.Fatalf("expected ALLOW (%s) but guard rejected: %s; code=%q", c.reason, hit, c.code)
+				}
+			}
+		})
+	}
+	t.Logf("must-red round9 summary: cases=%d", len(cases))
+}
+
+// TestAST_Round9_BaselineSnapshot logs which Round9 must-red rows currently
+// pass/fail so REPORT can compare ce557f1 vs HEAD. It never fails.
+func TestAST_Round9_BaselineSnapshot(t *testing.T) {
+	var pass, fail []string
+	for _, c := range astMustRedRound9Cases() {
+		setAstRole(t, c.role)
+		hit := runAstGuard(c.role, c.code)
+		allowed := hit == ""
+		ok := (c.reject && !allowed) || (!c.reject && allowed)
+		line := c.id + " role=" + c.role + " reject=" + boolStr(c.reject)
+		if ok {
+			pass = append(pass, line+" PASS hit="+truncate(hit, 60))
+		} else {
+			fail = append(fail, line+" FAIL hit="+truncate(hit, 60))
+		}
+	}
+	t.Logf("PASS %d / FAIL %d (of %d)", len(pass), len(fail), len(pass)+len(fail))
+	for _, l := range fail {
+		t.Log("FAIL:", l)
+	}
+	for _, l := range pass {
+		t.Log("PASS:", l)
+	}
+}
