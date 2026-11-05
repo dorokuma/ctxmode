@@ -3,7 +3,6 @@ package main
 import (
 	"strings"
 	"unicode"
-	"unicode/utf8"
 )
 
 // checkReadonlyShellSyntax is the fail-closed minimal shell syntax gate for
@@ -14,49 +13,6 @@ func checkReadonlyShellSyntax(code string) string {
 	}
 	_, hit := parseReadonlyShellAST(code)
 	return hit
-}
-
-// roByteAllowlist rejects illegal UTF-8, C0 controls (except \t \n), DEL,
-// and Unicode control / special-space code points.
-func roByteAllowlist(code string) string {
-	if !utf8.ValidString(code) {
-		return "illegal UTF-8 Hint: 命令必须是合法 UTF-8"
-	}
-	for i := 0; i < len(code); {
-		b := code[i]
-		if b < 0x20 {
-			if b == '\t' || b == '\n' {
-				i++
-				continue
-			}
-			return "control character forbidden Hint: 禁止控制字符（含 \\r \\v \\f）；匹配回车请写 rg '\\r'"
-		}
-		if b == 0x7f {
-			return "control character forbidden Hint: 禁止 DEL (0x7f)"
-		}
-		if b < 0x80 {
-			i++
-			continue
-		}
-		r, size := utf8.DecodeRuneInString(code[i:])
-		if r == utf8.RuneError && size == 1 {
-			return "illegal UTF-8 Hint: 命令必须是合法 UTF-8"
-		}
-		if unicode.IsControl(r) || unicode.Is(unicode.Z, r) && r != ' ' {
-			// Reject Unicode controls and non-ASCII spaces (U+00A0, U+2000.., U+2028/9, …).
-			return "unicode control/space forbidden Hint: 禁止 Unicode 控制/特殊空白码点"
-		}
-		switch r {
-		case '\u0085', '\u00a0', '\u1680', '\u180e',
-			'\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005',
-			'\u2006', '\u2007', '\u2008', '\u2009', '\u200a',
-			'\u200b', '\u200c', '\u200d', '\u200e', '\u200f',
-			'\u2028', '\u2029', '\u202f', '\u205f', '\u3000', '\ufeff':
-			return "unicode control/space forbidden Hint: 禁止 Unicode 控制/特殊空白码点"
-		}
-		i += size
-	}
-	return ""
 }
 
 func roShellCheckCmdHead(word string) string {

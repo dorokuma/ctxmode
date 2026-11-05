@@ -28,10 +28,29 @@ func checkControlAndUTF8(code string) string {
 }
 
 // checkShellBytes runs shared control/UTF-8 checks; strictReadonly also rejects
-// Unicode controls and non-ASCII spaces (same policy as roByteAllowlist).
+// Unicode controls / non-ASCII spaces and attaches Chinese Hint: text.
 func checkShellBytes(code string, strictReadonly bool) string {
-	if hit := checkControlAndUTF8(code); hit != "" {
-		return hit
+	if !utf8.ValidString(code) {
+		if strictReadonly {
+			return "illegal UTF-8 Hint: 命令必须是合法 UTF-8"
+		}
+		return "illegal UTF-8"
+	}
+	for i := 0; i < len(code); i++ {
+		b := code[i]
+		if b == '\t' || b == '\n' {
+			continue
+		}
+		if b <= 0x08 || b == 0x0b || b == 0x0c || b == 0x0d ||
+			(b >= 0x0e && b <= 0x1f) || b == 0x7f {
+			if !strictReadonly {
+				return "control character forbidden"
+			}
+			if b == 0x7f {
+				return "control character forbidden Hint: 禁止 DEL (0x7f)"
+			}
+			return "control character forbidden Hint: 禁止控制字符（含 \\r \\v \\f）；匹配回车请写 rg '\\r'"
+		}
 	}
 	if !strictReadonly {
 		return ""
@@ -44,10 +63,10 @@ func checkShellBytes(code string, strictReadonly bool) string {
 		}
 		r, size := utf8.DecodeRuneInString(code[i:])
 		if r == utf8.RuneError && size == 1 {
-			return "illegal UTF-8"
+			return "illegal UTF-8 Hint: 命令必须是合法 UTF-8"
 		}
 		if unicode.IsControl(r) || (unicode.Is(unicode.Z, r) && r != ' ') {
-			return "unicode control/space forbidden"
+			return "unicode control/space forbidden Hint: 禁止 Unicode 控制/特殊空白码点"
 		}
 		switch r {
 		case '\u0085', '\u00a0', '\u1680', '\u180e',
@@ -55,53 +74,107 @@ func checkShellBytes(code string, strictReadonly bool) string {
 			'\u2006', '\u2007', '\u2008', '\u2009', '\u200a',
 			'\u200b', '\u200c', '\u200d', '\u200e', '\u200f',
 			'\u2028', '\u2029', '\u202f', '\u205f', '\u3000', '\ufeff':
-			return "unicode control/space forbidden"
+			return "unicode control/space forbidden Hint: 禁止 Unicode 控制/特殊空白码点"
 		}
 		i += size
 	}
 	return ""
 }
 
-// rawHasActiveLineCont reports a backslash-newline that is NOT inside a
-// # comment on its physical line. Comment-trailing \ does not continue
-// (D9 / dash); active continuations are folded away by mvdan before Word
-// spans are recorded, so readonly rejects them at source level.
-func rawHasActiveLineCont(code string) bool {
-	lineStart := 0
-	for i := 0; i < len(code); i++ {
-		if code[i] == '\n' {
-			lineStart = i + 1
-			continue
-		}
-		if code[i] != '\\' || i+1 >= len(code) || code[i+1] != '\n' {
-			continue
-		}
-		line := code[lineStart:i]
-		sq, dq := false, false
-		inComment := false
-		for j := 0; j < len(line); j++ {
-			c := line[j]
-			if !sq && !dq && c == '#' {
-				inComment = true
-				break
-			}
-			if !dq && c == '\'' {
-				sq = !sq
-				continue
-			}
-			if !sq && c == '"' {
-				dq = !dq
-				continue
-			}
-			if !sq && c == '\\' && j+1 < len(line) {
-				j++
-			}
-		}
-		if !inComment {
-			return true
-		}
+// checkCommentsAndContinuations validates KeepComments AST comment starts
+// (MF-1 / Audit-5) and comment/active line continuations (MF-5 / SF-3 / SF-4).
+func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly bool) string {
+	if f == nil {
+		return ""
 	}
-	return false
+	type span struct{ lo, hi int }
+	var comments []span
+	var sglQuoted []span
+	var ambig string
+	syntax.Walk(f, func(n syntax.Node) bool {
+		if n == nil || ambig != "" {
+			return false
+		}
+		switch x := n.(type) {
+		case *syntax.Comment:
+			off := int(x.Hash.Offset())
+			if off < 0 || off >= len(code) || code[off] != '#' {
+				ambig = "ambiguous comment start"
+				return false
+			}
+			if off > 0 {
+				prev := code[off-1]
+				switch prev {
+				case ' ', '\t', '\n', ';', '|', '&', '(', ')':
+					if off >= 2 && code[off-2] == '\\' {
+						ambig = "ambiguous comment start"
+						return false
+					}
+				default:
+					ambig = "ambiguous comment start"
+					return false
+				}
+			}
+			end := int(x.End().Offset())
+			if end < off {
+				end = off + 1
+			}
+			if end > len(code) {
+				end = len(code)
+			}
+			comments = append(comments, span{off, end})
+			// Trailing \ on a same-line (non-leading) comment must not continue.
+			trimmed := strings.TrimRight(x.Text, " \t\r\n")
+			if strings.HasSuffix(trimmed, `\`) {
+				lineStart := 0
+				if i := strings.LastIndex(code[:off], "\n"); i >= 0 {
+					lineStart = i + 1
+				}
+				prefix := code[lineStart:off]
+				hasNonWS := false
+				for j := 0; j < len(prefix); j++ {
+					if prefix[j] != ' ' && prefix[j] != '\t' {
+						hasNonWS = true
+						break
+					}
+				}
+				if hasNonWS {
+					ambig = "comment line continuation forbidden"
+					return false
+				}
+			}
+		case *syntax.SglQuoted:
+			lo, hi := int(x.Pos().Offset()), int(x.End().Offset())
+			if lo >= 0 && hi >= lo && hi <= len(code) {
+				sglQuoted = append(sglQuoted, span{lo, hi})
+			}
+		}
+		return true
+	})
+	if ambig != "" {
+		return ambig
+	}
+	if !strictReadonly {
+		return ""
+	}
+	inSpan := func(spans []span, i int) bool {
+		for _, s := range spans {
+			if i >= s.lo && i < s.hi {
+				return true
+			}
+		}
+		return false
+	}
+	for i := 0; i+1 < len(code); i++ {
+		if code[i] != '\\' || code[i+1] != '\n' {
+			continue
+		}
+		if inSpan(comments, i) || inSpan(sglQuoted, i) {
+			continue
+		}
+		return "backslash line continuation forbidden"
+	}
+	return ""
 }
 
 // parseReadonlyShellAST fail-closed-parses code under LangPOSIX and returns
@@ -110,15 +183,13 @@ func parseReadonlyShellAST(code string) (argvs [][]string, rejectReason string) 
 	if hit := checkShellBytes(code, true); hit != "" {
 		return nil, hit
 	}
-	// Reject active (non-comment) backslash-newline. mvdan folds those away
-	// before Word spans are recorded; comment-trailing \ does not continue (D9).
-	if rawHasActiveLineCont(code) {
-		return nil, "backslash line continuation forbidden"
-	}
-	parser := syntax.NewParser(syntax.Variant(syntax.LangPOSIX))
+	parser := syntax.NewParser(syntax.Variant(syntax.LangPOSIX), syntax.KeepComments(true))
 	file, err := parser.Parse(strings.NewReader(code), "")
 	if err != nil {
 		return nil, "shell syntax error: " + err.Error()
+	}
+	if hit := checkCommentsAndContinuations(code, file, true); hit != "" {
+		return nil, hit
 	}
 	var out [][]string
 	if hit := roWalkFile(code, file, &out); hit != "" {
@@ -206,9 +277,6 @@ func roWord(code string, w *syntax.Word, isHead bool) (string, string) {
 	if w == nil || len(w.Parts) == 0 {
 		return "", "empty command"
 	}
-	if raw, ok := rawSlice(code, w.Pos(), w.End()); ok && strings.Contains(raw, "\\\n") {
-		return "", "backslash line continuation forbidden"
-	}
 	if isHead {
 		if len(w.Parts) != 1 {
 			return "", "command head must be a plain literal"
@@ -229,6 +297,9 @@ func roWord(code string, w *syntax.Word, isHead bool) (string, string) {
 	for _, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
+			if strings.Contains(p.Value, `$`) {
+				return "", "shell expansion $ forbidden Hint: $ 只能放在单引号里"
+			}
 			if strings.Contains(p.Value, `\`) {
 				return "", "unquoted backslash forbidden Hint: 特殊字符请放进引号"
 			}
@@ -344,29 +415,6 @@ func rawSlice(code string, pos, end syntax.Pos) (string, bool) {
 	return code[lo:hi], true
 }
 
-// rawHasCommentLineCont reports a # comment physical line that ends with \.
-// dash always ends comments at newline (D9); mvdan may fold the next line into
-// the preceding statement as an argument — fail closed on this divergence.
-func rawHasCommentLineCont(code string) bool {
-	for i := 0; i < len(code); i++ {
-		if code[i] != '#' {
-			continue
-		}
-		j := i + 1
-		for j < len(code) && code[j] != '\n' {
-			j++
-		}
-		line := strings.TrimRight(code[i:j], " \t")
-		if strings.HasSuffix(line, `\`) {
-			return true
-		}
-		if j < len(code) {
-			i = j
-		}
-	}
-	return false
-}
-
 // rawHasLineContCmdsubst reports $ followed by backslash-newline then (,
 // which dash folds into $(...) but mvdan may leave as adjacent Lits.
 func rawHasLineContCmdsubst(raw string) bool {
@@ -397,9 +445,6 @@ func rawHasLineContCmdsubst(raw string) bool {
 // ok=false means fail-closed (caller treats as depthExceeded).
 func parseSubagentShellAST(code string, depth int, pipeIn bool, useBashVariant bool) ([]shellSegment, bool) {
 	if hit := checkShellBytes(code, false); hit != "" {
-		return []shellSegment{{depthExceeded: true}}, false
-	}
-	if rawHasCommentLineCont(code) {
 		return []shellSegment{{depthExceeded: true}}, false
 	}
 	if depth >= shellSplitMaxDepth {
@@ -441,14 +486,30 @@ func parseSubagentShellAST(code string, depth int, pipeIn bool, useBashVariant b
 	if useBashVariant {
 		primary = bashFile
 	}
-	if primary == nil || !col.failClosedFile(primary) {
+	if primary == nil {
 		return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 	}
-	if !useBashVariant && bashFile != nil && !col.failClosedFile(bashFile) {
+	if hit := checkCommentsAndContinuations(code, primary, false); hit != "" {
+		return []shellSegment{{parseErr: hit}}, false
+	}
+	if !col.failClosedFile(primary) {
 		return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 	}
-	if useBashVariant && posixFile != nil && !col.failClosedFile(posixFile) {
-		return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
+	if !useBashVariant && bashFile != nil {
+		if hit := checkCommentsAndContinuations(code, bashFile, false); hit != "" {
+			return []shellSegment{{parseErr: hit}}, false
+		}
+		if !col.failClosedFile(bashFile) {
+			return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
+		}
+	}
+	if useBashVariant && posixFile != nil {
+		if hit := checkCommentsAndContinuations(code, posixFile, false); hit != "" {
+			return []shellSegment{{parseErr: hit}}, false
+		}
+		if !col.failClosedFile(posixFile) {
+			return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
+		}
 	}
 
 	col.walkStmts(primary.Stmts, pipeIn)
@@ -498,11 +559,17 @@ func segEqual(a, b shellSegment) bool {
 	if a.depthExceeded != b.depthExceeded || a.pipedStdin != b.pipedStdin ||
 		a.backgrounded != b.backgrounded || a.processSubst != b.processSubst ||
 		a.redirectFile != b.redirectFile || a.hereString != b.hereString ||
+		a.parseErr != b.parseErr ||
 		len(a.argv) != len(b.argv) || len(a.heredocText) != len(b.heredocText) {
 		return false
 	}
 	for i := range a.argv {
 		if a.argv[i] != b.argv[i] {
+			return false
+		}
+	}
+	for i := range a.heredocText {
+		if a.heredocText[i] != b.heredocText[i] {
 			return false
 		}
 	}
