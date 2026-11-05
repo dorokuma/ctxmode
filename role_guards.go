@@ -125,6 +125,10 @@ type shellSegment struct {
 	// parsed, so the guards must fail closed instead of silently dropping
 	// them. It is never a real command.
 	depthExceeded bool
+	// parseErr is a fail-closed parse/validation reason that is NOT a nesting-depth
+	// overflow (e.g. bash-only syntax under /bin/sh). Prefer this over stuffing
+	// every parse failure into depthExceeded.
+	parseErr string
 }
 
 // shellSplitMaxDepth bounds recursion into $(...)/`...`/subshell text so a
@@ -171,6 +175,9 @@ func isDynamicArg(a string) bool {
 func splitShellSegments(code string) []shellSegment {
 	segs, ok := parseSubagentShellAST(code, 0, false, false)
 	if !ok {
+		if len(segs) > 0 {
+			return segs
+		}
 		return []shellSegment{{depthExceeded: true}}
 	}
 	return segs
@@ -180,6 +187,9 @@ func splitShellSegments(code string) []shellSegment {
 func splitShellSegmentsBash(code string) []shellSegment {
 	segs, ok := parseSubagentShellAST(code, 0, false, true)
 	if !ok {
+		if len(segs) > 0 {
+			return segs
+		}
 		return []shellSegment{{depthExceeded: true}}
 	}
 	return segs
@@ -2639,6 +2649,9 @@ func screenStdinProgram(text, lang string, kind byte, depth int, caller callerId
 
 // screenOneSegmentDepth applies the head/tail checks to one parsed segment.
 func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller callerIdentity) string {
+	if seg.parseErr != "" {
+		return seg.parseErr
+	}
 	if seg.depthExceeded {
 		return depthExceededHit
 	}
@@ -2743,6 +2756,9 @@ func guardShellSubagentDepthSegs(segs []shellSegment, depth int, caller callerId
 		return depthExceededHit
 	}
 	for _, seg := range segs {
+		if seg.parseErr != "" {
+			return seg.parseErr
+		}
 		if seg.depthExceeded {
 			return depthExceededHit
 		}
@@ -8672,6 +8688,12 @@ func (g guardCall) guardCtxRunShell(code string) (rule, detail string) {
 			}
 			return ruleSubagentNestedAgent, hit
 		}
+		// screenSSHHead already applied remote readonly for readonly callers.
+		// Re-running parseReadonlyShellAST on the outer text rejects << heredocs
+		// attached to ssh (data or program) before peel can see them.
+		if g.strictReadonly && shellSegmentsAllSSH(splitShellSegments(code)) {
+			return "", ""
+		}
 	}
 	if g.strictReadonly {
 		if hit := guardShellReadonly(code); hit != "" {
@@ -8679,6 +8701,26 @@ func (g guardCall) guardCtxRunShell(code string) (rule, detail string) {
 		}
 	}
 	return "", ""
+}
+
+// shellSegmentsAllSSH reports whether every command-bearing segment peels to ssh,
+// so screenSSHHead was the sole screener for this shell string.
+func shellSegmentsAllSSH(segs []shellSegment) bool {
+	saw := false
+	for _, seg := range segs {
+		if seg.parseErr != "" || seg.depthExceeded {
+			return false
+		}
+		if len(seg.argv) == 0 {
+			continue
+		}
+		i, _, _, _ := peelWrappers(seg.argv)
+		if i >= len(seg.argv) || filepath.Base(seg.argv[i]) != "ssh" {
+			return false
+		}
+		saw = true
+	}
+	return saw
 }
 
 // stdinProgramHead reports whether a peeled argv head reads its program

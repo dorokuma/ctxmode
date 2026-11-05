@@ -406,41 +406,68 @@ func parseSubagentShellAST(code string, depth int, pipeIn bool, useBashVariant b
 		return []shellSegment{{depthExceeded: true}}, false
 	}
 
-	posixParser := syntax.NewParser(syntax.Variant(syntax.LangPOSIX))
-	posixFile, err := posixParser.Parse(strings.NewReader(code), "")
-	if err != nil {
-		return []shellSegment{{depthExceeded: true}}, false
-	}
-
+	posixParser := syntax.NewParser(syntax.Variant(syntax.LangPOSIX), syntax.KeepComments(true))
+	bashParser := syntax.NewParser(syntax.Variant(syntax.LangBash), syntax.KeepComments(true))
+	posixFile, perr := posixParser.Parse(strings.NewReader(code), "")
 	var bashFile *syntax.File
-	bashParser := syntax.NewParser(syntax.Variant(syntax.LangBash))
-	if bf, berr := bashParser.Parse(strings.NewReader(code), ""); berr == nil {
+	var berr error
+	if bf, e := bashParser.Parse(strings.NewReader(code), ""); e == nil {
 		bashFile = bf
-	} else if useBashVariant {
-		// bash/zsh/ksh -c payloads must be Bash-parseable.
-		return []shellSegment{{depthExceeded: true}}, false
+	} else {
+		berr = e
+	}
+	if useBashVariant {
+		if berr != nil {
+			return []shellSegment{{parseErr: "shell syntax error: " + berr.Error()}}, false
+		}
+		if perr != nil {
+			posixFile = nil
+		}
+	} else {
+		// Top-level ctx_run is /bin/sh (dash): no LangBash fallback.
+		if perr != nil {
+			if berr == nil {
+				return []shellSegment{{parseErr: "bash-only syntax under /bin/sh Hint: /bin/sh 是 dash，不支持这种写法，请改用 bash -c '...'"}}, false
+			}
+			return []shellSegment{{parseErr: "shell syntax error: " + perr.Error()}}, false
+		}
+		if berr != nil {
+			bashFile = nil
+		}
 	}
 
 	col := &subCollector{code: code, depth: depth}
-	if !col.failClosedFile(posixFile) {
-		return []shellSegment{{depthExceeded: true}}, false
+	primary := posixFile
+	if useBashVariant {
+		primary = bashFile
 	}
-	if bashFile != nil && !col.failClosedFile(bashFile) {
-		return []shellSegment{{depthExceeded: true}}, false
+	if primary == nil || !col.failClosedFile(primary) {
+		return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
+	}
+	if !useBashVariant && bashFile != nil && !col.failClosedFile(bashFile) {
+		return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
+	}
+	if useBashVariant && posixFile != nil && !col.failClosedFile(posixFile) {
+		return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 	}
 
-	col.walkStmts(posixFile.Stmts, pipeIn)
+	col.walkStmts(primary.Stmts, pipeIn)
 	if col.rejected {
-		return []shellSegment{{depthExceeded: true}}, false
+		return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 	}
-	if bashFile != nil {
-		// Merge Bash-only constructs (DeclClause, ProcSubst, here-string, …).
+	if useBashVariant && posixFile != nil {
+		pre := len(col.segs)
+		col.walkStmts(posixFile.Stmts, pipeIn)
+		if col.rejected {
+			return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
+		}
+		col.segs = dedupeSegTail(col.segs, pre)
+	} else if !useBashVariant && bashFile != nil {
 		pre := len(col.segs)
 		col.walkStmts(bashFile.Stmts, pipeIn)
 		if col.rejected {
-			return []shellSegment{{depthExceeded: true}}, false
+			return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 		}
-		// Drop exact duplicate trailing segments copied from the POSIX walk.
 		col.segs = dedupeSegTail(col.segs, pre)
 	}
 	return col.segs, true

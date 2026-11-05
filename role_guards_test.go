@@ -1340,7 +1340,7 @@ func TestGuard_SSHPeel(t *testing.T) {
 		{name: "piped pig", code: "echo pig | ssh dmit sh", want: "piped stdin to ssh"},
 		{name: "piped data ok", code: "cat list | ssh dmit 'xargs touch'", want: ""},
 		{name: "heredoc pig", code: "ssh dmit sh <<'EOF'\npig\nEOF", want: "pig"},
-		{name: "herestring pig", code: "ssh dmit sh <<< 'pig'", want: "pig"},
+		{name: "herestring pig", code: "ssh dmit sh <<< 'pig'", want: "bash-only syntax under /bin/sh Hint: /bin/sh 是 dash，不支持这种写法，请改用 bash -c '...'"},
 	}
 	for _, tc := range sub {
 		t.Run("sub/"+tc.name, func(t *testing.T) {
@@ -1382,7 +1382,6 @@ func TestGuard_SSHPeel(t *testing.T) {
 			for _, code := range []string{
 				`echo uptime | ssh dmit sh`,
 				"ssh dmit sh <<'EOF'\nls -la /tmp\nEOF",
-				"ssh dmit sh <<< 'ls -la /tmp'",
 			} {
 				if rule, _ := g.guardCtxRunShell(code); rule != ruleReadonlyWrite {
 					t.Fatalf("%s: %q rule = %q, want %s", role, code, rule, ruleReadonlyWrite)
