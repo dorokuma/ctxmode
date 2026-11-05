@@ -89,8 +89,9 @@ func callerIsRoleGuarded() bool {
 // `<<` redirect; quoted=false bodies also get $(...)/`...` substitution
 // scanning because the shell still expands them.
 type heredocBody struct {
-	text   string
-	quoted bool
+	text    string
+	quoted  bool
+	dynamic bool // unquoted body had ParamExp/CmdSubst/ArithmExp — not static text
 }
 
 // shellSegment is one simple command parsed out of a shell command string:
@@ -2083,8 +2084,22 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 	// `ssh` head, whose stdin is opaque). A remote `cat`/`xargs` head reads
 	// data, so the bodies stay unscreened here.
 	if stdinIsProg {
-		for _, body := range sshStdinTexts(seg) {
-			if h := screenStdinProgram(body, "", kind, depth, caller); h != "" {
+		if seg.hereString != "" {
+			if isDynamicArg(seg.hereString) {
+				return "dynamic code payload"
+			}
+			if h := screenStdinProgram(seg.hereString, "", kind, depth, caller); h != "" {
+				return h
+			}
+		}
+		for _, hb := range seg.heredocText {
+			if hb.dynamic || isDynamicArg(hb.text) {
+				return "dynamic code payload"
+			}
+			if hb.text == "" {
+				continue
+			}
+			if h := screenStdinProgram(hb.text, "", kind, depth, caller); h != "" {
 				return h
 			}
 		}
@@ -2345,6 +2360,11 @@ func parseSSHInvocation(head []string) (remoteCmd, hit string) {
 		}
 		// Second non-option operand: everything from here is the remote
 		// command OpenSSH joins and hands to the login shell.
+		for _, w := range head[i:] {
+			if isDynamicArg(w) {
+				return "", "dynamic code payload"
+			}
+		}
 		remote := strings.Join(head[i:], " ")
 		if strings.Trim(remote, " \t\r\n") == "" {
 			return "", "ssh"
@@ -2705,6 +2725,9 @@ func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller c
 		return ""
 	}
 	for _, hb := range seg.heredocText {
+		if hb.dynamic || isDynamicArg(hb.text) {
+			return "dynamic code payload"
+		}
 		if hit := screenStdinProgram(hb.text, lang, kind, depth, caller); hit != "" {
 			return hit
 		}

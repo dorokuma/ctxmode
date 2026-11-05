@@ -335,11 +335,15 @@ func roWord(code string, w *syntax.Word, isHead bool) (string, string) {
 
 func decodeDblQuotedLit(s string) string {
 	var b strings.Builder
+	b.Grow(len(s))
 	for i := 0; i < len(s); i++ {
 		if s[i] == '\\' && i+1 < len(s) {
 			switch s[i+1] {
-			case '"', '\\':
+			case '"', '\\', '$', '`':
 				b.WriteByte(s[i+1])
+				i++
+				continue
+			case '\n':
 				i++
 				continue
 			}
@@ -349,6 +353,68 @@ func decodeDblQuotedLit(s string) string {
 	return b.String()
 }
 
+// decodeUnquotedHeredocLit applies POSIX §2.7.4 unquoted-heredoc unescape:
+// \$ → $, \` → `, \\ → \, \\\n folds away; <<- strips leading tabs per line.
+func decodeUnquotedHeredocLit(s string, dashHdoc bool) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	lineStart := true
+	for i < len(s) {
+		if dashHdoc && lineStart {
+			for i < len(s) && s[i] == '\t' {
+				i++
+			}
+			lineStart = false
+			if i >= len(s) {
+				break
+			}
+		}
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case '$', '`', '\\':
+				b.WriteByte(s[i+1])
+				i += 2
+				lineStart = false
+				continue
+			case '\n':
+				i += 2
+				lineStart = true
+				continue
+			}
+		}
+		if s[i] == '\n' {
+			lineStart = true
+		} else {
+			lineStart = false
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+func stripDashHdocTabs(s string) string {
+	if s == "" || !strings.Contains(s, "\t") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	lineStart := true
+	for i := 0; i < len(s); i++ {
+		if lineStart {
+			if s[i] == '\t' {
+				continue
+			}
+			lineStart = false
+		}
+		if s[i] == '\n' {
+			lineStart = true
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
 func roCheckRedirect(code string, call *syntax.CallExpr, r *syntax.Redirect) string {
 	if len(call.Args) == 0 {
 		return "empty command"
@@ -600,12 +666,7 @@ func (c *subCollector) failClosedFile(f *syntax.File) bool {
 				return false
 			}
 			for _, p := range x.Parts {
-				pe, is := p.(*syntax.ParamExp)
-				if !is {
-					continue
-				}
-				raw, okRaw := rawSlice(c.code, pe.Pos(), pe.End())
-				if okRaw && (strings.ContainsAny(raw, `'"`) || strings.Contains(raw, `\}`)) {
+				if pe, is := p.(*syntax.ParamExp); is && paramExpD2Ambiguous(c.code, pe) {
 					ok = false
 					return false
 				}
@@ -627,45 +688,222 @@ func (c *subCollector) failClosedFile(f *syntax.File) bool {
 					ok = false
 					return false
 				}
-				// Unquoted heredoc: dash expands $(...) / backticks even when
-				// mvdan left the body as plain Lits (delim mismatch / opaque body).
 				if x.Hdoc != nil && !isQuotedHeredocDelim(x.Word) {
-					body := ""
-					if lit := x.Hdoc.Lit(); lit != "" {
-						body = lit
-					}
-					if raw, okRaw := rawSlice(c.code, x.Hdoc.Pos(), x.Hdoc.End()); okRaw {
-						if body == "" || len(raw) > len(body) {
-							body = raw
-						}
-					}
-					if body != "" && (rawHasLineContCmdsubst(body) || strings.Contains(body, "$(") || strings.Contains(body, "`")) {
-						hasCS := false
-						syntax.Walk(x.Hdoc, func(n syntax.Node) bool {
-							if _, is := n.(*syntax.CmdSubst); is {
-								hasCS = true
-								return false
-							}
-							return true
-						})
-						if !hasCS {
-							ok = false
-							return false
-						}
+					if !c.failClosedUnquotedHdoc(x.Hdoc) {
+						ok = false
+						return false
 					}
 				}
 			}
 		case *syntax.ArithmExp:
 			raw, okRaw := rawSlice(c.code, x.Pos(), x.End())
 			if okRaw && (strings.Contains(raw, ";") || strings.Contains(raw, "\n")) {
-				// D6: ambiguous arith vs cmdsubst boundary — fail closed.
+				ok = false
+				return false
+			}
+			if !c.failClosedArithmCtx(x.X) {
+				ok = false
+				return false
+			}
+		case *syntax.ArithmCmd:
+			if !c.failClosedArithmCtx(x.X) {
+				ok = false
+				return false
+			}
+		case *syntax.ExtGlob:
+			if x.Pattern != nil && strings.ContainsAny(x.Pattern.Value, "$`\n\\;") {
+				ok = false
+				return false
+			}
+		case *syntax.ParamExp:
+			if peAssignsHookOrTaint(x) {
+				ok = false
+				return false
+			}
+		case *syntax.BinaryArithm:
+			if isArithAssignOp(x.Op) && arithmTargetIsHookOrTaint(x.X) {
+				ok = false
+				return false
+			}
+		case *syntax.UnaryArithm:
+			if (x.Op == syntax.Inc || x.Op == syntax.Dec) && arithmTargetIsHookOrTaint(x.X) {
+				ok = false
+				return false
+			}
+		case *syntax.ForClause:
+			if wi, is := x.Loop.(*syntax.WordIter); is && wi.Name != nil {
+				if envHookVars[wi.Name.Value] || guardTaintVars[wi.Name.Value] {
+					ok = false
+					return false
+				}
+			}
+		}
+		return true
+	})
+	return ok && !c.rejected
+}
+
+func paramExpD2Ambiguous(code string, pe *syntax.ParamExp) bool {
+	if pe == nil {
+		return false
+	}
+	ambig := false
+	var csSpans [][2]int
+	syntax.Walk(pe, func(n syntax.Node) bool {
+		if n == nil || ambig {
+			return false
+		}
+		switch x := n.(type) {
+		case *syntax.CmdSubst:
+			lo, hi := int(x.Pos().Offset()), int(x.End().Offset())
+			if lo >= 0 && hi >= lo && hi <= len(code) {
+				csSpans = append(csSpans, [2]int{lo, hi})
+			}
+			return false
+		case *syntax.SglQuoted, *syntax.DblQuoted:
+			ambig = true
+			return false
+		}
+		return true
+	})
+	if ambig {
+		return true
+	}
+	raw, okRaw := rawSlice(code, pe.Pos(), pe.End())
+	if !okRaw {
+		return false
+	}
+	lo := int(pe.Pos().Offset())
+	for i := 0; i < len(raw); i++ {
+		abs := lo + i
+		inCS := false
+		for _, sp := range csSpans {
+			if abs >= sp[0] && abs < sp[1] {
+				inCS = true
+				break
+			}
+		}
+		if inCS {
+			continue
+		}
+		switch raw[i] {
+		case '\'', '"', '\\':
+			return true
+		}
+	}
+	return false
+}
+
+func peAssignsHookOrTaint(pe *syntax.ParamExp) bool {
+	if pe == nil || pe.Exp == nil || pe.Param == nil {
+		return false
+	}
+	switch pe.Exp.Op {
+	case syntax.AssignUnset, syntax.AssignUnsetOrNull:
+		name := pe.Param.Value
+		return envHookVars[name] || guardTaintVars[name]
+	}
+	return false
+}
+
+func isArithAssignOp(op syntax.BinAritOperator) bool {
+	switch op {
+	case syntax.Assgn, syntax.AddAssgn, syntax.SubAssgn, syntax.MulAssgn,
+		syntax.QuoAssgn, syntax.RemAssgn, syntax.ShlAssgn, syntax.ShrAssgn,
+		syntax.AndAssgn, syntax.XorAssgn, syntax.OrAssgn:
+		return true
+	}
+	return false
+}
+
+func arithmTargetIsHookOrTaint(x syntax.ArithmExpr) bool {
+	name := arithmTargetName(x)
+	if name == "" {
+		return false
+	}
+	return envHookVars[name] || guardTaintVars[name]
+}
+
+func arithmTargetName(x syntax.ArithmExpr) string {
+	switch t := x.(type) {
+	case *syntax.Word:
+		if len(t.Parts) == 1 {
+			if lit, ok := t.Parts[0].(*syntax.Lit); ok {
+				return lit.Value
+			}
+			if pe, ok := t.Parts[0].(*syntax.ParamExp); ok && pe.Param != nil && pe.Short && pe.Exp == nil && pe.Index == nil {
+				return pe.Param.Value
+			}
+		}
+	case *syntax.UnaryArithm:
+		return arithmTargetName(t.X)
+	}
+	return ""
+}
+
+func (c *subCollector) failClosedArithmCtx(x syntax.ArithmExpr) bool {
+	if x == nil {
+		return true
+	}
+	ok := true
+	syntax.Walk(x, func(n syntax.Node) bool {
+		if n == nil || !ok {
+			return false
+		}
+		switch t := n.(type) {
+		case *syntax.CmdSubst:
+			return false
+		case *syntax.ParamExp:
+			if paramExpD2Ambiguous(c.code, t) || peAssignsHookOrTaint(t) {
+				ok = false
+				return false
+			}
+		case *syntax.BinaryArithm:
+			if isArithAssignOp(t.Op) && arithmTargetIsHookOrTaint(t.X) {
+				ok = false
+				return false
+			}
+		case *syntax.UnaryArithm:
+			if (t.Op == syntax.Inc || t.Op == syntax.Dec) && arithmTargetIsHookOrTaint(t.X) {
 				ok = false
 				return false
 			}
 		}
 		return true
 	})
-	return ok && !c.rejected
+	return ok
+}
+
+func (c *subCollector) failClosedUnquotedHdoc(hdoc *syntax.Word) bool {
+	if hdoc == nil {
+		return true
+	}
+	ok := true
+	syntax.Walk(hdoc, func(n syntax.Node) bool {
+		if n == nil || !ok {
+			return false
+		}
+		switch t := n.(type) {
+		case *syntax.CmdSubst:
+			return false
+		case *syntax.SglQuoted:
+			ok = false
+			return false
+		case *syntax.ParamExp:
+			if paramExpD2Ambiguous(c.code, t) || peAssignsHookOrTaint(t) {
+				ok = false
+				return false
+			}
+		case *syntax.Lit:
+			dec := decodeUnquotedHeredocLit(t.Value, false)
+			if strings.Contains(dec, "$(") || strings.Contains(dec, "`") || rawHasLineContCmdsubst(dec) {
+				ok = false
+				return false
+			}
+		}
+		return true
+	})
+	return ok
 }
 
 func (c *subCollector) heredocDelimOK(r *syntax.Redirect) bool {
@@ -891,31 +1129,39 @@ func (c *subCollector) applyRedirs(seg *shellSegment, redirs []*syntax.Redirect)
 		switch r.Op {
 		case syntax.Hdoc, syntax.DashHdoc:
 			quoted := isQuotedHeredocDelim(r.Word)
-			text := ""
-			if r.Hdoc != nil {
-				if lit := r.Hdoc.Lit(); lit != "" {
-					text = lit
-				} else if raw, ok := rawSlice(c.code, r.Hdoc.Pos(), r.Hdoc.End()); ok {
-					text = raw
-				}
-			}
-			// Opaque unquoted heredoc: $( / backticks present as text but no CmdSubst nodes.
-			if !quoted && text != "" && (strings.Contains(text, "$(") || strings.Contains(text, "`")) {
-				hasCS := false
+			dash := r.Op == syntax.DashHdoc
+			if quoted {
+				text := ""
 				if r.Hdoc != nil {
-					syntax.Walk(r.Hdoc, func(n syntax.Node) bool {
-						if _, ok := n.(*syntax.CmdSubst); ok {
-							hasCS = true
-							return false
-						}
-						return true
-					})
+					if lit := r.Hdoc.Lit(); lit != "" {
+						text = lit
+					} else if raw, ok := rawSlice(c.code, r.Hdoc.Pos(), r.Hdoc.End()); ok {
+						text = raw
+					}
 				}
-				if !hasCS {
-					c.reject()
+				if dash {
+					text = stripDashHdocTabs(text)
+				}
+				seg.heredocText = append(seg.heredocText, heredocBody{text: text, quoted: true, dynamic: false})
+			} else if r.Hdoc == nil {
+				seg.heredocText = append(seg.heredocText, heredocBody{quoted: false, dynamic: false})
+			} else {
+				dynamic := false
+				var b strings.Builder
+				for _, p := range r.Hdoc.Parts {
+					lit, isLit := p.(*syntax.Lit)
+					if !isLit {
+						dynamic = true
+						break
+					}
+					b.WriteString(decodeUnquotedHeredocLit(lit.Value, dash))
+				}
+				if dynamic {
+					seg.heredocText = append(seg.heredocText, heredocBody{text: cmdSubPlaceholder, quoted: false, dynamic: true})
+				} else {
+					seg.heredocText = append(seg.heredocText, heredocBody{text: b.String(), quoted: false, dynamic: false})
 				}
 			}
-			seg.heredocText = append(seg.heredocText, heredocBody{text: text, quoted: quoted})
 		case syntax.WordHdoc:
 			if r.Word != nil {
 				s, ok := wordToArg(r.Word)
