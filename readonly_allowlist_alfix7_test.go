@@ -533,14 +533,28 @@ func staticConcreteLeafArgvs(argvs [][]string) [][]string {
 
 // leafArgvDeepAgree reports whether every dash leaf whose argv[0] appears in
 // goLeaves has an exact full argv[0]+argv[1:] match among those Go leaves.
-// Go-only over-parses are ignored; unknown dash heads use dashExecutedUnknown.
+// When Go also tracked a dynamic sibling with the same argv[0] (placeholder
+// args), a dash expansion that does not exact-match is ignored — the static
+// Go leaf is a different invocation. Unknown dash heads use dashExecutedUnknown.
+// Go-only over-parses (untaken || branches, uncalled function bodies) are ignored.
 func leafArgvDeepAgree(goLeaves, dashLeaves [][]string) bool {
+	return leafArgvDeepAgreeExt(goLeaves, dashLeaves, nil)
+}
+
+func leafArgvDeepAgreeExt(goLeaves, dashLeaves, goWithDyn [][]string) bool {
 	byHead := map[string][][]string{}
 	for _, g := range goLeaves {
 		if len(g) == 0 {
 			continue
 		}
 		byHead[g[0]] = append(byHead[g[0]], g)
+	}
+	dynHeads := map[string]bool{}
+	for _, g := range goWithDyn {
+		if len(g) == 0 || !argvHasDynamic(g) {
+			continue
+		}
+		dynHeads[g[0]] = true
 	}
 	for _, d := range dashLeaves {
 		if len(d) == 0 {
@@ -568,6 +582,9 @@ func leafArgvDeepAgree(goLeaves, dashLeaves [][]string) bool {
 			}
 		}
 		if !ok {
+			if dynHeads[d[0]] {
+				continue
+			}
 			return false
 		}
 	}
@@ -576,11 +593,60 @@ func leafArgvDeepAgree(goLeaves, dashLeaves [][]string) bool {
 
 // dashExecutedUnknown reports whether dash ran a command name that Go did not
 // list in any segment argv[0]. This is the Must-Fix-1 failure shape.
+
+// envArgv0Aliases collects names that env -a / --argv0 would install as the
+// executed process argv[0], so argvprinter recordings of those names are not
+// treated as real executions of a binary with that basename.
+func envArgv0Aliases(argvs [][]string) map[string]bool {
+	out := map[string]bool{}
+	for _, a := range argvs {
+		for i := 0; i < len(a); i++ {
+			switch {
+			case a[i] == "-a" || a[i] == "--argv0":
+				if i+1 < len(a) {
+					out[a[i+1]] = true
+					i++
+				}
+			case strings.HasPrefix(a[i], "-a") && a[i] != "-a" && !strings.HasPrefix(a[i], "--"):
+				rest := a[i][2:]
+				if rest != "" {
+					out[rest] = true
+				}
+			case strings.HasPrefix(a[i], "--argv0="):
+				out[a[i][len("--argv0="):]] = true
+			}
+		}
+	}
+	return out
+}
+
+func filterAliasMisses(miss []string, aliases map[string]bool) []string {
+	if len(aliases) == 0 {
+		return miss
+	}
+	var out []string
+	for _, m := range miss {
+		if !aliases[m] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 func dashExecutedUnknown(goArgvs, dashArgvs [][]string) []string {
 	seen := map[string]bool{}
+	argv0Aliases := map[string]bool{} // env -a NAME / --argv0 NAME rename the executed argv0
 	for _, a := range goArgvs {
 		if len(a) > 0 {
 			seen[a[0]] = true
+		}
+		for i := 0; i+1 < len(a); i++ {
+			if a[i] == "-a" || a[i] == "--argv0" {
+				argv0Aliases[a[i+1]] = true
+			}
+			if strings.HasPrefix(a[i], "--argv0=") {
+				argv0Aliases[a[i][len("--argv0="):]] = true
+			}
 		}
 	}
 	var miss []string
@@ -588,7 +654,7 @@ func dashExecutedUnknown(goArgvs, dashArgvs [][]string) []string {
 		if len(a) == 0 {
 			continue
 		}
-		if !seen[a[0]] {
+		if !seen[a[0]] && !argv0Aliases[a[0]] {
 			miss = append(miss, a[0])
 		}
 	}
@@ -1020,18 +1086,25 @@ func TestAlFix7_FuzzArgvDiff(t *testing.T) {
 		goExt := filterExternalArgvs(goArgvs)
 
 		if hit == "" {
+			var rawArgvs [][]string
+			for _, s := range splitShellSegments(code) {
+				if len(s.argv) > 0 {
+					rawArgvs = append(rawArgvs, append([]string(nil), s.argv...))
+				}
+			}
+			aliases := envArgv0Aliases(rawArgvs)
 			for _, a := range dashArgvs {
 				if len(a) == 0 {
 					continue
 				}
-				if a[0] == "pig" || a[0] == "agy" {
+				if (a[0] == "pig" || a[0] == "agy") && !aliases[a[0]] {
 					bypasses++
 					if bypasses <= 5 {
 						t.Fatalf("BYPASS FOUND: worker guard allowed script that executed %s in dash: %q", a[0], code)
 					}
 				}
 			}
-			miss := dashExecutedUnknown(goExt, dashArgvs)
+			miss := filterAliasMisses(dashExecutedUnknown(goExt, dashArgvs), aliases)
 			if len(miss) > 0 && !depthEx {
 				mismatches++
 				if mismatches <= 10 {
@@ -1042,7 +1115,7 @@ func TestAlFix7_FuzzArgvDiff(t *testing.T) {
 			if !depthEx {
 				goLeaves := staticConcreteLeafArgvs(goExt)
 				dashLeaves := staticLeafArgvs(dashArgvs)
-				if !leafArgvDeepAgree(goLeaves, dashLeaves) {
+				if !leafArgvDeepAgreeExt(goLeaves, dashLeaves, goExt) {
 					mismatches++
 					if mismatches <= 10 {
 						t.Logf("LEAF ARGV MISMATCH i=%d code=%q goLeaves=%s dashLeaves=%s",
@@ -1054,9 +1127,10 @@ func TestAlFix7_FuzzArgvDiff(t *testing.T) {
 
 		// Readonly AST allow path: concrete static-leaf full argv must agree with dash.
 		if roReject == "" && !depthEx {
-			roLeaves := staticConcreteLeafArgvs(filterExternalArgvs(roArgvs))
+			roExt := filterExternalArgvs(roArgvs)
+			roLeaves := staticConcreteLeafArgvs(roExt)
 			dashLeaves := staticLeafArgvs(dashArgvs)
-			if !leafArgvDeepAgree(roLeaves, dashLeaves) {
+			if !leafArgvDeepAgreeExt(roLeaves, dashLeaves, roExt) {
 				mismatches++
 				if mismatches <= 10 {
 					t.Logf("RO FULL ARGV MISMATCH i=%d code=%q roLeaves=%s dashLeaves=%s",

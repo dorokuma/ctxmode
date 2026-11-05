@@ -108,8 +108,8 @@ func TestParseSubagentShellAST_D2Reject(t *testing.T) {
 	if ok {
 		t.Fatalf("D2 should reject, got ok segs=%v", dumpSegs(segs))
 	}
-	if len(segs) != 1 || !segs[0].depthExceeded {
-		t.Fatalf("want depthExceeded marker, got %v", dumpSegs(segs))
+	if len(segs) != 1 || (segs[0].parseErr == "" && !segs[0].depthExceeded) {
+		t.Fatalf("want parseErr or depthExceeded marker, got %v", dumpSegs(segs))
 	}
 }
 
@@ -118,8 +118,8 @@ func TestParseSubagentShellAST_ControlChar(t *testing.T) {
 	if ok {
 		t.Fatal("expected reject for \\r")
 	}
-	if len(segs) != 1 || !segs[0].depthExceeded {
-		t.Fatalf("want depthExceeded, got %v", dumpSegs(segs))
+	if len(segs) != 1 || (segs[0].parseErr == "" && !segs[0].depthExceeded) {
+		t.Fatalf("want parseErr or depthExceeded, got %v", dumpSegs(segs))
 	}
 }
 

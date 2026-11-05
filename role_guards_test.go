@@ -1453,7 +1453,7 @@ func TestGuard_CompoundKeywords(t *testing.T) {
 		{name: "until loop", code: "until false; do pi; done", want: "pi"},
 		{name: "elif chain", code: "if a; then b; elif c; then grok; fi", want: "grok"},
 		{name: "coproc", code: "coproc pig", want: "pig"},
-		{name: "fi done } bare no-op", code: "fi; done; }", want: depthExceededHit},
+		{name: "fi done } bare no-op", code: "fi; done; }", want: "shell syntax error: 1:1: `fi` can only be used to end an `if`"},
 		{name: "echo safe", code: "if true; then echo pig; fi", want: ""},
 	}
 	for _, tc := range subCases {
@@ -2651,7 +2651,7 @@ func TestGuard_HardGuardsRound3(t *testing.T) {
 		{name: "echo hi | grep ok", code: "echo hi | grep hi", want: ""},
 		{name: "heredoc-pipe binding", code: "sh <<'EOF' | cat\npig\nEOF", want: "pig"},
 		{name: "cat <$(pig)", code: "cat <$(pig)", want: "pig"},
-		{name: "cat <<< $(pig)", code: "cat <<< \"$(pig)\"", want: depthExceededHit},
+		{name: "cat <<< $(pig)", code: "cat <<< \"$(pig)\"", want: "bash-only syntax under /bin/sh Hint: /bin/sh 是 dash，不支持这种写法，请改用 bash -c '...'"},
 	}
 	for _, tc := range subShell {
 		t.Run("subsh/"+tc.name, func(t *testing.T) {
@@ -2890,7 +2890,7 @@ func TestGuard_CmdSubArgvIntegrity(t *testing.T) {
 	}{
 		// The substitution's inner command is screened as its own segment
 		// while the outer argv stays whole (no "" head, no torn "status").
-		{name: "git -C $(pwd) ok", code: "git -C $(pwd) status", want: ""},
+		{name: "git -C $(pwd) ok", code: "git -C $(pwd) status", want: "git dynamic global option"},
 		{name: "git -C $(pig)", code: "git -C $(pig) status", want: "pig"},
 		{name: "assign prefix pig", code: "A=$(true) pig", want: "pig"},
 		{name: "assign prefix ls ok", code: "A=$(true) ls", want: ""},

@@ -392,7 +392,10 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 			continue
 		}
 		if isDynamicArg(a) {
-			return i, splitPayloads, envAs, true // option/head zone dynamic → exhausted
+			// Dynamic word in head position: stop peeling so peelResolvedSegDepth
+			// can return "dynamic command head". Wrapper option loops have their
+			// own isDynamicArg->exhausted checks.
+			return i, splitPayloads, envAs, false
 		}
 		switch filepath.Base(a) {
 		case "time":
@@ -6366,7 +6369,10 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 			// short-circuit the whole screen).
 			argvs, shellCmds, allResolved := codeStaticSpawnsDetailed(language, code)
 			for _, argv := range argvs {
-				if hit := screenNestedDispatch(argv); hit != "" {
+				// peelResolvedDepth so ssh goes through screenSSHHead (ssh was
+				// removed from blockedAgentExecutables but stays in codeAgentNames
+				// for unresolved dynamic spawns).
+				if hit := peelResolvedDepth(argv, 's', 0, currentCallerIdentity()); hit != "" {
 					return ruleSubagentNestedAgent, hit
 				}
 			}

@@ -154,9 +154,6 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 	if ambig != "" {
 		return ambig
 	}
-	if !strictReadonly {
-		return ""
-	}
 	inSpan := func(spans []span, i int) bool {
 		for _, s := range spans {
 			if i >= s.lo && i < s.hi {
@@ -164,6 +161,26 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 			}
 		}
 		return false
+	}
+	// mvdan drops the word before `\\\n>` / `\\\n<` while dash keeps it.
+	// Fail closed for both readonly and subagent paths.
+	for i := 0; i+1 < len(code); i++ {
+		if code[i] != '\\' || code[i+1] != '\n' {
+			continue
+		}
+		if inSpan(comments, i) || inSpan(sglQuoted, i) {
+			continue
+		}
+		j := i + 2
+		for j < len(code) && (code[j] == ' ' || code[j] == '\t') {
+			j++
+		}
+		if j < len(code) && (code[j] == '<' || code[j] == '>') {
+			return "ambiguous line continuation before redirect"
+		}
+	}
+	if !strictReadonly {
+		return ""
 	}
 	for i := 0; i+1 < len(code); i++ {
 		if code[i] != '\\' || code[i+1] != '\n' {
