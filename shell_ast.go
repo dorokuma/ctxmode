@@ -547,7 +547,7 @@ func parseSubagentShellAST(code string, depth int, pipeIn bool, useBashVariant b
 		}
 	}
 
-	col := &subCollector{code: code, depth: depth, staticVars: map[string]string{}, taintedVars: map[string]bool{}, allowBind: depth == 0}
+	col := &subCollector{code: code, depth: depth, staticVars: map[string]string{}, enumVars: map[string]string{}, taintedVars: map[string]bool{}, allowBind: depth == 0}
 	primary := posixFile
 	if useBashVariant {
 		primary = bashFile
@@ -647,7 +647,8 @@ type subCollector struct {
 	depth       int
 	segs        []shellSegment
 	rejected    bool
-	staticVars  map[string]string
+	staticVars  map[string]string // head-eligible abs-path binds (R-Allow-2)
+	enumVars    map[string]string // for-loop enum temporary binds (payload subst only)
 	taintedVars map[string]bool
 	allowBind   bool // top-level sequential stmts only (R-Allow-2)
 }
@@ -997,8 +998,11 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 	case *syntax.BinaryCmd:
 		switch cmd.Op {
 		case syntax.Pipe, syntax.PipeAll:
+			prevBind := c.allowBind
+			c.allowBind = false // no static head-bind across/inside pipelines
 			c.walkStmt(cmd.X, pipeIn)
 			c.walkStmt(cmd.Y, true)
+			c.allowBind = prevBind
 		case syntax.AndStmt, syntax.OrStmt:
 			c.walkStmt(cmd.X, pipeIn)
 			c.walkStmt(cmd.Y, false)
@@ -1032,15 +1036,23 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 	case *syntax.ForClause:
 		prevBind := c.allowBind
 		c.allowBind = false
+		enumDone := false
 		if wi, ok := cmd.Loop.(*syntax.WordIter); ok {
+			loopName := ""
 			if wi.Name != nil {
-				c.noteStaticAssign(wi.Name.Value, "", false) // loop var is tainted for R-Allow-2 head bind
+				loopName = wi.Name.Value
+				c.taintVar(loopName) // loop var never eligible as static command head
 			}
 			for _, w := range wi.Items {
 				c.emitNestedFromWord(w)
 			}
+			if loopName != "" {
+				enumDone = c.forEnumSubst(loopName, wi.Items, cmd.Do)
+			}
 		}
-		c.walkStmts(cmd.Do, false)
+		if !enumDone {
+			c.walkStmts(cmd.Do, false)
+		}
 		c.allowBind = prevBind
 	case *syntax.CaseClause:
 		c.emitNestedFromWord(cmd.Word)
@@ -1088,6 +1100,11 @@ func (c *subCollector) emitDecl(st *syntax.Stmt, d *syntax.DeclClause, pipeIn bo
 	for _, a := range d.Args {
 		if a.Name != nil && !a.Naked {
 			argv = append(argv, assignToPrefix(a))
+			val, stOk := "", false
+			if a.Value != nil {
+				val, stOk = c.wordToArg(a.Value)
+			}
+			c.noteStaticAssign(a.Name.Value, val, stOk)
 			continue
 		}
 		if a.Name != nil && a.Naked {
@@ -1137,10 +1154,22 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, pipeIn b
 			c.noteStaticAssign(a.Name.Value, val, st)
 		}
 	}
-	for _, w := range call.Args {
+	for i, w := range call.Args {
+		// Command head: never resolve for-loop enumVars (R-Allow-2 head bind
+		// is top-level abs-path staticVars only).
+		if i == 0 && len(c.enumVars) > 0 {
+			saved := c.enumVars
+			c.enumVars = nil
+			s, _ := c.wordToArg(w)
+			c.enumVars = saved
+			argv = append(argv, s)
+			continue
+		}
 		s, _ := c.wordToArg(w)
 		argv = append(argv, s)
 	}
+	// POSIX parses `export NAME=VAL` as CallExpr (bash uses DeclClause).
+	c.noteDeclCallBinds(argv)
 
 	seg := shellSegment{
 		argv:         argv,
@@ -1276,7 +1305,7 @@ func (c *subCollector) emitNestedFromNode(n syntax.Node) {
 				c.segs = append(c.segs, shellSegment{depthExceeded: true})
 				return false
 			}
-			sub := &subCollector{code: c.code, depth: c.depth + 1, staticVars: map[string]string{}, taintedVars: map[string]bool{}, allowBind: false}
+			sub := &subCollector{code: c.code, depth: c.depth + 1, staticVars: map[string]string{}, enumVars: map[string]string{}, taintedVars: map[string]bool{}, allowBind: false}
 			sub.walkStmts(x.Stmts, false)
 			if sub.rejected {
 				c.reject()
@@ -1289,7 +1318,7 @@ func (c *subCollector) emitNestedFromNode(n syntax.Node) {
 				c.segs = append(c.segs, shellSegment{depthExceeded: true})
 				return false
 			}
-			sub := &subCollector{code: c.code, depth: c.depth + 1, staticVars: map[string]string{}, taintedVars: map[string]bool{}, allowBind: false}
+			sub := &subCollector{code: c.code, depth: c.depth + 1, staticVars: map[string]string{}, enumVars: map[string]string{}, taintedVars: map[string]bool{}, allowBind: false}
 			sub.walkStmts(x.Stmts, false)
 			if sub.rejected {
 				c.reject()
@@ -1354,6 +1383,42 @@ func isSafeIdentOrRelPath(s string) bool {
 	return true
 }
 
+func (c *subCollector) taintVar(name string) {
+	if name == "" {
+		return
+	}
+	if c.taintedVars == nil {
+		c.taintedVars = map[string]bool{}
+	}
+	c.taintedVars[name] = true
+	delete(c.staticVars, name)
+}
+
+// noteDeclCallBinds records abs-path binds from POSIX-style
+// `export`/`readonly`/`declare`/`typeset`/`local` CallExpr KEY=VAL args.
+func (c *subCollector) noteDeclCallBinds(argv []string) {
+	if len(argv) < 2 || !c.allowBind {
+		return
+	}
+	switch argv[0] {
+	case "export", "readonly", "declare", "typeset", "local":
+	default:
+		return
+	}
+	for _, a := range argv[1:] {
+		if !isAssignWord(a) {
+			continue
+		}
+		k := strings.IndexByte(a, '=')
+		if k <= 0 {
+			continue
+		}
+		name, val := a[:k], a[k+1:]
+		static := !strings.Contains(val, cmdSubPlaceholder)
+		c.noteStaticAssign(name, val, static)
+	}
+}
+
 func (c *subCollector) noteStaticAssign(name, val string, static bool) {
 	if c.staticVars == nil {
 		c.staticVars = map[string]string{}
@@ -1389,6 +1454,68 @@ func (c *subCollector) resolveStaticParam(pe *syntax.ParamExp) (string, bool) {
 	}
 	v, ok := c.staticVars[pe.Param.Value]
 	return v, ok
+}
+
+// resolveParamForSubst resolves a simple $VAR / ${VAR} from enumVars (for-loop
+// payload subst) or staticVars (abs-path binds). Used for in-word expansion;
+// command-head resolution stays on resolveStaticParam (staticVars only).
+func (c *subCollector) resolveParamForSubst(pe *syntax.ParamExp) (string, bool) {
+	if pe == nil || pe.Param == nil {
+		return "", false
+	}
+	if pe.Exp != nil || pe.Slice != nil || pe.Repl != nil || pe.Index != nil || pe.Length || pe.Excl || pe.Names != 0 {
+		return "", false
+	}
+	name := pe.Param.Value
+	if c.enumVars != nil {
+		if v, ok := c.enumVars[name]; ok {
+			return v, true
+		}
+	}
+	if c.staticVars != nil {
+		if v, ok := c.staticVars[name]; ok {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// forEnumSubst substitutes each static for-list value into the Do body.
+// Returns true when the Do body was handled (either enum-walked or rejected).
+// Dynamic items leave the caller to walk Do once without binding.
+func (c *subCollector) forEnumSubst(loopName string, items []*syntax.Word, do []*syntax.Stmt) bool {
+	if len(items) == 0 {
+		return false
+	}
+	vals := make([]string, 0, len(items))
+	for _, w := range items {
+		s, ok := wordToArg(w)
+		if !ok {
+			return false // dynamic item → stay dynamic
+		}
+		if !isSafeIdentOrRelPath(s) {
+			c.reject()
+			return true
+		}
+		vals = append(vals, s)
+	}
+	if c.enumVars == nil {
+		c.enumVars = map[string]string{}
+	}
+	prev, hadPrev := c.enumVars[loopName]
+	for _, v := range vals {
+		c.enumVars[loopName] = v
+		c.walkStmts(do, false)
+		if c.rejected {
+			break
+		}
+	}
+	if hadPrev {
+		c.enumVars[loopName] = prev
+	} else {
+		delete(c.enumVars, loopName)
+	}
+	return true
 }
 
 func litHasUnquotedGlobOrTilde(rawLit string, isWordStart bool, openBracket *bool) bool {
@@ -1485,7 +1612,8 @@ func (c *subCollector) wordToArg(w *syntax.Word) (string, bool) {
 	if w == nil || len(w.Parts) == 0 {
 		return "", false
 	}
-	// Fast path: try full-word simple ParamExp resolve for command heads.
+	// Fast path: full-word simple ParamExp resolve for command heads
+	// (staticVars / abs-path binds only — enumVars never become heads).
 	if len(w.Parts) == 1 {
 		if pe, ok := w.Parts[0].(*syntax.ParamExp); ok {
 			if v, ok := c.resolveStaticParam(pe); ok {
@@ -1500,7 +1628,84 @@ func (c *subCollector) wordToArg(w *syntax.Word) (string, bool) {
 			}
 		}
 	}
-	return wordToArg(w)
+	hasSubst := (c.enumVars != nil && len(c.enumVars) > 0) || (c.staticVars != nil && len(c.staticVars) > 0)
+	if !hasSubst {
+		return wordToArg(w)
+	}
+	return c.wordToArgWithSubst(w)
+}
+
+// wordToArgWithSubst is wordToArg plus R-Allow-2 ParamExp substitution from
+// enumVars/staticVars (in-word / -c payload expansion).
+func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
+	if w == nil || len(w.Parts) == 0 {
+		return "", false
+	}
+	var b strings.Builder
+	static := true
+	openBracket := false
+	for i, part := range w.Parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+			if litHasUnquotedGlobOrTilde(p.Value, i == 0 && b.Len() == 0, &openBracket) {
+				static = false
+				b.WriteString(posixUnescapeLit(p.Value))
+				b.WriteString(cmdSubPlaceholder)
+				continue
+			}
+			b.WriteString(posixUnescapeLit(p.Value))
+		case *syntax.SglQuoted:
+			if p.Dollar {
+				static = false
+				b.WriteString(cmdSubPlaceholder)
+			} else {
+				b.WriteString(p.Value)
+			}
+		case *syntax.DblQuoted:
+			if p.Dollar {
+				static = false
+				b.WriteString(cmdSubPlaceholder)
+				break
+			}
+			for _, ip := range p.Parts {
+				switch ipp := ip.(type) {
+				case *syntax.Lit:
+					b.WriteString(decodeDblQuotedLit(ipp.Value))
+				case *syntax.ParamExp:
+					if v, ok := c.resolveParamForSubst(ipp); ok {
+						b.WriteString(v)
+					} else {
+						static = false
+						b.WriteString(cmdSubPlaceholder)
+					}
+				default:
+					static = false
+					b.WriteString(cmdSubPlaceholder)
+				}
+			}
+		case *syntax.ParamExp:
+			if v, ok := c.resolveParamForSubst(p); ok {
+				b.WriteString(v)
+			} else {
+				static = false
+				b.WriteString(cmdSubPlaceholder)
+			}
+		case *syntax.CmdSubst, *syntax.ArithmExp,
+			*syntax.ProcSubst, *syntax.ExtGlob, *syntax.BraceExp:
+			static = false
+			b.WriteString(cmdSubPlaceholder)
+		default:
+			static = false
+			b.WriteString(cmdSubPlaceholder)
+		}
+	}
+	if !static {
+		if b.Len() == 0 {
+			return cmdSubPlaceholder, false
+		}
+		return b.String(), false
+	}
+	return b.String(), true
 }
 
 func callHasProcSubst(call *syntax.CallExpr) bool {
