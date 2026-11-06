@@ -166,11 +166,29 @@ const dynamicRedirectTarget = "<dynamic>"
 // cannot be vetted); placeholders in argument positions are inert.
 const cmdSubPlaceholder = "__ctx_cmdsub__"
 
-// isDynamicArg reports a word that still carries the dynamic placeholder
+// cmdSubPlaceholderQuoted marks dynamic content that lived entirely inside
+// double quotes (no field-split / glob). Unquoted dynamics keep cmdSubPlaceholder.
+const cmdSubPlaceholderQuoted = "__ctx_dq_sub__"
+
+// isDynamicArg reports a word that still carries a dynamic placeholder
 // (static prefix may precede it, e.g. -c__ctx_cmdsub__).
 func isDynamicArg(a string) bool {
-	return strings.Contains(a, cmdSubPlaceholder)
+	return strings.Contains(a, cmdSubPlaceholder) || strings.Contains(a, cmdSubPlaceholderQuoted)
 }
+
+// isSplitSafeDynamicWord reports a dynamic argv word whose dynamic parts were
+// fully double-quoted (TASK.md correction 1). Static words return false;
+// callers must check isDynamicArg first when distinguishing allow vs deny.
+func isSplitSafeDynamicWord(a string) bool {
+	// Unquoted dynamics are never split-safe.
+	if strings.Contains(a, cmdSubPlaceholder) {
+		return false
+	}
+	return strings.Contains(a, cmdSubPlaceholderQuoted)
+}
+
+// argHasDyn reports either placeholder (for code-payload Contains checks).
+func argHasDyn(a string) bool { return isDynamicArg(a) }
 
 // splitShellSegments parses shell text via mvdan.cc/sh (LangPOSIX + Bash cross-check).
 func splitShellSegments(code string) []shellSegment {
@@ -282,10 +300,16 @@ var envHookVars = map[string]bool{
 	"GIT_EDITOR": true, "EDITOR": true, "VISUAL": true,
 	"SEQUENCE_EDITOR": true, "BASH_ENV": true, "ENV": true,
 	"PROMPT_COMMAND": true, "LD_PRELOAD": true, "LD_AUDIT": true,
-	"DYLD_INSERT_LIBRARIES": true,
-	"NODE_OPTIONS":          true, "PYTHONSTARTUP": true, "PYTHONINSPECT": true,
-	"PERL5OPT": true, "PERL5DB": true, "RUBYOPT": true,
+	"LD_LIBRARY_PATH": true, "DYLD_INSERT_LIBRARIES": true,
+	"PATH": true, "IFS": true,
+	"NODE_OPTIONS": true, "PYTHONSTARTUP": true, "PYTHONINSPECT": true,
+	"PYTHONPATH": true,
+	"PERL5OPT":   true, "PERL5DB": true, "RUBYOPT": true,
 	"JAVA_TOOL_OPTIONS": true, "JDK_JAVA_OPTIONS": true, "_JAVA_OPTIONS": true,
+	// Broad GIT_* execution hooks beyond the explicit names above.
+	"GIT_PROXY_COMMAND": true, "GIT_DIFF_OPTS": true,
+	"GIT_CONFIG_COUNT": true, "GIT_CONFIG_KEY_0": true, "GIT_CONFIG_VALUE_0": true,
+	"GIT_TRACE2_PARENT_SID": true, "GIT_EXEC_PATH": true,
 }
 
 // pagerSafeVars may be set to "" or "cat" — disabling the pager is the
@@ -683,6 +707,10 @@ func skipWatchArgs(argv []string, i int) (int, bool) {
 func skipFlockArgs(argv []string, i int) (int, string) {
 	for i < len(argv) {
 		a := argv[i]
+		if isDynamicArg(a) {
+			// Dynamic option/lock/command in flock zone → treat as code payload.
+			return len(argv), cmdSubPlaceholder
+		}
 		switch {
 		case a == "--":
 			return i + 1, ""
@@ -1172,6 +1200,10 @@ func unwrapInterpreterInline(argv []string) (lang, code string, ok bool) {
 				}
 				continue
 			}
+			if isDynamicArg(a) {
+				frags = append(frags, a)
+				return strings.Join(frags, "\n"), true
+			}
 			break // first non-option operand is the script file
 		}
 		if len(frags) == 0 {
@@ -1451,7 +1483,7 @@ func withScreenCwd(cwd string) func() {
 // names; every lookup failure yields "" (screen the typed name only), which
 // is exactly the pre-alias behaviour.
 func resolveHeadBase(name string) string {
-	if name == "" || strings.Contains(name, cmdSubPlaceholder) {
+	if name == "" || isDynamicArg(name) {
 		return ""
 	}
 	target := name
@@ -1856,7 +1888,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	// the head word means the executable name is dynamic — fail closed for
 	// both guards. Placeholders in ARGUMENT positions are inert (the
 	// substitution's own commands were already screened as segments).
-	if strings.Contains(head[0], cmdSubPlaceholder) {
+	if isDynamicArg(head[0]) {
 		return "dynamic command head"
 	}
 	base := filepath.Base(head[0])
@@ -1927,7 +1959,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		}
 	}
 	if text, has := unwrapShellArgv(head); has {
-		if strings.Contains(text, cmdSubPlaceholder) {
+		if isDynamicArg(text) {
 			return "dynamic code payload"
 		}
 		if kind == 's' {
@@ -1940,7 +1972,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		return guardShellReadonlyDepth(text, depth+1, caller)
 	}
 	if lang, code, has := unwrapInterpreterInline(head); has {
-		if strings.Contains(code, cmdSubPlaceholder) {
+		if isDynamicArg(code) {
 			return "dynamic code payload"
 		}
 		if lang == "python-module" {
@@ -1986,7 +2018,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return allowlistDetail("eval")
 		}
 		text := strings.Join(head[1:], " ")
-		if strings.Contains(text, cmdSubPlaceholder) {
+		if isDynamicArg(text) {
 			return "dynamic code payload"
 		}
 		if kind == 's' {
@@ -2032,7 +2064,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return peelResolvedDepth(head[k:], kind, depth+1, caller)
 		}
 		text := strings.Join(head[k:], " ")
-		if strings.Contains(text, cmdSubPlaceholder) {
+		if isDynamicArg(text) {
 			return "dynamic code payload"
 		}
 		if kind == 's' {
@@ -2049,6 +2081,9 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		}
 		inner, cmdText := skipFlockArgs(head, 1)
 		if cmdText != "" {
+			if isDynamicArg(cmdText) {
+				return "dynamic code payload"
+			}
 			return guardShellSubagentDepth(cmdText, depth+1, caller)
 		}
 		if inner < len(head) {
@@ -2064,6 +2099,9 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return "script"
 		}
 		if payload := scriptCommandArg(head); payload != "" {
+			if isDynamicArg(payload) {
+				return "dynamic code payload"
+			}
 			return guardShellSubagentDepth(payload, depth+1, caller)
 		}
 		return ""
@@ -2449,6 +2487,9 @@ func parseSSHInvocation(head []string) (remoteCmd, hit string) {
 func scriptCommandArg(head []string) string {
 	for i := 1; i < len(head); i++ {
 		a := head[i]
+		if a != "--" && isDynamicArg(a) {
+			return cmdSubPlaceholder
+		}
 		switch {
 		case a == "-c" || a == "--command":
 			if i+1 < len(head) {
@@ -2481,6 +2522,33 @@ func scriptCommandArg(head []string) string {
 	return ""
 }
 
+// pathPrependsNonSystem reports PATH values that put a non-system directory
+// ahead of the search (TASK S4). Empty / system-only paths are allowed.
+func pathPrependsNonSystem(val string) bool {
+	if val == "" {
+		return false
+	}
+	system := map[string]bool{
+		"/usr/bin": true, "/bin": true, "/usr/sbin": true, "/sbin": true,
+		"/usr/local/bin": true, "/usr/local/sbin": true,
+	}
+	for _, p := range strings.Split(val, ":") {
+		if p == "" {
+			continue
+		}
+		if p == "$PATH" || p == "${PATH}" {
+			return false // appending/referencing old PATH without prepend content
+		}
+		if !system[p] {
+			return true
+		}
+		// first real entry was system — still scan? TASK: 往前插了非系统目录
+		// Once we see a system dir first, later non-system is a append — allow.
+		return false
+	}
+	return false
+}
+
 // screenEnvAssignments replays the ordered env ops and screens each
 // assignment for execution-hook variables. For the sub-agent guard it
 // additionally simulates the spawned child's ROLE IDENTITY: starting from
@@ -2505,24 +2573,43 @@ func screenEnvAssignments(envAs envAssignments, kind byte, callerRole, callerRea
 			effRole = ""
 			effReadonly = ""
 		case 'u':
+			if isDynamicArg(op.key) {
+				return "env unset dynamic"
+			}
 			switch op.key {
 			case auditEnvRole:
 				effRole = ""
 			case auditEnvReadonly:
 				effReadonly = ""
 			}
+			if envHookVars[op.key] || guardTaintVars[op.key] {
+				return "env " + op.key
+			}
 		case 'a':
+			if isDynamicArg(op.key) {
+				return "env dynamic key"
+			}
 			switch op.key {
 			case auditEnvRole:
 				effRole = op.value
 			case auditEnvReadonly:
 				effReadonly = op.value
 			}
-			if envHookVars[op.key] {
+			if envHookVars[op.key] || guardTaintVars[op.key] {
 				if pagerSafeVars[op.key] && (op.value == "" || op.value == "cat") {
 					continue
 				}
-				return "env " + op.key
+				// Hook var: any dynamic value is rejected; PATH also rejects
+				// static prepend of non-system dirs (checked below).
+				if isDynamicArg(op.value) {
+					return "env " + op.key
+				}
+				if op.key == "PATH" && pathPrependsNonSystem(op.value) {
+					return "env PATH"
+				}
+				if op.key != "PATH" {
+					return "env " + op.key
+				}
 			}
 		}
 	}
@@ -2555,6 +2642,9 @@ func callerReadonlyRole(c callerIdentity) bool {
 // non-"-" operand is the action.
 func screenTrapArgs(args []string, kind byte, depth int, caller callerIdentity) string {
 	for _, a := range args {
+		if isDynamicArg(a) {
+			return "dynamic code payload"
+		}
 		if strings.HasPrefix(a, "-") && a != "-" {
 			continue // -p / -l / --help stay read-only
 		}
@@ -2690,6 +2780,17 @@ func screenFindArgs(args []string, kind byte, depth int, caller callerIdentity) 
 		"-newermt": true, "-newer": true, "-size": true, "-perm": true,
 		"-mtime": true, "-mmin": true, "-uid": true, "-gid": true,
 		"-user": true, "-group": true, "-printf": true, "-fprintf": true,
+		"-lname": true, "-ilname": true, "-samefile": true, "-inum": true,
+		"-links": true, "-used": true, "-fstype": true, "-anewer": true,
+		"-cnewer": true, "-newerat": true, "-newerct": true, "-regextype": true,
+		"-D": true,
+	}
+	hasExecTerm := false
+	for _, x := range args {
+		if x == ";" || x == "+" {
+			hasExecTerm = true
+			break
+		}
 	}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -2697,9 +2798,19 @@ func screenFindArgs(args []string, kind byte, depth int, caller callerIdentity) 
 			expectValue = false
 			continue
 		}
+		if kind == 'r' && (a == "-delete" || a == "-fprint" || a == "-fprint0" || a == "-fprintf" || a == "-fls") {
+			return "find " + a
+		}
 		if isDynamicArg(a) {
 			if !pathDone {
-				// still in starting path zone — dynamic path is ok-ish but fail closed
+				// Path zone: unquoted dyn always reject (TASK split). Quoted dyn
+				// with "/" is path-like; pure "$d" only if no -exec terminators
+				// (otherwise it may expand to -exec).
+				if isSplitSafeDynamicWord(a) && !strings.HasPrefix(a, "-") {
+					if strings.Contains(a, "/") || !hasExecTerm {
+						continue
+					}
+				}
 				return "find dynamic predicate"
 			}
 			return "find dynamic predicate"
@@ -3358,13 +3469,27 @@ func awkProgramFrags(args []string) (string, bool) {
 // text: the strict guard blocks it; the sub-agent guard has no write
 // fence to protect inside awk).
 func screenAwkSubagent(args []string, depth int, caller callerIdentity) string {
+	for _, a := range args {
+		if a == "--" {
+			break
+		}
+		if isDynamicArg(a) {
+			return "dynamic code payload"
+		}
+	}
 	program, _ := awkProgramFrags(args)
 	if program == "" {
 		return ""
 	}
+	if isDynamicArg(program) {
+		return "dynamic code payload"
+	}
 	// Screen each STRING LITERAL that reaches a command sink as shell text;
 	// a non-literal command is only allowed when it names no blocked head.
 	for _, lit := range awkCommandLiterals(program) {
+		if isDynamicArg(lit.text) {
+			return "dynamic code payload"
+		}
 		if lit.dynamic {
 			// Dynamic command text: only fails when the program itself names
 			// a blocked agent/orchestrator identifier.
@@ -3510,8 +3635,19 @@ func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
 	// sawFile is ignored: a script FILE is unvetted text, and unlike the
 	// strict guard the sub-agent caller keeps screening the inline/positional
 	// fragments collected alongside (the strict guard fails closed on -f).
+	for _, a := range args {
+		if a == "--" {
+			break
+		}
+		if isDynamicArg(a) {
+			return "dynamic code payload"
+		}
+	}
 	scripts, _ := sedScripts(args)
 	for _, s := range scripts {
+		if isDynamicArg(s) {
+			return "dynamic code payload"
+		}
 		cmds := sedExecCommands(s)
 		for _, cmd := range cmds {
 			if hit := guardShellSubagentDepth(cmd, depth+1, caller); hit != "" {
@@ -3827,6 +3963,12 @@ func sedExecCommands(s string) []string {
 func screenTarSubagent(args []string, depth int, caller callerIdentity) string {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if a == "--" {
+			break
+		}
+		if isDynamicArg(a) {
+			return "dynamic code payload"
+		}
 		var cmd string
 		switch {
 		case strings.HasPrefix(a, "--checkpoint-action="):
@@ -3858,6 +4000,9 @@ func screenTarSubagent(args []string, depth int, caller callerIdentity) string {
 		}
 		if cmd == "" {
 			continue
+		}
+		if isDynamicArg(cmd) {
+			return "dynamic code payload"
 		}
 		if hit := guardShellSubagentDepth(cmd, depth+1, caller); hit != "" {
 			return hit
@@ -4657,6 +4802,25 @@ func gitSubmoduleVerb(args []string) (verb string, isVerb bool) {
 // `--exec-path=<dir>` that redirects git to an unvetted helper directory.
 // Returns (index of the subcommand, guard hit or ""). Bare `git --exec-path`
 // (no value) is the path query and stays free.
+
+func gitKeyIsExecCapable(key string) bool {
+	if gitExecConfigKeys[key] {
+		return true
+	}
+	for _, p := range gitExecConfigPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	lk := strings.ToLower(key)
+	for _, needle := range []string{"hook", "command", "exec", "driver", "helper", "askpass", "editor", "pager", "ssh", "proxy"} {
+		if strings.Contains(lk, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func screenGitGlobalArgs(args []string) (int, string) {
 	i := 0
 	for i < len(args) {
@@ -4666,22 +4830,34 @@ func screenGitGlobalArgs(args []string) (int, string) {
 		}
 		switch {
 		case a == "-C" || a == "--git-dir" || a == "--work-tree" || a == "--namespace":
-			if i+1 < len(args) && isDynamicArg(args[i+1]) {
+			if i+1 >= len(args) {
+				return i, "git " + a
+			}
+			if isDynamicArg(args[i+1]) && !isSplitSafeDynamicWord(args[i+1]) {
 				return i, "git dynamic global option"
 			}
 			i += 2
 		case a == "-c":
-			if i+1 < len(args) {
-				if isDynamicArg(args[i+1]) {
+			if i+1 >= len(args) {
+				return i, "git -c"
+			}
+			pair := args[i+1]
+			if isDynamicArg(pair) {
+				// Key must be static; value may be split-safe dynamic for non-hook keys.
+				eq := strings.IndexByte(pair, '=')
+				if eq < 0 || isDynamicArg(pair[:eq]) {
 					return i, "git dynamic global option"
 				}
-				if hit := screenGitConfigPair(args[i+1]); hit != "" {
-					return i, hit
+				key, val := pair[:eq], pair[eq+1:]
+				if gitKeyIsExecCapable(key) || strings.HasPrefix(val, "!") {
+					return i, "git dynamic global option"
 				}
+			} else if hit := screenGitConfigPair(pair); hit != "" {
+				return i, hit
 			}
 			i += 2
 		case strings.HasPrefix(a, "-c") && len(a) > 2:
-			if isDynamicArg(a) || isDynamicArg(a[2:]) {
+			if isDynamicArg(a) {
 				return i, "git dynamic global option"
 			}
 			if hit := screenGitConfigPair(a[2:]); hit != "" {
@@ -4689,13 +4865,17 @@ func screenGitGlobalArgs(args []string) (int, string) {
 			}
 			i++
 		case a == "--config-env":
-			if i+1 < len(args) {
-				if hit := screenGitConfigEnvPair(args[i+1]); hit != "" {
-					return i, hit
-				}
+			if i+1 >= len(args) || isDynamicArg(args[i+1]) {
+				return i, "git dynamic global option"
+			}
+			if hit := screenGitConfigEnvPair(args[i+1]); hit != "" {
+				return i, hit
 			}
 			i += 2
 		case strings.HasPrefix(a, "--config-env="):
+			if isDynamicArg(a) {
+				return i, "git dynamic global option"
+			}
 			if hit := screenGitConfigEnvPair(a[len("--config-env="):]); hit != "" {
 				return i, hit
 			}
@@ -4711,6 +4891,9 @@ func screenGitGlobalArgs(args []string) (int, string) {
 			return i, "git --exec-path"
 		case strings.HasPrefix(a, "--git-dir=") || strings.HasPrefix(a, "--work-tree=") ||
 			strings.HasPrefix(a, "--namespace="):
+			if isDynamicArg(a) && !isSplitSafeDynamicWord(a) {
+				return i, "git dynamic global option"
+			}
 			i++
 		case strings.HasPrefix(a, "-"):
 			i++ // boolean global flags (--no-pager, --bare, -P, ...)
@@ -4730,9 +4913,25 @@ func screenGitGlobalArgs(args []string) (int, string) {
 func screenGitSubagentExecArgs(args []string) string {
 	// Skip the global options (same walk as screenGitGlobalArgs) to reach
 	// the subcommand operands.
-	i, _ := screenGitGlobalArgs(args)
+	i, hit := screenGitGlobalArgs(args)
+	if hit != "" {
+		return hit
+	}
+	sub := ""
+	if i < len(args) {
+		sub = args[i]
+		i++
+	}
+	endOpts := false
 	for ; i < len(args); i++ {
 		a := args[i]
+		if a == "--" {
+			endOpts = true
+			continue
+		}
+		if !endOpts && isDynamicArg(a) && (sub == "grep" || sub == "rebase") {
+			return "git " + sub + " dynamic option"
+		}
 		var val string
 		switch {
 		case a == "--open-files-in-pager" || a == "-O":
@@ -5508,7 +5707,7 @@ func pythonModuleHit(args []string) (hit string, hasModule bool) {
 		return "", false // no -m on this invocation
 	}
 	hasModule = true
-	if strings.Contains(mod, cmdSubPlaceholder) {
+	if isDynamicArg(mod) {
 		return "python -m <dynamic>", true // module name generated at run time
 	}
 	// `--` ends options; positionals after it still count (outfile path).
@@ -8889,32 +9088,63 @@ func hasDynamicInterpOption(head []string, base string) bool {
 		"--loader": true, "--import": true, "--experimental-loader": true,
 		"--conditions": true, "-I": true, "-M": true, "-m": true,
 		"-d": true, "-z": true, "--rcfile": true, "--init-file": true,
+		// Code-carrying flags: still consume the next argv so a following
+		// dynamic -e is not mistaken for the script file (MF-2 multi -e).
+		"-c": true, "+c": true, "-e": true, "-E": true, "-p": true,
+		"--eval": true, "--print": true,
+	}
+	codeFlags := map[string]bool{
+		"-c": true, "+c": true, "-e": true, "-E": true, "-p": true,
+		"--eval": true, "--print": true, "-r": true,
 	}
 	for i := 1; i < len(head); i++ {
 		a := head[i]
 		if a == "--" {
 			return false
 		}
+		// "-" means stdin script source; remaining args are script argv (W-Fix-6).
+		if a == "-" {
+			return false
+		}
 		if isDynamicArg(a) {
+			// Shell option zone: any dynamic word may expand to -c/-s etc.
+			if shell {
+				return true
+			}
+			// Interpreters: split-safe / path-like / script-ext operand ends options (W-Fix-6).
+			if !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+") {
+				if (isSplitSafeDynamicWord(a) && (strings.Contains(a, "/") || hasInterpScriptExt(a))) ||
+					strings.Contains(a, "/") || hasInterpScriptExt(a) {
+					return false
+				}
+			}
 			return true
 		}
 		if valueExact[a] {
-			if i+1 < len(head) && isDynamicArg(head[i+1]) {
+			if i+1 < len(head) && isDynamicArg(head[i+1]) && !codeFlags[a] {
 				return true
 			}
-			i++
+			i++ // consume value / code slot
 			continue
 		}
 		if strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+") {
-			// short cluster / long flag; glued -cPAYLOAD already checked via isDynamicArg(a)
 			if strings.HasPrefix(a, "--") {
 				continue
 			}
-			// -c / +c clusters: if 'c' present with empty tail, next argv is code (not option zone end)
 			continue
 		}
 		// first static non-option operand = script file → option zone ends
 		return false
+	}
+	return false
+}
+
+func hasInterpScriptExt(a string) bool {
+	lower := strings.ToLower(a)
+	for _, ext := range []string{".js", ".ts", ".mjs", ".cjs", ".py", ".pl", ".rb", ".php"} {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
 	}
 	return false
 }

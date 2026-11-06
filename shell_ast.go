@@ -1681,7 +1681,7 @@ func (c *subCollector) noteDeclCallBinds(argv []string) {
 			continue
 		}
 		name, val := a[:k], a[k+1:]
-		static := !strings.Contains(val, cmdSubPlaceholder)
+		static := !isDynamicArg(val)
 		c.noteStaticAssign(name, val, static)
 	}
 }
@@ -1855,14 +1855,14 @@ func wordToArg(w *syntax.Word) (string, bool) {
 		case *syntax.DblQuoted:
 			if p.Dollar {
 				static = false
-				b.WriteString(cmdSubPlaceholder)
+				b.WriteString(cmdSubPlaceholderQuoted)
 				break
 			}
 			for _, ip := range p.Parts {
 				lit, ok := ip.(*syntax.Lit)
 				if !ok {
 					static = false
-					b.WriteString(cmdSubPlaceholder)
+					b.WriteString(cmdSubPlaceholderQuoted)
 					continue
 				}
 				b.WriteString(decodeDblQuotedLit(lit.Value))
@@ -1947,7 +1947,7 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 		case *syntax.DblQuoted:
 			if p.Dollar {
 				static = false
-				b.WriteString(cmdSubPlaceholder)
+				b.WriteString(cmdSubPlaceholderQuoted)
 				break
 			}
 			for _, ip := range p.Parts {
@@ -1959,11 +1959,11 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 						b.WriteString(v)
 					} else {
 						static = false
-						b.WriteString(cmdSubPlaceholder)
+						b.WriteString(cmdSubPlaceholderQuoted)
 					}
 				default:
 					static = false
-					b.WriteString(cmdSubPlaceholder)
+					b.WriteString(cmdSubPlaceholderQuoted)
 				}
 			}
 		case *syntax.ParamExp:
