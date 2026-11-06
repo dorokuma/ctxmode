@@ -47,3 +47,7 @@ oracle 第 1 轮复审输出的 5 条 `consider` 观察项及结论，逐条归�
 - **C9 `deploy.sh` 预检重试窗口临时清除 EXIT trap（deploy.sh:170-184）**：`deploy.sh` 在解锁线上二进制之前的 `set +e` MCP `initialize` 探针重试循环中临时执行了 `trap - EXIT`（随后恢复 `trap cleanup_on_error EXIT`）；该极窄窗口内若收到外部 `SIGINT`/`SIGTERM` 可能遗留 staging 临时文件 `$TMP_FILE` / `$TMP_FILE.err`，但此时线上 `$BINARY` 尚未解锁（仍保持 `0555` + `chattr +i`），不影响线上二进制与不可变锁安全性；正常成功与探针失败退出分支均已显式清理临时文件，后续如需进一步收紧可拆分 `ERR` 与 `EXIT` trap。
 
 附注：`run_task.go:103` 的 run_task 拦截仅针对 `guard.strictReadonly`（即只读角色集合减去 verifier）；`verifier` 因此仍可使用固定 `kind` 白名单的 `ctx_run action=run_task`，其 `args`/`env` 参数继续走子代理嵌套门禁筛查（`guardCtxRunArgv`/`guardCtxRunShell`），身份与环境字段不受豁免。
+
+## SH11 round-8 复审 consider 归档（2026-11-06）
+
+- **C10 [pattern:path-trust-user-writable] PATH 信任表含用户可写目录段**：`isSafePathDirEntry` 把 `/home/linuxbrew/` 前缀、`/.local/bin`、`/.local/share/mise/shims` 等 dev-toolchain/包管理器目录视为可信 PATH 段；`headBaseAliasHits`/`resolveHeadBase` 在解析命令头时同样走这份信任。若此类用户可写目录被植入同名恶意二进制，命令头会被解析为已放行名而绕过名白名单。该边界**非本 diff（readonly allowlist + 守卫加固）引入**，属刻意的信任边界权衡：这些目录本身已握有执行权（PATH 中任何二进制都在用户权限下运行），门禁层的 PATH 筛查目标是挡"明显不可信的可写区"（`/tmp`/`/var/tmp`/`/dev/shm`/`/run` 已显式拒绝），不为用户家目录内已有的执行位做第二层防植入。标记为 consider（非 must fix）；如需收紧可在 `isSafePathDirEntry` 引入"仅 root 可写"校验（`os.Stat` mode 位 + owner 检查），代价是失去 portable 信任语义并引入每次调用的 stat 开销。关联 round-8 审查与 `role_guards.go` `isSafePathDirEntry`/`headBaseAliasHits`。

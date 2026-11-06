@@ -373,6 +373,17 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 	if language == "" {
 		language = "shell"
 	}
+	guardEarly := currentGuardCall()
+	if guardEarly.strictReadonly && !useArgv {
+		if language != "" && language != "shell" {
+			audit.setScreen(shellBlock, ruleReadonlyWrite)
+			return nil, nil, guardBlockedError(ruleReadonlyWrite, "language "+language)
+		}
+	}
+	if guardEarly.strictReadonly && args.Background {
+		audit.setScreen(shellBlock, ruleReadonlyWrite)
+		return nil, nil, guardBlockedError(ruleReadonlyWrite, "background")
+	}
 
 	// Parse timeout_ms (capped at 1 hour).
 	var timeout time.Duration
@@ -940,6 +951,11 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		audit.setError(err)
 		audit.emit()
 	}()
+
+	if currentGuardCall().strictReadonly {
+		audit.setScreen(shellBlock, ruleReadonlyWrite)
+		return nil, nil, guardBlockedError(ruleReadonlyWrite, "execute_file")
+	}
 
 	if args.Path == "" {
 		return nil, nil, fmt.Errorf("path is required")
