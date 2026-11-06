@@ -102,6 +102,9 @@ func collectGoCmdArgvs(code string) (argvs [][]string, depthExceeded bool) {
 	// parseErr is fail-closed (same as depthExceeded for dash-diff purposes): the guard
 	// rejected before emitting a complete argv picture, so argv mismatch is expected.
 	// Wrapper heads are peeled so dash argv[0] (post env/nice/xargs) can match Go targets.
+	// Interpreter -c payloads are recursively collected so dashExecutedUnknown sees nested
+	// heads (SF-1). When peelWrappers consumes the whole argv (env -S only, etc.), treat
+	// as fail-closed — the argv picture of what -S would exec is incomplete.
 	segs := splitShellSegments(code)
 	for _, s := range segs {
 		if s.depthExceeded || s.parseErr != "" {
@@ -111,20 +114,62 @@ func collectGoCmdArgvs(code string) (argvs [][]string, depthExceeded bool) {
 		if len(s.argv) == 0 {
 			continue
 		}
-		i, _, _, exhausted := peelWrappers(s.argv)
+		i, payloads, _, exhausted := peelWrappers(s.argv)
 		if exhausted {
 			depthExceeded = true
 			continue
 		}
-		head := s.argv
-		if i < len(s.argv) {
-			head = s.argv[i:]
+		if i < 0 {
+			i = 0
 		}
+		if i > len(s.argv) {
+			i = len(s.argv)
+		}
+		head := s.argv[i:]
 		if len(head) == 0 {
+			// Peel ate everything (e.g. env -vS '…' with no trailing command).
+			if len(payloads) > 0 || i > 0 {
+				depthExceeded = true
+			}
 			continue
 		}
 		cp := append([]string(nil), head...)
 		argvs = append(argvs, cp)
+		if shellText, ok := unwrapShellArgv(head); ok && shellText != "" {
+			nested, nestEx := collectGoCmdArgvs(shellText)
+			if nestEx {
+				depthExceeded = true
+			}
+			argvs = append(argvs, nested...)
+		}
+		// flock LOCK -c CMD / flock LOCK cmd…: collect inner command so
+		// dashExecutedUnknown sees what dash runs after the lock wrapper (SF-1).
+		if filepath.Base(head[0]) == "flock" {
+			inner, cmdText := skipFlockArgs(head, 1)
+			if cmdText != "" {
+				if isDynamicArg(cmdText) {
+					depthExceeded = true
+				} else {
+					nested, nestEx := collectGoCmdArgvs(cmdText)
+					if nestEx {
+						depthExceeded = true
+					}
+					argvs = append(argvs, nested...)
+				}
+			} else if inner >= 0 && inner < len(head) {
+				nestedHead := append([]string(nil), head[inner:]...)
+				if len(nestedHead) > 0 {
+					argvs = append(argvs, nestedHead)
+					if shellText2, ok2 := unwrapShellArgv(nestedHead); ok2 && shellText2 != "" {
+						n2, n2ex := collectGoCmdArgvs(shellText2)
+						if n2ex {
+							depthExceeded = true
+						}
+						argvs = append(argvs, n2...)
+					}
+				}
+			}
+		}
 	}
 	return argvs, depthExceeded
 }
@@ -310,12 +355,33 @@ func takeRedirectWord(s string) (word string, n int) {
 }
 
 // isSafeRedirectForTestExec reports whether code is safe to feed to /bin/sh.
-// Unsafe = any redirect target that starts with "/" and is not exactly
-// "/dev/null" (word boundary). Heredocs and fd-duplication (>&N) are ignored.
-// On unsafe, callers must NOT exec /bin/sh.
+// Unsafe = absolute redirect targets other than /dev/null, dynamic redirect
+// targets ($ ` * ? [ ..), unquoted-# comment quote-flip hazards, or find
+// write actions (-delete/-fprint*/-fls). Heredocs and fd-duplication (>&N)
+// are ignored. On unsafe, callers must NOT exec /bin/sh.
 func isSafeRedirectForTestExec(code string) bool {
+	// Real find in PATH can write/delete; never feed those samples to /bin/sh.
+	if strings.Contains(code, "-delete") || strings.Contains(code, "-fprint") || strings.Contains(code, "-fls") {
+		return false
+	}
 	i := 0
 	for i < len(code) {
+		// Unquoted '#' at a word-start boundary starts a comment through '\n'.
+		// Quotes inside the comment must NOT flip quote state (SF-1).
+		if code[i] == '#' {
+			atWordStart := i == 0
+			if !atWordStart {
+				prev := code[i-1]
+				atWordStart = prev == ' ' || prev == '\t' || prev == '\n' ||
+					prev == ';' || prev == '|' || prev == '&' || prev == '(' || prev == ')'
+			}
+			if atWordStart {
+				for i < len(code) && code[i] != '\n' {
+					i++
+				}
+				continue
+			}
+		}
 		// Skip single-quoted regions so literal > inside quotes is ignored.
 		if code[i] == '\'' {
 			i++
@@ -371,8 +437,13 @@ func isSafeRedirectForTestExec(code string) bool {
 		if j >= len(code) {
 			return true
 		}
-		target, _ := takeRedirectWord(code[j:])
-		if strings.HasPrefix(target, "/") && target != "/dev/null" {
+		rawStart := j
+		target, n := takeRedirectWord(code[j:])
+		rawTarget := code[rawStart : rawStart+n]
+		if target == "" ||
+			strings.ContainsAny(rawTarget, "$`*?[\r\n") ||
+			strings.Contains(target, "..") ||
+			(strings.HasPrefix(target, "/") && target != "/dev/null") {
 			return false
 		}
 		i = j
@@ -510,8 +581,9 @@ func staticLeafArgvs(argvs [][]string) [][]string {
 // argvHasDynamic reports placeholders left by the AST for non-static words.
 func argvHasDynamic(a []string) bool {
 	for _, s := range a {
-		if strings.Contains(s, cmdSubPlaceholder) || strings.Contains(s, dynamicRedirectTarget) ||
-			strings.Contains(s, envUnknownLongPrefix) || strings.HasPrefix(s, "__ctx_") {
+		if strings.Contains(s, cmdSubPlaceholder) || strings.Contains(s, cmdSubPlaceholderQuoted) ||
+			strings.Contains(s, dynamicRedirectTarget) ||
+			strings.Contains(s, envUnknownLongPrefix) || strings.Contains(s, "__ctx_") {
 			return true
 		}
 	}
@@ -542,6 +614,11 @@ func leafArgvDeepAgree(goLeaves, dashLeaves [][]string) bool {
 }
 
 func leafArgvDeepAgreeExt(goLeaves, dashLeaves, goWithDyn [][]string) bool {
+	// When dash ran a head that Go listed as a static leaf, full argv must
+	// exact-match one static Go leaf. If Go also tracked a dynamic sibling
+	// with the same argv0 (placeholder args), a dash expansion that does not
+	// exact-match is ignored — the static Go leaf is a different invocation.
+	// Unknown dash heads use dashExecutedUnknown. Go-only over-parses are ignored.
 	byHead := map[string][][]string{}
 	for _, g := range goLeaves {
 		if len(g) == 0 {
@@ -783,17 +860,15 @@ func runDashDiffCases(t *testing.T, cases []dashDiffCase) (mismatches []string) 
 				}
 			}
 			pathDir, outFile := setupPrinterPATH(t, names)
+			safe := isSafeRedirectForTestExec(c.code)
 			dashArgvs, raw, _ := runDashCollectArgvs(t, c.code, pathDir, outFile)
 
-			// When the worker guard fail-closes, argv pictures may diverge
-			// (env -a renames argv0; -S splits; parseErr drops segs). The
-			// MustFix_SubagentBlocks suite covers the reject; dash-diff only
-			// asserts agreement on scripts the guard would allow.
-			if guardShellSubagent(c.code) != "" {
-				return
-			}
-
-			if c.expectDashRuns && len(dashArgvs) == 0 {
+			// SF-1: never early-return on guard reject. When !depthEx the Go AST
+			// produced a complete argv picture, so dashExecutedUnknown must still
+			// fire even if the worker guard blocked pig/rm by name. Only depthEx
+			// (parseErr / depthExceeded fail-closed) skips those asserts.
+			// expectDashRuns: skip when safety gate refused exec or AST fail-closed.
+			if c.expectDashRuns && len(dashArgvs) == 0 && safe && !depthEx {
 				msg := fmt.Sprintf("%s: expected dash to run external probe; raw=%q go=%s Hint: replace builtins with p1/p2/pig", c.name, raw, fmtArgvs(goArgvs))
 				mismatches = append(mismatches, msg)
 				t.Error(msg)
@@ -801,7 +876,15 @@ func runDashDiffCases(t *testing.T, cases []dashDiffCase) (mismatches []string) 
 			}
 
 			goExt := filterExternalArgvs(goArgvs)
-			miss := dashExecutedUnknown(goExt, dashArgvs)
+			// env -a/--argv0 aliases come from the unpeeled segment argv.
+			rawArgvs := [][]string{}
+			for _, s := range splitShellSegments(c.code) {
+				if len(s.argv) > 0 {
+					rawArgvs = append(rawArgvs, append([]string(nil), s.argv...))
+				}
+			}
+			aliases := envArgv0Aliases(rawArgvs)
+			miss := filterAliasMisses(dashExecutedUnknown(goExt, dashArgvs), aliases)
 			if len(miss) > 0 && !depthEx {
 				msg := fmt.Sprintf("%s: dash ran cmds Go missed: %v\ncode=%q\ngo:\n%sdash:\n%sraw=%q",
 					c.name, miss, c.code, fmtArgvs(goArgvs), fmtArgvs(dashArgvs), raw)
@@ -1000,6 +1083,11 @@ func TestAlFix7_FuzzArgvDiff(t *testing.T) {
 		"\nEOF\n", "\n$EOF\n", "\n)\nEOF\n",
 		"case $? in 0) p1;; esac", "case x in x) pig;; esac",
 		"# \\\np1\n", "2\\\n>sink", "'2'>sink",
+		// SF-1 grammar-aware lexical seeds (no "/", "..", "cd", "~")
+		"$", "$\\\n", "{x:-pig}", "{x:-p1}", "{x:--c}", "1",
+		"\\\n # \\\n", " # \\\n", "p1 \\\n # \\\npig\n",
+		"sh -c '", "' _ pig", "env -u ", "flock sink -c ", "trap ", " EXIT",
+		"${x:-", "\\\"\"", "$(case x in x) p1;; esac)",
 	}
 	// Host safety: no "/", "..", "cd", or "~"; redirects use relative sink.
 	templates := []string{
@@ -1033,6 +1121,13 @@ func TestAlFix7_FuzzArgvDiff(t *testing.T) {
 		"true; pig",
 		"p1\npig",
 		"cat <<\"\\$EOF\"\n$EOF\npig",
+		// SF-1 grammar-aware templates
+		"$\\\n{x:-pig}",
+		"echo \\\n # \\\npig",
+		"sh -c '$\\\n1' _ pig",
+		"flock sink -c 'pig'",
+		"trap 'pig' EXIT",
+		"env -u CTXMODE_ROLE sh -c p1",
 	}
 
 	mismatches := 0
@@ -1204,4 +1299,27 @@ func TestAlFix7_CaptureBaselineMismatches(t *testing.T) {
 		t.Fatalf("write report: %v", err)
 	}
 	t.Logf("wrote %s fail=%d/%d", outPath, nFail, len(all))
+}
+
+// TestIsSafeRedirect_SF1 closes PLAN10 R10_SF1_01/02: comment quote-flip and
+// dynamic redirect targets must never be fed to real /bin/sh.
+func TestIsSafeRedirect_SF1(t *testing.T) {
+	if isSafeRedirectForTestExec("# '\necho x > /pwn # '") {
+		t.Fatalf("R10_SF1_01: comment quote-flip must be unsafe")
+	}
+	if isSafeRedirectForTestExec("echo x > ${UNSET:-/pwn}") {
+		t.Fatalf("R10_SF1_02: dynamic redirect target must be unsafe")
+	}
+	if isSafeRedirectForTestExec("find . -delete") {
+		t.Fatalf("find -delete must be unsafe")
+	}
+	if isSafeRedirectForTestExec("find . -fprint /tmp/x") {
+		t.Fatalf("find -fprint must be unsafe")
+	}
+	if !isSafeRedirectForTestExec("echo x > sink") {
+		t.Fatalf("relative sink redirect should be safe")
+	}
+	if !isSafeRedirectForTestExec("cat < /dev/null") {
+		t.Fatalf("/dev/null redirect should be safe")
+	}
 }
