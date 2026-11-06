@@ -1512,12 +1512,24 @@ func TestGuard_CtxRunStdinEnv(t *testing.T) {
 			detail:  "find dynamic predicate",
 		},
 		{
+			// R15: the xargs fed-code slot runs under the INNER wrapper's
+			// env too — env ops peeled off the fed argv must merge into
+			// envAs (was dropped by the fed-code fast path).
+			name:   "xargs fed-code keeps inner wrapper env (argv)",
+			argv:   []string{"xargs", "-I{}", "env", "HOME=-exec", "sh", "-c", "{}"},
+			stdin:  `find "$HOME" -maxdepth 1`,
+			rule:   ruleSubagentNestedAgent,
+			detail: "find dynamic predicate",
+		},
+		{
 			// R14 evidence: `read -s` binds an ORDINARY variable — the
 			// stdin pre-scan must taint it so the later "$x" head cannot
-			// borrow a static bind.
+			// borrow a static bind. R15: bind a legal head first — an
+			// unbound $x is a dynamic head either way, which made the
+			// original probe vacuous.
 			name:   "read -s binds ordinary var (argv)",
 			argv:   []string{"sh"},
-			stdin:  `read -s x; "$x"`,
+			stdin:  `x=/bin/echo; read -s x; "$x"`,
 			rule:   ruleSubagentNestedAgent,
 			detail: "dynamic command head",
 		},

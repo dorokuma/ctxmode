@@ -735,9 +735,71 @@ func astMustRedRound14Cases() []astRedWantCase {
 		{astRedCase{"R14_M5_02", "PATH=\"./venv/bin:$PATH\" python3 -V", "worker", true, "M5 ./venv/bin no longer allowed"}, "env PATH"},
 
 		// Evidence: `read -s x` binds x — the pre-scan must taint the name so
-		// a later head/$ expansion does not inherit a stale trust.
-		{astRedCase{"R14_EV_01", "read -s x; \"$x\"", "worker", true, "EV read -s x taints x"}, "dynamic command head"},
+		// a later head/$ expansion does not inherit a stale trust. R15: x is
+		// bound to a LEGAL head first; without the read taint the "$x" head
+		// would resolve statically and pass — a bare `read -s x; "$x"` was a
+		// false-green probe because an unbound $x is dynamic either way.
+		{astRedCase{"R14_EV_01", "x=/bin/echo; read -s x; \"$x\"", "worker", true, "EV read -s x taints x"}, "dynamic command head"},
 	}
+}
+
+// astMustRedRound15Cases is the review round-5 fix table: operator-scoped
+// default fd descriptors, inherited compound fd origins, perl/ruby
+// optional-glued cluster letters (-i not swallowing -e), recursive env
+// propagation through wrapper/fed-code/stdin branches, and sed's dynamic
+// -f argv advance.
+func astMustRedRound15Cases() []astRedWantCase {
+	return []astRedWantCase{
+		// MF-1: an output op without N binds fd1, not fd0 — `sh >/dev/null`
+		// inside a pipeline still reads its program from the pipe.
+		{astRedCase{"R15_M1_01", "echo pig | sh >/dev/null", "worker", true, "M1 > binds fd1 not fd0"}, "piped code to shell"},
+		{astRedCase{"R15_M1_02", "echo pig | sh >>/dev/null", "worker", true, "M1 >> binds fd1 not fd0"}, "piped code to shell"},
+
+		// MF-2: a compound statement's own non-fd0 dups ride the inherited
+		// descriptor table into the body — `{ sh 0<&9; } 9<&0` smuggles the
+		// pipe through fd9 exactly like the flat `9<&0 0<&9` spelling.
+		{astRedCase{"R15_M2_01", "echo pig | { sh 0<&9; } 9<&0", "worker", true, "M2 compound fd9 dup carries pipe"}, "piped code to shell"},
+		{astRedCase{"R15_M2_02", "echo pig | (sh 0<&9) 9<&0", "worker", true, "M2 subshell fd9 dup carries pipe"}, "piped code to shell"},
+		{astRedCase{"R15_M2_03", "echo pig | { sh 0<&9; } 9<f", "worker", false, "M2 fd9 file-bound inside group"}, ""},
+
+		// MF-3: perl/ruby -i is an optional-GLUED flag — a bare -i consumes
+		// no argv word, so a separate -e still carries the code operand.
+		{astRedCase{"R15_M3_01", "perl -i -e 'system(\"pig\")'", "worker", true, "M3 perl -i -e code slot"}, "perl inline code"},
+		{astRedCase{"R15_M3_02", "ruby -i -e 'system(\"pig\")'", "worker", true, "M3 ruby -i -e code slot"}, "ruby inline code"},
+		{astRedCase{"R15_M3_03", "echo x | xargs -I{} perl -i -e '{}'", "worker", true, "M3 xargs-fed perl -e after -i"}, "piped code to perl"},
+
+		// MF-4: env ops peeled inside flock/watch/xargs recursion reach the
+		// env the stdin-program text runs under — a heredoc / here-string
+		// payload screens `find "$HOME"` as a dynamic predicate once the
+		// inner HOME=-exec op merges into envAs (the xargs fed-code inner
+		// env is covered in TestGuard_CtxRunStdinEnv).
+		{astRedCase{"R15_M4_01", "flock /tmp/l env HOME=-exec sh <<'EOF'\nfind \"$HOME\" -maxdepth 1\nEOF", "worker", true, "M4 flock inner env reaches heredoc"}, "find dynamic predicate"},
+		{astRedCase{"R15_M4_02", "watch -x env HOME=-exec sh <<'EOF'\nfind \"$HOME\" -maxdepth 1\nEOF", "worker", true, "M4 watch -x inner env reaches heredoc"}, "find dynamic predicate"},
+		{astRedCase{"R15_M4_03", "xargs -r env HOME=-exec sh <<'EOF'\nfind \"$HOME\" -maxdepth 1\nEOF", "worker", true, "M4 xargs inner env reaches heredoc"}, "find dynamic predicate"},
+		// <<< needs the bash grammar — the payload rides a bash -c wrapper;
+		// the escaped \$ keeps $HOME literal inside the here-string so the
+		// env-merge (not collect-time substitution) decides the verdict.
+		{astRedCase{"R15_M4_04", "bash -c 'flock /tmp/l env HOME=-exec sh <<< \"find \\$HOME -maxdepth 1\"'", "worker", true, "M4 flock inner env reaches here-string"}, "find dynamic predicate"},
+		{astRedCase{"R15_M4_05", "bash -c 'watch -x env HOME=-exec sh <<< \"find \\$HOME -maxdepth 1\"'", "worker", true, "M4 watch inner env reaches here-string"}, "find dynamic predicate"},
+
+		// MF-5: a dynamic -f tail is the GLUED script-file operand — argv
+		// advance uses the real word length, so a following -e still arms
+		// the exec screen while the dynamic path operand stays free.
+		{astRedCase{"R15_M5_01", "sed -nf\"$PWD/x.sed\" -e 'e pig' /tmp/f", "worker", true, "M5 dynamic -f tail: -e still seen"}, "pig"},
+		{astRedCase{"R15_M5_02", "sed -nf\"$PWD/x.sed\" 'e pig' /tmp/f", "worker", false, "M5 dynamic -f tail: positional is data"}, ""},
+	}
+}
+
+// TestAST_MustRed_Round15 is the review round-5 regression gate.
+func TestAST_MustRed_Round15(t *testing.T) {
+	cases := astMustRedRound15Cases()
+	for _, c := range cases {
+		c := c
+		t.Run(c.id, func(t *testing.T) {
+			runAstWantCase(t, c)
+		})
+	}
+	t.Logf("must-red round15 summary: cases=%d", len(cases))
 }
 
 // TestAST_MustRed_Round14 is the review round-4 regression gate.

@@ -1856,12 +1856,17 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 // compound's heredoc / here-string (only an fd0 redirect queues them), and
 // file for a real file/dup binding. A file-bound stdin never reaches the
 // program as piped bytes, so feeds carrying file set seg.stdinRedir.
+// fds carries the full fd->origin snapshot an enclosing compound left
+// behind: `{ sh 0<&9; } 9<&0` needs fd9's piped origin inside the braces
+// even though only fd0 feeds the group itself. Entries carry no nested
+// fds; fds[0] always equals the feed itself.
 type stdinFeed struct {
 	piped   bool
 	bodies  []heredocBody
 	hereStr string
 	hasHere bool
 	file    bool
+	fds     map[string]stdinFeed
 }
 
 // applyRedirs folds st.Redirs into seg: output redirects feed redirectFile /
@@ -1873,8 +1878,12 @@ type stdinFeed struct {
 // origin sets stdinRedir; non-fd0 heredocs never reach stdin, so their
 // bodies are not collected.
 func (c *subCollector) applyRedirs(seg *shellSegment, redirs []*syntax.Redirect, feed stdinFeed) {
-	origin := c.feedThrough(redirs, feed)
+	origin := c.feedThrough(redirs, feed)["0"]
 	seg.stdinRedir = origin.file
+	// The FINAL fd0 origin decides the piped-stdin mark too: an explicit
+	// rebind (0< f, 0>f, 0<&9 with fd9 file-bound) means no pipe bytes
+	// reach the program even though the segment sits inside a pipeline.
+	seg.pipedStdin = origin.piped
 	seg.heredocText = append(seg.heredocText, origin.bodies...)
 	if origin.hasHere {
 		seg.hereString = origin.hereStr
@@ -1944,18 +1953,33 @@ func (c *subCollector) heredocBodyOf(r *syntax.Redirect) heredocBody {
 }
 
 // feedThrough replays a redirect list over base and returns the resulting
-// fd0 origin. Fd origins are tracked per descriptor: an input op on fd n
-// re-binds that fd (file / heredoc payload / here-string / closed / dup of
-// another fd's origin), an output op on fd0 binds it to the write target,
-// and anything else leaves the fd alone. An fd never touched by the list
-// keeps a file origin (an inherited foreign fd cannot be the pipe) — except
-// fd0, which starts at base. No nested commands are emitted here; callers
-// emit them so compound statements can reuse the replay without double
-// scanning.
-func (c *subCollector) feedThrough(redirs []*syntax.Redirect, base stdinFeed) stdinFeed {
-	origins := map[string]stdinFeed{"0": base}
+// per-descriptor origin table; callers read ["0"] for the fd0 origin. Fd
+// origins are tracked per descriptor: an input op on fd n re-binds that fd
+// (file / heredoc payload / here-string / closed / dup of another fd's
+// origin), an output op on fd0 binds it to the write target, and anything
+// else leaves the fd alone. An fd never touched by the list keeps a file
+// origin (an inherited foreign fd cannot be the pipe) — except fd0, which
+// starts at base, and the descriptors base.fds carries down from an
+// enclosing compound's own redirect list. The default descriptor when the
+// redirect word omits N is the operator's own: fd0 for stdin-side ops,
+// fd1 for output-side ops — `sh >/dev/null` rebinds stdout, never stdin.
+// No nested commands are emitted here; callers emit them so compound
+// statements can reuse the replay without double scanning.
+func (c *subCollector) feedThrough(redirs []*syntax.Redirect, base stdinFeed) map[string]stdinFeed {
+	origins := make(map[string]stdinFeed, len(base.fds)+1)
+	for fd, o := range base.fds {
+		origins[fd] = o
+	}
+	origins["0"] = base
 	for _, r := range redirs {
+		// n: the descriptor the op actually binds when the word omits N —
+		// fd0 for stdin-side ops, fd1 for output-side ops.
 		n := "0"
+		switch r.Op {
+		case syntax.RdrOut, syntax.AppOut, syntax.RdrAll, syntax.AppAll,
+			syntax.RdrClob, syntax.DplOut:
+			n = "1"
+		}
 		if r.N != nil {
 			n = r.N.Value
 		}
@@ -2011,13 +2035,15 @@ func (c *subCollector) feedThrough(redirs []*syntax.Redirect, base stdinFeed) st
 			}
 		}
 	}
-	return origins["0"]
+	return origins
 }
 
 // stmtFeed computes the stdin feed a COMPOUND statement's body sees:
 // its own redirect list is replayed over the enclosing feed so
 // `(sh) <<'EOF'` hands the heredoc payload to inner commands (they are
 // screened as program text) and `(sh) < f` marks their stdin file-bound.
+// The body also inherits the whole descriptor table: `{ sh 0<&9; } 9<&0`
+// resolves fd9 through feed.fds to the pipe the group's redirect copied.
 // Redirect words and unquoted heredoc bodies still emit their nested
 // substitutions exactly like a CallExpr's redirects do.
 func (c *subCollector) stmtFeed(st *syntax.Stmt, feed stdinFeed) stdinFeed {
@@ -2029,7 +2055,10 @@ func (c *subCollector) stmtFeed(st *syntax.Stmt, feed stdinFeed) stdinFeed {
 			c.emitNestedFromWord(r.Hdoc, feed)
 		}
 	}
-	return c.feedThrough(st.Redirs, feed)
+	origins := c.feedThrough(st.Redirs, feed)
+	inner := origins["0"]
+	inner.fds = origins
+	return inner
 }
 
 func (c *subCollector) setWriteRedirect(seg *shellSegment, r *syntax.Redirect) {

@@ -3992,8 +3992,11 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 	if seg.hereString != "" && !seg.stdinRedir {
 		head, _, envAs, _ := peelWrappers(seg.argv)
 		if len(head) > 0 {
-			if lang, isProg := stdinProgramHead(head); isProg {
-				if hit := screenStdinProgram(seg.hereString, lang, kind, depth, caller.seededWith(envAs)); hit != "" {
+			// R15: the program head may itself hide inside wrappers
+			// (flock/watch/xargs/env) — env ops found at ANY recursion
+			// level are the env the here-string text runs under.
+			if lang, isProg, inner := stdinProgramHeadEnv(head); isProg {
+				if hit := screenStdinProgram(seg.hereString, lang, kind, depth, caller.seededWith(envAs.merged(inner))); hit != "" {
 					return hit
 				}
 			}
@@ -4017,7 +4020,11 @@ func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller c
 		head, _, ea, _ := peelWrappers(seg.argv)
 		envAs = ea
 		if len(head) > 0 && !seg.stdinRedir {
-			lang, isProg = stdinProgramHead(head)
+			// R15: merge env ops found at every recursion level inside the
+			// head's own wrappers (flock/watch/xargs/env ...).
+			var inner envAssignments
+			lang, isProg, inner = stdinProgramHeadEnv(head)
+			envAs = envAs.merged(inner)
 		}
 	}
 	if !isProg {
@@ -5050,13 +5057,18 @@ func sedScripts(args []string) (scripts []string, sawFile bool) {
 						sawExplicit = true
 						sawFile = true
 						sawValLetter = true
-						if j+1 >= lim {
+						// R15: a dynamic TAIL is the glued file operand —
+						// argv advance is decided by the real word length,
+						// not the placeholder boundary (lim). Skipping the
+						// next argv here would let a following -e land in
+						// the positional slot where sawExplicit ignores it.
+						if j+1 >= len(a) {
 							i++ // file operand is the next argv
 						}
 						j = lim
 					case 'l':
 						sawValLetter = true
-						if j+1 >= lim {
+						if j+1 >= len(a) {
 							i++ // length operand is the next argv
 						}
 						j = lim
@@ -9096,7 +9108,8 @@ func interpCodeSlots(argv []string) []codeSlot {
 	base := filepath.Base(argv[0])
 	gluedCodes := ""               // cluster letters whose TAIL (or next argv) is code
 	flagCodes := ""                // code flags: operand is the next argv AFTER the cluster scan
-	valShort := ""                 // cluster letters consuming a value (tail or next argv)
+	valShort := ""                 // letters REQUIRING a value: glued tail, else the next argv
+	optShort := ""                 // letters with an OPTIONAL glued value: glued tail ends the cluster, a bare letter is a flag and consumes nothing
 	longCode := map[string]bool{}  // --name / --name=code
 	longValue := map[string]bool{} // --name consumes a separate value
 	dynScriptOperand := false      // a dynamic first operand is inline code (xargs feed / $X eval)
@@ -9118,10 +9131,17 @@ func interpCodeSlots(argv []string) []codeSlot {
 		longValue = map[string]bool{"--require": true, "--loader": true, "--import": true}
 		dynScriptOperand = true
 	case base == "perl":
-		gluedCodes, valShort = "eE", "iFl07Mmx"
+		// -M/-m/-I REQUIRE a module/dir operand (glued or next argv); -i/-F/
+		// -l/-0/-x take an OPTIONAL GLUED value only — a bare -i is a flag,
+		// so `perl -i -e CODE` must still see the -e (R15: valShort used to
+		// swallow -e as the -i extension). -7 is not a real perl option but
+		// stays optional-glued so a glued tail is consumed conservatively.
+		gluedCodes, valShort, optShort = "eE", "MmI", "iFl07x"
 		dynScriptOperand = true
 	case base == "ruby":
-		gluedCodes, valShort = "e", "iFKC0xXrI"
+		// Same split for ruby: -F/-K/-C/-X/-r/-I require operands (K eats
+		// its single coding char); -i/-0/-x are optional-glued flags.
+		gluedCodes, valShort, optShort = "e", "FKCXrI", "i0x"
 		dynScriptOperand = true
 	case base == "php":
 		gluedCodes, valShort = "r", "cdz"
@@ -9226,6 +9246,12 @@ func interpCodeSlots(argv []string) []codeSlot {
 					i++ // value is the next argv
 				}
 				break // value letters end the cluster either way
+			}
+			if strings.IndexByte(optShort, ch) >= 0 {
+				if j+1 >= len(a) {
+					continue // bare optional-value flag — consumes no argv
+				}
+				break // glued value ends the cluster
 			}
 		}
 	}
@@ -10888,7 +10914,9 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			return "", false, envAs
 		}
 		if inner < len(head) {
-			return stdinProgramHeadDepth(head[inner:], depth+1)
+			// The inner command still inherits this level's peeled env.
+			l, isProg, inner := stdinProgramHeadDepth(head[inner:], depth+1)
+			return l, isProg, envAs.merged(inner)
 		}
 		return "", false, envAs
 	case "script":
@@ -10921,7 +10949,8 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			return "", false, envAs
 		}
 		if execMode {
-			return stdinProgramHeadDepth(head[k:], depth+1)
+			l, isProg, inner := stdinProgramHeadDepth(head[k:], depth+1)
+			return l, isProg, envAs.merged(inner)
 		}
 		text := strings.Join(head[k:], " ")
 		if isDynamicArg(text) {
@@ -10951,7 +10980,8 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 		// the language follows the fed interpreter head so the payload is
 		// screened under the right code rules.
 		if xargsFeedsCodeFlag(head[k:], head) {
-			innerHead, _, _, _ := peelWrappers(head[k:])
+			innerHead, _, innerEnv, _ := peelWrappers(head[k:])
+			envAs = envAs.merged(innerEnv) // fed code runs under the inner wrapper env too
 			if len(innerHead) > 0 {
 				if l, ok := heredocInterpLang(filepath.Base(innerHead[0])); ok {
 					return l, true, envAs
@@ -10959,7 +10989,8 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			}
 			return "", true, envAs
 		}
-		return stdinProgramHeadDepth(head[k:], depth+1)
+		l, isProg, inner := stdinProgramHeadDepth(head[k:], depth+1)
+		return l, isProg, envAs.merged(inner)
 	}
 	if shellHeads[base] {
 		// sh/bash/... without -c: commands come from a script file or
