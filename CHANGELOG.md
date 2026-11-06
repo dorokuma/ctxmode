@@ -5,6 +5,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Docs
+- **SH11 round-8 `consider` archived**: user-writable PATH dirs (`/home/linuxbrew/`, `~/.local/bin`, toolchain shim dirs) are trusted by `isSafePathDirEntry`/`headBaseAliasHits`; a planted same-name binary there resolves as an already-allowed name. Trust-boundary tradeoff, not introduced by this diff — archived in `.agents/notes/2026-11-01-role-guards-non-sandbox-boundaries.md` (C10, `[pattern:path-trust-user-writable]`).
+
 ### Fixed
 - **Role guards SH11 review round 8: function bodies model the unknown call environment, dup source normalization, bash move syntax (`shell_ast.go`).** A `FuncDecl` no longer captures the DECLARATION-site environment as a closure — the body now walks a fresh `stdinFeed{piped:true}` base with only the decl's own redirects replayed at call time, so `{ f() { sh; }; } </dev/null; echo pig | f` and `{ f() { sh 0<&9; }; } 9</dev/null` stop inheriting the enclosing group's file exemption / fd table while `f() { sh; } </dev/null` (or `9<f`/`9<&-`) still binds provably. `feedThrough`'s `n<&m`/`n>&m` source word normalizes leading zeros before the origins lookup — bash reads `0<&00` as `dup2(0,0)`, so `"00"` now hits the `"0"` slot instead of defaulting to a file origin — and a trailing `-` on a digit word is the bash move syntax `n<&m-`/`n>&m-`: the source origin copies into `n`, then the source closes (a later `0<&m` reads a closed descriptor), never a `>&word` file target (`sh 9<&0 0<&9-` blocks; `isFdDupWord` keeps `>&9-` out of `redirectFile`). Descriptor keys normalize on write too (`09<f` lands on fd9). Regression coverage: `shell_ast_red_test.go` `TestAST_MustRed_Round18` (11 probes).
 
