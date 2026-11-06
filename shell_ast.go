@@ -1712,19 +1712,17 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 		prevUnvetted := c.fdUnvetted
 		c.fdUnvetted = true
 		if cmd.Body != nil {
-			// The body's stdin is the stdin of whatever invocation runs
-			// it — unknown at definition, so conservatively fed. The fd
-			// table is inherited from the CALL, which is likewise
-			// unprovable, so every descriptor the declaration itself does
-			// not bind (st.Redirs replayed at call time, plus the table an
-			// enclosing compound left behind) fails closed: a bare
-			// `f() { sh 0<&9; }; f` dup gets no file exemption (R17 MF-2).
-			inner := c.stmtFeed(st, feed)
-			inner.piped = true
-			if fd0, seen := inner.fds["0"]; seen && !fd0.piped {
-				fd0.piped = true
-				inner.fds["0"] = fd0
-			}
+			// The body runs with the CALL's stdin and descriptor table —
+			// both unknown at declaration, so the entry feed is an
+			// unknown-call-environment base: stdin conservatively fed and
+			// an EMPTY table (fdUnvetted makes every unproven dup fail
+			// closed). The declaration-site environment is never captured:
+			// `{ f() { sh; }; } </dev/null` leaves the body's file/body
+			// exemptions out, and a decl-env fd9 cannot be duped back as a
+			// file (R18 MF-1). Only st.Redirs replay over the fresh base —
+			// `f() { sh; } </dev/null` (or 9<f / 9<&-) still applies at
+			// call time exactly like the enclosing stmt's redirects do.
+			inner := c.stmtFeed(st, stdinFeed{piped: true})
 			c.walkStmt(cmd.Body, inner)
 		}
 		c.fdUnvetted = prevUnvetted
@@ -1919,12 +1917,14 @@ func (c *subCollector) applyRedirs(seg *shellSegment, redirs []*syntax.Redirect,
 		case syntax.RdrOut, syntax.AppOut, syntax.RdrAll, syntax.AppAll, syntax.RdrClob:
 			c.setWriteRedirect(seg, r)
 		case syntax.DplOut:
-			// fd duplication: blocking only when target is not a bare fd
+			// fd duplication: blocking only when target is not a bare fd —
+			// `>&9-` is the bash move syntax (a descriptor dup, never a
+			// write target; R18 MF-2).
 			if r.Word != nil {
 				s, ok := wordToArg(r.Word)
 				if !ok {
 					seg.redirectFile = dynamicRedirectTarget
-				} else if s != "-" && !allDigits(s) {
+				} else if !isFdDupWord(s) {
 					if seg.redirectFile == "" {
 						seg.redirectFile = s
 					}
@@ -1939,6 +1939,45 @@ func (c *subCollector) applyRedirs(seg *shellSegment, redirs []*syntax.Redirect,
 			}
 		}
 	}
+}
+
+// fdDupSource splits a dup word into the source descriptor and the bash
+// move flag: a trailing `-` on a digit word is the n<&m- / n>&m- move
+// syntax (dup then close the source), not part of the descriptor.
+func fdDupSource(s string) (src string, move bool) {
+	src, move = s, false
+	if strings.HasSuffix(src, "-") {
+		maybe := src[:len(src)-1]
+		if allDigits(maybe) {
+			src, move = maybe, true
+		}
+	}
+	return src, move
+}
+
+// fdNormalize canonicalizes a numeric descriptor for the origins table:
+// bash treats `00` as fd0, so every lookup and table key strips leading
+// zeros. Non-numeric words return unchanged.
+func fdNormalize(s string) string {
+	if !allDigits(s) {
+		return s
+	}
+	s = strings.TrimLeft(s, "0")
+	if s == "" {
+		return "0"
+	}
+	return s
+}
+
+// isFdDupWord reports whether a dup word names a descriptor rather than a
+// write target: "-" (close), digits (dup), or digits with a trailing "-"
+// (the bash n>&m- move syntax).
+func isFdDupWord(s string) bool {
+	if s == "-" {
+		return true
+	}
+	src, _ := fdDupSource(s)
+	return allDigits(src)
 }
 
 // heredocBodyOf decodes one heredoc redirect's body exactly the way the
@@ -2005,7 +2044,7 @@ func (c *subCollector) feedThrough(redirs []*syntax.Redirect, base stdinFeed) ma
 			n = "1"
 		}
 		if r.N != nil {
-			n = r.N.Value
+			n = fdNormalize(r.N.Value)
 		}
 		switch r.Op {
 		case syntax.Hdoc, syntax.DashHdoc:
@@ -2040,7 +2079,12 @@ func (c *subCollector) feedThrough(redirs []*syntax.Redirect, base stdinFeed) ma
 			// dup2s whatever the expansion yields — fd0 may still be the
 			// pipe, so the file exemption must not apply (R17 MF-1). A
 			// non-digit >&word is a write target (applyRedirs records it
-			// as redirectFile) which is file for origin purposes.
+			// as redirectFile) which is file for origin purposes. The
+			// SOURCE descriptor normalizes leading zeros before the table
+			// lookup — bash reads `0<&00` as dup2(0,0), so "00" must hit
+			// the "0" slot — and a trailing `-` is the bash move syntax
+			// n<&m-: it copies m's origin into n and then CLOSES m, never
+			// a file target (R18 MF-2).
 			if r.Word == nil {
 				origins[n] = stdinFeed{file: true}
 				break
@@ -2053,8 +2097,15 @@ func (c *subCollector) feedThrough(redirs []*syntax.Redirect, base stdinFeed) ma
 				origins[n] = stdinFeed{piped: true}
 			case s == "-":
 				origins[n] = stdinFeed{file: true}
-			case allDigits(s):
-				if o, seen := origins[s]; seen {
+			default:
+				src, move := fdDupSource(s)
+				if !allDigits(src) {
+					// Non-descriptor word: >&word write target — file.
+					origins[n] = stdinFeed{file: true}
+					break
+				}
+				src = fdNormalize(src)
+				if o, seen := origins[src]; seen {
 					origins[n] = o
 				} else if c.fdUnvetted {
 					// Inside a function body the call-site descriptor set
@@ -2063,8 +2114,11 @@ func (c *subCollector) feedThrough(redirs []*syntax.Redirect, base stdinFeed) ma
 				} else {
 					origins[n] = stdinFeed{file: true}
 				}
-			default:
-				origins[n] = stdinFeed{file: true}
+				if move {
+					// n<&m- closes m after the copy: a later 0<&m reads a
+					// closed descriptor (file), not m's pre-move pipe.
+					origins[src] = stdinFeed{file: true}
+				}
 			}
 		default:
 			// Output-side ops on fd0 (0>f) re-bind it to the write target

@@ -906,6 +906,54 @@ func TestAST_MustRed_Round17(t *testing.T) {
 	t.Logf("must-red round17 summary: cases=%d", len(cases))
 }
 
+// astMustRedRound18Cases is the review round-8 fix table: a function
+// declaration no longer captures the DECLARATION-site environment (the
+// body's file/body exemptions and fd table now model the unknown call
+// environment — only the decl's own redirects replay at call time), dup
+// source descriptors normalize leading zeros (00 is fd0), and the bash
+// n<&m- move syntax copies the source origin then closes the source.
+func astMustRedRound18Cases() []astRedWantCase {
+	return []astRedWantCase{
+		// MF-1: the declaration environment is not a closure — a file
+		// bound at decl site (compound redirect or decl-env fd9) does not
+		// carry into the body, so a call-time pipe still feeds sh.
+		{astRedCase{"R18_M1_01", "{ f() { sh; }; } </dev/null; echo pig | f", "worker", true, "M1 decl-env </dev/null not captured by body"}, "piped code to shell"},
+		{astRedCase{"R18_M1_02", "{ f() { sh 0<&9; }; } 9</dev/null; echo pig | f", "worker", true, "M1 decl-env file fd9 not captured by body"}, "piped code to shell"},
+		{astRedCase{"R18_M1_03", "f() { sh; }; echo pig | f", "worker", true, "M1 bare call pipe still feeds body"}, "piped code to shell"},
+		// Release controls: the function's OWN redirects replay at call
+		// time — `</dev/null` on the decl binds call-site stdin to a file,
+		// `9<f` keeps the provable file fd9 exemption, and `9<&-` closes.
+		{astRedCase{"R18_M1_04", "f() { sh; } </dev/null; echo pig | f", "worker", false, "M1 decl-self </dev/null binds call stdin"}, ""},
+		{astRedCase{"R18_M1_05", "f() { sh 0<&9; } 9</dev/null; f", "worker", false, "M1 decl-self 9<f stays provable file"}, ""},
+		{astRedCase{"R18_M1_06", "f() { sh 0<&9; } 9<&-; f", "worker", false, "M1 decl-self fd9 close stays file"}, ""},
+
+		// MF-2: the dup source descriptor normalizes leading zeros —
+		// bash reads `0<&00` as dup2(0,0), so the "00" word must hit the
+		// "0" slot and keep the pipe origin instead of a file.
+		{astRedCase{"R18_M2_01", "echo pig | sh 0<&00", "worker", true, "M2 leading-zero source fd resolves fd0"}, "piped code to shell"},
+		{astRedCase{"R18_M2_02", "echo pig | sh 09<&0 0<&9", "worker", true, "M2 leading-zero dest fd9 still carries pipe"}, "piped code to shell"},
+
+		// MF-3: `n<&m-` is the bash move syntax — dup m into n then close
+		// m — never a file target. fd0 inherits fd9's piped origin, and a
+		// later dup of the moved-away fd reads the CLOSED descriptor.
+		{astRedCase{"R18_M3_01", "echo pig | sh 9<&0 0<&9-", "worker", true, "M3 move copies piped fd9 into fd0"}, "piped code to shell"},
+		{astRedCase{"R18_M3_02", "echo pig | sh 0>&9- 0<&9", "worker", false, "M3 moved-away fd9 reads closed"}, ""},
+		{astRedCase{"R18_M3_03", "echo pig | sh 9>&/tmp/out", "worker", true, "M3 non-digit >&word is no fd bind (fd0 keeps pipe)"}, "piped code to shell"},
+	}
+}
+
+// TestAST_MustRed_Round18 is the review round-8 regression gate.
+func TestAST_MustRed_Round18(t *testing.T) {
+	cases := astMustRedRound18Cases()
+	for _, c := range cases {
+		c := c
+		t.Run(c.id, func(t *testing.T) {
+			runAstWantCase(t, c)
+		})
+	}
+	t.Logf("must-red round18 summary: cases=%d", len(cases))
+}
+
 // TestAST_MustRed_Round14 is the review round-4 regression gate.
 func TestAST_MustRed_Round14(t *testing.T) {
 	cases := astMustRedRound14Cases()
