@@ -1552,8 +1552,10 @@ func (c *subCollector) walkStmts(stmts []*syntax.Stmt, feed stdinFeed) {
 		if i > 0 {
 			// Sequential list: only the FIRST statement consumes the piped
 			// stream. Heredoc/here-string/file feeds are pre-bound input, so
-			// every statement in the list shares them.
-			c.walkStmt(st, stdinFeed{piped: false, bodies: feed.bodies, hasHere: feed.hasHere, hereStr: feed.hereStr, file: feed.file})
+			// every statement in the list shares them — and so does the
+			// inherited descriptor table: { cat; sh 0<&9; } 9<&0 resolves
+			// fd9 for the later statements too.
+			c.walkStmt(st, stdinFeed{piped: false, bodies: feed.bodies, hasHere: feed.hasHere, hereStr: feed.hereStr, file: feed.file, fds: feed.fds})
 			continue
 		}
 		c.walkStmt(st, feed)
@@ -1619,18 +1621,22 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 			prevBind := c.allowBind
 			c.allowBind = false // no static head-bind across/inside pipelines
 			c.walkStmt(cmd.X, feed)
-			c.walkStmt(cmd.Y, stdinFeed{piped: true})
+			// Pipe right: fd0 becomes the upstream stream, but the rest of
+			// the descriptor table is inherited — { cat | sh 0<&9; } 9<&0
+			// still resolves fd9 to the pipe.
+			c.walkStmt(cmd.Y, stdinFeed{piped: true, fds: feed.fds})
 			c.allowBind = prevBind
 		case syntax.AndStmt, syntax.OrStmt:
 			c.walkStmt(cmd.X, feed)
 			// SH11 MF-4.1: the right side is a conditional short-circuit
 			// branch — its assignments are NOT guaranteed to run, so they
-			// must never become staticVars binds. Its STDIN is still the
-			// operator's shared stream: `true && sh` fed by a pipe runs the
-			// piped bytes as sh's program (R13).
+			// must never become staticVars binds. Its stdin is the SAME
+			// feed the left side saw — `true && sh` fed by a pipe runs the
+			// piped bytes as sh's program (R13), and { true && sh 0<&9; }
+			// 9<&0 resolves fd9 through the inherited descriptor table.
 			prevBind := c.allowBind
 			c.allowBind = false
-			c.walkStmt(cmd.Y, stdinFeed{piped: true})
+			c.walkStmt(cmd.Y, feed)
 			c.allowBind = prevBind
 		default:
 			c.reject()
@@ -1859,7 +1865,8 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 // fds carries the full fd->origin snapshot an enclosing compound left
 // behind: `{ sh 0<&9; } 9<&0` needs fd9's piped origin inside the braces
 // even though only fd0 feeds the group itself. Entries carry no nested
-// fds; fds[0] always equals the feed itself.
+// fds; a fds[0] entry holds the enclosing fd0 origin and feedThrough
+// always overrides origins[0] with the statement's own feed.
 type stdinFeed struct {
 	piped   bool
 	bodies  []heredocBody
@@ -2007,10 +2014,14 @@ func (c *subCollector) feedThrough(redirs []*syntax.Redirect, base stdinFeed) ma
 			origins[n] = o
 		case syntax.RdrIn, syntax.RdrInOut:
 			origins[n] = stdinFeed{file: true}
-		case syntax.DplIn:
-			// n<&m copies m's CURRENT origin (0<&0 keeps base, 9<&0 then
-			// 0<&9 still smuggles the pipe); n<&- closes the fd; an
-			// unresolvable target binds to something unvetted — file.
+		case syntax.DplIn, syntax.DplOut:
+			// n<&m / n>&m copies m's CURRENT origin — dash runs the same
+			// dup2 for both operators, so 0>&0 keeps base (it never rebinds
+			// the input side) and 9>&0 then 0<&9 still smuggles the pipe
+			// through fd9. n>&- / n<&- closes the fd; an unresolvable target
+			// binds to something unvetted — file. A non-digit >&word is a
+			// write target (applyRedirs records it as redirectFile) which is
+			// file for origin purposes.
 			if r.Word == nil {
 				origins[n] = stdinFeed{file: true}
 				break
@@ -2028,8 +2039,9 @@ func (c *subCollector) feedThrough(redirs []*syntax.Redirect, base stdinFeed) ma
 				origins[n] = stdinFeed{file: true}
 			}
 		default:
-			// Output-side ops on fd0 (0>f, 0>&1) re-bind it to the write
-			// target — no program bytes stream through it.
+			// Output-side ops on fd0 (0>f) re-bind it to the write target
+			// — no program bytes stream through it. (0>&m is DplOut,
+			// handled by the dup case above.)
 			if n == "0" {
 				origins[n] = stdinFeed{file: true}
 			}

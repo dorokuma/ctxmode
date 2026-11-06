@@ -802,6 +802,53 @@ func TestAST_MustRed_Round15(t *testing.T) {
 	t.Logf("must-red round15 summary: cases=%d", len(cases))
 }
 
+// astMustRedRound16Cases is the review round-6 fix table: output-side fd
+// duplication copies the source descriptor's stdin origin (0>&0 is a
+// no-op, not a file bind), the right side of &&/|| and a pipeline keeps
+// the inherited descriptor table (0<&9 still resolves fd9), and perl/ruby
+// restricted numeric optional flags resume cluster scanning after their
+// legal tail (-0e is -0 -e).
+func astMustRedRound16Cases() []astRedWantCase {
+	return []astRedWantCase{
+		// MF-1: n>&m duplicates the descriptor — dash runs the same dup2
+		// for >& and <&, so 0>&0 leaves fd0's origin untouched and the
+		// pipe still reaches the program.
+		{astRedCase{"R16_M1_01", "echo pig | sh 0>&0", "worker", true, "M1 output-side fd0 self-dup keeps pipe"}, "piped code to shell"},
+		{astRedCase{"R16_M1_02", "echo pig | sh 9>&0 0<&9", "worker", true, "M1 fd9 dup of fd0 via >&"}, "piped code to shell"},
+		{astRedCase{"R16_M1_03", "echo pig | sh 0>&1", "worker", false, "M1 fd0 dup of unseen fd1 is a write target"}, ""},
+		{astRedCase{"R16_M1_04", "echo pig | sh 0>&-", "worker", false, "M1 fd0 close binds stdin"}, ""},
+
+		// MF-2: a && / || / | right branch shares the whole descriptor
+		// table — only fd0's stream differs (pipe) or is identical
+		// (conditional), so an inherited fd9 dup still smuggles the pipe.
+		{astRedCase{"R16_M2_01", "echo pig | { true && sh 0<&9; } 9<&0", "worker", true, "M2 &&-right inherits fd table"}, "piped code to shell"},
+		{astRedCase{"R16_M2_02", "echo pig | { cat | sh 0<&9; } 9<&0", "worker", true, "M2 pipe-right keeps fd9"}, "piped code to shell"},
+		{astRedCase{"R16_M2_03", "echo pig | { cat; sh 0<&9; } 9<&0", "worker", true, "M2 sequential stmt keeps fd9"}, "piped code to shell"},
+		{astRedCase{"R16_M2_04", "echo pig | { true && sh 0<&9; } 9<f", "worker", false, "M2 fd9 file-bound inside group"}, ""},
+
+		// MF-3: perl/ruby restricted numeric optional tails (-0/-l) end at
+		// their legal bytes — a glued flag letter after the value is a
+		// FLAG, not part of the value, so -0e/-le still carry -e's code.
+		{astRedCase{"R16_M3_01", "perl -0e 'system(\"pig\")'", "worker", true, "M3 perl -0e code slot"}, "perl inline code"},
+		{astRedCase{"R16_M3_02", "perl -le 'system(\"pig\")'", "worker", true, "M3 perl -le code slot"}, "perl inline code"},
+		{astRedCase{"R16_M3_03", "perl -0777e 'system(\"pig\")'", "worker", true, "M3 perl -0 digit tail then e"}, "perl inline code"},
+		{astRedCase{"R16_M3_04", "ruby -0e 'system(\"pig\")'", "worker", true, "M3 ruby -0e code slot"}, "ruby inline code"},
+		{astRedCase{"R16_M3_05", "echo x | xargs -I{} perl -0e '{}'", "worker", true, "M3 xargs-fed perl -e after -0"}, "piped code to perl"},
+	}
+}
+
+// TestAST_MustRed_Round16 is the review round-6 regression gate.
+func TestAST_MustRed_Round16(t *testing.T) {
+	cases := astMustRedRound16Cases()
+	for _, c := range cases {
+		c := c
+		t.Run(c.id, func(t *testing.T) {
+			runAstWantCase(t, c)
+		})
+	}
+	t.Logf("must-red round16 summary: cases=%d", len(cases))
+}
+
 // TestAST_MustRed_Round14 is the review round-4 regression gate.
 func TestAST_MustRed_Round14(t *testing.T) {
 	cases := astMustRedRound14Cases()

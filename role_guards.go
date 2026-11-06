@@ -9109,7 +9109,8 @@ func interpCodeSlots(argv []string) []codeSlot {
 	gluedCodes := ""               // cluster letters whose TAIL (or next argv) is code
 	flagCodes := ""                // code flags: operand is the next argv AFTER the cluster scan
 	valShort := ""                 // letters REQUIRING a value: glued tail, else the next argv
-	optShort := ""                 // letters with an OPTIONAL glued value: glued tail ends the cluster, a bare letter is a flag and consumes nothing
+	optShort := ""                 // letters with an OPTIONAL glued value of ARBITRARY bytes: glued tail ends the cluster, a bare letter is a flag and consumes nothing
+	optNumShort := ""              // letters with an OPTIONAL restricted NUMERIC glued value: after its legal tail the cluster keeps scanning — perl -0e is -0 -e, not -0 with value 'e'
 	longCode := map[string]bool{}  // --name / --name=code
 	longValue := map[string]bool{} // --name consumes a separate value
 	dynScriptOperand := false      // a dynamic first operand is inline code (xargs feed / $X eval)
@@ -9131,17 +9132,23 @@ func interpCodeSlots(argv []string) []codeSlot {
 		longValue = map[string]bool{"--require": true, "--loader": true, "--import": true}
 		dynScriptOperand = true
 	case base == "perl":
-		// -M/-m/-I REQUIRE a module/dir operand (glued or next argv); -i/-F/
-		// -l/-0/-x take an OPTIONAL GLUED value only — a bare -i is a flag,
-		// so `perl -i -e CODE` must still see the -e (R15: valShort used to
-		// swallow -e as the -i extension). -7 is not a real perl option but
-		// stays optional-glued so a glued tail is consumed conservatively.
-		gluedCodes, valShort, optShort = "eE", "MmI", "iFl07x"
+		// -M/-m/-I REQUIRE a module/dir operand (glued or next argv). The
+		// optional-glued letters split in two: -i/-F/-x take an ARBITRARY
+		// tail (backup extension, autosplit pattern, extract dir) that ends
+		// the cluster, while -0/-l take a restricted NUMERIC tail — after
+		// the digits (or -0's xHH hex) the cluster resumes, so `perl -0e
+		// CODE` and `perl -le CODE` still see the -e (R15 handled the
+		// bare-letter form; R16 covers the glued tail). -7 is not a real
+		// perl option but stays optional-glued so a glued tail is consumed
+		// conservatively.
+		gluedCodes, valShort, optShort, optNumShort = "eE", "MmI", "iF7x", "l0"
 		dynScriptOperand = true
 	case base == "ruby":
 		// Same split for ruby: -F/-K/-C/-X/-r/-I require operands (K eats
-		// its single coding char); -i/-0/-x are optional-glued flags.
-		gluedCodes, valShort, optShort = "e", "FKCXrI", "i0x"
+		// its single coding char); -i/-x take arbitrary optional-glued
+		// tails while -0 is the restricted numeric kind (`ruby -0e CODE`
+		// still reaches -e).
+		gluedCodes, valShort, optShort, optNumShort = "e", "FKCXrI", "ix", "0"
 		dynScriptOperand = true
 	case base == "php":
 		gluedCodes, valShort = "r", "cdz"
@@ -9247,6 +9254,13 @@ func interpCodeSlots(argv []string) []codeSlot {
 				}
 				break // value letters end the cluster either way
 			}
+			if strings.IndexByte(optNumShort, ch) >= 0 {
+				// Restricted numeric tail: consume its legal bytes, then RESUME
+				// the cluster — `perl -0e` is -0 -e, so the e must not be eaten
+				// as a value.
+				j += consumeNumOptTail(a, j, ch)
+				continue
+			}
 			if strings.IndexByte(optShort, ch) >= 0 {
 				if j+1 >= len(a) {
 					continue // bare optional-value flag — consumes no argv
@@ -9261,6 +9275,33 @@ func interpCodeSlots(argv []string) []codeSlot {
 		out = append(out, codeSlot{flag: len(argv) - 1, flagOnly: true})
 	}
 	return out
+}
+
+// consumeNumOptTail returns how many bytes after a[j] form the legal
+// glued value of a restricted numeric optional flag (perl -0/-l, ruby
+// -0): decimal digits, or an x/X marker plus hexadecimal digits for -0's
+// hex spelling (-0x1be). The caller then resumes scanning the cluster,
+// so flag letters glued after the value still resolve.
+func consumeNumOptTail(a string, j int, ch byte) int {
+	i := j + 1
+	if ch == '0' && i < len(a) && (a[i] == 'x' || a[i] == 'X') {
+		k := i + 1
+		for k < len(a) && isHexDigit(a[k]) {
+			k++
+		}
+		if k > i+1 {
+			return k - i // 'x' marker plus its hex digits
+		}
+	}
+	k := i
+	for k < len(a) && a[k] >= '0' && a[k] <= '9' {
+		k++
+	}
+	return k - i // decimal digits only — the flag letter itself is not counted
+}
+
+func isHexDigit(b byte) bool {
+	return b >= '0' && b <= '9' || b >= 'a' && b <= 'f' || b >= 'A' && b <= 'F'
 }
 
 // xargsFeedsCodeFlag reports whether xargs' fed words land in a shell /
