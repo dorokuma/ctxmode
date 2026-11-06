@@ -2177,7 +2177,7 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 	if hit != "" {
 		return hit
 	}
-	stdinIsProg := remoteReadsProgramFromStdin(remoteCmd)
+	langs, stdinIsProg := remoteStdinProgramLangs(remoteCmd)
 	if seg.pipedStdin && stdinIsProg {
 		if kind == 'r' || callerReadonlyRole(caller) {
 			return roSSHWriteHit
@@ -2187,26 +2187,41 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 	// The ssh segment's here-string / heredoc bodies ride the ssh stdin
 	// stream to the remote side; when the remote command's head reads its
 	// PROGRAM from that stream the body text is remote code and gets the
-	// caller's own screen (screenSegmentHeredocsDepth only sees the local
-	// `ssh` head, whose stdin is opaque). A remote `cat`/`xargs` head reads
-	// data, so the bodies stay unscreened here.
+	// caller's own screen with the correct interpreter lang (SF-2).
 	if stdinIsProg {
-		if seg.hereString != "" {
-			if isDynamicArg(seg.hereString) {
+		screenBody := func(body string) string {
+			if isDynamicArg(body) {
 				return "dynamic code payload"
 			}
-			if h := screenStdinProgram(seg.hereString, "", kind, depth, caller); h != "" {
+			if body == "" {
+				return ""
+			}
+			if len(langs) == 0 {
+				langs = []string{""}
+			}
+			for _, lang := range langs {
+				if h := screenStdinProgram(body, lang, kind, depth, caller); h != "" {
+					if kind == 'r' || callerReadonlyRole(caller) {
+						// Map readonly hits on remote stdin code to ssh remote write.
+						if h != "" {
+							return h
+						}
+					}
+					return h
+				}
+			}
+			return ""
+		}
+		if seg.hereString != "" {
+			if h := screenBody(seg.hereString); h != "" {
 				return h
 			}
 		}
 		for _, hb := range seg.heredocText {
-			if hb.dynamic || isDynamicArg(hb.text) {
+			if hb.dynamic {
 				return "dynamic code payload"
 			}
-			if hb.text == "" {
-				continue
-			}
-			if h := screenStdinProgram(hb.text, "", kind, depth, caller); h != "" {
+			if h := screenBody(hb.text); h != "" {
 				return h
 			}
 		}
@@ -2219,15 +2234,20 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 		if h := guardShellSubagentDepth(remoteCmd, depth+1, caller); h != "" {
 			return h
 		}
-		if callerReadonlyRole(caller) {
+		if callerReadonlyRole(caller) && !stdinIsProg {
 			if h := guardShellReadonlyDepth(remoteCmd, depth+1, caller); h != "" {
 				return roSSHWriteHit
 			}
 		}
 		return ""
 	}
-	if h := guardShellReadonlyDepth(remoteCmd, depth+1, caller); h != "" {
-		return roSSHWriteHit
+	// Strict readonly: when the remote head reads PROGRAM from stdin, the
+	// heredoc/here-string bodies were already screened above with the right
+	// lang. Do not allowlist-reject the bare `sh`/`python3 -` vehicle.
+	if !stdinIsProg {
+		if h := guardShellReadonlyDepth(remoteCmd, depth+1, caller); h != "" {
+			return roSSHWriteHit
+		}
 	}
 	return ""
 }
@@ -2237,15 +2257,25 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 // `sh`/`python3 -` with no inline code). Only then are piped bytes
 // unaudited remote CODE rather than data for the remote command.
 func remoteReadsProgramFromStdin(remoteCmd string) bool {
+	_, reads := remoteStdinProgramLangs(remoteCmd)
+	return reads
+}
+
+// remoteStdinProgramLangs returns the interpreter langs of remote heads that
+// read program text from stdin (SF-2).
+func remoteStdinProgramLangs(remoteCmd string) (langs []string, readsProg bool) {
 	for _, seg := range splitShellSegments(remoteCmd) {
-		if len(seg.argv) == 0 {
+		if seg.depthExceeded || seg.parseErr != "" {
+			return []string{""}, true
+		}
+		if len(seg.argv) == 0 || seg.pipedStdin || len(seg.heredocText) > 0 || seg.hereString != "" {
 			continue
 		}
-		if _, isProg := stdinProgramHead(seg.argv); isProg {
-			return true
+		if lang, isProg := stdinProgramHead(seg.argv); isProg {
+			langs = append(langs, lang)
 		}
 	}
-	return false
+	return langs, len(langs) > 0
 }
 
 // sshStdinTexts returns the visible stdin payloads attached to the ssh
@@ -2887,6 +2917,9 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 	}
 	if seg.depthExceeded {
 		return depthExceededHit
+	}
+	if kind == 'r' && seg.redirectFile != "" {
+		return "redirect to " + seg.redirectFile + " forbidden"
 	}
 	if len(seg.argv) == 0 {
 		return ""
@@ -5864,12 +5897,18 @@ func guardShellReadonlyDepth(code string, depth int, caller callerIdentity) stri
 	if depth >= peelChainMaxDepth {
 		return depthExceededHit
 	}
-	argvs, hit := parseReadonlyShellAST(code)
+	roSegs, hit := parseReadonlyShellSegments(code)
 	if hit != "" {
 		return readonlyBlockWithHint(allowlistDetail(hit))
 	}
-	for _, argv := range argvs {
-		if h := peelResolvedDepth(argv, 'r', depth, caller); h != "" {
+	for _, ro := range roSegs {
+		seg := shellSegment{
+			argv:         ro.argv,
+			pipedStdin:   ro.pipedStdin,
+			heredocText:  ro.heredocText,
+			redirectFile: ro.redirectFile,
+		}
+		if h := screenOneSegmentDepth(seg, 'r', depth, caller); h != "" {
 			return h
 		}
 	}
@@ -6572,7 +6611,18 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 				// removed from blockedAgentExecutables but stays in codeAgentNames
 				// for unresolved dynamic spawns).
 				if hit := peelResolvedDepth(argv, 's', 0, currentCallerIdentity()); hit != "" {
+					if hit == "ctxmode index" || hit == roSSHWriteHit {
+						return ruleReadonlyWrite, hit
+					}
 					return ruleSubagentNestedAgent, hit
+				}
+				// SF-3: static spawn that reads program from stdin may take
+				// input=/stdin.write — disable allResolved short-circuit.
+				if _, isProg := stdinProgramHead(argv); isProg {
+					if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(argv) {
+						return ruleReadonlyWrite, roSSHWriteHit
+					}
+					allResolved = false
 				}
 			}
 			// String-form commands (`os.system("cat f | pig")`,
@@ -6583,6 +6633,9 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 				caller := currentCallerIdentity()
 				for _, cmd := range shellCmds {
 					if hit := guardShellSubagentDepth(cmd, 0, caller); hit != "" {
+						if hit == "ctxmode index" || hit == roSSHWriteHit {
+							return ruleReadonlyWrite, hit
+						}
 						return ruleSubagentNestedAgent, hit
 					}
 				}
@@ -9027,12 +9080,6 @@ func (g guardCall) guardCtxRunShell(code string) (rule, detail string) {
 			}
 			return ruleSubagentNestedAgent, hit
 		}
-		// screenSSHHead already applied remote readonly for readonly callers.
-		// Re-running parseReadonlyShellAST on the outer text rejects << heredocs
-		// attached to ssh (data or program) before peel can see them.
-		if g.strictReadonly && shellSegmentsAllSSH(splitShellSegments(code)) {
-			return "", ""
-		}
 	}
 	if g.strictReadonly {
 		if hit := guardShellReadonly(code); hit != "" {
@@ -9040,26 +9087,6 @@ func (g guardCall) guardCtxRunShell(code string) (rule, detail string) {
 		}
 	}
 	return "", ""
-}
-
-// shellSegmentsAllSSH reports whether every command-bearing segment peels to ssh,
-// so screenSSHHead was the sole screener for this shell string.
-func shellSegmentsAllSSH(segs []shellSegment) bool {
-	saw := false
-	for _, seg := range segs {
-		if seg.parseErr != "" || seg.depthExceeded {
-			return false
-		}
-		if len(seg.argv) == 0 {
-			continue
-		}
-		i, _, _, _ := peelWrappers(seg.argv)
-		if i >= len(seg.argv) || filepath.Base(seg.argv[i]) != "ssh" {
-			return false
-		}
-		saw = true
-	}
-	return saw
 }
 
 // stdinProgramHead reports whether a peeled argv head reads its program
@@ -9174,7 +9201,10 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			return "", false
 		}
 		for _, seg := range splitShellSegments(remoteCmd) {
-			if seg.depthExceeded || len(seg.argv) == 0 {
+			if seg.depthExceeded || seg.parseErr != "" {
+				return "", true
+			}
+			if len(seg.argv) == 0 || seg.pipedStdin || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
 			if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
@@ -9183,8 +9213,30 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 		}
 		return "", false
 	}
-	// A `shell -c 'code'` argv carries its program inline — stdin is data.
-	if _, has := unwrapShellArgv(head); has {
+	// A `shell -c 'code'` argv carries outer program inline, but the INNER
+	// script may still start a stdin-reading head (MF-5: sh -c 'sh').
+	if innerText, has := unwrapShellArgv(head); has {
+		if isDynamicArg(innerText) {
+			return "", true
+		}
+		var segs []shellSegment
+		switch base {
+		case "bash", "zsh", "ksh", "mksh":
+			segs = splitShellSegmentsBash(innerText)
+		default:
+			segs = splitShellSegments(innerText)
+		}
+		for _, seg := range segs {
+			if seg.depthExceeded || seg.parseErr != "" {
+				return "", true
+			}
+			if len(seg.argv) == 0 || seg.pipedStdin || len(seg.heredocText) > 0 || seg.hereString != "" {
+				continue
+			}
+			if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+				return l, true
+			}
+		}
 		return "", false
 	}
 	// An interpreter with -c/-e/-r/-m/-p inline code likewise.

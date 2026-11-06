@@ -305,7 +305,27 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 
 // parseReadonlyShellAST fail-closed-parses code under LangPOSIX and returns
 // every CallExpr argv, or a reject reason.
+// roSegment is one readonly-parsed command segment with stdin metadata.
+type roSegment struct {
+	argv         []string
+	pipedStdin   bool
+	heredocText  []heredocBody
+	redirectFile string
+}
+
 func parseReadonlyShellAST(code string) (argvs [][]string, rejectReason string) {
+	segs, hit := parseReadonlyShellSegments(code)
+	if hit != "" {
+		return nil, hit
+	}
+	out := make([][]string, 0, len(segs))
+	for _, s := range segs {
+		out = append(out, s.argv)
+	}
+	return out, ""
+}
+
+func parseReadonlyShellSegments(code string) (segs []roSegment, rejectReason string) {
 	if hit := checkShellBytes(code, true); hit != "" {
 		return nil, hit
 	}
@@ -317,23 +337,23 @@ func parseReadonlyShellAST(code string) (argvs [][]string, rejectReason string) 
 	if hit := checkCommentsAndContinuations(code, file, true); hit != "" {
 		return nil, hit
 	}
-	var out [][]string
-	if hit := roWalkFile(code, file, &out); hit != "" {
+	var out []roSegment
+	if hit := roWalkFile(code, file, &out, false); hit != "" {
 		return nil, hit
 	}
 	return out, ""
 }
 
-func roWalkFile(code string, f *syntax.File, out *[][]string) string {
-	for _, st := range f.Stmts {
-		if hit := roWalkStmt(code, st, out); hit != "" {
+func roWalkFile(code string, f *syntax.File, out *[]roSegment, pipeIn bool) string {
+	for i, st := range f.Stmts {
+		if hit := roWalkStmt(code, st, out, pipeIn && i == 0); hit != "" {
 			return hit
 		}
 	}
 	return ""
 }
 
-func roWalkStmt(code string, st *syntax.Stmt, out *[][]string) string {
+func roWalkStmt(code string, st *syntax.Stmt, out *[]roSegment, pipeIn bool) string {
 	if st.Negated {
 		return "control flow '!' forbidden"
 	}
@@ -348,14 +368,19 @@ func roWalkStmt(code string, st *syntax.Stmt, out *[][]string) string {
 	}
 	switch cmd := st.Cmd.(type) {
 	case *syntax.CallExpr:
-		return roWalkCall(code, st, cmd, out)
+		return roWalkCall(code, st, cmd, out, pipeIn)
 	case *syntax.BinaryCmd:
 		switch cmd.Op {
-		case syntax.Pipe, syntax.AndStmt, syntax.OrStmt:
-			if hit := roWalkStmt(code, cmd.X, out); hit != "" {
+		case syntax.Pipe, syntax.PipeAll:
+			if hit := roWalkStmt(code, cmd.X, out, pipeIn); hit != "" {
 				return hit
 			}
-			return roWalkStmt(code, cmd.Y, out)
+			return roWalkStmt(code, cmd.Y, out, true)
+		case syntax.AndStmt, syntax.OrStmt:
+			if hit := roWalkStmt(code, cmd.X, out, pipeIn); hit != "" {
+				return hit
+			}
+			return roWalkStmt(code, cmd.Y, out, false)
 		default:
 			return fmt.Sprintf("unsupported syntax node %T op=%v", cmd, cmd.Op)
 		}
@@ -375,7 +400,7 @@ func roWalkStmt(code string, st *syntax.Stmt, out *[][]string) string {
 	}
 }
 
-func roWalkCall(code string, st *syntax.Stmt, call *syntax.CallExpr, out *[][]string) string {
+func roWalkCall(code string, st *syntax.Stmt, call *syntax.CallExpr, out *[]roSegment, pipeIn bool) string {
 	if len(call.Assigns) > 0 {
 		return "env assign forbidden Hint: 禁止 VAR=val 前缀；需要环境变量时只用 LANG/LC_ALL/TZ 经 ctx_run env"
 	}
@@ -390,12 +415,20 @@ func roWalkCall(code string, st *syntax.Stmt, call *syntax.CallExpr, out *[][]st
 		}
 		argv = append(argv, s)
 	}
+	seg := roSegment{argv: argv, pipedStdin: pipeIn}
 	for _, r := range st.Redirs {
-		if hit := roCheckRedirect(code, call, r); hit != "" {
+		hb, redirFile, hit := roCheckRedirect(code, call, r)
+		if hit != "" {
 			return hit
 		}
+		if hb != nil {
+			seg.heredocText = append(seg.heredocText, *hb)
+		}
+		if redirFile != "" {
+			seg.redirectFile = redirFile
+		}
 	}
-	*out = append(*out, argv)
+	*out = append(*out, seg)
 	return ""
 }
 
@@ -541,58 +574,99 @@ func stripDashHdocTabs(s string) string {
 	}
 	return b.String()
 }
-func roCheckRedirect(code string, call *syntax.CallExpr, r *syntax.Redirect) string {
+func roCheckRedirect(code string, call *syntax.CallExpr, r *syntax.Redirect) (hb *heredocBody, redirectFile string, hit string) {
 	if len(call.Args) == 0 {
-		return "empty command"
+		return nil, "", "empty command"
 	}
 	// Redirects must follow the command head (no prefix redirs like 2>/dev/null ls).
 	if !r.Pos().After(call.Args[0].End()) {
-		return "prefix redirect forbidden"
+		return nil, "", "prefix redirect forbidden"
 	}
 	off := int(r.Pos().Offset())
 	if off == 0 || off > len(code) {
-		return "prefix redirect forbidden"
+		return nil, "", "prefix redirect forbidden"
 	}
 	prev := code[off-1]
 	if prev != ' ' && prev != '\t' {
-		return "redirect must be preceded by space/tab"
+		return nil, "", "redirect must be preceded by space/tab"
 	}
 	if r.Word == nil {
-		return "redirect target required"
+		return nil, "", "redirect target required"
 	}
-	end := int(r.Word.End().Offset())
-	if end < len(code) {
-		c := code[end]
+	endPos := int(r.Word.End().Offset())
+	if endPos < len(code) {
+		c := code[endPos]
 		switch c {
 		case ' ', '\t', '\n', ';', '|', '&':
 		default:
-			return "redirect not word-bounded"
+			return nil, "", "redirect not word-bounded"
 		}
 	}
 	switch r.Op {
 	case syntax.RdrOut:
 		if r.N != nil && r.N.Value != "1" && r.N.Value != "2" {
-			return "redirect fd forbidden"
+			return nil, "", "redirect fd forbidden"
 		}
 		if len(r.Word.Parts) != 1 {
-			return "redirect target must be plain literal"
+			return nil, "", "redirect target must be plain literal"
 		}
 		lit, ok := r.Word.Parts[0].(*syntax.Lit)
 		if !ok || strings.ContainsAny(lit.Value, "\\'\"") {
-			return "redirect target must be plain literal"
+			return nil, "", "redirect target must be plain literal"
 		}
 		if lit.Value != "/dev/null" {
-			return "redirect target forbidden"
+			return nil, lit.Value, "redirect target forbidden"
 		}
-		return ""
+		return nil, "", ""
 	case syntax.DplOut:
 		raw, ok := rawSlice(code, r.Pos(), r.End())
 		if !ok || (raw != "2>&1" && raw != "1>&2") {
-			return "redirect duplex forbidden"
+			return nil, "", "redirect duplex forbidden"
 		}
-		return ""
+		return nil, "", ""
+	case syntax.Hdoc, syntax.DashHdoc:
+		// MF-4: only static single-quoted heredoc on a literal ssh head.
+		head, hhit := roWord(code, call.Args[0], true)
+		if hhit != "" || head != "ssh" {
+			return nil, "", fmt.Sprintf("unsupported syntax node %T op=%v", r, r.Op)
+		}
+		if r.N != nil {
+			return nil, "", "ssh heredoc fd forbidden"
+		}
+		if len(r.Word.Parts) != 1 {
+			return nil, "", "ssh heredoc delim must be single-quoted"
+		}
+		sgl, ok := r.Word.Parts[0].(*syntax.SglQuoted)
+		if !ok || sgl.Dollar || !isHeredocDelimName(sgl.Value) {
+			return nil, "", "ssh heredoc delim must be single-quoted"
+		}
+		opLen := len(r.Op.String())
+		lo := int(r.OpPos.Offset()) + opLen
+		hi := int(r.Word.End().Offset())
+		if lo < 0 || hi > len(code) || lo > hi {
+			return nil, "", "ssh heredoc delim span"
+		}
+		if strings.ContainsAny(code[lo:hi], "\\\n") {
+			return nil, "", "ssh heredoc delim span"
+		}
+		text := ""
+		if r.Hdoc != nil {
+			// Prefer Lit() so the closing delimiter is not part of the body.
+			if lit := r.Hdoc.Lit(); lit != "" {
+				text = lit
+			} else if raw, ok := rawSlice(code, r.Hdoc.Pos(), r.Hdoc.End()); ok {
+				text = raw
+			} else {
+				return nil, "", "ssh heredoc body"
+			}
+			if r.Op == syntax.DashHdoc {
+				text = stripDashHdocTabs(text)
+			}
+		}
+		body := heredocBody{text: text, quoted: true, dynamic: false}
+		return &body, "", ""
 	default:
-		return fmt.Sprintf("unsupported syntax node %T op=%v", r, r.Op)
+		return nil, "", fmt.Sprintf("unsupported syntax node %T op=%v", r, r.Op)
 	}
 }
 
