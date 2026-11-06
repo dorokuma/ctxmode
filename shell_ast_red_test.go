@@ -821,9 +821,13 @@ func astMustRedRound16Cases() []astRedWantCase {
 		// MF-2: a && / || / | right branch shares the whole descriptor
 		// table — only fd0's stream differs (pipe) or is identical
 		// (conditional), so an inherited fd9 dup still smuggles the pipe.
+		// R16_M2_03 narrowed (R17): the { cat; sh; } row exercises
+		// stmtFeed's group-redirect replay into walkStmtsAll's shared feed,
+		// NOT walkStmts' i>0 sequential fds branch — that branch's
+		// feed.fds is nil at every call site (see R17_M3_01).
 		{astRedCase{"R16_M2_01", "echo pig | { true && sh 0<&9; } 9<&0", "worker", true, "M2 &&-right inherits fd table"}, "piped code to shell"},
 		{astRedCase{"R16_M2_02", "echo pig | { cat | sh 0<&9; } 9<&0", "worker", true, "M2 pipe-right keeps fd9"}, "piped code to shell"},
-		{astRedCase{"R16_M2_03", "echo pig | { cat; sh 0<&9; } 9<&0", "worker", true, "M2 sequential stmt keeps fd9"}, "piped code to shell"},
+		{astRedCase{"R16_M2_03", "echo pig | { cat; sh 0<&9; } 9<&0", "worker", true, "M2 brace-group fd table into later stmts (walkStmtsAll)"}, "piped code to shell"},
 		{astRedCase{"R16_M2_04", "echo pig | { true && sh 0<&9; } 9<f", "worker", false, "M2 fd9 file-bound inside group"}, ""},
 
 		// MF-3: perl/ruby restricted numeric optional tails (-0/-l) end at
@@ -847,6 +851,59 @@ func TestAST_MustRed_Round16(t *testing.T) {
 		})
 	}
 	t.Logf("must-red round16 summary: cases=%d", len(cases))
+}
+
+// astMustRedRound17Cases is the review round-7 fix table: a dynamic
+// n<&m / n>&m target no longer earns a file exemption (an unparseable dup
+// word keeps fd n's origin tainted, never file-bound), and a function body
+// inherits the declaration's PROVABLE descriptor table while every other
+// dup inside the body fails closed — the call-site fd set is unknown.
+func astMustRedRound17Cases() []astRedWantCase {
+	return []astRedWantCase{
+		// MF-1: 0<&$(...) cannot prove the dup target, so fd0 keeps a
+		// tainted (possibly-pipe) origin — the real shell dup2s whatever the
+		// expansion yields and fd0 may still be the pipe.
+		{astRedCase{"R17_M1_01", "echo pig | sh 0<&$(printf 0)", "worker", true, "M1 dynamic dup target keeps fd0 taint"}, "piped code to shell"},
+		{astRedCase{"R17_M1_02", "echo pig | sh 0<&`printf 0`", "worker", true, "M1 backtick dup target keeps fd0 taint"}, "piped code to shell"},
+		{astRedCase{"R17_M1_03", "echo pig | sh 9<&$(printf 0) 0<&9", "worker", true, "M1 dynamic fd9 stays tainted"}, "piped code to shell"},
+		{astRedCase{"R17_M1_04", "echo pig | sh 9<&$(printf 1) 0>&9", "worker", true, "M1 output-side dynamic dup stays tainted"}, "piped code to shell"},
+		// Without a pipe the same construct still fails closed: an
+		// unprovable dup target never buys back the file exemption, and the
+		// tainted origin reads as a possibly-piped stdin for a program head.
+		{astRedCase{"R17_M1_05", "sh 0<&$(printf 0)", "worker", true, "M1 dynamic dup fails closed without pipe too"}, "piped code to shell"},
+		{astRedCase{"R17_M1_06", "echo pig | sh 0<&0", "worker", true, "M1 static self-dup still resolves"}, "piped code to shell"},
+
+		// MF-2: a function body sees the CALL's stdin, modelled as fed —
+		// its fd table therefore inherits only the declaration-site
+		// redirects that provably ride the call (`{ f(){...}; f; } 9<&0` and
+		// `f(){...} 9<&0`), and every dup of an unproven fd fails closed
+		// instead of inheriting the old file exemption.
+		{astRedCase{"R17_M2_01", "echo pig | { f() { sh 0<&9; }; f; } 9<&0", "worker", true, "M2 function body inherits group fd9"}, "piped code to shell"},
+		{astRedCase{"R17_M2_02", "f() { sh 0<&9; }; f", "worker", true, "M2 unprovable call-site fd9 fails closed"}, "piped code to shell"},
+		{astRedCase{"R17_M2_03", "echo pig | f() { sh 0<&9; } 9<&0", "worker", true, "M2 decl-site 9<&0 rides the call"}, "piped code to shell"},
+		{astRedCase{"R17_M2_04", "f() { cat; sh 0<&9; }; f", "worker", true, "M2 unprovable fd9 in sequential body"}, "piped code to shell"},
+		{astRedCase{"R17_M2_05", "f() { sh 0<&9; } 9<f; f", "worker", false, "M2 provable file fd9 stays file"}, ""},
+
+		// MF-3 coverage honesty: R16_M2_03's sequential claim actually
+		// exercises stmtFeed's group-redirect replay into walkStmtsAll's
+		// shared feed — walkStmts' i>0 fds field is dead (every list-level
+		// feed carries fds=nil, propagated only defensively). This row pins
+		// the standalone spelling of the same brace redirect so the real
+		// covered path is what the reason names.
+		{astRedCase{"R17_M3_01", "{ cat; sh 0<&9; } 9<&0", "worker", false, "M3 standalone brace group fd9 resolves fd0"}, ""},
+	}
+}
+
+// TestAST_MustRed_Round17 is the review round-7 regression gate.
+func TestAST_MustRed_Round17(t *testing.T) {
+	cases := astMustRedRound17Cases()
+	for _, c := range cases {
+		c := c
+		t.Run(c.id, func(t *testing.T) {
+			runAstWantCase(t, c)
+		})
+	}
+	t.Logf("must-red round17 summary: cases=%d", len(cases))
 }
 
 // TestAST_MustRed_Round14 is the review round-4 regression gate.

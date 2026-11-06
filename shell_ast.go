@@ -1181,6 +1181,7 @@ type subCollector struct {
 	taintedVars  map[string]bool
 	ssaBlocked   map[string]bool // G3: writeCount>1 from preScan
 	allowBind    bool            // top-level sequential stmts only (R-Allow-2)
+	fdUnvetted   bool            // inside a function body: unproven dups fail closed (R17 MF-2)
 }
 
 func (c *subCollector) reject() {
@@ -1551,10 +1552,12 @@ func (c *subCollector) walkStmts(stmts []*syntax.Stmt, feed stdinFeed) {
 		}
 		if i > 0 {
 			// Sequential list: only the FIRST statement consumes the piped
-			// stream. Heredoc/here-string/file feeds are pre-bound input, so
-			// every statement in the list shares them — and so does the
-			// inherited descriptor table: { cat; sh 0<&9; } 9<&0 resolves
-			// fd9 for the later statements too.
+			// stream. Heredoc/here-string/file feeds are pre-bound input,
+			// so every statement in the list shares them. R17: feed.fds is
+			// nil at every call site (all three list-level feeds are
+			// {piped: pipeIn}) — sequential statements inside compounds
+			// run through walkStmtsAll instead, so the fds field below is
+			// propagated only defensively and carries no coverage.
 			c.walkStmt(st, stdinFeed{piped: false, bodies: feed.bodies, hasHere: feed.hasHere, hereStr: feed.hereStr, file: feed.file, fds: feed.fds})
 			continue
 		}
@@ -1706,11 +1709,25 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 	case *syntax.FuncDecl:
 		prevBind := c.allowBind
 		c.allowBind = false
+		prevUnvetted := c.fdUnvetted
+		c.fdUnvetted = true
 		if cmd.Body != nil {
-			// The body's stdin is the stdin of whatever invocation runs it —
-			// unknown at definition, so conservatively treat it as fed.
-			c.walkStmt(cmd.Body, stdinFeed{piped: true})
+			// The body's stdin is the stdin of whatever invocation runs
+			// it — unknown at definition, so conservatively fed. The fd
+			// table is inherited from the CALL, which is likewise
+			// unprovable, so every descriptor the declaration itself does
+			// not bind (st.Redirs replayed at call time, plus the table an
+			// enclosing compound left behind) fails closed: a bare
+			// `f() { sh 0<&9; }; f` dup gets no file exemption (R17 MF-2).
+			inner := c.stmtFeed(st, feed)
+			inner.piped = true
+			if fd0, seen := inner.fds["0"]; seen && !fd0.piped {
+				fd0.piped = true
+				inner.fds["0"] = fd0
+			}
+			c.walkStmt(cmd.Body, inner)
 		}
+		c.fdUnvetted = prevUnvetted
 		c.allowBind = prevBind
 	case *syntax.TimeClause:
 		prevBind := c.allowBind
@@ -2018,24 +2035,35 @@ func (c *subCollector) feedThrough(redirs []*syntax.Redirect, base stdinFeed) ma
 			// n<&m / n>&m copies m's CURRENT origin — dash runs the same
 			// dup2 for both operators, so 0>&0 keeps base (it never rebinds
 			// the input side) and 9>&0 then 0<&9 still smuggles the pipe
-			// through fd9. n>&- / n<&- closes the fd; an unresolvable target
-			// binds to something unvetted — file. A non-digit >&word is a
-			// write target (applyRedirs records it as redirectFile) which is
-			// file for origin purposes.
+			// through fd9. n>&- / n<&- closes the fd. A target that fails
+			// to parse keeps a TAINTED (possibly-pipe) origin: `0<&$(…)`
+			// dup2s whatever the expansion yields — fd0 may still be the
+			// pipe, so the file exemption must not apply (R17 MF-1). A
+			// non-digit >&word is a write target (applyRedirs records it
+			// as redirectFile) which is file for origin purposes.
 			if r.Word == nil {
 				origins[n] = stdinFeed{file: true}
 				break
 			}
 			s, ok := wordToArg(r.Word)
-			if !ok || s == "-" {
+			switch {
+			case !ok:
+				// Unparseable dup target: fd n binds to an unvetted,
+				// possibly-piped stream — never a file exemption.
+				origins[n] = stdinFeed{piped: true}
+			case s == "-":
 				origins[n] = stdinFeed{file: true}
-			} else if allDigits(s) {
+			case allDigits(s):
 				if o, seen := origins[s]; seen {
 					origins[n] = o
+				} else if c.fdUnvetted {
+					// Inside a function body the call-site descriptor set
+					// is unknown: an unproven fd fails closed as tainted.
+					origins[n] = stdinFeed{piped: true}
 				} else {
 					origins[n] = stdinFeed{file: true}
 				}
-			} else {
+			default:
 				origins[n] = stdinFeed{file: true}
 			}
 		default:
@@ -2180,6 +2208,7 @@ func (c *subCollector) newSub() *subCollector {
 		taintedVars:  cloneBoolMap(c.taintedVars),
 		ssaBlocked:   cloneBoolMap(c.ssaBlocked),
 		allowBind:    false,
+		fdUnvetted:   c.fdUnvetted,
 	}
 }
 
