@@ -81,15 +81,70 @@ func checkShellBytes(code string, strictReadonly bool) string {
 	return ""
 }
 
+// hasOddTrailingBackslash reports whether s ends with an odd number of
+// backslashes (so a following newline would be a line continuation).
+func hasOddTrailingBackslash(s string) bool {
+	n := 0
+	for i := len(s) - 1; i >= 0 && s[i] == '\\'; i-- {
+		n++
+	}
+	return n%2 == 1
+}
+
+// litHasResidualExpand reports an unescaped $ in a Lit that dash would
+// treat as the start of a parameter/command expansion (G1-3).
+
+// litHasUnescapedCmdExpand reports unescaped $( or ` in a raw literal
+// (used for unquoted-heredoc outer-expand checks).
+func litHasUnescapedCmdExpand(raw string) bool {
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' {
+			i++
+			continue
+		}
+		if raw[i] == '`' {
+			return true
+		}
+		if raw[i] == '$' && i+1 < len(raw) && raw[i+1] == '(' {
+			return true
+		}
+	}
+	return false
+}
+
+func litHasResidualExpand(raw string) bool {
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' {
+			i++ // skip escaped byte
+			continue
+		}
+		if raw[i] != '$' {
+			continue
+		}
+		if i+1 >= len(raw) {
+			continue
+		}
+		n := raw[i+1]
+		if n == '{' || n == '(' || n == '\\' ||
+			(n >= 'a' && n <= 'z') || (n >= 'A' && n <= 'Z') || n == '_' ||
+			(n >= '0' && n <= '9') ||
+			n == '@' || n == '*' || n == '#' || n == '?' || n == '!' || n == '-' || n == '$' {
+			return true
+		}
+	}
+	return false
+}
+
 // checkCommentsAndContinuations validates KeepComments AST comment starts
-// (MF-1 / Audit-5) and comment/active line continuations (MF-5 / SF-3 / SF-4).
+// (MF-1 / Audit-5) and G1 lexical gates (token-internal \\\n, comment-tail \,
+// $ then \\\n, quoted-heredoc exemption).
 func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly bool) string {
 	if f == nil {
 		return ""
 	}
 	type span struct{ lo, hi int }
 	var comments []span
-	var sglQuoted []span
+	var exempt []span // sgl-quoted + quoted-heredoc bodies
 	var ambig string
 	syntax.Walk(f, func(n syntax.Node) bool {
 		if n == nil || ambig != "" {
@@ -106,7 +161,7 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 				prev := code[off-1]
 				switch prev {
 				case ' ', '\t', '\n', ';', '|', '&', '(', ')':
-					if off >= 2 && code[off-2] == '\\' {
+					if off >= 2 && hasOddTrailingBackslash(code[:off-1]) {
 						ambig = "ambiguous comment start"
 						return false
 					}
@@ -123,7 +178,8 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 				end = len(code)
 			}
 			comments = append(comments, span{off, end})
-			// Trailing \ on a same-line (non-leading) comment must not continue.
+			// G1-2: comment text ending with \ is dangerous (dash ends the
+			// command; mvdan may swallow the next line).
 			trimmed := strings.TrimRight(x.Text, " \t\r\n")
 			if strings.HasSuffix(trimmed, `\`) {
 				lineStart := 0
@@ -138,7 +194,17 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 						break
 					}
 				}
-				if hasNonWS {
+				prevCont := lineStart >= 2 && hasOddTrailingBackslash(code[:lineStart-1])
+				if !strictReadonly {
+					// worker: any comment ending with \ is forbidden
+					ambig = "comment line continuation forbidden"
+					return false
+				}
+				// readonly: file-leading # \ only (R9_MF5_01). A trailing
+				// newline in Comment.Text is normal; swallowed NEXT-line
+				// content shows as an interior newline after TrimRight.
+				body := strings.TrimRight(x.Text, "\r\n")
+				if off != 0 || strings.Contains(body, "\n") || hasNonWS || prevCont {
 					ambig = "comment line continuation forbidden"
 					return false
 				}
@@ -146,7 +212,16 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 		case *syntax.SglQuoted:
 			lo, hi := int(x.Pos().Offset()), int(x.End().Offset())
 			if lo >= 0 && hi >= lo && hi <= len(code) {
-				sglQuoted = append(sglQuoted, span{lo, hi})
+				exempt = append(exempt, span{lo, hi})
+			}
+		case *syntax.Redirect:
+			// W-Fix-3: quoted heredoc bodies are pure literals at top-level dash.
+			if (x.Op == syntax.Hdoc || x.Op == syntax.DashHdoc) &&
+				isQuotedHeredocDelim(x.Word) && x.Hdoc != nil {
+				lo, hi := int(x.Hdoc.Pos().Offset()), int(x.Hdoc.End().Offset())
+				if lo >= 0 && hi >= lo && hi <= len(code) {
+					exempt = append(exempt, span{lo, hi})
+				}
 			}
 		}
 		return true
@@ -162,14 +237,45 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 		}
 		return false
 	}
-	// mvdan drops the word before `\\\n>` / `\\\n<` while dash keeps it.
-	// Fail closed for both readonly and subagent paths.
+	isSepPrev := func(i int) bool {
+		if i <= 0 {
+			return true
+		}
+		switch code[i-1] {
+		case ' ', '\t', '\n', ';', '|', '&', '(':
+			return true
+		}
+		return false
+	}
+	// G1-1 + existing redirect-after-cont + $ then \\\n
 	for i := 0; i+1 < len(code); i++ {
 		if code[i] != '\\' || code[i+1] != '\n' {
 			continue
 		}
-		if inSpan(comments, i) || inSpan(sglQuoted, i) {
+		// only odd-parity backslash starts a real continuation
+		if i > 0 && code[i-1] == '\\' {
+			// count run
+			k := i
+			for k > 0 && code[k-1] == '\\' {
+				k--
+			}
+			if (i-k)%2 == 1 {
+				continue // even total → escaped backslash, not cont
+			}
+		}
+		if inSpan(comments, i) || inSpan(exempt, i) {
 			continue
+		}
+		// $ then \\\n (G1 / MF-1)
+		if i > 0 && code[i-1] == '$' {
+			// ensure $ itself is unescaped
+			if i < 2 || !hasOddTrailingBackslash(code[:i-1]) {
+				return "ambiguous line continuation after $"
+			}
+		}
+		// Forward boundary: must follow whitespace/separator (token-external).
+		if !isSepPrev(i) {
+			return "ambiguous line continuation inside token"
 		}
 		j := i + 2
 		for j < len(code) && (code[j] == ' ' || code[j] == '\t') {
@@ -177,6 +283,9 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 		}
 		if j < len(code) && (code[j] == '<' || code[j] == '>') {
 			return "ambiguous line continuation before redirect"
+		}
+		if j < len(code) && code[j] == '#' {
+			return "ambiguous line continuation before comment"
 		}
 	}
 	if !strictReadonly {
@@ -186,7 +295,7 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 		if code[i] != '\\' || code[i+1] != '\n' {
 			continue
 		}
-		if inSpan(comments, i) || inSpan(sglQuoted, i) {
+		if inSpan(comments, i) || inSpan(exempt, i) {
 			continue
 		}
 		return "backslash line continuation forbidden"
@@ -498,30 +607,124 @@ func rawSlice(code string, pos, end syntax.Pos) (string, bool) {
 	return code[lo:hi], true
 }
 
-// rawHasLineContCmdsubst reports $ followed by backslash-newline then (,
-// which dash folds into $(...) but mvdan may leave as adjacent Lits.
-func rawHasLineContCmdsubst(raw string) bool {
+// rawHasLineContAfterDollar reports an unescaped $ followed by \\\n.
+// dash folds the continuation before parsing the expansion; mvdan may not.
+func rawHasLineContAfterDollar(raw string) bool {
 	for i := 0; i+1 < len(raw); i++ {
+		if raw[i] == '\\' {
+			i++ // skip escaped byte
+			continue
+		}
 		if raw[i] != '$' {
 			continue
 		}
-		j := i + 1
-		sawCont := false
-		for j+1 < len(raw) && raw[j] == '\\' && raw[j+1] == '\n' {
-			j += 2
-			sawCont = true
-		}
-		if !sawCont {
-			continue
-		}
-		for j < len(raw) && (raw[j] == ' ' || raw[j] == '\t') {
-			j++
-		}
-		if j < len(raw) && raw[j] == '(' {
+		if i+2 < len(raw) && raw[i+1] == '\\' && raw[i+2] == '\n' {
 			return true
 		}
 	}
 	return false
+}
+
+// preScanVarMutations counts variable write/bind sites across the whole AST
+// (G3 SSA-like invariant). Names with writeCount > 1 are tainted before walk.
+func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted bool) {
+	writeCount = map[string]int{}
+	if f == nil {
+		return writeCount, false
+	}
+	inc := func(name string) {
+		if name != "" {
+			writeCount[name]++
+		}
+	}
+	syntax.Walk(f, func(n syntax.Node) bool {
+		if n == nil || allTainted {
+			return false
+		}
+		switch x := n.(type) {
+		case *syntax.Assign:
+			if x.Name != nil {
+				inc(x.Name.Value)
+			}
+		case *syntax.ForClause:
+			if wi, ok := x.Loop.(*syntax.WordIter); ok && wi.Name != nil {
+				inc(wi.Name.Value)
+			}
+		case *syntax.ParamExp:
+			if x.Param != nil && x.Exp != nil &&
+				(x.Exp.Op == syntax.AssignUnset || x.Exp.Op == syntax.AssignUnsetOrNull) {
+				inc(x.Param.Value)
+			}
+		case *syntax.BinaryArithm:
+			if isArithAssignOp(x.Op) {
+				inc(arithmTargetName(x.X))
+			}
+		case *syntax.UnaryArithm:
+			if x.Op == syntax.Inc || x.Op == syntax.Dec {
+				inc(arithmTargetName(x.X))
+			}
+		case *syntax.CallExpr:
+			if len(x.Args) == 0 {
+				return true
+			}
+			head, _ := wordToArg(x.Args[0])
+			base := head
+			if i := strings.LastIndex(base, "/"); i >= 0 {
+				base = base[i+1:]
+			}
+			switch base {
+			case "unset", "read", "export", "readonly", "declare", "typeset", "local", "getopts":
+				for _, w := range x.Args[1:] {
+					s, ok := wordToArg(w)
+					if !ok {
+						allTainted = true
+						return false
+					}
+					if base == "unset" || base == "read" || base == "getopts" {
+						// bare names / optstring+name
+						if base == "getopts" {
+							continue // handled loosely: taint following name words
+						}
+						name := s
+						if eq := strings.IndexByte(s, '='); eq > 0 && (base == "export" || base == "readonly" || base == "declare" || base == "typeset" || base == "local") {
+							name = s[:eq]
+						}
+						if name != "" && !strings.HasPrefix(name, "-") {
+							inc(name)
+						}
+					} else {
+						// export/readonly/declare/typeset/local NAME[=VAL]
+						name := s
+						if eq := strings.IndexByte(s, '='); eq >= 0 {
+							name = s[:eq]
+						}
+						if name != "" && !strings.HasPrefix(name, "-") {
+							inc(name)
+						}
+					}
+				}
+			case "printf":
+				// printf -v VAR ...
+				for i := 1; i+1 < len(x.Args); i++ {
+					s, ok := wordToArg(x.Args[i])
+					if !ok {
+						continue
+					}
+					if s == "-v" {
+						vn, vok := wordToArg(x.Args[i+1])
+						if !vok {
+							allTainted = true
+							return false
+						}
+						inc(vn)
+						i++
+					}
+				}
+			}
+		}
+		return true
+	})
+	return writeCount, allTainted
 }
 
 // parseSubagentShellAST parses code into shellSegments for subagent guards.
@@ -595,6 +798,22 @@ func parseSubagentShellAST(code string, depth int, pipeIn bool, useBashVariant b
 		}
 	}
 
+	col.ssaBlocked = map[string]bool{}
+	writes, allTainted := preScanVarMutations(primary)
+	if allTainted {
+		for name := range writes {
+			col.taintedVars[name] = true
+			col.ssaBlocked[name] = true
+		}
+		col.taintedVars["*"] = true
+	} else {
+		for name, n := range writes {
+			if n > 1 {
+				col.taintedVars[name] = true
+				col.ssaBlocked[name] = true
+			}
+		}
+	}
 	col.walkStmts(primary.Stmts, pipeIn)
 	if col.rejected {
 		return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
@@ -667,7 +886,8 @@ type subCollector struct {
 	staticVars  map[string]string // head-eligible abs-path binds (R-Allow-2)
 	enumVars    map[string]string // for-loop enum temporary binds (payload subst only)
 	taintedVars map[string]bool
-	allowBind   bool // top-level sequential stmts only (R-Allow-2)
+	ssaBlocked  map[string]bool // G3: writeCount>1 from preScan
+	allowBind   bool            // top-level sequential stmts only (R-Allow-2)
 }
 
 func (c *subCollector) reject() {
@@ -682,7 +902,7 @@ func (c *subCollector) failClosedFile(f *syntax.File) bool {
 		}
 		switch x := n.(type) {
 		case *syntax.DblQuoted:
-			if raw, okRaw := rawSlice(c.code, x.Pos(), x.End()); okRaw && rawHasLineContCmdsubst(raw) {
+			if raw, okRaw := rawSlice(c.code, x.Pos(), x.End()); okRaw && rawHasLineContAfterDollar(raw) {
 				ok = false
 				return false
 			}
@@ -691,6 +911,16 @@ func (c *subCollector) failClosedFile(f *syntax.File) bool {
 					ok = false
 					return false
 				}
+				if lit, is := p.(*syntax.Lit); is && litHasResidualExpand(lit.Value) {
+					ok = false
+					return false
+				}
+			}
+		case *syntax.Lit:
+			// G1-3: mvdan left an expand residue inside a Lit
+			if litHasResidualExpand(x.Value) {
+				ok = false
+				return false
 			}
 		case *syntax.CmdSubst:
 			if x.Backquotes {
@@ -916,8 +1146,8 @@ func (c *subCollector) failClosedUnquotedHdoc(hdoc *syntax.Word) bool {
 				return false
 			}
 		case *syntax.Lit:
-			dec := decodeUnquotedHeredocLit(t.Value, false)
-			if strings.Contains(dec, "$(") || strings.Contains(dec, "`") || rawHasLineContCmdsubst(dec) {
+			// W-Fix-2: check ORIGINAL lit for unescaped $( / backtick / dollar-linecont.
+			if litHasUnescapedCmdExpand(t.Value) || rawHasLineContAfterDollar(t.Value) {
 				ok = false
 				return false
 			}
@@ -1072,6 +1302,8 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 		}
 		c.allowBind = prevBind
 	case *syntax.CaseClause:
+		prevBind := c.allowBind
+		c.allowBind = false
 		c.emitNestedFromWord(cmd.Word)
 		for _, item := range cmd.Items {
 			for _, pat := range item.Patterns {
@@ -1079,6 +1311,7 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 			}
 			c.walkStmts(item.Stmts, false)
 		}
+		c.allowBind = prevBind
 	case *syntax.FuncDecl:
 		prevBind := c.allowBind
 		c.allowBind = false
@@ -1087,13 +1320,19 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 		}
 		c.allowBind = prevBind
 	case *syntax.TimeClause:
+		prevBind := c.allowBind
+		c.allowBind = false
 		if cmd.Stmt != nil {
 			c.walkStmt(cmd.Stmt, pipeIn)
 		}
+		c.allowBind = prevBind
 	case *syntax.CoprocClause:
+		prevBind := c.allowBind
+		c.allowBind = false
 		if cmd.Stmt != nil {
 			c.walkStmt(cmd.Stmt, false)
 		}
+		c.allowBind = prevBind
 	case *syntax.DeclClause:
 		c.emitDecl(st, cmd, pipeIn)
 	case *syntax.ArithmCmd:
@@ -1164,20 +1403,31 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, pipeIn b
 	for _, a := range call.Assigns {
 		argv = append(argv, assignToPrefix(a))
 		if a.Name != nil && !a.Naked {
-			val, st := "", false
-			if a.Value != nil {
-				val, st = c.wordToArg(a.Value)
+			if len(call.Args) == 0 {
+				// Pure assignment statement — eligible for staticVars.
+				val, st := "", false
+				if a.Value != nil {
+					val, st = c.wordToArg(a.Value)
+				}
+				c.noteStaticAssign(a.Name.Value, val, st)
+			} else {
+				// Prefix env (FOO=bar cmd) does not bind in the current shell.
+				c.taintVar(a.Name.Value)
 			}
-			c.noteStaticAssign(a.Name.Value, val, st)
 		}
 	}
 	for i, w := range call.Args {
-		// Command head: never resolve for-loop enumVars (R-Allow-2 head bind
-		// is top-level abs-path staticVars only).
+		// Command head: allow enumVars only for abs-path for-loop values (W-Fix-6).
 		if i == 0 && len(c.enumVars) > 0 {
+			// Try with enumVars; if resolved value is not a safe abs path, fall back.
+			s, ok := c.wordToArg(w)
+			if ok && isSafeAbsPathVal(s) {
+				argv = append(argv, s)
+				continue
+			}
 			saved := c.enumVars
 			c.enumVars = nil
-			s, _ := c.wordToArg(w)
+			s, _ = c.wordToArg(w)
 			c.enumVars = saved
 			argv = append(argv, s)
 			continue
@@ -1301,7 +1551,7 @@ func (c *subCollector) emitNestedFromWord(w *syntax.Word) {
 	if w == nil {
 		return
 	}
-	if raw, ok := rawSlice(c.code, w.Pos(), w.End()); ok && rawHasLineContCmdsubst(raw) {
+	if raw, ok := rawSlice(c.code, w.Pos(), w.End()); ok && rawHasLineContAfterDollar(raw) {
 		c.reject()
 		return
 	}
@@ -1443,7 +1693,11 @@ func (c *subCollector) noteStaticAssign(name, val string, static bool) {
 	if c.taintedVars == nil {
 		c.taintedVars = map[string]bool{}
 	}
-	if name == "" || !c.allowBind {
+	if name == "" {
+		return
+	}
+	if !c.allowBind {
+		c.taintVar(name)
 		return
 	}
 	if c.taintedVars[name] {
@@ -1470,7 +1724,10 @@ func (c *subCollector) resolveStaticParam(pe *syntax.ParamExp) (string, bool) {
 		return "", false
 	}
 	v, ok := c.staticVars[pe.Param.Value]
-	return v, ok
+	if !ok || !isSafeIdentOrRelPath(v) {
+		return "", false
+	}
+	return v, true
 }
 
 // resolveParamForSubst resolves a simple $VAR / ${VAR} from enumVars (for-loop
@@ -1486,11 +1743,17 @@ func (c *subCollector) resolveParamForSubst(pe *syntax.ParamExp) (string, bool) 
 	name := pe.Param.Value
 	if c.enumVars != nil {
 		if v, ok := c.enumVars[name]; ok {
+			if !isSafeIdentOrRelPath(v) {
+				return "", false
+			}
 			return v, true
 		}
 	}
 	if c.staticVars != nil {
 		if v, ok := c.staticVars[name]; ok {
+			if !isSafeIdentOrRelPath(v) {
+				return "", false
+			}
 			return v, true
 		}
 	}
@@ -1504,15 +1767,18 @@ func (c *subCollector) forEnumSubst(loopName string, items []*syntax.Word, do []
 	if len(items) == 0 {
 		return false
 	}
+	if c.ssaBlocked != nil && c.ssaBlocked[loopName] {
+		return false // G3: multi-write elsewhere → no static enum
+	}
 	vals := make([]string, 0, len(items))
 	for _, w := range items {
 		s, ok := wordToArg(w)
 		if !ok {
 			return false // dynamic item → stay dynamic
 		}
+		// W-Fix-1: non-simple enum items → graceful fallback (not reject).
 		if !isSafeIdentOrRelPath(s) {
-			c.reject()
-			return true
+			return false
 		}
 		vals = append(vals, s)
 	}
@@ -1702,6 +1968,10 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 			}
 		case *syntax.ParamExp:
 			if v, ok := c.resolveParamForSubst(p); ok {
+				if openBracket {
+					// SF-4: [prefix$v] can form a glob after expansion.
+					static = false
+				}
 				b.WriteString(v)
 			} else {
 				static = false
