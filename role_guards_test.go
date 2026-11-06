@@ -1375,17 +1375,17 @@ func TestGuard_SSHPeel(t *testing.T) {
 			if rule, _ := g.guardCtxRunShell(`ssh dmit pig`); rule != ruleSubagentNestedAgent {
 				t.Fatalf("%s: remote pig rule = %q, want %s", role, rule, ruleSubagentNestedAgent)
 			}
-			// Stdin reaching a remote program reader is unscreenable code
-			// for a read-only role and blocks — a remote `sh`/`python3`
-			// reading its program from the pipe/heredoc/here-string is the
-			// same verdict the local stdin-program model gives.
-			for _, code := range []string{
-				`echo uptime | ssh dmit sh`,
-				"ssh dmit sh <<'EOF'\nls -la /tmp\nEOF",
-			} {
-				if rule, _ := g.guardCtxRunShell(code); rule != ruleReadonlyWrite {
-					t.Fatalf("%s: %q rule = %q, want %s", role, code, rule, ruleReadonlyWrite)
-				}
+			// Pipe-fed remote program readers stay unscreenable for read-only.
+			// MF-4/SF-2: single-quoted ssh heredoc with a readonly remote body
+			// (remote `sh`/`python3 -`) is peeled and screened — allow.
+			if rule, _ := g.guardCtxRunShell(`echo uptime | ssh dmit sh`); rule != ruleReadonlyWrite {
+				t.Fatalf("%s: pipe-fed remote sh rule = %q, want %s", role, rule, ruleReadonlyWrite)
+			}
+			if rule, _ := g.guardCtxRunShell("ssh dmit sh <<'EOF'\nls -la /tmp\nEOF"); rule != "" {
+				t.Fatalf("%s: sq-heredoc remote readonly sh must pass, got %q", role, rule)
+			}
+			if rule, _ := g.guardCtxRunShell("ssh dmit sh <<'EOF'\nrm -rf /tmp/x\nEOF"); rule != ruleReadonlyWrite {
+				t.Fatalf("%s: sq-heredoc remote write rule = %q, want %s", role, rule, ruleReadonlyWrite)
 			}
 			// A read-only command receiving a heredoc as DATA (remote cat)
 			// stays free.

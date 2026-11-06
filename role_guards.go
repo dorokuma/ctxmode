@@ -2199,13 +2199,17 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 			if len(langs) == 0 {
 				langs = []string{""}
 			}
+			// Remote stdin program text: verifier's /tmp exemption ends at the
+			// wire — always screen with strict readonly when the caller is any
+			// read-only role (PLAN10 MF-4 / screenSSHHead contract).
+			bodyKind := kind
+			if kind == 's' && callerReadonlyRole(caller) {
+				bodyKind = 'r'
+			}
 			for _, lang := range langs {
-				if h := screenStdinProgram(body, lang, kind, depth, caller); h != "" {
+				if h := screenStdinProgram(body, lang, bodyKind, depth, caller); h != "" {
 					if kind == 'r' || callerReadonlyRole(caller) {
-						// Map readonly hits on remote stdin code to ssh remote write.
-						if h != "" {
-							return h
-						}
+						return roSSHWriteHit
 					}
 					return h
 				}
@@ -2612,7 +2616,11 @@ func screenEnvAssignments(envAs envAssignments, kind byte, callerRole, callerRea
 			case auditEnvReadonly:
 				effReadonly = ""
 			}
-			if envHookVars[op.key] || guardTaintVars[op.key] {
+			// Execution-hook vars may not be unset. Role-identity taint vars
+			// (CTXMODE_ROLE / CTXMODE_READONLY) only update eff* above; the
+			// final identity check decides (allows readonly-clear → fall to
+			// command head, blocks role clear/downgrade).
+			if envHookVars[op.key] {
 				return "env " + op.key
 			}
 		case 'a':
@@ -2625,12 +2633,12 @@ func screenEnvAssignments(envAs envAssignments, kind byte, callerRole, callerRea
 			case auditEnvReadonly:
 				effReadonly = op.value
 			}
-			if envHookVars[op.key] || guardTaintVars[op.key] {
+			if envHookVars[op.key] {
 				if pagerSafeVars[op.key] && (op.value == "" || op.value == "cat") {
 					continue
 				}
 				// Hook var: any dynamic value is rejected; PATH also rejects
-				// static prepend of non-system dirs (checked below).
+				// static prepend of non-system dirs (TASK S4).
 				if isDynamicArg(op.value) {
 					return "env " + op.key
 				}
@@ -2641,6 +2649,7 @@ func screenEnvAssignments(envAs envAssignments, kind byte, callerRole, callerRea
 					return "env " + op.key
 				}
 			}
+			// Taint vars: identity simulation only (no early return).
 		}
 	}
 	if !callerSub || kind != 's' {
