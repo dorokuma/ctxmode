@@ -267,3 +267,104 @@ func TestAST_Round9_BaselineSnapshot(t *testing.T) {
 		t.Log("PASS:", l)
 	}
 }
+
+// astMustRedRound10Cases is PLAN10 §must-red + TASK.md split-safe corrections.
+func astMustRedRound10Cases() []astRedCase {
+	return []astRedCase{
+		// MF-1 lexical
+		{"R10_MF1_01", "$\\\n{UNSET:-pig}", "worker", true, "MF-1 $ then \\\n brace param"},
+		{"R10_MF1_02", "/bin/sh -c '$\\\n1' _ pig", "worker", true, "MF-1 $ then \\\n positional"},
+		{"R10_MF1_03", "/bin/sh \"$\\\n{UNSET:--c}\" pig", "worker", true, "MF-1 dq $ then \\\n expands -c"},
+		{"R10_MF1_04", "/bin/sh <<EOF\ntrue $\\\n{UNSET:-; pig}\nEOF", "worker", true, "MF-1 unquoted hdoc $ \\\n"},
+		{"R10_MF1_05", "echo \\\n # \\\npig", "worker", true, "MF-1 cont then indented comment \\\n swallows pig"},
+		// MF-2 dynamic payload slots
+		{"R10_MF2_01", "flock /tmp/lk -c \"true ${UNSET:-; pig}\"", "worker", true, "MF-2 flock -c dynamic"},
+		{"R10_MF2_02", "script -qc \"true ${UNSET:-; pig}\" /dev/null", "worker", true, "MF-2 script -c dynamic"},
+		{"R10_MF2_03", "trap \"true ${UNSET:-; pig}\" EXIT", "worker", true, "MF-2 trap dynamic"},
+		{"R10_MF2_04", "awk \"${UNSET:-BEGIN{system(\\\"pig\\\")}}\"", "worker", true, "MF-2 awk program dynamic"},
+		{"R10_MF2_05", "awk \"BEGIN{system(\\\"true ${UNSET:-; pig}\\\")}\"", "worker", true, "MF-2 awk system dynamic"},
+		{"R10_MF2_06", "echo x | sed \"${UNSET:-e pig}\"", "worker", true, "MF-2 sed script dynamic"},
+		{"R10_MF2_07", "tar -cf /dev/null /dev/null \"${UNSET:---checkpoint=1}\" \"${UNSET:---checkpoint-action=exec=pig}\"", "worker", true, "MF-2 tar checkpoint dynamic"},
+		{"R10_MF2_08", "node -e \"1\" \"${UNSET:--e}\" \"require('child_process').execSync('pig')\"", "worker", true, "MF-2 node multi -e dynamic"},
+		{"R10_MF2_09", "perl -e 1 \"${UNSET:--e}\" 'system(\"pig\")'", "worker", true, "MF-2 perl multi -e dynamic"},
+		{"R10_MF2_10", "env -u \"${UNSET:-CTXMODE_ROLE}\" sh -c 'echo ok'", "worker", true, "MF-2 env -u dynamic key"},
+		{"R10_MF2_11", "git --config-env \"${UNSET:-core.pager=pig}\" log", "worker", true, "MF-2 git --config-env dynamic"},
+		{"R10_MF2_12", "git grep \"${UNSET:--Opig}\" main", "worker", true, "MF-2 git grep dynamic option"},
+		// MF-3 staticVars invariant
+		{"R10_MF3_01", "BUN=/bin/true /usr/bin/env; : \"${BUN:=pig}\"; \"$BUN\"", "worker", true, "MF-3 prefix assign not persistent"},
+		{"R10_MF3_02", "BUN=/bin/true; if true; then BUN=pig; fi; \"$BUN\"", "worker", true, "MF-3 branch reassign"},
+		{"R10_MF3_03", "BUN=/bin/true; unset BUN; : \"${BUN:=pig}\"; \"$BUN\"", "worker", true, "MF-3 unset then default assign"},
+		{"R10_MF3_04", "for x in true; do x=pig; sh -c \"$x\"; done", "worker", true, "MF-3 for body reassign"},
+		// MF-4 readonly ssh local bypass
+		{"R10_MF4_01", "> /tmp/pwn_host; ssh -o BatchMode=yes dmit uptime", "ro", true, "MF-4 bare redirect then ssh"},
+		{"R10_MF4_02", "ssh -o BatchMode=yes dmit uptime > /tmp/pwn_host", "ro", true, "MF-4 ssh with local redir"},
+		{"R10_MF4_03", "strace -o /tmp/pwn_host ssh -o BatchMode=yes dmit uptime", "ro", true, "MF-4 strace -o wrap ssh"},
+		{"R10_MF4_04", "ssh -o BatchMode=yes dmit sh <<'EOF'\nls -la\nEOF", "ro", false, "MF-4 ssh sq heredoc readonly remote"},
+		{"R10_MF4_05", "ssh -o BatchMode=yes dmit sh <<'EOF'\nrm -rf /tmp/x\nEOF", "ro", true, "MF-4 ssh sq heredoc remote write"},
+		// MF-5 stdin inherit
+		{"R10_MF5_01", "echo pig | sh -c 'sh'", "worker", true, "MF-5 sh -c sh inherits pipe"},
+		{"R10_MF5_02", "sh -c 'sh' <<'EOF'\npig\nEOF", "worker", true, "MF-5 sh -c sh inherits heredoc"},
+		{"R10_MF5_03", "echo pig | ssh dmit 'sh -c sh'", "worker", true, "MF-5 ssh tunnel stdin inherit"},
+		// SF-2 remote interp lang
+		{"R10_SF2_01", "ssh -o BatchMode=yes dmit python3 - <<'PY'\ndef f():\n print(123)\nf()\nPY", "worker", false, "SF-2 ssh python3 heredoc lang"},
+		// SF-3 static spawn stdin
+		{"R10_SF3_01", "python3 -c \"import subprocess; subprocess.run(['ssh', 'dmit', 'sh'], input=b'pig')\"", "worker", true, "SF-3 python spawn stdin code"},
+		// W-Fix allow
+		{"R10_WF_01", "for p in '/tmp/' '整条不画'; do printf '%s\\n' \"$(grep -c -- \"$p\" report2.md)\"; done", "worker", false, "W-Fix-1 for enum chinese fallback"},
+		{"R10_WF_02", "d=/tmp/repo; git -C \"$d\" rev-parse --git-dir", "worker", false, "W-Fix-5 git -C quoted dyn path"},
+		{"R10_WF_03", "for d in /tmp/a /tmp/b; do find \"$d\" -maxdepth 2 -newermt '-40 minutes' -type f; done", "worker", false, "W-Fix-4 find quoted start path"},
+		// TASK.md correction 1: unquoted dynamic split must reject
+		{"R10_SPLIT_01", "git -C /tmp/w-$d status", "worker", true, "TASK split: unquoted git -C dyn"},
+		{"R10_SPLIT_02", "find $d/s -name x", "worker", true, "TASK split: unquoted find start path"},
+		{"R10_SPLIT_03", "node $X.js", "worker", true, "TASK split: unquoted node script"},
+		{"R10_SPLIT_04", "d=/tmp/repo; git -C \"$d\" rev-parse --git-dir", "worker", false, "TASK split: quoted git -C allow"},
+		{"R10_SPLIT_05", "python3 $X", "worker", true, "TASK split: unquoted python script"},
+	}
+}
+
+// TestAST_MustRed_Round10 is the PLAN10 + TASK split must-red table.
+func TestAST_MustRed_Round10(t *testing.T) {
+	cases := astMustRedRound10Cases()
+	for _, c := range cases {
+		c := c
+		t.Run(c.id, func(t *testing.T) {
+			setAstRole(t, c.role)
+			hit := runAstGuard(c.role, c.code)
+			allowed := hit == ""
+			if c.reject {
+				if allowed {
+					t.Fatalf("expected REJECT (%s) but guard allowed; code=%q", c.reason, c.code)
+				}
+			} else {
+				if !allowed {
+					t.Fatalf("expected ALLOW (%s) but guard rejected: %s; code=%q", c.reason, hit, c.code)
+				}
+			}
+		})
+	}
+	t.Logf("must-red round10 summary: cases=%d", len(cases))
+}
+
+// TestAST_Round10_BaselineSnapshot logs Round10 pass/fail; never fails.
+func TestAST_Round10_BaselineSnapshot(t *testing.T) {
+	var pass, fail []string
+	for _, c := range astMustRedRound10Cases() {
+		setAstRole(t, c.role)
+		hit := runAstGuard(c.role, c.code)
+		allowed := hit == ""
+		ok := (c.reject && !allowed) || (!c.reject && allowed)
+		line := c.id + " role=" + c.role + " reject=" + boolStr(c.reject)
+		if ok {
+			pass = append(pass, line+" PASS hit="+truncate(hit, 60))
+		} else {
+			fail = append(fail, line+" FAIL hit="+truncate(hit, 60))
+		}
+	}
+	t.Logf("PASS %d / FAIL %d (of %d)", len(pass), len(fail), len(pass)+len(fail))
+	for _, l := range fail {
+		t.Log("FAIL:", l)
+	}
+	for _, l := range pass {
+		t.Log("PASS:", l)
+	}
+}
