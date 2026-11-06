@@ -1494,6 +1494,33 @@ func TestGuard_CtxRunStdinEnv(t *testing.T) {
 			rule:   ruleSubagentNestedAgent,
 			detail: "env GIT_PAGER",
 		},
+		{
+			// R14: the env inside a nested -c payload is the env the stdin
+			// program runs under — stdinProgramHeadEnv must return the
+			// HOME=-exec override found one shell level down.
+			name:   "recursive env inside -c payload (argv)",
+			argv:   []string{"sh", "-c", "env HOME=-exec sh"},
+			stdin:  `find "$HOME" -maxdepth 1`,
+			rule:   ruleSubagentNestedAgent,
+			detail: "find dynamic predicate",
+		},
+		{
+			name:    "recursive env inside -c payload (command)",
+			command: "sh -c 'env HOME=-exec sh'",
+			stdin:   `find "$HOME" -maxdepth 1`,
+			rule:    ruleSubagentNestedAgent,
+			detail:  "find dynamic predicate",
+		},
+		{
+			// R14 evidence: `read -s` binds an ORDINARY variable — the
+			// stdin pre-scan must taint it so the later "$x" head cannot
+			// borrow a static bind.
+			name:   "read -s binds ordinary var (argv)",
+			argv:   []string{"sh"},
+			stdin:  `read -s x; "$x"`,
+			rule:   ruleSubagentNestedAgent,
+			detail: "dynamic command head",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

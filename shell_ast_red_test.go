@@ -687,6 +687,71 @@ func TestAST_MustRed_Round13(t *testing.T) {
 	t.Logf("must-red round13 summary: cases=%d", len(cases))
 }
 
+// astMustRedRound14Cases is the review round-4 fix table: fd-duplication
+// stdin origins, the flag-model interpreter cluster fix (-ce / -pe / -co),
+// xargs cluster + GNU --replace replace-token handling, recursive API-stdin
+// env propagation (probes in TestGuard_CtxRunStdinEnv), sed dynamic cluster
+// values and the narrowed relative-PATH exception.
+func astMustRedRound14Cases() []astRedWantCase {
+	return []astRedWantCase{
+		// MF-1a: n<&m copies the SOURCE fd's stdin origin — `0<&0` keeps the
+		// pipe open (no file binding happened) and `9<&0 0<&9` still routes
+		// the piped fd0 into the program slot through fd 9.
+		{astRedCase{"R14_M1_01", "echo pig | sh 0<&0", "worker", true, "M1 fd0 self-dup keeps pipe"}, "piped code to shell"},
+		{astRedCase{"R14_M1_02", "echo pig | sh 9<&0 0<&9", "worker", true, "M1 fd0 dup via fd9 keeps pipe"}, "piped code to shell"},
+		{astRedCase{"R14_M1_03", "echo pig | sh 0<&-", "worker", false, "M1 fd0 close binds stdin"}, ""},
+		{astRedCase{"R14_M1_04", "echo pig | sh 9<f 0<&9", "worker", false, "M1 fd0 dup of file-bound fd"}, ""},
+		// MF-1b: a compound statement's fd0 redirect feeds its body —
+		// `(sh) <<'EOF'` hands the heredoc payload to the inner sh and
+		// `(sh) < f` marks its stdin file-bound.
+		{astRedCase{"R14_M1_05", "(sh) <<'EOF'\npig\nEOF", "worker", true, "M1 compound heredoc feeds inner sh"}, "pig"},
+		{astRedCase{"R14_M1_06", "echo pig | (sh) <<'EOF'\nls\nEOF", "worker", false, "M1 compound heredoc overrides pipe"}, ""},
+		{astRedCase{"R14_M1_07", "{ sh; } <<'EOF'\npig\nEOF", "worker", true, "M1 brace-group heredoc feeds sh"}, "pig"},
+		{astRedCase{"R14_M1_08", "echo pig | (sh) < /dev/null", "worker", false, "M1 compound file redir binds stdin"}, ""},
+
+		// MF-2: flag-model interpreter clusters — letters after a code flag
+		// are flags, not code tails (sh -ce, node -pe), and a trailing -o
+		// inside the tail consumes the next argv as its option name.
+		{astRedCase{"R14_M2_01", "echo pig | xargs -I{} sh -ce '{}'", "worker", true, "M2 sh -ce flag tail fed"}, "piped code to shell"},
+		{astRedCase{"R14_M2_02", "sh -ce 'pig'", "worker", true, "M2 sh -ce code is next argv"}, "pig"},
+		{astRedCase{"R14_M2_03", "bash -co vi 'pig'", "worker", true, "M2 bash -co: vi is -o operand, pig is code"}, "pig"},
+		{astRedCase{"R14_M2_04", "node -pe 'require(\"child_process\").execSync(\"pig\")'", "worker", true, "M2 node -pe code is next argv"}, "javascript inline code"},
+		{astRedCase{"R14_M2_05", "echo pig | xargs -I{} node -pe '{}'", "worker", true, "M2 node -pe code slot fed"}, "piped code to javascript"},
+		{astRedCase{"R14_M2_06", "echo pig | xargs -rI{} sh -c '{}'", "worker", true, "M2 -rI{} cluster repl token"}, "piped code to shell"},
+		{astRedCase{"R14_M2_07", "echo pig | xargs --replace sh -c '{}'", "worker", true, "M2 bare --replace defaults to {}"}, "piped code to shell"},
+		{astRedCase{"R14_M2_08", "xargs --replace true <<'EOF'\npig\nEOF", "worker", false, "M2 --replace does not eat the command"}, ""},
+
+		// MF-4: a dynamic sed cluster value is located by the static prefix —
+		// -nf<V> names a script FILE and must get the -f operand screen; an
+		// unvettable dynamic option zone fails closed.
+		{astRedCase{"R14_M4_01", "bash -c 'sed -nf<(echo \"e pig\")'", "worker", true, "M4 -nf proc-subst script file"}, "dynamic code payload"},
+		{astRedCase{"R14_M4_02", "sed -nf$X /tmp/f", "worker", true, "M4 -nf unquoted dynamic"}, "dynamic code payload"},
+		{astRedCase{"R14_M4_03", "sed -$X /tmp/f", "worker", true, "M4 unvettable dynamic option word"}, "dynamic code payload"},
+		{astRedCase{"R14_M4_04", "sed -nf\"$PWD/x.sed\" /tmp/f", "worker", false, "M4 -nf abs-dq file stays free"}, ""},
+
+		// MF-5: only the four authorized relative PATH segments survive —
+		// venv/bin and ./venv/bin (no leading dot) must reject again.
+		{astRedCase{"R14_M5_01", "PATH=\"venv/bin:$PATH\" python3 -V", "worker", true, "M5 venv/bin no longer allowed"}, "env PATH"},
+		{astRedCase{"R14_M5_02", "PATH=\"./venv/bin:$PATH\" python3 -V", "worker", true, "M5 ./venv/bin no longer allowed"}, "env PATH"},
+
+		// Evidence: `read -s x` binds x — the pre-scan must taint the name so
+		// a later head/$ expansion does not inherit a stale trust.
+		{astRedCase{"R14_EV_01", "read -s x; \"$x\"", "worker", true, "EV read -s x taints x"}, "dynamic command head"},
+	}
+}
+
+// TestAST_MustRed_Round14 is the review round-4 regression gate.
+func TestAST_MustRed_Round14(t *testing.T) {
+	cases := astMustRedRound14Cases()
+	for _, c := range cases {
+		c := c
+		t.Run(c.id, func(t *testing.T) {
+			runAstWantCase(t, c)
+		})
+	}
+	t.Logf("must-red round14 summary: cases=%d", len(cases))
+}
+
 // runAstWantCase executes one want-case row: an expected reject must hit,
 // and when want is set the hit detail must contain it (the WHY).
 func runAstWantCase(t *testing.T, c astRedWantCase) {

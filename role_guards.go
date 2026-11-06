@@ -396,6 +396,21 @@ func (e *envAssignments) addAssign(word string) {
 	}
 }
 
+// merged returns the env op list of e followed by o's ops, preserving
+// order so a nested invocation's env ops replay after the outer ones.
+func (e envAssignments) merged(o envAssignments) envAssignments {
+	if len(e.ops) == 0 {
+		return o
+	}
+	if len(o.ops) == 0 {
+		return e
+	}
+	out := envAssignments{ops: make([]envOp, 0, len(e.ops)+len(o.ops))}
+	out.ops = append(out.ops, e.ops...)
+	out.ops = append(out.ops, o.ops...)
+	return out
+}
+
 // envHookVars are execution-hook environment variable names: assigning one a
 // non-trivial value hands a command string (or a preload path) to git, the
 // pager stack, a shell, or the dynamic loader, so a sub-agent or strict
@@ -1452,8 +1467,32 @@ func unwrapShellArgv(argv []string) (shellText string, has bool) {
 				ch := a[j]
 				if ch == 'c' && !plus {
 					tail := a[j+1:]
+					if isLetterOnly(tail) {
+						// Flag model (R14): letters after c are flags, not
+						// code — `sh -ce 'x'` is -c -e 'x'. A trailing -o/-O
+						// inside the tail still consumes the next argv as
+						// its option name (`sh -co vi 'x'`: vi feeds -o and
+						// 'x' is the program). The letter tail is ambiguous
+						// (ksh/zsh read -cWORD as glued code) so it is
+						// prepended to the screened text, never dropped.
+						for k := j + 1; k < len(a); k++ {
+							if a[k] == 'o' || a[k] == 'O' {
+								if k+1 >= len(a) && i+1 < len(argv) {
+									i++
+								}
+								break
+							}
+						}
+						if i+1 < len(argv) {
+							return tail + "\n" + argv[i+1], true
+						}
+						return tail, true // bare -cWORD: ambiguous glued operand — screen it
+					}
+					// A non-letter tail is an ambiguous glued spelling
+					// (zsh-style -c= or -c"x"); screen it as a prepended
+					// line along with the real operand — fail closed.
 					if i+1 < len(argv) {
-						if tail != "" && !isLetterOnly(tail) {
+						if tail != "" {
 							return tail + "\n" + argv[i+1], true
 						}
 						return argv[i+1], true
@@ -1565,110 +1604,28 @@ func unwrapInterpreterInline(argv []string) (lang, code string, ok bool) {
 		}
 		return "", "", false
 	}
-	// inlineArgs collects EVERY inline-code operand of this interpreter run
-	// (perl -e A -e B, node -e A -p B). opts lists the option spellings that
-	// carry code; shortCodes the short-option letters whose cluster tail or
-	// next argv is code; valueOpts lists non-code options that consume the
-	// next argv (-I dir, -M mod, -r lib, --require mod, -c ini, -d k=v,
-	// -z ext). The collected fragments are joined with "\n" and screened
-	// together so code split across several -e flags cannot hide.
-	inlineArgs := func(opts map[string]bool, shortCodes string, valueOpts map[string]bool) (string, bool) {
+	// The remaining interpreters share interpCodeSlots' option model so the
+	// xargs feed analysis and the inline unwrap cannot disagree: clusters
+	// (`node -pe`, `perl -eA -eB`, `ruby -e`), glued code tails, --eval /
+	// --require-style longs and dynamic operand words all behave identically.
+	switch base {
+	case "node", "nodejs", "ts-node", "tsx", "bun", "perl", "ruby", "php":
 		var frags []string
-		for i := 1; i < len(argv); i++ {
-			a := argv[i]
-			if a == "--" {
-				break // -- terminates options; what follows is a script file
-			}
-			if opts[a] {
-				if i+1 < len(argv) {
-					frags = append(frags, argv[i+1])
-					i++
-				}
+		for _, s := range interpCodeSlots(argv) {
+			if s.flagOnly || s.text == "" {
 				continue
 			}
-			if valueOpts[a] {
-				i++ // non-code option consumes its value operand
-				continue
-			}
-			if strings.HasPrefix(a, "--") {
-				if j := strings.IndexByte(a, '='); j > 0 && opts[a[:j]] {
-					frags = append(frags, a[j+1:])
-				}
-				continue
-			}
-			if strings.HasPrefix(a, "-") && len(a) > 1 {
-				// Bundled short option carrying inline code: -eCODE / -peCODE,
-				// -pCODE for node, -ECODE for perl. A value-option letter at
-				// the cluster end consumes the next argv instead; either way
-				// the cluster scan stops — letters inside the option VALUE
-				// (-rtime's 'e', -Mstrict's 'e') are not code flags.
-				for j := 1; j < len(a); j++ {
-					if strings.IndexByte(shortCodes, a[j]) >= 0 {
-						if tail := a[j+1:]; tail != "" {
-							frags = append(frags, tail)
-						} else if i+1 < len(argv) {
-							frags = append(frags, argv[i+1])
-							i++
-						}
-						break
-					}
-					if valueOpts["-"+string(a[j])] {
-						if j+1 >= len(a) {
-							i++ // -I / -M / -r / -d at cluster end: next argv is the value
-						}
-						break
-					}
-				}
-				continue
-			}
-			if isDynamicArg(a) {
-				// SH11 MF-2: a split-safe path-shaped word is the script-file
-				// operand, not inline code — end the option scan (Q1-C).
-				if isSafeDynamicDataOperand(a) &&
-					(strings.Contains(a, "/") || strings.HasPrefix(a, "/") ||
-						strings.HasPrefix(a, cmdSubPlaceholderAbsDq) || hasInterpScriptExt(a)) {
-					break
-				}
-				frags = append(frags, a)
-				return strings.Join(frags, "\n"), true
-			}
-			break // first non-option operand is the script file
+			frags = append(frags, s.text)
 		}
 		if len(frags) == 0 {
-			return "", false
+			return "", "", false
 		}
-		return strings.Join(frags, "\n"), true
-	}
-	switch base {
-	case "node", "nodejs":
-		if c, has := inlineArgs(map[string]bool{
-			"-e": true, "--eval": true, "-p": true, "--print": true,
-		}, "ep", map[string]bool{
-			"-r": true, "--require": true, "--loader": true, "--import": true,
-			"--experimental-loader": true, "--conditions": true,
-		}); has {
-			return "javascript", c, true
-		}
-	case "ts-node", "tsx", "bun":
-		if c, has := inlineArgs(map[string]bool{"-e": true, "--eval": true}, "e",
-			map[string]bool{"-r": true, "--require": true, "--loader": true, "--import": true}); has {
-			return "javascript", c, true
-		}
-	case "perl":
-		if c, has := inlineArgs(map[string]bool{"-e": true, "-E": true}, "eE",
-			map[string]bool{"-I": true, "-M": true, "-m": true}); has {
-			return "perl", c, true
-		}
-	case "ruby":
-		if c, has := inlineArgs(map[string]bool{"-e": true}, "e",
-			map[string]bool{"-I": true, "-r": true}); has {
-			return "ruby", c, true
-		}
-	case "php":
-		if c, has := inlineArgs(map[string]bool{"-r": true}, "r",
-			map[string]bool{"-c": true, "-d": true, "-z": true}); has {
-			return "php", c, true
-		}
+		lang := map[string]string{
+			"node": "javascript", "nodejs": "javascript",
+			"ts-node": "javascript", "tsx": "javascript", "bun": "javascript",
+			"perl": "perl", "ruby": "ruby", "php": "php",
+		}[base]
+		return lang, strings.Join(frags, "\n"), true
 	}
 	return "", "", false
 }
@@ -3268,7 +3225,7 @@ func pathIsUnsafeForSubagent(val, headBase string) bool {
 			if relOK {
 				switch p {
 				case "node_modules/.bin", "./node_modules/.bin",
-					".venv/bin", "./.venv/bin", "venv/bin", "./venv/bin":
+					".venv/bin", "./.venv/bin":
 					continue
 				}
 			}
@@ -3751,26 +3708,32 @@ func screenUnsetArgs(args []string, kind byte) string {
 	return ""
 }
 
+// xargsLongWithValue are GNU xargs long options that consume a SEPARATE
+// value operand. GNU --eof and --replace take an optional value only via
+// =glue: bare --eof/--replace must NOT consume the next argv (that word is
+// the command or an operand).
+var xargsLongWithValue = map[string]bool{
+	"--arg-file": true, "--delimiter": true,
+	"--max-args": true, "--max-lines": true, "--max-procs": true,
+	"--max-chars": true, "--process-slot-var": true,
+}
+
+// xargsShortWithValue are short-option letters that consume a value (the
+// cluster tail, or the next argv when they end the cluster). Lowercase -e
+// and -i take only a GLUED optional operand (-eE / -iSTR), never a
+// separate argv, so like -e they are absent here and handled as
+// cluster-ending letters by the caller's scan. Uppercase -E keeps the
+// separate-operand form.
+var xargsShortWithValue = map[byte]bool{
+	'I': true, 'L': true, 'n': true, 'P': true, 's': true,
+	'd': true, 'a': true, 'E': true, 'J': true,
+}
+
 // xargsTargetIndex returns the index in argv of the command xargs would run,
 // or len(argv) when xargs would run its default (echo). Option arities follow
 // GNU findutils; `--` terminates xargs options.
 func xargsTargetIndex(argv []string) int {
 	i := 1
-	longWithValue := map[string]bool{
-		"--arg-file": true, "--delimiter": true,
-		// GNU --eof takes an optional value only via --eof=STR; bare --eof
-		// must NOT consume the next argv (unlike -E which requires a value).
-		"--max-args": true, "--max-lines": true, "--max-procs": true,
-		"--max-chars": true, "--process-slot-var": true,
-	}
-	shortWithValue := map[byte]bool{
-		// GNU xargs option arity: lowercase -e takes only a GLUED optional
-		// eof-str (-eE / -e=E), never a separate argv — it is absent here so
-		// `xargs -e pig` resolves to `pig`. Uppercase -E keeps the
-		// separate-operand form.
-		'I': true, 'L': true, 'n': true, 'P': true, 's': true,
-		'd': true, 'a': true, 'E': true, 'J': true,
-	}
 	for i < len(argv) {
 		a := argv[i]
 		if a == "--" {
@@ -3779,7 +3742,7 @@ func xargsTargetIndex(argv []string) int {
 		if strings.HasPrefix(a, "--") {
 			if j := strings.IndexByte(a, '='); j > 0 {
 				i++ // --opt=value
-			} else if longWithValue[a] {
+			} else if xargsLongWithValue[a] {
 				i += 2 // --opt value
 			} else {
 				i++ // boolean long option
@@ -3798,7 +3761,7 @@ func xargsTargetIndex(argv []string) int {
 					break // -e/-i take only a glued optional operand: the rest of
 					// the cluster is its operand, never the next argv slot.
 				}
-				if shortWithValue[a[j]] {
+				if xargsShortWithValue[a[j]] {
 					consumedNext = j+1 >= len(a)
 					break
 				}
@@ -3812,6 +3775,73 @@ func xargsTargetIndex(argv []string) int {
 		return i
 	}
 	return i
+}
+
+// xargsReplToken returns the LAST -I/-i/--replace replacement token the
+// xargs option zone names, or "" when none appeared. The scan shares
+// xargs' option-arity model with xargsTargetIndex: clusters like -rI{}
+// expose the I operand, -iSTR's tail is the token while a bare -i defaults
+// to "{}", and GNU bare --replace also defaults to "{}" without consuming
+// the next argv (only --replace=STR names a token).
+func xargsReplToken(argv []string) string {
+	repl := ""
+	for i := 1; i < len(argv); i++ {
+		a := argv[i]
+		if a == "--" {
+			break
+		}
+		if strings.HasPrefix(a, "--") {
+			if j := strings.IndexByte(a, '='); j > 0 {
+				if a[:j] == "--replace" {
+					repl = a[j+1:]
+				}
+				continue
+			}
+			if a == "--replace" {
+				repl = "{}" // GNU: bare --replace == -I{}
+			} else if xargsLongWithValue[a] {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			consumedNext := false
+			for j := 1; j < len(a); j++ {
+				ch := a[j]
+				if ch == 'e' {
+					break // -e's tail is its optional operand
+				}
+				if ch == 'i' {
+					// Deprecated -I: bare -i defaults to "{}"; -iSTR glued.
+					if tail := a[j+1:]; tail != "" {
+						repl = tail
+					} else {
+						repl = "{}"
+					}
+					break
+				}
+				if ch == 'I' {
+					if tail := a[j+1:]; tail != "" {
+						repl = tail
+					} else if i+1 < len(argv) {
+						repl = argv[i+1]
+						consumedNext = true
+					}
+					break
+				}
+				if xargsShortWithValue[ch] {
+					consumedNext = j+1 >= len(a)
+					break
+				}
+			}
+			if consumedNext {
+				i++
+			}
+			continue
+		}
+		break // first non-option operand is the command
+	}
+	return repl
 }
 
 // screenFindArgs scans find's operand list: -exec/-execdir/-ok/-okdir inner
@@ -4794,13 +4824,32 @@ func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
 			endOpts = true
 			continue
 		}
-		if !endOpts && strings.HasPrefix(a, "-") && a != "-" && !(isDynamicArg(a) && !strings.HasPrefix(a, "-f") && !strings.HasPrefix(a, "--file=") && !strings.HasPrefix(a, "--expression=")) {
+		dynOptVal, dynOptKind := sedDynamicOptValue(a)
+		if !endOpts && strings.HasPrefix(a, "-") && a != "-" && (!isDynamicArg(a) || dynOptKind != 0 || strings.HasPrefix(a, "--file=") || strings.HasPrefix(a, "--expression=")) {
 			// Option word: replicate the value consumption (e/f script or
-			// file, l wrap length — cluster tail or next argv). R13: a
-			// -f/--file=/--expression= word whose VALUE is dynamic still
-			// belongs to the option zone (the flag slot is recognisable
-			// from its static prefix); other dynamic option words are
-			// unvettable and fall through to the positional/dynamic screen.
+			// file, l wrap length — cluster tail or next argv). R13/R14: a
+			// -f/--file=/-nfV word whose VALUE is dynamic still belongs to
+			// the option zone (the flag slot is recognisable from its
+			// static prefix) and its value gets the same independent /
+			// glued / long-option validation; any OTHER dynamic option word
+			// is unvettable and fails closed instead of being skipped as a
+			// checked positional.
+			if isDynamicArg(a) && dynOptKind == 0 {
+				return "dynamic code payload"
+			}
+			if dynOptKind != 0 {
+				// Dynamic cluster value: dynOptVal is the dynamic tail
+				// (the glued operand). '-' feeds the script from stdin;
+				// a safe data path is the only other allowed value.
+				switch {
+				case dynOptVal == "-":
+					return "sed script from stdin"
+				case !isSafeDynamicDataOperand(dynOptVal):
+					return "dynamic code payload"
+				}
+				sawExplicit = true
+				continue
+			}
 			switch {
 			case a == "-f" || a == "--file":
 				sawExplicit = true
@@ -4898,6 +4947,40 @@ func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
 	return ""
 }
 
+// sedDynamicOptValue locates the value slot of a DYNAMIC short-option
+// cluster (-nf<V>, -e<V>, -l<V>): it scans the static prefix before the
+// first dynamic byte for sed's value-carrying letters (e script, f file,
+// l length — each ends the cluster). kind is 'e', 'f' or 'l' and val the
+// dynamic tail (the glued operand); kind 0 means no recognisable value
+// slot — either the word is not dynamic/option-shaped or the option zone
+// itself is unvettable.
+func sedDynamicOptValue(a string) (val string, kind byte) {
+	if len(a) < 3 || a[0] != '-' || a[1] == '-' || !isDynamicArg(a) {
+		return "", 0
+	}
+	// lim: the static prefix length — the cluster scan never crosses a
+	// placeholder boundary.
+	lim := len(a)
+	for _, ph := range []string{cmdSubPlaceholder, cmdSubPlaceholderQuoted,
+		cmdSubPlaceholderGlob, cmdSubPlaceholderAbsDq} {
+		if k := strings.Index(a, ph); k >= 0 && k < lim {
+			lim = k
+		}
+	}
+	for j := 1; j < lim; j++ {
+		switch a[j] {
+		case 'e', 'f', 'l':
+			if lim < len(a) {
+				// The glued operand is everything after the letter — it
+				// may carry static bytes before the dynamic part.
+				return a[j+1:], a[j]
+			}
+			return "", 0 // value letter inside a fully static cluster
+		}
+	}
+	return "", 0
+}
+
 // sedScripts extracts the script text fragments a sed invocation actually
 // executes: every -e/--expression payload (separate, =glued, or a
 // short-option-cluster tail) plus the FIRST positional operand when no -e/-f
@@ -4938,30 +5021,53 @@ func sedScripts(args []string) (scripts []string, sawFile bool) {
 				// Short-option cluster: 'e' carries the script (cluster tail
 				// or next argv), 'f' names a script file, 'l' (GNU -l N
 				// wrap length) carries a value — all three end the cluster.
-				for j := 1; j < len(a); j++ {
+				// R14: the scan stops at the first placeholder byte so a
+				// dynamic tail lands on the value letter's slot (-nf<V>
+				// marks sawFile, -ne<V> feeds the script); an option word
+				// whose OPTION ZONE is dynamic is unvettable and is fed to
+				// the caller's script screen as a dynamic payload.
+				lim := len(a)
+				for _, ph := range []string{cmdSubPlaceholder, cmdSubPlaceholderQuoted,
+					cmdSubPlaceholderGlob, cmdSubPlaceholderAbsDq} {
+					if k := strings.Index(a, ph); k >= 0 && k < lim {
+						lim = k
+					}
+				}
+				sawValLetter := false
+				for j := 1; j < lim; j++ {
 					switch a[j] {
 					case 'e':
 						sawExplicit = true
+						sawValLetter = true
 						if tail := a[j+1:]; tail != "" {
 							scripts = append(scripts, tail)
 						} else if i+1 < len(args) {
 							scripts = append(scripts, args[i+1])
 							i++
 						}
-						j = len(a)
+						j = lim
 					case 'f':
 						sawExplicit = true
 						sawFile = true
-						if j+1 >= len(a) {
+						sawValLetter = true
+						if j+1 >= lim {
 							i++ // file operand is the next argv
 						}
-						j = len(a)
+						j = lim
 					case 'l':
-						if j+1 >= len(a) {
+						sawValLetter = true
+						if j+1 >= lim {
 							i++ // length operand is the next argv
 						}
-						j = len(a)
+						j = lim
 					}
+				}
+				if isDynamicArg(a) && !sawValLetter {
+					// -$X / -n$X: the dynamic part could expand into option
+					// letters (nf script file, e script) or a script — feed
+					// it to the caller's dynamic rejection instead of
+					// silently skipping it as "first script already seen".
+					scripts = append(scripts, a)
 				}
 			case strings.HasPrefix(a, "-"):
 				continue // other long options (--posix, --regexp-extended, ...)
@@ -8960,64 +9066,84 @@ func splitTopLevelItems(s string, open, close byte) []string {
 	return out
 }
 
-// codeSlot is one inline-code operand slot of an interpreter argv: flag
-// is the index of the flag WORD (the operand may be glued onto it), text
-// the operand value (empty when flagOnly is set — a trailing bare flag
-// whose operand would come from words the caller appends).
+// interpCodeSlots walks argv's option zone with the interpreter's real
+// option model and returns every inline-code operand slot. Two cluster
+// models exist:
+//
+//   - GLUED model (python -c/-m, perl -eE, ruby -e, php -r): the option
+//     letter's cluster tail IS the code/value (-eCODE, -cCODE).
+//   - FLAG model (sh/bash/dash/... -c, node -e/-p): a cluster tail is never
+//     code — `sh -ce code` is `-c -e`, `node -pe code` is `-p -e`. A
+//     flag-model code letter sets a PENDING slot whose operand is the next
+//     argv word AFTER the whole cluster's option scan finishes (a trailing
+//     -o/-O in the tail may still consume a word first, e.g.
+//     `bash -co vi 'code'`).
+//
+// A non-empty cluster tail after a flag-model code letter is ambiguous
+// (ksh/zsh/node spell the glued operand there) so it is screened as code
+// in addition to the pending argv operand — never silently ignored. A "--" or the first static non-option operand ends the
+// zone; a bare "-" is the stdin-script operand, not a cluster.
 type codeSlot struct {
 	flag     int
 	text     string
 	flagOnly bool
 }
 
-// interpCodeSlots walks argv's option zone the way unwrapShellArgv /
-// unwrapInterpreterInline does — including flag CLUSTERS (`sh -lc '…'`,
-// `python3 -uc '…'`, `node -pe '…'`, `perl -pe '…'`), glued code tails and
-// value-carrying short letters that end a cluster — and returns every
-// inline-code operand slot. A non-option operand ends the zone; a "--"
-// does too.
 func interpCodeSlots(argv []string) []codeSlot {
 	if len(argv) < 2 {
 		return nil
 	}
 	base := filepath.Base(argv[0])
-	gluedCodes := ""               // cluster letters whose TAIL or next argv is code
-	bareCodes := ""                // cluster letters whose operand is always next argv
+	gluedCodes := ""               // cluster letters whose TAIL (or next argv) is code
+	flagCodes := ""                // code flags: operand is the next argv AFTER the cluster scan
 	valShort := ""                 // cluster letters consuming a value (tail or next argv)
 	longCode := map[string]bool{}  // --name / --name=code
 	longValue := map[string]bool{} // --name consumes a separate value
+	dynScriptOperand := false      // a dynamic first operand is inline code (xargs feed / $X eval)
 	switch {
 	case base == "python" || strings.HasPrefix(base, "python2") || strings.HasPrefix(base, "python3"):
 		gluedCodes, valShort = "cm", "WX"
+		dynScriptOperand = true
 	case base == "node" || base == "nodejs":
-		// -eCODE glued; -p is a code flag whose operand is the NEXT argv
-		// (`node -pe x` = -p + -e, not -p with code "e").
-		gluedCodes, bareCodes = "e", "p"
+		// node clusters are flag-parsed: -pe is -p -e and the code operand
+		// is the next argv; -e/-p never glue their operand. -r takes a
+		// module operand (tail or next argv).
+		flagCodes, valShort = "ep", "r"
 		longCode = map[string]bool{"--eval": true, "--print": true}
 		longValue = map[string]bool{"--require": true, "--loader": true, "--import": true, "--experimental-loader": true, "--conditions": true}
+		dynScriptOperand = true
 	case base == "ts-node" || base == "tsx" || base == "bun":
 		gluedCodes = "e"
 		longCode = map[string]bool{"--eval": true}
 		longValue = map[string]bool{"--require": true, "--loader": true, "--import": true}
+		dynScriptOperand = true
 	case base == "perl":
 		gluedCodes, valShort = "eE", "iFl07Mmx"
+		dynScriptOperand = true
 	case base == "ruby":
-		gluedCodes, valShort = "e", "iFKC0xX"
+		gluedCodes, valShort = "e", "iFKC0xXrI"
+		dynScriptOperand = true
 	case base == "php":
 		gluedCodes, valShort = "r", "cdz"
+		dynScriptOperand = true
 	case shellHeads[base]:
-		// dash/bash -c; -o/-O consume an option-name operand.
-		gluedCodes, valShort = "c", "oO"
+		// dash/bash/zsh/ksh flag-model -c; -o/-O consume an option-name
+		// operand (cluster tail or next argv).
+		flagCodes, valShort = "c", "oO"
 	default:
 		return nil
 	}
 	var out []codeSlot
+	pendingCode := false // flag-model code letter seen; operand resolves after the cluster
 	for i := 1; i < len(argv); i++ {
 		a := argv[i]
 		if a == "--" {
 			break // option terminator
 		}
 		if strings.HasPrefix(a, "--") {
+			if pendingCode {
+				break // an option still cannot be -c's operand
+			}
 			name, val, hasVal := a[2:], "", false
 			if k := strings.IndexByte(name, '='); k >= 0 {
 				name, val, hasVal = name[:k], name[k+1:], true
@@ -9042,6 +9168,28 @@ func interpCodeSlots(argv []string) []codeSlot {
 		}
 		// A bare "-" is the stdin-script operand, not an option cluster.
 		if !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+") || a == "-" || a == "+" {
+			if pendingCode {
+				// The pending flag-model code operand IS this word
+				// (`sh -c code`, `node -pe code`): argv0/positional-name
+				// words that follow are already covered — a second
+				// non-option operand ends the zone.
+				out = append(out, codeSlot{flag: i, text: a})
+				pendingCode = false
+				continue
+			}
+			if dynScriptOperand && isDynamicArg(a) {
+				// SH11 MF-2: a split-safe path-shaped word is the script-file
+				// operand, not inline code — end the option scan (Q1-C). Any
+				// other dynamic word in operand position may BE the code text
+				// (xargs replace-token / $X eval) — screen it.
+				if isSafeDynamicDataOperand(a) &&
+					(strings.Contains(a, "/") || strings.HasPrefix(a, "/") ||
+						strings.HasPrefix(a, cmdSubPlaceholderAbsDq) || hasInterpScriptExt(a)) {
+					break
+				}
+				out = append(out, codeSlot{flag: i, text: a})
+				break
+			}
 			break // first non-option operand: the script file
 		}
 		plus := a[0] == '+'
@@ -9058,14 +9206,20 @@ func interpCodeSlots(argv []string) []codeSlot {
 				}
 				break
 			}
-			if !plus && strings.IndexByte(bareCodes, ch) >= 0 {
-				if i+1 < len(argv) {
-					out = append(out, codeSlot{flag: i, text: argv[i+1]})
-					i++
-				} else {
-					out = append(out, codeSlot{flag: i, flagOnly: true})
+			if !plus && strings.IndexByte(flagCodes, ch) >= 0 {
+				// Flag-model code letter: the operand is the next argv word
+				// after the cluster scan. A non-empty tail is an ambiguous
+				// glued spelling (ksh/zsh may read it as the operand —
+				// `-cpig`) so it is ALSO screened as code while its letters
+				// keep being parsed as flags (`-ce` needs the next argv too).
+				pendingCode = true
+				if tail := a[j+1:]; tail != "" {
+					out = append(out, codeSlot{flag: i, text: tail})
+					if !isLetterOnly(tail) {
+						break // ambiguous glued operand — not flag letters
+					}
 				}
-				break
+				continue
 			}
 			if strings.IndexByte(valShort, ch) >= 0 {
 				if j+1 >= len(a) {
@@ -9074,6 +9228,11 @@ func interpCodeSlots(argv []string) []codeSlot {
 				break // value letters end the cluster either way
 			}
 		}
+	}
+	if pendingCode {
+		// A trailing flag-model code letter with no operand word: the fed
+		// text lands here (xargs model) — mark the open slot.
+		out = append(out, codeSlot{flag: len(argv) - 1, flagOnly: true})
 	}
 	return out
 }
@@ -9100,28 +9259,13 @@ func xargsFeedsCodeFlag(inner, full []string) bool {
 	if len(slots) == 0 {
 		return false
 	}
-	// Collect xargs' replace-token when -I/-i/--replace names one. -i is
-	// the deprecated -I: a bare -i defaults the token to "{}", -iSTR is
-	// glued-only like -e.
-	repl := ""
-	for j := 1; j < len(full); j++ {
-		a := full[j]
-		switch {
-		case a == "-I" || a == "--replace":
-			if j+1 < len(full) {
-				repl = full[j+1]
-				j++
-			}
-		case a == "-i":
-			repl = "{}"
-		case strings.HasPrefix(a, "-I") && len(a) > 2:
-			repl = a[2:]
-		case strings.HasPrefix(a, "-i") && len(a) > 2:
-			repl = a[2:]
-		case strings.HasPrefix(a, "--replace="):
-			repl = a[len("--replace="):]
-		}
-	}
+	// Collect xargs' replace-token under xargs' own option model (shared
+	// with xargsTargetIndex so they cannot drift): -I names the token
+	// (cluster tail or next argv, also inside clusters like -rI{}), -i is
+	// the deprecated glued-only spelling, and GNU bare --replace defaults
+	// the token to "{}" WITHOUT consuming the next argv (that word is the
+	// command to run).
+	repl := xargsReplToken(full)
 	for _, s := range slots {
 		if s.flagOnly {
 			// A trailing bare code flag always takes the fed words as its
@@ -10618,16 +10762,32 @@ func hasInterpScriptExt(a string) bool {
 }
 
 func stdinProgramHead(argv []string) (lang string, isInterp bool) {
+	lang, isProg, _ := stdinProgramHeadEnv(argv)
+	return lang, isProg
+}
+
+// stdinProgramHeadEnv is stdinProgramHead plus the environment the resolved
+// stdin-program head runs under: the merged env ops peeled at every
+// recursion level (prefix KEY=VAL, env -i/-u/-S operands, ops inside -c
+// payloads and ssh remote commands). ctx_run stdin payloads and remote
+// heredoc screens must replay them — `sh -c 'env HOME=-exec sh'` runs the
+// stdin text with HOME overridden, so $HOME's placeholder grant is gone.
+func stdinProgramHeadEnv(argv []string) (lang string, isInterp bool, envAs envAssignments) {
 	return stdinProgramHeadDepth(argv, 0)
 }
 
-func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool) {
+func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool, envAs envAssignments) {
 	if len(argv) == 0 || depth >= shellSplitMaxDepth {
-		return "", false
+		return "", false, envAs
 	}
-	head, _, _, _ := peelWrappers(argv)
+	head, _, ea, _ := peelWrappers(argv)
+	// R14: the env ops peeled at every recursion level are the environment
+	// the stdin program text actually runs under — `sh -c 'env HOME=-exec
+	// sh'` hands stdin a head whose HOME is overridden. Accumulate them so
+	// the caller screens the payload under the consumed position's env.
+	envAs = envAs.merged(ea)
 	if len(head) == 0 {
-		return "", false
+		return "", false, envAs
 	}
 	base := filepath.Base(head[0])
 	// An ssh head forwards stdin to the remote command's stdin: resolve the
@@ -10638,26 +10798,26 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 	if base == "ssh" || resolveHeadBase(head[0], "") == "ssh" {
 		remoteCmd, hit := parseSSHInvocation(head)
 		if hit != "" {
-			return "", false
+			return "", false, envAs
 		}
 		for _, seg := range splitShellSegments(remoteCmd) {
 			if seg.depthExceeded || seg.parseErr != "" {
-				return "", true
+				return "", true, envAs
 			}
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
-			if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
-				return l, true
+			if l, isProg, inner := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+				return l, true, envAs.merged(inner)
 			}
 		}
-		return "", false
+		return "", false, envAs
 	}
 	// A `shell -c 'code'` argv carries outer program inline, but the INNER
 	// script may still start a stdin-reading head (MF-5: sh -c 'sh').
 	if innerText, has := unwrapShellArgv(head); has {
 		if isDynamicArg(innerText) {
-			return "", true
+			return "", true, envAs
 		}
 		var segs []shellSegment
 		switch base {
@@ -10668,20 +10828,20 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 		}
 		for _, seg := range segs {
 			if seg.depthExceeded || seg.parseErr != "" {
-				return "", true
+				return "", true, envAs
 			}
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
-			if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
-				return l, true
+			if l, isProg, inner := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+				return l, true, envAs.merged(inner)
 			}
 		}
-		return "", false
+		return "", false, envAs
 	}
 	// An interpreter with -c/-e/-r/-m/-p inline code likewise.
 	if _, _, has := unwrapInterpreterInline(head); has {
-		return "", false
+		return "", false, envAs
 	}
 	// SH11 MF-1.2: statement-level wrappers whose inner command shares this
 	// stdin. eval joins its operands as shell text; flock/script/watch and
@@ -10690,99 +10850,99 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 	switch base {
 	case "eval":
 		if len(head) < 2 {
-			return "", false
+			return "", false, envAs
 		}
 		inner := strings.Join(head[1:], " ")
 		if isDynamicArg(inner) {
-			return "", true
+			return "", true, envAs
 		}
 		for _, seg := range splitShellSegments(inner) {
 			if seg.depthExceeded || seg.parseErr != "" {
-				return "", true
+				return "", true, envAs
 			}
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
-			if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
-				return l, true
+			if l, isProg, inner := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+				return l, true, envAs.merged(inner)
 			}
 		}
-		return "", false
+		return "", false, envAs
 	case "flock":
 		inner, cmdText := skipFlockArgs(head, 1)
 		if cmdText != "" {
 			if isDynamicArg(cmdText) {
-				return "", true
+				return "", true, envAs
 			}
 			for _, seg := range splitShellSegments(cmdText) {
 				if seg.depthExceeded || seg.parseErr != "" {
-					return "", true
+					return "", true, envAs
 				}
 				if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 					continue
 				}
-				if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
-					return l, true
+				if l, isProg, inner := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+					return l, true, envAs.merged(inner)
 				}
 			}
-			return "", false
+			return "", false, envAs
 		}
 		if inner < len(head) {
 			return stdinProgramHeadDepth(head[inner:], depth+1)
 		}
-		return "", false
+		return "", false, envAs
 	case "script":
 		if payload := scriptCommandArg(head); payload != "" {
 			if isDynamicArg(payload) {
-				return "", true
+				return "", true, envAs
 			}
 			for _, seg := range splitShellSegments(payload) {
 				if seg.depthExceeded || seg.parseErr != "" {
-					return "", true
+					return "", true, envAs
 				}
 				if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 					continue
 				}
-				if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
-					return l, true
+				if l, isProg, inner := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+					return l, true, envAs.merged(inner)
 				}
 			}
-			return "", false
+			return "", false, envAs
 		}
 		// script without -c spawns a login shell on the pty — it reads the
 		// forwarded stdin as commands.
-		return "", true
+		return "", true, envAs
 	case "watch":
 		if len(head) < 2 {
-			return "", false
+			return "", false, envAs
 		}
 		k, execMode := skipWatchArgs(head, 1)
 		if k >= len(head) {
-			return "", false
+			return "", false, envAs
 		}
 		if execMode {
 			return stdinProgramHeadDepth(head[k:], depth+1)
 		}
 		text := strings.Join(head[k:], " ")
 		if isDynamicArg(text) {
-			return "", true
+			return "", true, envAs
 		}
 		for _, seg := range splitShellSegments(text) {
 			if seg.depthExceeded || seg.parseErr != "" {
-				return "", true
+				return "", true, envAs
 			}
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
-			if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
-				return l, true
+			if l, isProg, inner := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+				return l, true, envAs.merged(inner)
 			}
 		}
-		return "", false
+		return "", false, envAs
 	case "xargs":
 		k := xargsTargetIndex(head)
 		if k >= len(head) {
-			return "", false // xargs with no command runs echo
+			return "", false, envAs // xargs with no command runs echo
 		}
 		// xargs feeds the piped words as ARGV, not stdin: an inner bare
 		// `sh` is not a stdin-program (S3). But an inner `sh -c`/`python -c`
@@ -10794,10 +10954,10 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			innerHead, _, _, _ := peelWrappers(head[k:])
 			if len(innerHead) > 0 {
 				if l, ok := heredocInterpLang(filepath.Base(innerHead[0])); ok {
-					return l, true
+					return l, true, envAs
 				}
 			}
-			return "", true
+			return "", true, envAs
 		}
 		return stdinProgramHeadDepth(head[k:], depth+1)
 	}
@@ -10811,7 +10971,7 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 		for i < len(head) {
 			a := head[i]
 			if isDynamicArg(a) {
-				return "", true // dynamic option/script → treat as stdin-program so heredoc screens
+				return "", true, envAs // dynamic option/script → treat as stdin-program so heredoc screens
 			}
 			if a == "--" {
 				sawDashDash = true
@@ -10820,12 +10980,12 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			}
 			if sawDashDash {
 				if forceStdin {
-					return "", true
+					return "", true, envAs
 				}
-				return "", false
+				return "", false, envAs
 			}
 			if a == "-" {
-				return "", true
+				return "", true, envAs
 			}
 			if a == "-o" || a == "+o" || a == "-O" || a == "+O" {
 				i += 2
@@ -10839,7 +10999,7 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 						forceStdin = true
 					}
 					if ch == 'c' && !plus {
-						return "", false // -c means inline, not stdin
+						return "", false, envAs // -c means inline, not stdin
 					}
 					if ch == 'o' || ch == 'O' {
 						if j+1 >= len(a) {
@@ -10857,11 +11017,11 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			}
 			// non-option operand
 			if forceStdin {
-				return "", true // -s arg1 still reads stdin
+				return "", true, envAs // -s arg1 still reads stdin
 			}
-			return "", false // script file
+			return "", false, envAs // script file
 		}
-		return "", true // bare shell / only flags
+		return "", true, envAs // bare shell / only flags
 	}
 	if lang, ok := heredocInterpLang(base); ok {
 		sawDashDash := false
@@ -10875,7 +11035,7 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 		for i < len(head) {
 			a := head[i]
 			if isDynamicArg(a) {
-				return lang, true
+				return lang, true, envAs
 			}
 			if a == "--" {
 				sawDashDash = true
@@ -10883,10 +11043,10 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 				continue
 			}
 			if a == "-" {
-				return lang, true
+				return lang, true, envAs
 			}
 			if sawDashDash || !strings.HasPrefix(a, "-") {
-				return "", false
+				return "", false, envAs
 			}
 			if valueOpts[a] {
 				i += 2
@@ -10899,9 +11059,9 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			// bundled short opts: -Wignore / -Xutf8 etc. already single argv
 			i++
 		}
-		return lang, true
+		return lang, true, envAs
 	}
-	return "", false
+	return "", false, envAs
 }
 
 // sshTunnelsStdinProgram reports whether the peeled argv head is an ssh
@@ -10940,10 +11100,11 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 	if stdin == "" || (!g.subagent && !g.strictReadonly) {
 		return "", ""
 	}
-	// Peel the argv once: the env ops the head runs under are the env the
-	// stdin PROGRAM text is parsed against (env HOME=-exec sh + stdin).
-	_, _, envAs, _ := peelWrappers(argv)
-	lang, isProg := stdinProgramHead(argv)
+	// The env ops peeled at EVERY recursion level (including inside -c
+	// payloads and remote commands) are the env the stdin program text is
+	// parsed against: env HOME=-exec sh +stdin, and `sh -c 'env HOME=-exec
+	// sh'`+stdin alike (R14).
+	lang, isProg, envAs := stdinProgramHeadEnv(argv)
 	if !isProg {
 		return "", ""
 	}
@@ -10978,8 +11139,7 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 		if len(seg.argv) == 0 {
 			continue
 		}
-		_, _, envAs, _ := peelWrappers(seg.argv)
-		if lang, isProg := stdinProgramHead(seg.argv); isProg {
+		if lang, isProg, envAs := stdinProgramHeadEnv(seg.argv); isProg {
 			if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(seg.argv) {
 				g.strictReadonly = true
 			}

@@ -1104,20 +1104,20 @@ func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVarian
 			col.ssaBlocked[name] = true
 		}
 	}
-	col.walkStmts(primary.Stmts, pipeIn)
+	col.walkStmts(primary.Stmts, stdinFeed{piped: pipeIn})
 	if col.rejected {
 		return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 	}
 	if useBashVariant && posixFile != nil {
 		pre := len(col.segs)
-		col.walkStmts(posixFile.Stmts, pipeIn)
+		col.walkStmts(posixFile.Stmts, stdinFeed{piped: pipeIn})
 		if col.rejected {
 			return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 		}
 		col.segs = dedupeSegTail(col.segs, pre)
 	} else if !useBashVariant && bashFile != nil {
 		pre := len(col.segs)
-		col.walkStmts(bashFile.Stmts, pipeIn)
+		col.walkStmts(bashFile.Stmts, stdinFeed{piped: pipeIn})
 		if col.rejected {
 			return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 		}
@@ -1544,25 +1544,32 @@ func isHeredocDelimName(s string) bool {
 	return true
 }
 
-func (c *subCollector) walkStmts(stmts []*syntax.Stmt, pipeIn bool) {
+func (c *subCollector) walkStmts(stmts []*syntax.Stmt, feed stdinFeed) {
 	for i, st := range stmts {
 		if c.rejected {
 			return
 		}
-		c.walkStmt(st, pipeIn && i == 0)
+		if i > 0 {
+			// Sequential list: only the FIRST statement consumes the piped
+			// stream. Heredoc/here-string/file feeds are pre-bound input, so
+			// every statement in the list shares them.
+			c.walkStmt(st, stdinFeed{piped: false, bodies: feed.bodies, hasHere: feed.hasHere, hereStr: feed.hereStr, file: feed.file})
+			continue
+		}
+		c.walkStmt(st, feed)
 	}
 }
 
-// walkStmtsAll walks every stmt of a COMPOUND body with the same pipeIn:
+// walkStmtsAll walks every stmt of a COMPOUND body with the same feed:
 // inside ( ... )/{ ...; }/if/while/for/case the whole body shares the
 // compound's stdin, so the first-executed-statement rule cannot pick a
 // single inner stmt (M4: `echo pig | (sh)` marks sh's pipedStdin).
-func (c *subCollector) walkStmtsAll(stmts []*syntax.Stmt, pipeIn bool) {
+func (c *subCollector) walkStmtsAll(stmts []*syntax.Stmt, feed stdinFeed) {
 	for _, st := range stmts {
 		if c.rejected {
 			return
 		}
-		c.walkStmt(st, pipeIn)
+		c.walkStmt(st, feed)
 	}
 }
 
@@ -1573,7 +1580,7 @@ func (c *subCollector) isTainted(name string) bool {
 	return c.taintedVars[name] || c.taintedVars["*"]
 }
 
-func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
+func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 	if st == nil || c.rejected {
 		return
 	}
@@ -1590,14 +1597,14 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 		// can contain $(...) that dash expands (must emit nested CallExprs).
 		for _, r := range st.Redirs {
 			if r.Word != nil {
-				c.emitNestedFromWord(r.Word, pipeIn)
+				c.emitNestedFromWord(r.Word, feed)
 			}
 			if r.Hdoc != nil && !isQuotedHeredocDelim(r.Word) {
-				c.emitNestedFromWord(r.Hdoc, pipeIn)
+				c.emitNestedFromWord(r.Hdoc, feed)
 			}
 		}
-		seg := shellSegment{pipedStdin: pipeIn, backgrounded: st.Background}
-		c.applyRedirs(&seg, st.Redirs, pipeIn)
+		seg := shellSegment{pipedStdin: feed.piped, backgrounded: st.Background}
+		c.applyRedirs(&seg, st.Redirs, feed)
 		if len(seg.argv) > 0 || seg.redirectFile != "" || len(seg.heredocText) > 0 || seg.hereString != "" || seg.depthExceeded {
 			c.segs = append(c.segs, seg)
 		}
@@ -1605,17 +1612,17 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 	}
 	switch cmd := st.Cmd.(type) {
 	case *syntax.CallExpr:
-		c.emitCall(st, cmd, pipeIn)
+		c.emitCall(st, cmd, feed)
 	case *syntax.BinaryCmd:
 		switch cmd.Op {
 		case syntax.Pipe, syntax.PipeAll:
 			prevBind := c.allowBind
 			c.allowBind = false // no static head-bind across/inside pipelines
-			c.walkStmt(cmd.X, pipeIn)
-			c.walkStmt(cmd.Y, true)
+			c.walkStmt(cmd.X, feed)
+			c.walkStmt(cmd.Y, stdinFeed{piped: true})
 			c.allowBind = prevBind
 		case syntax.AndStmt, syntax.OrStmt:
-			c.walkStmt(cmd.X, pipeIn)
+			c.walkStmt(cmd.X, feed)
 			// SH11 MF-4.1: the right side is a conditional short-circuit
 			// branch — its assignments are NOT guaranteed to run, so they
 			// must never become staticVars binds. Its STDIN is still the
@@ -1623,7 +1630,7 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 			// piped bytes as sh's program (R13).
 			prevBind := c.allowBind
 			c.allowBind = false
-			c.walkStmt(cmd.Y, pipeIn)
+			c.walkStmt(cmd.Y, stdinFeed{piped: true})
 			c.allowBind = prevBind
 		default:
 			c.reject()
@@ -1631,30 +1638,35 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 	case *syntax.Subshell:
 		prevBind := c.allowBind
 		c.allowBind = false
-		c.walkStmtsAll(cmd.Stmts, pipeIn)
+		innerFeed := c.stmtFeed(st, feed)
+		c.walkStmtsAll(cmd.Stmts, innerFeed)
 		c.allowBind = prevBind
 	case *syntax.Block:
 		prevBind := c.allowBind
 		c.allowBind = false
-		c.walkStmtsAll(cmd.Stmts, pipeIn)
+		innerFeed := c.stmtFeed(st, feed)
+		c.walkStmtsAll(cmd.Stmts, innerFeed)
 		c.allowBind = prevBind
 	case *syntax.IfClause:
 		prevBind := c.allowBind
 		c.allowBind = false
+		innerFeed := c.stmtFeed(st, feed)
 		for ic := cmd; ic != nil; ic = ic.Else {
-			c.walkStmtsAll(ic.Cond, pipeIn)
-			c.walkStmtsAll(ic.Then, pipeIn)
+			c.walkStmtsAll(ic.Cond, innerFeed)
+			c.walkStmtsAll(ic.Then, innerFeed)
 		}
 		c.allowBind = prevBind
 	case *syntax.WhileClause:
 		prevBind := c.allowBind
 		c.allowBind = false
-		c.walkStmtsAll(cmd.Cond, pipeIn)
-		c.walkStmtsAll(cmd.Do, pipeIn)
+		innerFeed := c.stmtFeed(st, feed)
+		c.walkStmtsAll(cmd.Cond, innerFeed)
+		c.walkStmtsAll(cmd.Do, innerFeed)
 		c.allowBind = prevBind
 	case *syntax.ForClause:
 		prevBind := c.allowBind
 		c.allowBind = false
+		innerFeed := c.stmtFeed(st, feed)
 		enumDone := false
 		if wi, ok := cmd.Loop.(*syntax.WordIter); ok {
 			loopName := ""
@@ -1663,25 +1675,26 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 				c.taintVar(loopName) // loop var never eligible as static command head
 			}
 			for _, w := range wi.Items {
-				c.emitNestedFromWord(w, pipeIn)
+				c.emitNestedFromWord(w, innerFeed)
 			}
 			if loopName != "" {
-				enumDone = c.forEnumSubst(loopName, wi.Items, cmd.Do, pipeIn)
+				enumDone = c.forEnumSubst(loopName, wi.Items, cmd.Do, innerFeed)
 			}
 		}
 		if !enumDone {
-			c.walkStmtsAll(cmd.Do, pipeIn)
+			c.walkStmtsAll(cmd.Do, innerFeed)
 		}
 		c.allowBind = prevBind
 	case *syntax.CaseClause:
 		prevBind := c.allowBind
 		c.allowBind = false
-		c.emitNestedFromWord(cmd.Word, pipeIn)
+		innerFeed := c.stmtFeed(st, feed)
+		c.emitNestedFromWord(cmd.Word, innerFeed)
 		for _, item := range cmd.Items {
 			for _, pat := range item.Patterns {
-				c.emitNestedFromWord(pat, pipeIn)
+				c.emitNestedFromWord(pat, innerFeed)
 			}
-			c.walkStmtsAll(item.Stmts, pipeIn)
+			c.walkStmtsAll(item.Stmts, innerFeed)
 		}
 		c.allowBind = prevBind
 	case *syntax.FuncDecl:
@@ -1690,39 +1703,39 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 		if cmd.Body != nil {
 			// The body's stdin is the stdin of whatever invocation runs it —
 			// unknown at definition, so conservatively treat it as fed.
-			c.walkStmt(cmd.Body, true)
+			c.walkStmt(cmd.Body, stdinFeed{piped: true})
 		}
 		c.allowBind = prevBind
 	case *syntax.TimeClause:
 		prevBind := c.allowBind
 		c.allowBind = false
 		if cmd.Stmt != nil {
-			c.walkStmt(cmd.Stmt, pipeIn)
+			c.walkStmt(cmd.Stmt, c.stmtFeed(st, feed))
 		}
 		c.allowBind = prevBind
 	case *syntax.CoprocClause:
 		prevBind := c.allowBind
 		c.allowBind = false
 		if cmd.Stmt != nil {
-			c.walkStmt(cmd.Stmt, false)
+			c.walkStmt(cmd.Stmt, stdinFeed{})
 		}
 		c.allowBind = prevBind
 	case *syntax.DeclClause:
-		c.emitDecl(st, cmd, pipeIn)
+		c.emitDecl(st, cmd, feed)
 	case *syntax.ArithmCmd:
 		// Bash arithmetic command: still scan for nested CmdSubst via Walk.
-		c.emitNestedFromNode(cmd, pipeIn)
+		c.emitNestedFromNode(cmd, feed)
 	case *syntax.TestClause:
-		c.emitNestedFromNode(cmd, pipeIn)
+		c.emitNestedFromNode(cmd, feed)
 	case *syntax.LetClause:
-		c.emitNestedFromNode(cmd, pipeIn)
+		c.emitNestedFromNode(cmd, feed)
 	default:
 		c.reject()
 	}
 }
 
-func (c *subCollector) emitDecl(st *syntax.Stmt, d *syntax.DeclClause, pipeIn bool) {
-	c.emitNestedFromNode(d, pipeIn)
+func (c *subCollector) emitDecl(st *syntax.Stmt, d *syntax.DeclClause, feed stdinFeed) {
+	c.emitNestedFromNode(d, feed)
 	argv := make([]string, 0, 1+len(d.Args))
 	if d.Variant != nil {
 		argv = append(argv, d.Variant.Value)
@@ -1746,30 +1759,30 @@ func (c *subCollector) emitDecl(st *syntax.Stmt, d *syntax.DeclClause, pipeIn bo
 			argv = append(argv, s)
 		}
 	}
-	seg := shellSegment{argv: argv, pipedStdin: pipeIn, backgrounded: st.Background}
-	c.applyRedirs(&seg, st.Redirs, pipeIn)
+	seg := shellSegment{argv: argv, pipedStdin: feed.piped, backgrounded: st.Background}
+	c.applyRedirs(&seg, st.Redirs, feed)
 	c.segs = append(c.segs, seg)
 }
 
-func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, pipeIn bool) {
+func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed stdinFeed) {
 	// Nested substitutions flush BEFORE the enclosing call.
 	for _, a := range call.Assigns {
 		if a.Value != nil {
-			c.emitNestedFromWord(a.Value, pipeIn)
+			c.emitNestedFromWord(a.Value, feed)
 		}
 		if a.Array != nil {
-			c.emitNestedFromNode(a.Array, pipeIn)
+			c.emitNestedFromNode(a.Array, feed)
 		}
 	}
 	for _, w := range call.Args {
-		c.emitNestedFromWord(w, pipeIn)
+		c.emitNestedFromWord(w, feed)
 	}
 	for _, r := range st.Redirs {
 		if r.Word != nil {
-			c.emitNestedFromWord(r.Word, pipeIn)
+			c.emitNestedFromWord(r.Word, feed)
 		}
 		if r.Hdoc != nil && !isQuotedHeredocDelim(r.Word) {
-			c.emitNestedFromWord(r.Hdoc, pipeIn)
+			c.emitNestedFromWord(r.Hdoc, feed)
 		}
 	}
 
@@ -1826,74 +1839,50 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, pipeIn b
 
 	seg := shellSegment{
 		argv:         argv,
-		pipedStdin:   pipeIn,
+		pipedStdin:   feed.piped,
 		backgrounded: st.Background,
 		processSubst: callHasProcSubst(call),
 	}
-	c.applyRedirs(&seg, st.Redirs, pipeIn)
+	c.applyRedirs(&seg, st.Redirs, feed)
 	if len(seg.argv) > 0 || seg.redirectFile != "" || len(seg.heredocText) > 0 ||
 		seg.hereString != "" || seg.processSubst || seg.depthExceeded {
 		c.segs = append(c.segs, seg)
 	}
 }
 
-func (c *subCollector) applyRedirs(seg *shellSegment, redirs []*syntax.Redirect, pipeIn bool) {
+// stdinFeed describes where a statement's fd0 comes from when it has no
+// redirect of its own (or when a dup re-binds fd0 to the same source):
+// piped for a pipeline upstream stream, bodies/hereStr for an enclosing
+// compound's heredoc / here-string (only an fd0 redirect queues them), and
+// file for a real file/dup binding. A file-bound stdin never reaches the
+// program as piped bytes, so feeds carrying file set seg.stdinRedir.
+type stdinFeed struct {
+	piped   bool
+	bodies  []heredocBody
+	hereStr string
+	hasHere bool
+	file    bool
+}
+
+// applyRedirs folds st.Redirs into seg: output redirects feed redirectFile /
+// processSubst, input redirects decide the segment's effective stdin by
+// tracking every fd's ORIGIN — a bare stmt starts from feed, n<f binds fd n
+// to a file, n<<EOF/n<<<w queue their payload on fd n, and n<&m copies m's
+// origin instead of pretending a file (`sh 0<&0` keeps the pipe open, while
+// `sh 9<&0 0<&9` still copies the piped fd0 origin). Only the FINAL fd0
+// origin sets stdinRedir; non-fd0 heredocs never reach stdin, so their
+// bodies are not collected.
+func (c *subCollector) applyRedirs(seg *shellSegment, redirs []*syntax.Redirect, feed stdinFeed) {
+	origin := c.feedThrough(redirs, feed)
+	seg.stdinRedir = origin.file
+	seg.heredocText = append(seg.heredocText, origin.bodies...)
+	if origin.hasHere {
+		seg.hereString = origin.hereStr
+	}
 	for _, r := range redirs {
 		// Only an fd0 redirect decides where the command's stdin comes from;
 		// 3< f or 2<<E leave stdin untouched.
-		fd0 := r.N == nil || r.N.Value == "0"
 		switch r.Op {
-		case syntax.Hdoc, syntax.DashHdoc:
-			quoted := isQuotedHeredocDelim(r.Word)
-			dash := r.Op == syntax.DashHdoc
-			if quoted {
-				text := ""
-				if r.Hdoc != nil {
-					if lit := r.Hdoc.Lit(); lit != "" {
-						text = lit
-					} else if raw, ok := rawSlice(c.code, r.Hdoc.Pos(), r.Hdoc.End()); ok {
-						text = raw
-					}
-				}
-				if dash {
-					text = stripDashHdocTabs(text)
-				}
-				seg.heredocText = append(seg.heredocText, heredocBody{text: text, quoted: true, dynamic: false})
-			} else if r.Hdoc == nil {
-				seg.heredocText = append(seg.heredocText, heredocBody{quoted: false, dynamic: false})
-			} else {
-				dynamic := false
-				var b strings.Builder
-				for _, p := range r.Hdoc.Parts {
-					lit, isLit := p.(*syntax.Lit)
-					if !isLit {
-						dynamic = true
-						break
-					}
-					b.WriteString(decodeUnquotedHeredocLit(lit.Value, dash))
-				}
-				if dynamic {
-					seg.heredocText = append(seg.heredocText, heredocBody{text: cmdSubPlaceholder, quoted: false, dynamic: true})
-				} else {
-					seg.heredocText = append(seg.heredocText, heredocBody{text: b.String(), quoted: false, dynamic: false})
-				}
-			}
-			// M3: an fd0 heredoc feeds stdin when it is the LAST fd0 redirect:
-			// `sh < f <<EOF` runs the body, not the file.
-			if fd0 {
-				seg.stdinRedir = false
-			}
-		case syntax.WordHdoc:
-			if r.Word != nil {
-				s, ok := wordToArg(r.Word)
-				if !ok {
-					s = cmdSubPlaceholder
-				}
-				seg.hereString = s
-			}
-			if fd0 {
-				seg.stdinRedir = false
-			}
 		case syntax.RdrOut, syntax.AppOut, syntax.RdrAll, syntax.AppAll, syntax.RdrClob:
 			c.setWriteRedirect(seg, r)
 		case syntax.DplOut:
@@ -1908,18 +1897,139 @@ func (c *subCollector) applyRedirs(seg *shellSegment, redirs []*syntax.Redirect,
 					}
 				}
 			}
-		case syntax.RdrIn, syntax.DplIn, syntax.RdrInOut:
-			// SH11 F7/R13: only an fd0 redirect binds the command's stdin —
-			// `sh 3</dev/null` still reads the inherited stream. The LAST fd0
-			// redirect decides (an fd0 heredoc above resets the flag).
-			if fd0 {
-				seg.stdinRedir = true
-			}
+		case syntax.Hdoc, syntax.DashHdoc, syntax.WordHdoc,
+			syntax.RdrIn, syntax.DplIn, syntax.RdrInOut:
+			// stdin-side ops already folded via feedThrough; a redirect WORD
+			// still hides nested substitutions to emit.
 			if r.Word != nil {
-				c.emitNestedFromWord(r.Word, pipeIn)
+				c.emitNestedFromWord(r.Word, feed)
 			}
 		}
 	}
+}
+
+// heredocBodyOf decodes one heredoc redirect's body exactly the way the
+// collector consumes it: quoted delimiters carry literal text, nil bodies a
+// payload-less entry, and unquoted bodies are POSIX-unescaped with a
+// dynamic marker when they contain substitutions.
+func (c *subCollector) heredocBodyOf(r *syntax.Redirect) heredocBody {
+	quoted := isQuotedHeredocDelim(r.Word)
+	dash := r.Op == syntax.DashHdoc
+	if quoted {
+		text := ""
+		if r.Hdoc != nil {
+			if lit := r.Hdoc.Lit(); lit != "" {
+				text = lit
+			} else if raw, ok := rawSlice(c.code, r.Hdoc.Pos(), r.Hdoc.End()); ok {
+				text = raw
+			}
+		}
+		if dash {
+			text = stripDashHdocTabs(text)
+		}
+		return heredocBody{text: text, quoted: true, dynamic: false}
+	}
+	if r.Hdoc == nil {
+		return heredocBody{quoted: false, dynamic: false}
+	}
+	var b strings.Builder
+	for _, p := range r.Hdoc.Parts {
+		lit, isLit := p.(*syntax.Lit)
+		if !isLit {
+			return heredocBody{text: cmdSubPlaceholder, quoted: false, dynamic: true}
+		}
+		b.WriteString(decodeUnquotedHeredocLit(lit.Value, dash))
+	}
+	return heredocBody{text: b.String(), quoted: false, dynamic: false}
+}
+
+// feedThrough replays a redirect list over base and returns the resulting
+// fd0 origin. Fd origins are tracked per descriptor: an input op on fd n
+// re-binds that fd (file / heredoc payload / here-string / closed / dup of
+// another fd's origin), an output op on fd0 binds it to the write target,
+// and anything else leaves the fd alone. An fd never touched by the list
+// keeps a file origin (an inherited foreign fd cannot be the pipe) — except
+// fd0, which starts at base. No nested commands are emitted here; callers
+// emit them so compound statements can reuse the replay without double
+// scanning.
+func (c *subCollector) feedThrough(redirs []*syntax.Redirect, base stdinFeed) stdinFeed {
+	origins := map[string]stdinFeed{"0": base}
+	for _, r := range redirs {
+		n := "0"
+		if r.N != nil {
+			n = r.N.Value
+		}
+		switch r.Op {
+		case syntax.Hdoc, syntax.DashHdoc:
+			o := origins[n]
+			o.piped, o.file = false, false
+			o.bodies = append(o.bodies, c.heredocBodyOf(r))
+			o.hasHere, o.hereStr = false, ""
+			origins[n] = o
+		case syntax.WordHdoc:
+			s := ""
+			if r.Word != nil {
+				w, ok := wordToArg(r.Word)
+				if !ok {
+					s = cmdSubPlaceholder
+				} else {
+					s = w
+				}
+			}
+			o := origins[n]
+			o.piped, o.file = false, false
+			o.bodies = nil
+			o.hasHere, o.hereStr = true, s
+			origins[n] = o
+		case syntax.RdrIn, syntax.RdrInOut:
+			origins[n] = stdinFeed{file: true}
+		case syntax.DplIn:
+			// n<&m copies m's CURRENT origin (0<&0 keeps base, 9<&0 then
+			// 0<&9 still smuggles the pipe); n<&- closes the fd; an
+			// unresolvable target binds to something unvetted — file.
+			if r.Word == nil {
+				origins[n] = stdinFeed{file: true}
+				break
+			}
+			s, ok := wordToArg(r.Word)
+			if !ok || s == "-" {
+				origins[n] = stdinFeed{file: true}
+			} else if allDigits(s) {
+				if o, seen := origins[s]; seen {
+					origins[n] = o
+				} else {
+					origins[n] = stdinFeed{file: true}
+				}
+			} else {
+				origins[n] = stdinFeed{file: true}
+			}
+		default:
+			// Output-side ops on fd0 (0>f, 0>&1) re-bind it to the write
+			// target — no program bytes stream through it.
+			if n == "0" {
+				origins[n] = stdinFeed{file: true}
+			}
+		}
+	}
+	return origins["0"]
+}
+
+// stmtFeed computes the stdin feed a COMPOUND statement's body sees:
+// its own redirect list is replayed over the enclosing feed so
+// `(sh) <<'EOF'` hands the heredoc payload to inner commands (they are
+// screened as program text) and `(sh) < f` marks their stdin file-bound.
+// Redirect words and unquoted heredoc bodies still emit their nested
+// substitutions exactly like a CallExpr's redirects do.
+func (c *subCollector) stmtFeed(st *syntax.Stmt, feed stdinFeed) stdinFeed {
+	for _, r := range st.Redirs {
+		if r.Word != nil {
+			c.emitNestedFromWord(r.Word, feed)
+		}
+		if r.Hdoc != nil && !isQuotedHeredocDelim(r.Word) {
+			c.emitNestedFromWord(r.Hdoc, feed)
+		}
+	}
+	return c.feedThrough(st.Redirs, feed)
 }
 
 func (c *subCollector) setWriteRedirect(seg *shellSegment, r *syntax.Redirect) {
@@ -1950,7 +2060,7 @@ func (c *subCollector) setWriteRedirect(seg *shellSegment, r *syntax.Redirect) {
 	}
 }
 
-func (c *subCollector) emitNestedFromWord(w *syntax.Word, pipeIn bool) {
+func (c *subCollector) emitNestedFromWord(w *syntax.Word, feed stdinFeed) {
 	if w == nil {
 		return
 	}
@@ -1958,14 +2068,14 @@ func (c *subCollector) emitNestedFromWord(w *syntax.Word, pipeIn bool) {
 		c.reject()
 		return
 	}
-	c.emitNestedFromNode(w, pipeIn)
+	c.emitNestedFromNode(w, feed)
 }
 
-// pipeIn flows into substitutions: a $(...) inherits the enclosing command's
+// feed flows into substitutions: a $(...) inherits the enclosing command's
 // stdin, so `echo pig | cat $(sh)` feeds the pipe to sh. A <(...) proc subst
 // inherits that same stdin; a >(...) subst is fed by the enclosing command's
-// stdout — also an unvetted byte stream, so its inner stmts get pipeIn too.
-func (c *subCollector) emitNestedFromNode(n syntax.Node, pipeIn bool) {
+// stdout — also an unvetted byte stream, so its inner stmts get feed too.
+func (c *subCollector) emitNestedFromNode(n syntax.Node, feed stdinFeed) {
 	if n == nil || c.rejected {
 		return
 	}
@@ -1983,7 +2093,7 @@ func (c *subCollector) emitNestedFromNode(n syntax.Node, pipeIn bool) {
 			// R13: every executable sub-statement shares the substitution's
 			// stdin — `cat $(true; sh)` feeds the pipe to sh, not only to
 			// the first statement.
-			sub.walkStmtsAll(x.Stmts, pipeIn)
+			sub.walkStmtsAll(x.Stmts, feed)
 			if sub.rejected {
 				c.reject()
 				return false
@@ -1999,9 +2109,9 @@ func (c *subCollector) emitNestedFromNode(n syntax.Node, pipeIn bool) {
 			if x.Op == syntax.CmdOut {
 				// >(...) : the inner command is fed by the enclosing command's
 				// stdout — an unvetted byte stream, treat as piped input.
-				sub.walkStmtsAll(x.Stmts, true)
+				sub.walkStmtsAll(x.Stmts, stdinFeed{piped: true})
 			} else {
-				sub.walkStmtsAll(x.Stmts, pipeIn)
+				sub.walkStmtsAll(x.Stmts, feed)
 			}
 			if sub.rejected {
 				c.reject()
@@ -2310,7 +2420,7 @@ func bareCallArgvIs(stmts []*syntax.Stmt, want []string) bool {
 // runtime split uses the live IFS while the model uses ASCII whitespace.
 // Items that fail even that check make the whole loop fall back to the
 // dynamic path.
-func (c *subCollector) forEnumSubst(loopName string, items []*syntax.Word, do []*syntax.Stmt, pipeIn bool) bool {
+func (c *subCollector) forEnumSubst(loopName string, items []*syntax.Word, do []*syntax.Stmt, feed stdinFeed) bool {
 	if len(items) == 0 {
 		return false
 	}
@@ -2369,7 +2479,7 @@ func (c *subCollector) forEnumSubst(loopName string, items []*syntax.Word, do []
 			delete(c.enumVars, loopName)
 		}
 		c.enumCmdWords[loopName] = it.words
-		c.walkStmtsAll(do, pipeIn)
+		c.walkStmtsAll(do, feed)
 		if c.rejected {
 			break
 		}
