@@ -114,21 +114,14 @@ func collectGoCmdArgvs(code string) (argvs [][]string, depthExceeded bool) {
 		if len(s.argv) == 0 {
 			continue
 		}
-		i, payloads, _, exhausted := peelWrappers(s.argv)
+		head, payloads, _, exhausted := peelWrappers(s.argv)
 		if exhausted {
 			depthExceeded = true
 			continue
 		}
-		if i < 0 {
-			i = 0
-		}
-		if i > len(s.argv) {
-			i = len(s.argv)
-		}
-		head := s.argv[i:]
 		if len(head) == 0 {
 			// Peel ate everything (e.g. env -vS '…' with no trailing command).
-			if len(payloads) > 0 || i > 0 {
+			if len(payloads) > 0 {
 				depthExceeded = true
 			}
 			continue

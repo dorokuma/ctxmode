@@ -126,6 +126,11 @@ type shellSegment struct {
 	// parsed, so the guards must fail closed instead of silently dropping
 	// them. It is never a real command.
 	depthExceeded bool
+	// stdinRedir marks a segment whose stdin was explicitly redirected from
+	// a file/fd (<, N<, <&N, <>): piped bytes and heredoc bodies do NOT
+	// reach it as a program stream, and a remote stdin vehicle must not
+	// have one (SH11 F7).
+	stdinRedir bool
 	// parseErr is a fail-closed parse/validation reason that is NOT a nesting-depth
 	// overflow (e.g. bash-only syntax under /bin/sh). Prefer this over stuffing
 	// every parse failure into depthExceeded.
@@ -170,21 +175,113 @@ const cmdSubPlaceholder = "__ctx_cmdsub__"
 // double quotes (no field-split / glob). Unquoted dynamics keep cmdSubPlaceholder.
 const cmdSubPlaceholderQuoted = "__ctx_dq_sub__"
 
-// isDynamicArg reports a word that still carries a dynamic placeholder
-// (static prefix may precede it, e.g. -c__ctx_cmdsub__).
-func isDynamicArg(a string) bool {
-	return strings.Contains(a, cmdSubPlaceholder) || strings.Contains(a, cmdSubPlaceholderQuoted)
+// cmdSubPlaceholderGlob marks an UNQUOTED glob/tilde literal (* ? [...] ~):
+// pathname expansion happens after field splitting and each match is one
+// argv word, so the word can never inject extra options — but it IS dynamic.
+const cmdSubPlaceholderGlob = "__ctx_glob__"
+
+// cmdSubPlaceholderAbsDq marks a double-quoted dynamic whose expansion is
+// GUARANTEED to begin with '/': $PWD/$OLDPWD/${PWD}/${OLDPWD}, $(pwd) and a
+// bare $(mktemp -d) with untainted TMPDIR. Word-start it is split-safe AND
+// cannot become an option flag (Q1-C: absolute-path placeholder class).
+const cmdSubPlaceholderAbsDq = "__ctx_abspath_dq__"
+
+// envPathSelfPlaceholder stands for a literal $PATH / ${PATH} expansion
+// inside a PATH= value. The embedded NUL bytes make it impossible to
+// produce from shell text or argv (exec rejects NUL) — so only a real
+// expansion site can mint it (SH11 F1/Q3: provenance is structural, not a
+// forgeable string literal).
+const envPathSelfPlaceholder = "\x00ctx-env-path\x00"
+
+// mktempDirPlaceholder is the fake absolute path bound for a bare
+// $(mktemp -d) assignment (F8: only with untainted TMPDIR).
+const mktempDirPlaceholder = "/tmp/__ctx_mktemp_dir__"
+
+// sentinelTrustVars are variables whose value the placeholder grants depend
+// on: writing them even once (any site counted by preScanVarMutations)
+// taints their expansion semantics in the collector.
+var sentinelTrustVars = map[string]bool{
+	"HOME": true, "PWD": true, "OLDPWD": true, "TMPDIR": true,
+	"IFS": true, "CTXMODE_ROLE": true, "CTXMODE_READONLY": true,
 }
 
-// isSplitSafeDynamicWord reports a dynamic argv word whose dynamic parts were
-// fully double-quoted (TASK.md correction 1). Static words return false;
-// callers must check isDynamicArg first when distinguishing allow vs deny.
+// isDynamicArg reports a word that still carries a dynamic placeholder
+// (static prefix may precede it, e.g. -c__ctx_cmdsub__). The PATH self
+// sentinel deliberately does NOT count: inside PATH= values it is the
+// legal "keep my current PATH" marker, and everywhere else its NUL bytes
+// make the word unexecutable anyway.
+func isDynamicArg(a string) bool {
+	return strings.Contains(a, cmdSubPlaceholder) || strings.Contains(a, cmdSubPlaceholderQuoted) ||
+		strings.Contains(a, cmdSubPlaceholderGlob) || strings.Contains(a, cmdSubPlaceholderAbsDq)
+}
+
+// isSplitSafeDynamicWord reports a dynamic argv word whose dynamic parts
+// are guaranteed to stay a single argv word at runtime: fully double-quoted
+// expansions, unquoted glob/tilde literals (pathname expansion never
+// field-splits) and the $$ PID. Plain unquoted $VAR/$(...)/`...` parts can
+// field-split and are NOT split-safe (TASK.md correction 1). Static words
+// return false; callers must check isDynamicArg first when distinguishing
+// allow vs deny.
 func isSplitSafeDynamicWord(a string) bool {
-	// Unquoted dynamics are never split-safe.
+	// Unquoted expansions are never split-safe.
 	if strings.Contains(a, cmdSubPlaceholder) {
 		return false
 	}
-	return strings.Contains(a, cmdSubPlaceholderQuoted)
+	if strings.Contains(a, cmdSubPlaceholderGlob) && !globWordIsSplitSafe(a) {
+		return false
+	}
+	return strings.Contains(a, cmdSubPlaceholderQuoted) ||
+		strings.Contains(a, cmdSubPlaceholderGlob) ||
+		strings.Contains(a, cmdSubPlaceholderAbsDq)
+}
+
+// globWordIsSplitSafe reports whether a word carrying cmdSubPlaceholderGlob
+// cannot expand to an option-looking argv word: the FIRST byte must be a
+// literal, non '-'/'+'/'~' character (a word starting with * ? [ ~ can
+// expand to a filename that begins with '-').
+func globWordIsSplitSafe(a string) bool {
+	if a == "" {
+		return false
+	}
+	switch a[0] {
+	case '-', '+', '~', '*', '?', '[':
+		return false
+	}
+	return true
+}
+
+// isSafeDynamicDataOperand reports whether a dynamic word is safe in a
+// plain file/data operand slot (script path, file operand, option value
+// consumed verbatim): it must be split-safe, must not be able to become an
+// option flag (no '-'/'+' word start — including the RUNTIME start, which
+// is why a word-start __ctx_dq_sub__ fails but __ctx_abspath_dq__ passes),
+// and it must name a path (start with '/' or contain '/' after a safe
+// static literal start — R3/M1: a word that BEGINS with a dynamic
+// placeholder can expand to `-c`/`-e`, so only __ctx_abspath_dq__ or a
+// literal non-'-'/'+'/'~' start may precede the '/').
+func isSafeDynamicDataOperand(a string) bool {
+	if !isSplitSafeDynamicWord(a) {
+		return false
+	}
+	if strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+") {
+		return false
+	}
+	if strings.HasPrefix(a, "/") || strings.HasPrefix(a, cmdSubPlaceholderAbsDq) {
+		return true
+	}
+	// Word-start dynamic placeholders other than abs-dq are unvettable:
+	// their runtime text may start with '-' (option injection).
+	if strings.HasPrefix(a, cmdSubPlaceholder) || strings.HasPrefix(a, cmdSubPlaceholderQuoted) ||
+		strings.HasPrefix(a, cmdSubPlaceholderGlob) {
+		return false
+	}
+	// First byte is a static literal now (placeholders checked above);
+	// it must not be '-', '+' or '~' for the same option-injection reason.
+	switch a[0] {
+	case '-', '+', '~':
+		return false
+	}
+	return strings.Contains(a, "/")
 }
 
 // argHasDyn reports either placeholder (for code-payload Contains checks).
@@ -192,7 +289,13 @@ func argHasDyn(a string) bool { return isDynamicArg(a) }
 
 // splitShellSegments parses shell text via mvdan.cc/sh (LangPOSIX + Bash cross-check).
 func splitShellSegments(code string) []shellSegment {
-	segs, ok := parseSubagentShellAST(code, 0, false, false)
+	return splitShellSegmentsEnv(code, nil)
+}
+
+// splitShellSegmentsEnv parses shell text with environment-override taint
+// from an outer envAs (HOME=/x sh -c 'PATH=$HOME/x:$PATH git').
+func splitShellSegmentsEnv(code string, envTaint map[string]bool) []shellSegment {
+	segs, ok := parseSubagentShellASTEnv(code, 0, false, false, envTaint)
 	if !ok {
 		if len(segs) > 0 {
 			return segs
@@ -204,7 +307,12 @@ func splitShellSegments(code string) []shellSegment {
 
 // splitShellSegmentsBash parses bash/zsh/ksh/mksh -c payloads with LangBash fail-closed.
 func splitShellSegmentsBash(code string) []shellSegment {
-	segs, ok := parseSubagentShellAST(code, 0, false, true)
+	return splitShellSegmentsBashEnv(code, nil)
+}
+
+// splitShellSegmentsBashEnv is splitShellSegmentsBash with env taint.
+func splitShellSegmentsBashEnv(code string, envTaint map[string]bool) []shellSegment {
+	segs, ok := parseSubagentShellASTEnv(code, 0, false, true, envTaint)
 	if !ok {
 		if len(segs) > 0 {
 			return segs
@@ -306,6 +414,10 @@ var envHookVars = map[string]bool{
 	"PYTHONPATH": true,
 	"PERL5OPT":   true, "PERL5DB": true, "RUBYOPT": true,
 	"JAVA_TOOL_OPTIONS": true, "JDK_JAVA_OPTIONS": true, "_JAVA_OPTIONS": true,
+	// S2: bash -x prompt expansion and startup option vars can re-arm
+	// execution (PS4='$(pig)' bash -x -c, SHELLOPTS=braceexpand,
+	// BASHOPTS=xpg_echo) the same way BASH_ENV does.
+	"PS4": true, "SHELLOPTS": true, "BASHOPTS": true,
 	// Broad GIT_* execution hooks beyond the explicit names above.
 	"GIT_PROXY_COMMAND": true, "GIT_DIFF_OPTS": true,
 	"GIT_CONFIG_COUNT": true, "GIT_CONFIG_KEY_0": true, "GIT_CONFIG_VALUE_0": true,
@@ -316,6 +428,36 @@ var envHookVars = map[string]bool{
 // canonical read-only spelling (`GIT_PAGER=cat git log`).
 var pagerSafeVars = map[string]bool{
 	"PAGER": true, "GIT_PAGER": true, "MANPAGER": true,
+}
+
+// isEnvHookVar reports whether assigning the variable hands an executable
+// command/path/module resolution to a later child: the static table plus
+// the LD_*/DYLD_*/GIT_CONFIG* prefixes and the GIT_DIR-family, NODE_PATH,
+// PERL5LIB/PERLLIB and RUBYLIB module-hijack variables (SH11 MF-5.2).
+func isEnvHookVar(key string) bool {
+	if envHookVars[key] {
+		return true
+	}
+	if strings.HasPrefix(key, "LD_") || strings.HasPrefix(key, "DYLD_") ||
+		strings.HasPrefix(key, "GIT_CONFIG") {
+		return true
+	}
+	switch key {
+	case "GIT_DIR", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE",
+		"GIT_TEMPLATE_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+		"NODE_PATH", "PERL5LIB", "PERLLIB", "RUBYLIB":
+		return true
+	}
+	return false
+}
+
+// gitDirEnvVars are the GIT_* path variables a non-readonly worker may
+// redirect to a (split-safe) dynamic path, matching the already-allowed
+// git --git-dir="$d" spellings. Strict read-only roles must never set them.
+var gitDirEnvVars = map[string]bool{
+	"GIT_DIR": true, "GIT_WORK_TREE": true, "GIT_COMMON_DIR": true,
+	"GIT_INDEX_FILE": true, "GIT_OBJECT_DIRECTORY": true,
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES": true, "GIT_TEMPLATE_DIR": true,
 }
 
 // guardTaintVars are the variables carrying the caller's role identity; a
@@ -388,7 +530,7 @@ func skipExecArgs(argv []string, i int) int {
 	return i
 }
 
-func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssignments, exhausted bool) {
+func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, envAs envAssignments, exhausted bool) {
 	i := 0
 	depth := 0
 	for ; depth < peelWrapperMaxSteps && i < len(argv); depth++ {
@@ -401,7 +543,7 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 		}
 		if shellNoopWords[a] {
 			if i+1 >= len(argv) {
-				return len(argv), splitPayloads, envAs, false // trailing `}`/`fi`/`done`
+				return argv[len(argv):], splitPayloads, envAs, false // trailing `}`/`fi`/`done`
 			}
 			i++ // leading `{` / `(` group opener: peel to the inner head
 			depth--
@@ -419,7 +561,7 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 			// Dynamic word in head position: stop peeling so peelResolvedSegDepth
 			// can return "dynamic command head". Wrapper option loops have their
 			// own isDynamicArg->exhausted checks.
-			return i, splitPayloads, envAs, false
+			return argv[i:], splitPayloads, envAs, false
 		}
 		switch filepath.Base(a) {
 		case "time":
@@ -435,7 +577,7 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 					break
 				}
 				if isDynamicArg(a) {
-					return i, splitPayloads, envAs, true
+					return argv[i:], splitPayloads, envAs, true
 				}
 				if !strings.HasPrefix(a, "-") || a == "-" {
 					break
@@ -448,9 +590,13 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 			}
 		case "env":
 			i++
-			var payloads []string
-			i, payloads, envAs = skipEnvOperands(argv, i, envAs)
+			rest, payloads, ea := skipEnvOperands(argv, i, envAs)
+			envAs = ea
 			splitPayloads = append(splitPayloads, payloads...)
+			// -S re-parses payload words INTO argv: continue peeling on the
+			// residual argv (may be a new slice when -S injected words).
+			argv = rest
+			i = 0
 		case "command":
 			start := i
 			i++
@@ -459,7 +605,7 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 			// it: keep `command` as the resolved head so peelResolvedDepth
 			// can allow it outright. Anything else peels to the real head.
 			if isCommandQuery(argv[i:]) {
-				return start, splitPayloads, envAs, false
+				return argv[start:], splitPayloads, envAs, false
 			}
 			for i < len(argv) && strings.HasPrefix(argv[i], "-") && argv[i] != "--" {
 				i++
@@ -506,7 +652,7 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 					break
 				}
 				if isDynamicArg(a) {
-					return i, splitPayloads, envAs, true
+					return argv[i:], splitPayloads, envAs, true
 				}
 				if !strings.HasPrefix(a, "-") || a == "-" {
 					break
@@ -538,10 +684,17 @@ func peelWrappers(argv []string) (idx int, splitPayloads []string, envAs envAssi
 			i++
 			i = skipStraceArgs(argv, i)
 		default:
-			return i, splitPayloads, envAs, false
+			if i > len(argv) {
+				i = len(argv)
+			}
+			return argv[i:], splitPayloads, envAs, false
 		}
 	}
-	return i, splitPayloads, envAs, depth >= peelWrapperMaxSteps
+	if i > len(argv) {
+		i = len(argv)
+		return argv[i:], splitPayloads, envAs, true
+	}
+	return argv[i:], splitPayloads, envAs, depth >= peelWrapperMaxSteps
 }
 
 // skipTimeoutArgs consumes timeout's option arguments and its duration.
@@ -853,6 +1006,217 @@ func envMatchLong(name string) string {
 	return ""
 }
 
+// envSEscape decodes one GNU env -S backslash escape at s[i] ('\\' + c).
+// Measured against coreutils 9.7: \_ is a WORD SEPARATOR, \t \n \r \v \f
+// are literal bytes inside the current word, \c truncates the rest of the
+// payload (and is an error inside double quotes), \" \' \\ \$ \# produce
+// the literal byte, and every other escape is invalid (fail closed).
+// Returns (emit byte, action) — action 'w' write byte, 's' word separator,
+// 'c' truncate rest of payload, 'e' invalid escape.
+func envSEscape(c byte, inDQ bool) (byte, byte) {
+	switch c {
+	case '_':
+		if inDQ {
+			return ' ', 'w' // inside dq \_ is a literal space
+		}
+		return 0, 's'
+	case 't':
+		return '\t', 'w'
+	case 'n':
+		return '\n', 'w'
+	case 'r':
+		return '\r', 'w'
+	case 'v':
+		return '\v', 'w'
+	case 'f':
+		return '\f', 'w'
+	case 'c':
+		if inDQ {
+			return 0, 'e' // GNU rejects "\c" inside double quotes
+		}
+		return 0, 'c'
+	case '"', '\'', '\\', '$', '#':
+		return c, 'w'
+	}
+	return 0, 'e'
+}
+
+// splitEnvSPayload splits an env -S/--split-string payload into the argv
+// GNU env would re-parse: whitespace and \_ split words, '#' outside a
+// word starts a comment, single/double quotes group, GNU backslash escapes
+// decode per envSEscape (unknown escapes fail closed like GNU does), and
+// every $/${}/$(..)/`..` sequence inside or outside double quotes emits a
+// placeholder word (unquoted dynamics stay splittable markers; a whole-$
+// word emits cmdSubPlaceholder so head/option checks see it as dynamic).
+// Quote/escape errors return (nil, true) so callers fail closed.
+func splitEnvSPayload(s string) ([]string, bool) {
+	var words []string
+	var b strings.Builder
+	inWord := false
+	emit := func() {
+		if inWord {
+			words = append(words, b.String())
+			b.Reset()
+			inWord = false
+		}
+	}
+	for i := 0; i < len(s); {
+		c := s[i]
+		switch c {
+		case ' ', '\t', '\n':
+			emit()
+			i++
+		case '#':
+			if inWord {
+				b.WriteByte(c)
+				i++
+				continue
+			}
+			return words, false // GNU: '#' at a word start comments out the rest
+		case '\\':
+			if i+1 >= len(s) {
+				return nil, true
+			}
+			b_, act := envSEscape(s[i+1], false)
+			switch act {
+			case 'e':
+				return nil, true
+			case 'c':
+				emit()
+				return words, false // \c truncates the rest of the payload
+			case 's':
+				emit()
+				i += 2
+				continue
+			}
+			inWord = true
+			b.WriteByte(b_)
+			i += 2
+		case '\'':
+			inWord = true
+			i++
+			for i < len(s) && s[i] != '\'' {
+				b.WriteByte(s[i])
+				i++
+			}
+			if i >= len(s) {
+				return nil, true // unterminated quote
+			}
+			i++
+		case '"':
+			inWord = true
+			i++
+			for i < len(s) && s[i] != '"' {
+				ch := s[i]
+				if ch == '\\' && i+1 < len(s) {
+					b_, act := envSEscape(s[i+1], true)
+					switch act {
+					case 'e':
+						return nil, true
+					case 'c', 's':
+						// unreachable: inDQ maps those to 'e'/'w'
+						return nil, true
+					}
+					b.WriteByte(b_)
+					i += 2
+					continue
+				}
+				if ch == '$' || ch == '`' {
+					b.WriteString(cmdSubPlaceholderQuoted)
+					i += splitEnvSubLen(s, i)
+					continue
+				}
+				b.WriteByte(ch)
+				i++
+			}
+			if i >= len(s) {
+				return nil, true
+			}
+			i++
+		case '$', '`':
+			inWord = true
+			b.WriteString(cmdSubPlaceholder)
+			i += splitEnvSubLen(s, i)
+		default:
+			inWord = true
+			b.WriteByte(c)
+			i++
+		}
+	}
+	emit()
+	return words, false
+}
+
+// splitEnvSubLen returns the byte length of a $/${}/$(..)/`..` expansion
+// starting at s[i] (at least 1), scanning nested quotes/parens loosely so
+// the expansion is consumed whole rather than split mid-way.
+func splitEnvSubLen(s string, i int) int {
+	if i >= len(s) {
+		return 0
+	}
+	if s[i] == '`' {
+		for j := i + 1; j < len(s); j++ {
+			if s[j] == '`' {
+				return j + 1 - i
+			}
+			if s[j] == '\\' {
+				j++
+			}
+		}
+		return len(s) - i
+	}
+	// s[i] == '$'
+	if i+1 >= len(s) {
+		return 1
+	}
+	switch s[i+1] {
+	case '(', '{':
+		close_ := byte(')')
+		if s[i+1] == '{' {
+			close_ = '}'
+		}
+		depth := 0
+		for j := i + 1; j < len(s); j++ {
+			ch := s[j]
+			if ch == '\\' {
+				j++
+				continue
+			}
+			if ch == '\'' {
+				for j+1 < len(s) && s[j+1] != '\'' {
+					j++
+				}
+				j++
+				continue
+			}
+			if ch == '"' {
+				for j+1 < len(s) && s[j+1] != '"' {
+					j++
+				}
+				j++
+				continue
+			}
+			if ch == s[i+1] {
+				depth++
+			} else if ch == close_ {
+				depth--
+				if depth == 0 {
+					return j + 1 - i
+				}
+			}
+		}
+		return len(s) - i
+	default:
+		// $VAR: consume the identifier.
+		j := i + 1
+		for j < len(s) && (s[j] == '_' || s[j] >= 'a' && s[j] <= 'z' ||
+			s[j] >= 'A' && s[j] <= 'Z' || s[j] >= '0' && s[j] <= '9') {
+			j++
+		}
+		return j - i
+	}
+}
+
 // skipEnvOperands consumes env's own arguments (options and NAME=val
 // assignments) starting at i and returns the index of the command env would
 // exec plus any -S/--split-string payloads for the caller to screen (the
@@ -860,17 +1224,17 @@ func envMatchLong(name string) string {
 // -u/--unset operands are recorded into envAs for the execution-hook env
 // screen. Short clusters are scanned character-by-character; bare "-" is
 // treated as -i; unknown shorts/longs fail closed via envUnknownLongPrefix.
-func skipEnvOperands(argv []string, i int, envAs envAssignments) (int, []string, envAssignments) {
+func skipEnvOperands(argv []string, i int, envAs envAssignments) ([]string, []string, envAssignments) {
 	var payloads []string
 	for i < len(argv) {
 		a := argv[i]
 		if isDynamicArg(a) && !isAssignWord(a) {
 			payloads = append(payloads, envUnknownLongPrefix+"dynamic option")
-			return i, payloads, envAs
+			return argv[i:], payloads, envAs
 		}
 		switch {
 		case a == "--":
-			return i + 1, payloads, envAs
+			return argv[i+1:], payloads, envAs
 		case a == "-":
 			// GNU: a mere "-" implies -i (clear inherited environment).
 			envAs.ops = append(envAs.ops, envOp{kind: 'c'})
@@ -889,21 +1253,59 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) (int, []string,
 				if hasVal {
 					envAs.ops = append(envAs.ops, envOp{kind: 'u', key: val})
 					i++
-				} else {
-					if i+1 < len(argv) {
-						envAs.ops = append(envAs.ops, envOp{kind: 'u', key: argv[i+1]})
-					}
+				} else if i+1 < len(argv) {
+					envAs.ops = append(envAs.ops, envOp{kind: 'u', key: argv[i+1]})
 					i += 2
+				} else {
+					// R1/M5: missing operand — GNU errors; fail closed and do
+					// NOT advance past the end (i+=2 would slice out of bounds).
+					payloads = append(payloads, envUnknownLongPrefix+"missing operand "+a)
+					i++
 				}
 			case "chdir", "argv0":
 				if hasVal {
 					i++
-				} else {
+				} else if i+1 < len(argv) {
 					i += 2
+				} else {
+					payloads = append(payloads, envUnknownLongPrefix+"missing operand "+a)
+					i++
 				}
 			case "split-string":
-				payloads = append(payloads, envUnknownLongPrefix+"-S/--split-string")
-				return i + 1, payloads, envAs
+				// GNU env -S/--split-string: the payload is re-parsed by env
+				// itself as its own argv — split it and feed the words back
+				// through the operand scanner so options, assignments and the
+				// real command head all resolve exactly like env (SH11 F5).
+				var payload string
+				havePayload := false
+				if hasVal {
+					payload, havePayload = val, true
+					i++
+				} else if i+1 < len(argv) {
+					payload, havePayload = argv[i+1], true
+					i += 2
+				} else {
+					i++
+				}
+				if !havePayload {
+					payloads = append(payloads, envUnknownLongPrefix+"-S/--split-string")
+					continue
+				}
+				if isDynamicArg(payload) {
+					payloads = append(payloads, envUnknownLongPrefix+"dynamic option")
+					continue
+				}
+				words, bad := splitEnvSPayload(payload)
+				if bad {
+					payloads = append(payloads, envUnknownLongPrefix+"-S/--split-string")
+					continue
+				}
+				// The -S argv restarts env's operand parse (options first),
+				// then the remaining real argv continues after it.
+				rest := append(append([]string{}, words...), argv[i:]...)
+				rem, moreP, envAs := skipEnvOperands(rest, 0, envAs)
+				payloads = append(payloads, moreP...)
+				return rem, payloads, envAs
 			case "block-signal", "default-signal", "ignore-signal":
 				// GNU optional_argument: only consume a value with '='.
 				i++
@@ -937,15 +1339,34 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) (int, []string,
 						hasOptVal = true
 						consumedNext = true
 					}
-					switch opt {
-					case 'u':
-						if hasOptVal {
-							envAs.ops = append(envAs.ops, envOp{kind: 'u', key: optVal})
-						}
-					case 'S':
-						payloads = append(payloads, envUnknownLongPrefix+"-S/--split-string")
+					if !hasOptVal {
+						// R1/M5: trailing value-option without an operand — GNU
+						// errors; fail closed instead of slicing past the end.
+						payloads = append(payloads, envUnknownLongPrefix+"missing operand "+a)
 						unknown = true
 						j = len(a)
+						break
+					}
+					switch opt {
+					case 'u':
+						envAs.ops = append(envAs.ops, envOp{kind: 'u', key: optVal})
+					case 'S':
+						// See the --split-string branch: the payload restarts
+						// env's operand parse.
+						start := i
+						if consumedNext {
+							start = i + 1
+						}
+						words, bad := splitEnvSPayload(optVal)
+						if bad || isDynamicArg(optVal) {
+							payloads = append(payloads, envUnknownLongPrefix+"-S/--split-string")
+							j = len(a)
+							break
+						}
+						rest := append(append([]string{}, words...), argv[start+1:]...)
+						rem, moreP, envAs := skipEnvOperands(rest, 0, envAs)
+						payloads = append(payloads, moreP...)
+						return rem, payloads, envAs
 					}
 					// 'C' (chdir) and 'a' (argv0): value consumed only
 				default:
@@ -961,16 +1382,16 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) (int, []string,
 				i++
 			}
 			if unknown {
-				return i, payloads, envAs
+				return argv[i:], payloads, envAs
 			}
 		case isAssignWord(a):
 			envAs.addAssign(a)
 			i++
 		default:
-			return i, payloads, envAs
+			return argv[i:], payloads, envAs
 		}
 	}
-	return i, payloads, envAs
+	return argv[i:], payloads, envAs
 }
 
 // unwrapShellArgv reports whether argv (starting at a resolved command head)
@@ -1201,6 +1622,13 @@ func unwrapInterpreterInline(argv []string) (lang, code string, ok bool) {
 				continue
 			}
 			if isDynamicArg(a) {
+				// SH11 MF-2: a split-safe path-shaped word is the script-file
+				// operand, not inline code — end the option scan (Q1-C).
+				if isSafeDynamicDataOperand(a) &&
+					(strings.Contains(a, "/") || strings.HasPrefix(a, "/") ||
+						strings.HasPrefix(a, cmdSubPlaceholderAbsDq) || hasInterpScriptExt(a)) {
+					break
+				}
 				frags = append(frags, a)
 				return strings.Join(frags, "\n"), true
 			}
@@ -1479,18 +1907,23 @@ func withScreenCwd(cwd string) func() {
 // resolveHeadBase returns the basename of the executable program a command
 // head actually runs: the same name when head[0] is not a symlink (or cannot
 // be located), the target's basename when it is. Resolution honours the
-// caller's ctx_run cwd for relative spellings and exec.LookPath for bare
+// caller's ctx_run cwd for relative spellings and a PATH emulation for bare
 // names; every lookup failure yields "" (screen the typed name only), which
-// is exactly the pre-alias behaviour.
-func resolveHeadBase(name string) string {
+// is exactly the pre-alias behaviour. pathEnv is the segment's EFFECTIVE
+// PATH (envAs replayed over the process PATH) — Q4/O3 symlink penetration
+// must see the same executable the runtime would pick, including shadowed
+// relative segments; "" falls back to the process PATH.
+func resolveHeadBase(name, pathEnv string) string {
 	if name == "" || isDynamicArg(name) {
 		return ""
 	}
 	target := name
 	if !filepath.IsAbs(target) {
 		if !looksLikePath(target) {
-			p, err := exec.LookPath(target)
-			if err != nil {
+			p, dot, err := lookPathIn(target, pathEnv)
+			if err != nil || (dot && !hasExplicitRelativeSegment(pathEnv)) {
+				// Not found, or found only in "." while the caller could not
+				// have armed a relative PATH segment → screen the typed name.
 				return ""
 			}
 			target = p
@@ -1503,6 +1936,49 @@ func resolveHeadBase(name string) string {
 		return ""
 	}
 	return filepath.Base(resolved)
+}
+
+// hasExplicitRelativeSegment reports whether pathEnv carries a relative
+// segment the guard explicitly admitted (the toolchain-relative list) —
+// only then is a "." lookup result reachable at runtime.
+func hasExplicitRelativeSegment(pathEnv string) bool {
+	for _, p := range strings.Split(pathEnv, ":") {
+		if p != "" && !strings.HasPrefix(p, "/") {
+			return true
+		}
+	}
+	return false
+}
+
+// lookPathIn emulates execvp name resolution over an explicit PATH value:
+// bare names scan each segment (relative segments resolve against the
+// screen cwd, empty segments mean "."); returns (path, foundInDot, err).
+func lookPathIn(name, pathEnv string) (string, bool, error) {
+	if pathEnv == "" {
+		pathEnv = os.Getenv("PATH")
+	}
+	cwd := currentScreenCwd()
+	for _, dir := range strings.Split(pathEnv, ":") {
+		dot := false
+		switch {
+		case dir == "":
+			dot = true
+			dir = "."
+		case !filepath.IsAbs(dir):
+			dot = true // relative segment resolves against the call cwd
+		}
+		if !filepath.IsAbs(dir) {
+			if cwd == "" {
+				continue
+			}
+			dir = filepath.Join(cwd, dir)
+		}
+		p := filepath.Join(dir, name)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0111 != 0 {
+			return p, dot, nil
+		}
+	}
+	return "", false, exec.ErrNotFound
 }
 
 // canonicalResolvedBase maps a symlink-resolved executable basename to the
@@ -1557,12 +2033,12 @@ func isVersionSuffix(s string) bool {
 // working because the target is allowed too (`sh -> dash` is a shell under
 // either name, `python3 -> python3.12` hits the python prefix match either
 // way), while an alias chosen to dodge a rule is caught on the target name.
-func headBaseAliasHits(headArgv []string) []string {
+func headBaseAliasHits(headArgv []string, pathEnv string) []string {
 	if len(headArgv) == 0 {
 		return nil
 	}
 	out := []string{filepath.Base(headArgv[0])}
-	if b := resolveHeadBase(headArgv[0]); b != "" && b != out[0] {
+	if b := resolveHeadBase(headArgv[0], pathEnv); b != "" && b != out[0] {
 		out = append(out, b)
 	}
 	return out
@@ -1572,11 +2048,11 @@ func headBaseAliasHits(headArgv []string) []string {
 // (already wrapper-peeled), or "" when allowed. headArgv starts at the head.
 // `git` heads also get the global exec-config screen: a sub-agent must not
 // arm a pager/ssh/hook command through `git -c`/`--config-env`/`--exec-path`.
-func screenNestedDispatch(headArgv []string) string {
+func screenNestedDispatch(headArgv []string, pathEnv string) string {
 	if len(headArgv) == 0 {
 		return ""
 	}
-	for _, base := range headBaseAliasHits(headArgv) {
+	for _, base := range headBaseAliasHits(headArgv, pathEnv) {
 		if isPureQueryInvocation(headArgv) && pureQueryOnlyHeads[base] {
 			continue // `dispatch-agent --version`: nothing is dispatched
 		}
@@ -1618,6 +2094,16 @@ func screenNestedDispatch(headArgv []string) string {
 type callerIdentity struct {
 	role     string // CTXMODE_ROLE as-is (trimmed)
 	readonly string // CTXMODE_READONLY raw value
+	// envTaint marks variables an outer envAs overrode (HOME=/x sh -c,
+	// env -i, env -u PWD). Nested shell payloads parsed under this
+	// caller degrade the PATH/HOME/abs-dir placeholder grants for these
+	// names (SH11 F3/Q5).
+	envTaint map[string]bool
+	// pathEnv is the EFFECTIVE PATH the nested child resolves against:
+	// the process PATH replayed through every envAs op seen so far. ""
+	// means "use the process PATH" — the same fallback lookPathIn
+	// already applies to an empty pathEnv argument (R7).
+	pathEnv string
 }
 
 // currentCallerIdentity reads the caller's role identity from the process
@@ -1626,7 +2112,31 @@ func currentCallerIdentity() callerIdentity {
 	return callerIdentity{
 		role:     strings.TrimSpace(os.Getenv(auditEnvRole)),
 		readonly: os.Getenv(auditEnvReadonly),
+		pathEnv:  os.Getenv("PATH"),
 	}
+}
+
+// seededWith returns a copy of the identity whose envTaint additionally
+// covers every name envAs overrode or cleared. Recursion into nested shell
+// payloads (-c scripts, eval text, env -S, flock -c, script -c, watch
+// operands, heredoc bodies, here-strings) uses it so inner placeholder
+// grants match the real env. The effective PATH is replayed too (R7): a
+// PATH=/x prefix must drive alias resolution inside the nested payload.
+func (c callerIdentity) seededWith(envAs envAssignments) callerIdentity {
+	c.pathEnv = envAs.effectivePATHFrom(c.pathEnv)
+	extra := envAs.taintedSentinelNames()
+	if len(extra) == 0 {
+		return c
+	}
+	merged := make(map[string]bool, len(c.envTaint)+len(extra))
+	for k, v := range c.envTaint {
+		merged[k] = v
+	}
+	for k := range extra {
+		merged[k] = true
+	}
+	c.envTaint = merged
+	return c
 }
 
 // wrapperWriteOpHit scans the leading wrapper chain of argv for options
@@ -1727,7 +2237,10 @@ func wrapperWriteOpHit(argv []string) string {
 			i++
 		case "env":
 			var payloads []string
-			i, payloads, envAs = skipEnvOperands(argv, i+1, envAs)
+			var rest []string
+			rest, payloads, envAs = skipEnvOperands(argv, i+1, envAs)
+			argv = rest
+			i = 0
 			_ = payloads // env -S payloads are screened by the caller chain
 		case "command":
 			if isCommandQuery(argv[i+1:]) {
@@ -1856,33 +2369,37 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return allowlistDetail(hit)
 		}
 	}
-	i, splitPayloads, envAs, exhausted := peelWrappers(argv)
+	head, splitPayloads, envAs, exhausted := peelWrappers(argv)
 	if exhausted {
 		return depthExceededHit // fail closed: wrapper chain never resolved
 	}
-	if hit := screenEnvAssignments(envAs, kind, caller.role, caller.readonly); hit != "" {
-		return hit
-	}
-	// env -S and script -c payloads were captured during peeling; screen
-	// each as shell text.
-	for _, payload := range splitPayloads {
-		if strings.HasPrefix(payload, envUnknownLongPrefix) {
-			return "env unknown option " + strings.TrimPrefix(payload, envUnknownLongPrefix)
-		}
-		if kind == 's' {
-			if hit := guardShellSubagentDepth(payload, depth+1, caller); hit != "" {
-				return hit
+	// env -S payloads were captured during peeling; they are screened even
+	// when the wrappers consumed the whole argv (env -S 'env pig').
+	screenPayloads := func() string {
+		for _, payload := range splitPayloads {
+			if strings.HasPrefix(payload, envUnknownLongPrefix) {
+				return "env unknown option " + strings.TrimPrefix(payload, envUnknownLongPrefix)
 			}
-		} else {
-			if hit := guardShellReadonlyDepth(payload, depth+1, caller); hit != "" {
-				return hit
+			if kind == 's' {
+				seeded := caller.seededWith(envAs)
+				if hit := guardShellSubagentDepthEnv(payload, depth+1, seeded, seeded.envTaint); hit != "" {
+					return hit
+				}
+			} else {
+				if hit := guardShellReadonlyDepth(payload, depth+1, caller); hit != "" {
+					return hit
+				}
 			}
 		}
-	}
-	if i >= len(argv) {
 		return ""
 	}
-	head := argv[i:]
+	if len(head) == 0 {
+		// Wrapper-only segment: still screen the env ops and payloads.
+		if hit := screenEnvAssignments(envAs, kind, caller.role, caller.readonly, ""); hit != "" {
+			return hit
+		}
+		return screenPayloads()
+	}
 	// A command head generated by a command substitution ($(...) / `...`)
 	// cannot be vetted statically: the placeholder the shell parser left in
 	// the head word means the executable name is dynamic — fail closed for
@@ -1899,7 +2416,11 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	// screen is keyed on the NAME: `mysh -c '…'` with mysh -> dash carries
 	// inline code exactly like `dash -c '…'`, and reading it as a bare
 	// script-file run would block a benign query (same for py3 -> python3.13).
-	if rb := resolveHeadBase(head[0]); rb != "" && rb != base {
+	// Q4/O3: resolution uses the segment's EFFECTIVE PATH (envAs replayed
+	// over the caller's own effective PATH — R7), so a shadowed or
+	// prepended directory resolves the same file the runtime would exec.
+	effPath := envAs.effectivePATHFrom(caller.pathEnv)
+	if rb := resolveHeadBase(head[0], effPath); rb != "" && rb != base {
 		// The resolved spelling is canonicalised first: a versioned or
 		// shim target (php8.3, npx-cli.js) must key the screens exactly
 		// like the canonical program name, or every branch written for
@@ -1908,6 +2429,18 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			head = append([]string{rb}, head[1:]...)
 			base = rb
 		}
+	}
+	if hit := screenEnvAssignments(envAs, kind, caller.role, caller.readonly, base); hit != "" {
+		return hit
+	}
+	// envAs overrides propagate into nested shell payloads as taint: an
+	// outer HOME=/x, env -i or env -u PATH must degrade the placeholder
+	// grants inside -c scripts / eval text / payloads (SH11 F3/Q5).
+	caller = caller.seededWith(envAs)
+	// env -S and script -c payloads were captured during peeling; screen
+	// each as shell text.
+	if hit := screenPayloads(); hit != "" {
+		return hit
 	}
 	// `command` followed by a pure query option run (-v/-V, -p allowed)
 	// is a read-only builtin query — peelWrappers kept `command` as the
@@ -1938,24 +2471,61 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	if hasDynamicInterpOption(head, base) {
 		return "dynamic code payload"
 	}
-	// export/readonly/declare/typeset/local: screen KEY=VAL args as env assignments
+	// export/readonly/declare/typeset/local: screen KEY=VAL args as env
+	// assignments, plus the identity-dropping option forms (export -n,
+	// declare/typeset/local +x) as envOp unset replays, plus -n nameref
+	// which aliases a variable's writes (SH11 MF-6/F10).
 	switch base {
 	case "export", "readonly", "declare", "typeset", "local":
 		if kind == 's' {
-			var envAs envAssignments
+			dropsExport, nameref := declFlagOps(base, head[1:])
+			if nameref {
+				// declare/typeset/local -n NAME=REF: writes through REF reach
+				// the target (CTXMODE_ROLE via `r=x`) but look like ordinary
+				// assignments — refuse the nameref outright for sub-agents.
+				return "env " + base + " -n"
+			}
+			var envAs2 envAssignments
 			for _, a := range head[1:] {
 				if isDynamicArg(a) && !isAssignWord(a) {
 					return "env dynamic export"
 				}
-				if isAssignWord(a) {
-					envAs.addAssign(a)
-				} else if strings.Contains(a, "=") {
-					envAs.addAssign(a)
+				if strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+") {
+					continue // option word (already classified above)
+				}
+				key := a
+				if eq := strings.IndexByte(a, '='); eq >= 0 {
+					key = a[:eq]
+				}
+				if dropsExport {
+					// export -n / declare +x / typeset +x strips the export
+					// attribute — the child loses the variable. Shedding a
+					// role-identity or execution-hook variable this way is
+					// the MF-6 bypass: refuse the name outright; benign
+					// variables still replay as unsets for env screening.
+					if guardTaintVars[key] || isEnvHookVar(key) {
+						return "env " + key
+					}
+					envAs2.ops = append(envAs2.ops, envOp{kind: 'u', key: key})
+					continue
+				}
+				if isAssignWord(a) || strings.Contains(a, "=") {
+					envAs2.addAssign(a)
 				}
 			}
-			if hit := screenEnvAssignments(envAs, kind, caller.role, caller.readonly); hit != "" {
+			if hit := screenEnvAssignments(envAs2, kind, caller.role, caller.readonly, base); hit != "" {
 				return hit
 			}
+		}
+	}
+	// SH11: read / getopts / printf -v write shell variables — writing a
+	// role-identity or execution-hook variable taints the process env for
+	// every later child (read CTXMODE_ROLE, getopts a: PATH, printf -v
+	// GIT_PAGER). Block writes to tainted/hook names; dynamic targets are
+	// unvettable. (Guarded roles only: 's' — 'r' never reaches these heads.)
+	if kind == 's' {
+		if hit := screenEnvWriteTargets(head, base); hit != "" {
+			return hit
 		}
 	}
 	if text, has := unwrapShellArgv(head); has {
@@ -1963,11 +2533,14 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return "dynamic code payload"
 		}
 		if kind == 's' {
+			// SH11 F3/Q5: outer env ops (env -i, HOME=/x, env -u PWD) apply
+			// to this child shell — degrade matching placeholder grants.
+			inner := caller.seededWith(envAs)
 			switch base {
 			case "bash", "zsh", "ksh", "mksh":
-				return guardShellSubagentDepthBash(text, depth+1, caller)
+				return guardShellSubagentDepthBash(text, depth+1, inner)
 			}
-			return guardShellSubagentDepth(text, depth+1, caller)
+			return guardShellSubagentDepth(text, depth+1, inner)
 		}
 		return guardShellReadonlyDepth(text, depth+1, caller)
 	}
@@ -1981,7 +2554,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 				return allowlistDetail("python interpreter")
 			}
 			if modArgv := pythonModuleArgvFrom(head); len(modArgv) > 0 {
-				if hit := screenNestedDispatch(modArgv); hit != "" {
+				if hit := screenNestedDispatch(modArgv, effPath); hit != "" {
 					return hit
 				}
 			}
@@ -2022,14 +2595,14 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return "dynamic code payload"
 		}
 		if kind == 's' {
-			return guardShellSubagentDepth(text, depth+1, caller)
+			return guardShellSubagentDepth(text, depth+1, caller.seededWith(envAs))
 		}
 		return guardShellReadonlyDepth(text, depth+1, caller)
 	}
 	// xargs: peel xargs options, then screen the target command argv.
 	if base == "xargs" {
 		if k := xargsTargetIndex(head); k >= 0 && k < len(head) {
-			return peelResolvedDepth(head[k:], kind, depth+1, caller)
+			return peelResolvedDepth(head[k:], kind, depth+1, caller.seededWith(envAs))
 		}
 		return "" // `xargs` with no command runs echo: read-only
 	}
@@ -2042,7 +2615,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			}
 			return screenFindArgs(head[1:], kind, depth+1, caller)
 		}
-		return screenFindArgs(head[1:], kind, depth+1, caller)
+		return screenFindArgs(head[1:], kind, depth+1, caller.seededWith(envAs))
 	}
 	// trap: a non-print action argument is shell text to screen.
 	if base == "trap" {
@@ -2061,14 +2634,14 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return "" // `watch` with no command does nothing
 		}
 		if execMode {
-			return peelResolvedDepth(head[k:], kind, depth+1, caller)
+			return peelResolvedDepth(head[k:], kind, depth+1, caller.seededWith(envAs))
 		}
 		text := strings.Join(head[k:], " ")
 		if isDynamicArg(text) {
 			return "dynamic code payload"
 		}
 		if kind == 's' {
-			return guardShellSubagentDepth(text, depth+1, caller)
+			return guardShellSubagentDepth(text, depth+1, caller.seededWith(envAs))
 		}
 		return guardShellReadonlyDepth(text, depth+1, caller)
 	}
@@ -2084,10 +2657,10 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			if isDynamicArg(cmdText) {
 				return "dynamic code payload"
 			}
-			return guardShellSubagentDepth(cmdText, depth+1, caller)
+			return guardShellSubagentDepth(cmdText, depth+1, caller.seededWith(envAs))
 		}
 		if inner < len(head) {
-			return peelResolvedDepth(head[inner:], kind, depth+1, caller)
+			return peelResolvedDepth(head[inner:], kind, depth+1, caller.seededWith(envAs))
 		}
 		return ""
 	}
@@ -2102,7 +2675,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			if isDynamicArg(payload) {
 				return "dynamic code payload"
 			}
-			return guardShellSubagentDepth(payload, depth+1, caller)
+			return guardShellSubagentDepth(payload, depth+1, caller.seededWith(envAs))
 		}
 		return ""
 	}
@@ -2139,13 +2712,13 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	// The plain head check, under the typed spelling and the resolved target
 	// alike (headBaseAliasHits walks both inside each screen).
 	if kind == 's' {
-		return screenNestedDispatch(typedHead)
+		return screenNestedDispatch(typedHead, effPath)
 	}
 	// Primary: default-deny allowlist. Secondary: legacy blacklist.
 	if hit := screenReadonlyAllowlist(typedHead); hit != "" {
 		return allowlistDetail(hit)
 	}
-	return screenReadonlyWrite(typedHead)
+	return screenReadonlyWritePath(typedHead, effPath)
 }
 
 // screenSSHHead applies the ssh model to one resolved ssh argv (head[0] is
@@ -2188,7 +2761,21 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 	// stream to the remote side; when the remote command's head reads its
 	// PROGRAM from that stream the body text is remote code and gets the
 	// caller's own screen with the correct interpreter lang (SF-2).
+	if stdinIsProg && seg.stdinRedir {
+		// `ssh host sh < localfile` runs an unvetted LOCAL FILE as the
+		// remote program — fail closed (M3/F7: a remote stdin vehicle
+		// must not have an input redirect).
+		if kind == 'r' || callerReadonlyRole(caller) {
+			return roSSHWriteHit
+		}
+		return "file stdin to ssh stdin-program"
+	}
 	if stdinIsProg {
+		if len(langs) > 1 && (seg.hereString != "" || len(seg.heredocText) > 0) {
+			// SF-2: POSIX consumes the single stdin stream once — two remote
+			// stages reading programs from it cannot both be vetted.
+			return "ssh multi-stage stdin program"
+		}
 		screenBody := func(body string) string {
 			if isDynamicArg(body) {
 				return "dynamic code payload"
@@ -2234,26 +2821,72 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 	// keep ("sub-agent first, then strict read-only"): under kind 's' the
 	// nested-dispatch screen gets first look, and the strict read-only
 	// screen only sees a remote command the sub-agent screen let through.
+	// R7: the REMOTE side runs under the remote shell's own environment —
+	// the caller's seeded taint and effective PATH are local facts, so the
+	// remote parse starts clean (its own env ops still seed inside).
+	remoteCaller := caller
+	remoteCaller.envTaint = nil
+	remoteCaller.pathEnv = ""
 	if kind == 's' {
-		if h := guardShellSubagentDepth(remoteCmd, depth+1, caller); h != "" {
+		if h := guardShellSubagentDepthEnv(remoteCmd, depth+1, remoteCaller, nil); h != "" {
 			return h
 		}
 		if callerReadonlyRole(caller) && !stdinIsProg {
-			if h := guardShellReadonlyDepth(remoteCmd, depth+1, caller); h != "" {
+			if h := guardShellReadonlyDepth(remoteCmd, depth+1, remoteCaller); h != "" {
 				return roSSHWriteHit
 			}
 		}
 		return ""
 	}
-	// Strict readonly: when the remote head reads PROGRAM from stdin, the
-	// heredoc/here-string bodies were already screened above with the right
-	// lang. Do not allowlist-reject the bare `sh`/`python3 -` vehicle.
-	if !stdinIsProg {
-		if h := guardShellReadonlyDepth(remoteCmd, depth+1, caller); h != "" {
+	// Strict readonly: the remote command is ALWAYS screened. The single
+	// exemption is a local static stdin payload (single-quoted heredoc or
+	// here-string — already screened above) feeding a remote command that
+	// is EXACTLY one pure stdin-program vehicle (SH11 MF-1): a bare `sh`,
+	// `python3 -`, etc. with no other segments, no redirects, no wrapper
+	// write-ops and no env prefixes. Everything else — a bare remote `sh`
+	// with no payload, multi-segment piggybacks like `rm -rf /x; sh`, or a
+	// vehicle with its own write redirect — gets the full remote readonly
+	// screen.
+	vehicleOnly := stdinIsProg &&
+		(seg.hereString != "" || len(seg.heredocText) > 0) &&
+		isPureRemoteStdinVehicle(remoteCmd)
+	if !vehicleOnly {
+		if h := guardShellReadonlyDepth(remoteCmd, depth+1, remoteCaller); h != "" {
 			return roSSHWriteHit
 		}
 	}
 	return ""
+}
+
+// isPureRemoteStdinVehicle reports whether remoteCmd parses (under the
+// strict readonly grammar) into EXACTLY ONE command whose head reads its
+// program from stdin (a bare `sh`, `python3 -`, `node -`…): no other
+// segments, no output redirect, no write-capable wrapper ops, no env
+// prefixes — anything else can carry an unaudited side effect and is not
+// pure. Input redirections and background/& are rejected by the readonly
+// grammar itself (SH11 MF-1/F7).
+func isPureRemoteStdinVehicle(remoteCmd string) bool {
+	roSegs, hit := parseReadonlyShellSegments(remoteCmd)
+	if hit != "" || len(roSegs) != 1 {
+		return false
+	}
+	s := roSegs[0]
+	if s.pipedStdin || s.redirectFile != "" || len(s.heredocText) > 0 || len(s.argv) == 0 {
+		return false
+	}
+	if wrapperWriteOpHit(s.argv) != "" {
+		return false
+	}
+	// Any env op (KEY=VAL prefix or env -i/-u/assign) mutates the remote
+	// vehicle's environment — not pure. `env FOO=1 sh` would otherwise
+	// smuggle an unscreened override through the exemption (R7).
+	if _, _, envAs, _ := peelWrappers(s.argv); len(envAs.ops) > 0 {
+		return false
+	}
+	// The head must be EXACTLY a bare stdin-program interpreter: no
+	// wrappers that could smuggle side effects past the head model.
+	_, isProg := stdinProgramHead(s.argv)
+	return isProg
 }
 
 // remoteReadsProgramFromStdin reports whether the remote command string
@@ -2272,7 +2905,8 @@ func remoteStdinProgramLangs(remoteCmd string) (langs []string, readsProg bool) 
 		if seg.depthExceeded || seg.parseErr != "" {
 			return []string{""}, true
 		}
-		if len(seg.argv) == 0 || seg.pipedStdin || len(seg.heredocText) > 0 || seg.hereString != "" {
+		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || seg.backgrounded ||
+			len(seg.heredocText) > 0 || seg.hereString != "" {
 			continue
 		}
 		if lang, isProg := stdinProgramHead(seg.argv); isProg {
@@ -2422,7 +3056,36 @@ func parseSSHInvocation(head []string) (remoteCmd, hit string) {
 	for i < len(head) {
 		a := head[i]
 		if isDynamicArg(a) {
-			return "", "dynamic code payload"
+			// SH11 MF-2/Q1-C: a dynamic word may pass only where it cannot
+			// become an option or inject extra words: no unquoted
+			// placeholder (it field-splits), no word-start dq/abs-dq
+			// placeholder only when options are still live (it may begin
+			// with '-'). Words that survive here are joined into the remote
+			// command text and screened remotely — an unsafe one still
+			// fails there. Absolute paths and literal-tail dq words pass.
+			if strings.Contains(a, cmdSubPlaceholder) || strings.Contains(a, cmdSubPlaceholderGlob) {
+				return "", "dynamic code payload"
+			}
+			optionCapable := strings.HasPrefix(a, cmdSubPlaceholderQuoted)
+			if !endOpts && !sawDest {
+				// Option zone / destination slot: a word that may start
+				// with '-' changes the local parse — refuse it; other
+				// split-safe words serve as <destination>.
+				if optionCapable {
+					return "", "dynamic code payload"
+				}
+				sawDest = true
+				i++
+				continue
+			}
+			if !endOpts && optionCapable {
+				// After <destination> without `--`, OpenSSH keeps parsing
+				// options until the second non-option word — a possible '-'
+				// word stays an option locally.
+				return "", "dynamic code payload"
+			}
+			i++
+			continue
 		}
 		if !endOpts && a == "--" {
 			endOpts = true
@@ -2501,12 +3164,11 @@ func parseSSHInvocation(head []string) (remoteCmd, hit string) {
 		}
 		// Second non-option operand: everything from here is the remote
 		// command OpenSSH joins and hands to the login shell.
-		for _, w := range head[i:] {
-			if isDynamicArg(w) {
-				return "", "dynamic code payload"
-			}
-		}
 		remote := strings.Join(head[i:], " ")
+		if strings.Contains(remote, cmdSubPlaceholder) || strings.Contains(remote, cmdSubPlaceholderQuoted) ||
+			strings.Contains(remote, cmdSubPlaceholderGlob) || strings.Contains(remote, cmdSubPlaceholderAbsDq) {
+			return "", "dynamic code payload"
+		}
 		if strings.Trim(remote, " \t\r\n") == "" {
 			return "", "ssh"
 		}
@@ -2556,31 +3218,352 @@ func scriptCommandArg(head []string) string {
 	return ""
 }
 
-// pathPrependsNonSystem reports PATH values that put a non-system directory
-// ahead of the search (TASK S4). Empty / system-only paths are allowed.
-func pathPrependsNonSystem(val string) bool {
+// toolchainRelPathHeads are the resolved command heads for which a RELATIVE
+// PATH segment (node_modules/.bin, .venv/bin, venv/bin) is tolerated: they
+// are toolchain executables living inside such directories. Controlled
+// commands (git, sh, find, tar, awk, env, the guards' own tables) keep the
+// absolute-only PATH rule so a repo's node_modules/.bin/git cannot shadow
+// the screened binary (SH11 Q4).
+var toolchainRelPathHeads = map[string]bool{
+	"tsc": true, "tsx": true, "ts-node": true, "eslint": true,
+	"jest": true, "vitest": true, "mocha": true, "ava": true,
+	"babel": true, "webpack": true, "vite": true, "rollup": true,
+	"esbuild": true, "turbo": true, "nx": true, "lerna": true,
+	"node": true, "nodejs": true, "npx": true, "npm": true,
+	"pnpm": true, "yarn": true, "bun": true, "bunx": true,
+	"deno": true, "corepack": true,
+	"python": true, "python2": true, "python3": true, "pip": true,
+	"pip3": true, "pipx": true, "pytest": true, "uv": true, "poetry": true,
+	"rye": true, "virtualenv": true, "mypy": true, "ruff": true,
+	"black": true, "flake8": true, "pylint": true, "prettier": true,
+}
+
+// pathIsUnsafeForSubagent reports whether a PATH= value may inject a
+// hostile executable ahead of (or instead of) the real one. Every segment
+// is checked (no early exit): empty segments mean ".", relative segments
+// are only the vetted toolchain directories and only when the command head
+// is itself a toolchain executable, and every absolute segment must be a
+// known system or toolchain directory. A $PATH/${PATH} expansion appears
+// as the unforgeable envPathSelfPlaceholder; every other dynamic or
+// literal-$ segment rejects (SH11 MF-5.1, Q4).
+func pathIsUnsafeForSubagent(val, headBase string) bool {
 	if val == "" {
-		return false
+		return true // empty PATH ≡ "."
 	}
-	system := map[string]bool{
-		"/usr/bin": true, "/bin": true, "/usr/sbin": true, "/sbin": true,
-		"/usr/local/bin": true, "/usr/local/sbin": true,
-	}
+	relOK := toolchainRelPathHeads[headBase] || isToolchainVersionVariant(headBase)
 	for _, p := range strings.Split(val, ":") {
 		if p == "" {
-			continue
+			return true // leading/trailing/inner empty segment is "."
 		}
-		if p == "$PATH" || p == "${PATH}" {
-			return false // appending/referencing old PATH without prepend content
+		if p == envPathSelfPlaceholder {
+			continue // genuine $PATH reference (unforgeable sentinel)
 		}
-		if !system[p] {
+		// Anything else carrying a placeholder or a literal '$' is an
+		// unvetted expansion: a single-quoted '$PATH' segment would search
+		// the relative directory ./$PATH.
+		if isDynamicArg(p) || strings.Contains(p, "$") || strings.ContainsRune(p, '\x00') {
 			return true
 		}
-		// first real entry was system — still scan? TASK: 往前插了非系统目录
-		// Once we see a system dir first, later non-system is a append — allow.
-		return false
+		if !strings.HasPrefix(p, "/") {
+			if relOK {
+				switch p {
+				case "node_modules/.bin", "./node_modules/.bin",
+					".venv/bin", "./.venv/bin", "venv/bin", "./venv/bin":
+					continue
+				}
+			}
+			return true
+		}
+		norm := filepath.Clean(p)
+		if !isSafePathDirEntry(norm) {
+			return true
+		}
 	}
 	return false
+}
+
+// isToolchainVersionVariant reports whether headBase is a VERSIONED spelling
+// of a toolchain interpreter (python3.12, python3, python2.7, node20, pypy3):
+// the PATH relative-segment rule keys on the canonical name, so a resolved
+// /usr/bin/python3 -> python3.12 alias must not lose its toolchain status.
+func isToolchainVersionVariant(b string) bool {
+	for _, stem := range []string{"python", "node", "pypy", "ruby", "perl", "php"} {
+		if rest, ok := strings.CutPrefix(b, stem); ok && rest != "" && isVersionSuffix(rest) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSafePathDirEntry reports whether a canonicalised absolute PATH segment
+// is a trusted system or development-toolchain directory. /tmp, /var/tmp,
+// /dev/shm and /run are never trusted (writable by definition).
+func isSafePathDirEntry(norm string) bool {
+	for _, bad := range []string{"/tmp", "/var/tmp", "/dev/shm", "/run"} {
+		if norm == bad || strings.HasPrefix(norm, bad+"/") {
+			return false
+		}
+	}
+	// Relative-after-clean or .. traversal can never be trusted.
+	if !filepath.IsAbs(norm) {
+		return false
+	}
+	switch norm {
+	case "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+		"/usr/local/bin", "/usr/local/sbin",
+		"/usr/games", "/usr/local/games", "/snap/bin":
+		return true
+	}
+	for _, sysPref := range []string{
+		"/usr/local/", "/usr/lib/", "/usr/libexec/", "/opt/",
+		"/nix/store/", "/home/linuxbrew/", "/snap/",
+	} {
+		if strings.HasPrefix(norm, sysPref) {
+			return true
+		}
+	}
+	// Known dev-toolchain / package-manager PREFIX dirs: anything under
+	// the manager root is trusted (installs/<tool>/<ver>/bin, shims, ...).
+	for _, toolPref := range []string{
+		"/.local/share/mise/", "/.local/share/fnm/", "/.local/share/nvim/",
+		"/.local/share/uv/", "/.mise/", "/.asdf/", "/.nvm/", "/.fnm/",
+		"/.volta/", "/.rustup/", "/.pyenv/", "/.sdkman/",
+		"/node_modules/.bin/",
+	} {
+		if strings.Contains(norm, toolPref) ||
+			strings.HasSuffix(norm, strings.TrimSuffix(toolPref, "/")) {
+			return true
+		}
+	}
+	// Exact toolchain dir spellings (mise/pnpm roots' own bin, shims,
+	// tool-specific bin dirs): exact match or a real component below it.
+	for _, toolSub := range []string{
+		"/.local/share/mise/shims", "/.local/share/pnpm",
+		"/.local/bin", "/.cargo/bin", "/go/bin", "/.go/bin",
+		"/.pyenv/shims", "/.pyenv/bin", "/.poetry/bin", "/.rye/shims",
+		"/.bun/bin", "/.deno/bin", "/.npm-global/bin", "/.yarn/bin",
+		"/node_modules/.bin", "/.venv/bin", "/venv/bin",
+	} {
+		if strings.HasSuffix(norm, toolSub) || strings.Contains(norm, toolSub+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// isSafeIFSValue reports whether an IFS= value is a benign field-split
+// alphabet: empty (the `IFS= read -r` idiom) or runs of whitespace plus
+// ':' ','  — the separators of the PATH/CSV world. Anything that could
+// resplit command tokens (letters, digits, '/', '-', '.', '_', ';', '|',
+// '=') is unsafe (SH11 MF-5/S2).
+func isSafeIFSValue(val string) bool {
+	for i := 0; i < len(val); i++ {
+		switch val[i] {
+		case ' ', '\t', '\n', '\r', ':', ',':
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// effectivePATH replays the env ops over the process PATH; see
+// effectivePATHFrom.
+func (e envAssignments) effectivePATH() string {
+	return e.effectivePATHFrom(os.Getenv("PATH"))
+}
+
+// effectivePATHFrom replays the env ops over base PATH and returns the
+// PATH a spawned command would resolve against: 'c' (env -i) drops to "",
+// 'u' unsets, 'a' re-assigns. A $PATH self-reference inside an assigned
+// value expands to the PATH in force BEFORE that op (the accumulator),
+// matching runtime scoping — nested replays therefore accumulate instead
+// of re-reading the process PATH (R7). An unset/empty result is returned
+// verbatim so lookup treats it as ".".
+func (e envAssignments) effectivePATHFrom(base string) string {
+	path := base
+	for _, op := range e.ops {
+		switch op.kind {
+		case 'c':
+			path = ""
+		case 'u':
+			if op.key == "PATH" {
+				path = ""
+			}
+		case 'a':
+			if op.key == "PATH" {
+				path = expandPathSelfRefs(op.value, path)
+			}
+		}
+	}
+	return path
+}
+
+// expandPathSelfRefs substitutes the unforgeable $PATH sentinel with base
+// (the PATH in force at assignment time) so alias resolution sees the same
+// search list the runtime would (a sentinel value never reaches here
+// unexpanded: it only exists in PATH= values the guard already admitted).
+func expandPathSelfRefs(val, base string) string {
+	return strings.ReplaceAll(val, envPathSelfPlaceholder, base)
+}
+
+// taintedSentinelNames returns the names whose expansion semantics this
+// env op list invalidated: every sentinelTrustVars name touched by an
+// assign/unset/clear op (Q5/F3: HOME= overrides and env -i/-u degrade
+// $HOME/$PWD/... placeholder grants inside nested payloads).
+func (e envAssignments) taintedSentinelNames() map[string]bool {
+	var out map[string]bool
+	for _, op := range e.ops {
+		switch op.kind {
+		case 'c':
+			if out == nil {
+				out = map[string]bool{}
+			}
+			for name := range sentinelTrustVars {
+				out[name] = true
+			}
+		case 'u', 'a':
+			if sentinelTrustVars[op.key] {
+				if out == nil {
+					out = map[string]bool{}
+				}
+				out[op.key] = true
+			}
+		}
+	}
+	return out
+}
+
+// declFlagOps classifies the option words of an
+// export/readonly/declare/typeset/local argv: dropsExport reports an
+// `export -n` short-cluster (or a `declare`/`typeset`/`local` +x
+// cluster) — both remove the export attribute so the child loses the
+// variable; nameref reports a -n cluster on declare/typeset/local (bash
+// nameref: writes through the ref reach the target).
+func declFlagOps(base string, args []string) (dropsExport, nameref bool) {
+	for _, a := range args {
+		if a == "--" {
+			break
+		}
+		if len(a) < 2 || (a[0] != '-' && a[0] != '+') || strings.HasPrefix(a, "--") {
+			continue
+		}
+		for _, ch := range a[1:] {
+			switch {
+			case base == "export" && a[0] == '-' && ch == 'n':
+				dropsExport = true
+			case (base == "declare" || base == "typeset" || base == "local") && a[0] == '+' && ch == 'x':
+				dropsExport = true
+			case (base == "declare" || base == "typeset" || base == "local") && a[0] == '-' && ch == 'n':
+				nameref = true
+			}
+		}
+	}
+	return dropsExport, nameref
+}
+
+// screenEnvWriteTargets rejects read/getopts/printf -v invocations whose
+// WRITE TARGETS name a role-identity or execution-hook variable, and any
+// dynamic (unvettable) target name (SH11 MF-4 tail). getopts implicitly
+// writes OPTARG/OPTIND — hook names are impossible there, so only an
+// explicit dynamic target matters; printf -v takes the name as its operand.
+func screenEnvWriteTargets(head []string, base string) string {
+	tainted := func(name string) string {
+		if isDynamicArg(name) {
+			return "env dynamic " + base
+		}
+		if guardTaintVars[name] || isEnvHookVar(name) {
+			return "env " + name
+		}
+		return ""
+	}
+	switch base {
+	case "read":
+		sawDashDash := false
+		j := 1
+		for j < len(head) {
+			a := head[j]
+			if a == "--" && !sawDashDash {
+				sawDashDash = true
+				j++
+				continue
+			}
+			if !sawDashDash && strings.HasPrefix(a, "-") && len(a) > 1 {
+				// Option cluster: value letters d n N p t u a consume a
+				// value (the cluster tail, or the next argv when last); every
+				// other letter (r s e i) is a boolean. R13: -s is silent echo,
+				// NOT a value option — `read -s x` still writes x.
+				for k := 1; k < len(a); k++ {
+					switch a[k] {
+					case 'a':
+						// -a ARRAY is itself a write target.
+						var arr string
+						if k+1 < len(a) {
+							arr = a[k+1:]
+						} else if j+1 < len(head) {
+							arr = head[j+1]
+							j++
+						}
+						if hit := tainted(arr); hit != "" {
+							return hit
+						}
+						k = len(a)
+					case 'd', 'n', 'N', 'p', 't', 'u':
+						if k+1 >= len(a) && j+1 < len(head) {
+							j++ // separate value operand
+						}
+						k = len(a)
+					}
+				}
+				j++
+				continue
+			}
+			if a == "" {
+				j++
+				continue
+			}
+			if hit := tainted(a); hit != "" {
+				return hit
+			}
+			j++
+		}
+	case "getopts":
+		// getopts OPTSTRING NAME [args...]: the second operand is the target
+		// (the optstring itself may begin with ':' or '-').
+		opIdx := 0
+		for j := 1; j < len(head); j++ {
+			a := head[j]
+			if a == "--" {
+				if j+1 < len(head) {
+					opIdx = j + 1
+				}
+				break
+			}
+			opIdx = j
+			break
+		}
+		if opIdx > 0 && opIdx+1 < len(head) {
+			if hit := tainted(head[opIdx+1]); hit != "" {
+				return hit
+			}
+		}
+	case "printf":
+		for j := 1; j+1 < len(head); j++ {
+			if head[j] == "-v" {
+				return tainted(head[j+1])
+			}
+			if !strings.HasPrefix(head[j], "-") {
+				break
+			}
+		}
+	}
+	return ""
+}
+
+// envTruthy reports whether a CTXMODE_READONLY value counts as set.
+func envTruthy(v string) bool {
+	v = strings.ToLower(strings.TrimSpace(v))
+	return v == "1" || v == "true"
 }
 
 // screenEnvAssignments replays the ordered env ops and screens each
@@ -2595,9 +3578,12 @@ func pathPrependsNonSystem(val string) bool {
 // check fires even when the command argv itself is benign, because the
 // child process would otherwise run unguarded.
 //
+// headBase is the resolved command head basename: relative PATH segments
+// are tolerated only for toolchain heads (Q4).
+//
 // Detail strings name only the variable (never the value): env values can
 // carry secrets and the detail goes into the audit record verbatim.
-func screenEnvAssignments(envAs envAssignments, kind byte, callerRole, callerReadonly string) string {
+func screenEnvAssignments(envAs envAssignments, kind byte, callerRole, callerReadonly, headBase string) string {
 	effRole := callerRole
 	effReadonly := callerReadonly
 	callerSub := callerRole != "" || envTruthy(callerReadonly)
@@ -2620,7 +3606,7 @@ func screenEnvAssignments(envAs envAssignments, kind byte, callerRole, callerRea
 			// (CTXMODE_ROLE / CTXMODE_READONLY) only update eff* above; the
 			// final identity check decides (allows readonly-clear → fall to
 			// command head, blocks role clear/downgrade).
-			if envHookVars[op.key] {
+			if isEnvHookVar(op.key) {
 				return "env " + op.key
 			}
 		case 'a':
@@ -2633,21 +3619,44 @@ func screenEnvAssignments(envAs envAssignments, kind byte, callerRole, callerRea
 			case auditEnvReadonly:
 				effReadonly = op.value
 			}
-			if envHookVars[op.key] {
-				if pagerSafeVars[op.key] && (op.value == "" || op.value == "cat") {
-					continue
+			if pagerSafeVars[op.key] && (op.value == "" || op.value == "cat") {
+				continue
+			}
+			// PATH: per-segment trust check — system/toolchain dirs and a
+			// genuine $PATH self-reference pass; empty, relative, tmp, and
+			// unvetted dynamic segments reject (MF-5.1).
+			if op.key == "PATH" {
+				if pathIsUnsafeForSubagent(op.value, headBase) {
+					return "env PATH"
 				}
-				// Hook var: any dynamic value is rejected; PATH also rejects
-				// static prepend of non-system dirs (TASK S4).
+				continue
+			}
+			// IFS: the split alphabet must stay benign — the `IFS= read -r`
+			// and `IFS=:` idioms pass, letters/slashes/=/; reject (S2).
+			if op.key == "IFS" {
+				if isDynamicArg(op.value) || !isSafeIFSValue(op.value) {
+					return "env IFS"
+				}
+				continue
+			}
+			// GIT_DIR-family: read-only roles may never redirect the repo;
+			// workers may point it at a static or split-safe path, matching
+			// the git --git-dir="$d" model.
+			if gitDirEnvVars[op.key] {
+				if kind == 'r' || callerReadonlyRole(callerIdentity{role: callerRole, readonly: callerReadonly}) {
+					return "env " + op.key
+				}
+				if isDynamicArg(op.value) && !isSplitSafeDynamicWord(op.value) {
+					return "env " + op.key
+				}
+				continue
+			}
+			if isEnvHookVar(op.key) {
+				// Remaining hook vars: any dynamic value is rejected outright.
 				if isDynamicArg(op.value) {
 					return "env " + op.key
 				}
-				if op.key == "PATH" && pathPrependsNonSystem(op.value) {
-					return "env PATH"
-				}
-				if op.key != "PATH" {
-					return "env " + op.key
-				}
+				return "env " + op.key
 			}
 			// Taint vars: identity simulation only (no early return).
 		}
@@ -2662,12 +3671,6 @@ func screenEnvAssignments(envAs envAssignments, kind byte, callerRole, callerRea
 		return "env " + auditEnvReadonly
 	}
 	return ""
-}
-
-// envTruthy reports whether a CTXMODE_READONLY value counts as set.
-func envTruthy(v string) bool {
-	v = strings.ToLower(strings.TrimSpace(v))
-	return v == "1" || v == "true"
 }
 
 // callerReadonlyRole reports whether the caller identity counts as a
@@ -2726,7 +3729,10 @@ func isLikelyTrapSignal(s string) bool {
 }
 
 // screenUnsetArgs blocks `unset CTXMODE_ROLE`/`CTXMODE_READONLY` for
-// sub-agent callers; strict read-only leaves other unsets free.
+// sub-agent callers, and any unset of an execution-hook or sentinel-trust
+// variable (unset GIT_PAGER, unset HOME would both re-arm a later child or
+// invalidate placeholder semantics). Strict read-only leaves other unsets
+// free.
 func screenUnsetArgs(args []string, kind byte) string {
 	if kind != 's' {
 		return ""
@@ -2738,7 +3744,7 @@ func screenUnsetArgs(args []string, kind byte) string {
 		if isDynamicArg(a) {
 			return "unset dynamic"
 		}
-		if guardTaintVars[a] {
+		if guardTaintVars[a] || isEnvHookVar(a) || sentinelTrustVars[a] {
 			return "unset " + a
 		}
 	}
@@ -2783,11 +3789,13 @@ func xargsTargetIndex(argv []string) int {
 		if strings.HasPrefix(a, "-") && len(a) > 1 {
 			// Short-option cluster: value-carrying letters take the rest of
 			// the cluster or the next arg; bare clusters (-0, -r, -t, -p, -x)
-			// consume one slot.
+			// consume one slot. R13: -i is the deprecated -I spelling — it
+			// takes only a GLUED optional repl-str (-iSTR), never a separate
+			// argv, so like -e it ends the cluster and consumes nothing.
 			consumedNext := false
 			for j := 1; j < len(a); j++ {
-				if a[j] == 'e' {
-					break // -e takes only a glued optional eof-str: the rest of
+				if a[j] == 'e' || a[j] == 'i' {
+					break // -e/-i take only a glued optional operand: the rest of
 					// the cluster is its operand, never the next argv slot.
 				}
 				if shortWithValue[a[j]] {
@@ -2808,7 +3816,12 @@ func xargsTargetIndex(argv []string) int {
 
 // screenFindArgs scans find's operand list: -exec/-execdir/-ok/-okdir inner
 // commands recurse into the argv guards; -delete/-fprint/-fprint0/-fprintf/
-// -fls block under strict read-only.
+// -fls block under strict read-only. Dynamic words in the PATH ZONE (before
+// the first predicate) are only tolerated as split-safe path operands whose
+// runtime value cannot become a predicate: an absolute literal, an
+// abs-dq placeholder or a word containing '/' — a bare word-start
+// __ctx_dq_sub__ can expand to `-exec`/`-delete` and is refused on BOTH
+// guards (SH11 MF-2.3/Q2).
 func screenFindArgs(args []string, kind byte, depth int, caller callerIdentity) string {
 	expectValue := false
 	pathDone := false
@@ -2824,13 +3837,6 @@ func screenFindArgs(args []string, kind byte, depth int, caller callerIdentity) 
 		"-cnewer": true, "-newerat": true, "-newerct": true, "-regextype": true,
 		"-D": true,
 	}
-	hasExecTerm := false
-	for _, x := range args {
-		if x == ";" || x == "+" {
-			hasExecTerm = true
-			break
-		}
-	}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if expectValue {
@@ -2842,15 +3848,13 @@ func screenFindArgs(args []string, kind byte, depth int, caller callerIdentity) 
 		}
 		if isDynamicArg(a) {
 			if !pathDone {
-				// Path zone: unquoted dyn always reject (TASK split). Quoted dyn
-				// with "/" is path-like; pure "$d" only if no -exec terminators
-				// (otherwise it may expand to -exec).
-				if isSplitSafeDynamicWord(a) && !strings.HasPrefix(a, "-") {
-					if strings.Contains(a, "/") || !hasExecTerm {
-						continue
-					}
+				// Path zone: a dynamic starting path must be a split-safe
+				// operand that cannot turn into a predicate — absolute
+				// literal, guaranteed-absolute placeholder, or containing
+				// '/' after a safe glob start ("$d/src", /tmp/tmp.*).
+				if isSafeDynamicDataOperand(a) {
+					continue
 				}
-				return "find dynamic predicate"
 			}
 			return "find dynamic predicate"
 		}
@@ -2941,7 +3945,7 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 	// REMOTE command reads its program from stdin is left for the ssh
 	// model (screenSSHHead) — it returns the remote-aware roSSHWriteHit /
 	// "piped stdin to ssh" verdict.
-	if seg.pipedStdin && !sshTunnelsStdinProgram(seg.argv) {
+	if seg.pipedStdin && !seg.stdinRedir && !sshTunnelsStdinProgram(seg.argv) {
 		if lang, isProg := stdinProgramHead(seg.argv); isProg {
 			if lang == "" {
 				return "piped code to shell"
@@ -2951,12 +3955,18 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 	}
 	// A `<<<` here-string is this command's stdin: when the head reads its
 	// PROGRAM from stdin (`bash <<< 'pig'`, `python3 <<< 'import …'`) the
-	// payload is program text and gets the code screen; for any other head
-	// (`cat <<< 'pig'`) it is plain data.
-	if seg.hereString != "" && headReadsStdinProgram(seg.argv) {
-		lang, _ := stdinProgramHead(seg.argv)
-		if hit := screenStdinProgram(seg.hereString, lang, kind, depth, caller); hit != "" {
-			return hit
+	// payload is program text and gets the code screen — under the same
+	// env context the peeled argv carries (R7); for any other head
+	// (`cat <<< 'pig'`) it is plain data. A later fd0 file redirect
+	// (stdinRedir) means the here-string never reaches the program.
+	if seg.hereString != "" && !seg.stdinRedir {
+		head, _, envAs, _ := peelWrappers(seg.argv)
+		if len(head) > 0 {
+			if lang, isProg := stdinProgramHead(head); isProg {
+				if hit := screenStdinProgram(seg.hereString, lang, kind, depth, caller.seededWith(envAs)); hit != "" {
+					return hit
+				}
+			}
 		}
 	}
 	return peelResolvedSegDepth(seg.argv, seg, kind, depth, caller)
@@ -2964,21 +3974,26 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 
 // screenSegmentHeredocsDepth screens heredoc bodies that feed a shell/interpreter
 // stdin-program head. Nested CmdSubst in unquoted heredocs are already emitted
-// as sibling segments by parseSubagentShellAST.
+// as sibling segments by parseSubagentShellAST. The caller is seeded with the
+// peeled env ops first (R7): `env -u PWD sh <<EOF` degrades PWD grants inside
+// the body exactly like a -c payload would.
 func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller callerIdentity) string {
 	if len(seg.heredocText) == 0 {
 		return ""
 	}
 	lang, isProg := "", false
+	var envAs envAssignments
 	{
-		i, _, _, _ := peelWrappers(seg.argv)
-		if i < len(seg.argv) {
-			lang, isProg = stdinProgramHead(seg.argv[i:])
+		head, _, ea, _ := peelWrappers(seg.argv)
+		envAs = ea
+		if len(head) > 0 && !seg.stdinRedir {
+			lang, isProg = stdinProgramHead(head)
 		}
 	}
 	if !isProg {
 		return ""
 	}
+	caller = caller.seededWith(envAs)
 	for _, hb := range seg.heredocText {
 		if hb.dynamic || isDynamicArg(hb.text) {
 			return "dynamic code payload"
@@ -3022,11 +4037,18 @@ func guardShellSubagent(code string) string {
 	return guardShellSubagentDepth(code, 0, currentCallerIdentity())
 }
 func guardShellSubagentDepth(code string, depth int, caller callerIdentity) string {
-	return guardShellSubagentDepthSegs(splitShellSegments(code), depth, caller)
+	return guardShellSubagentDepthEnv(code, depth, caller, caller.envTaint)
+}
+
+// guardShellSubagentDepthEnv parses with an explicit envTaint map (the
+// caller identity's own taint may already carry it; passing it separately
+// keeps remote-command parses untainted — the far side sees its own env).
+func guardShellSubagentDepthEnv(code string, depth int, caller callerIdentity, envTaint map[string]bool) string {
+	return guardShellSubagentDepthSegs(splitShellSegmentsEnv(code, envTaint), depth, caller)
 }
 
 func guardShellSubagentDepthBash(code string, depth int, caller callerIdentity) string {
-	return guardShellSubagentDepthSegs(splitShellSegmentsBash(code), depth, caller)
+	return guardShellSubagentDepthSegs(splitShellSegmentsBashEnv(code, caller.envTaint), depth, caller)
 }
 
 func guardShellSubagentDepthSegs(segs []shellSegment, depth int, caller callerIdentity) string {
@@ -3260,11 +4282,17 @@ var gitStashReadonlySubs = map[string]bool{
 // (headBaseAliasHits), so an alias like `ln -s /usr/bin/rm /tmp/remove`
 // cannot walk past the write table.
 func screenReadonlyWrite(headArgv []string) string {
+	return screenReadonlyWritePath(headArgv, "")
+}
+
+// screenReadonlyWritePath is screenReadonlyWrite with an explicit effective
+// PATH for alias resolution (Q4 symlink penetration under envAs overrides).
+func screenReadonlyWritePath(headArgv []string, pathEnv string) string {
 	if len(headArgv) == 0 {
 		return ""
 	}
 	args := headArgv[1:]
-	for _, base := range headBaseAliasHits(headArgv) {
+	for _, base := range headBaseAliasHits(headArgv, pathEnv) {
 		// `python -m <mod>` runs an arbitrary module: screen it as the command
 		// it actually executes instead of as an interpreter head. Runs before
 		// the alias walk so /usr/bin/python3 and python3 behave identically.
@@ -3433,14 +4461,35 @@ func screenReadonlyWriteAlias(headArgv []string, base string, args []string) str
 // the first positional operand when no -e/--source appeared, joined with
 // "\n" for screening. -f FILE / --file=FILE names an unvetted program
 // file — reported via the file flag so the caller can decide (sub-agent:
-// skip; strict read-only: block). Returns (program, sawFile).
-func awkProgramFrags(args []string) (string, bool) {
+// skip; strict read-only: block). hit names the offending dynamic operand
+// in a code/exec position; a plain data-position dynamic word (input file,
+// -v/-F value, -f path) is not a hit (SH11 W11-2).
+func awkProgramFrags(args []string) (string, bool, string) {
 	var frags []string
 	var positional string
 	sawFile := false
 	endOpts := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if isDynamicArg(a) {
+			if !endOpts && strings.HasPrefix(a, "-") {
+				return "", sawFile, "dynamic code payload"
+			}
+			// Data-position dynamic word: only a split-safe path/data value
+			// may pass — a word-start __ctx_dq_sub__ could be -f/-e at
+			// runtime.
+			if !isSafeDynamicDataOperand(a) {
+				return "", sawFile, "dynamic code payload"
+			}
+			if !endOpts && positional == "" && len(frags) == 0 {
+				// Dynamic program slot is unvettable.
+				return "", sawFile, "dynamic code payload"
+			}
+			if positional == "" {
+				positional = a // kept so a later non-option stays a file too
+			}
+			continue
+		}
 		switch {
 		case a == "--" && !endOpts:
 			// Option terminator: everything after is a positional operand —
@@ -3449,9 +4498,22 @@ func awkProgramFrags(args []string) (string, bool) {
 			endOpts = true
 		case a == "-f" || a == "--file":
 			sawFile = true
+			if i+1 < len(args) {
+				v := args[i+1]
+				// S3: `awk -f -` reads the PROGRAM from stdin — unvetted.
+				if v == "-" {
+					return "", sawFile, "awk script from stdin"
+				}
+				if isDynamicArg(v) && !isSafeDynamicDataOperand(v) {
+					return "", sawFile, "dynamic code payload"
+				}
+			}
 			i++ // consume the file operand
 		case strings.HasPrefix(a, "--file="):
 			sawFile = true
+			if a == "--file=-" {
+				return "", sawFile, "awk script from stdin"
+			}
 		case a == "-e" || a == "--source":
 			if i+1 < len(args) {
 				frags = append(frags, args[i+1])
@@ -3477,7 +4539,24 @@ func awkProgramFrags(args []string) (string, bool) {
 					j = len(a)
 				case 'f':
 					sawFile = true
-					if j+1 >= len(a) {
+					if j+1 < len(a) {
+						v := a[j+1:]
+						if v == "-" {
+							return "", sawFile, "awk script from stdin"
+						}
+						if isDynamicArg(v) && !isSafeDynamicDataOperand(v) {
+							return "", sawFile, "dynamic code payload"
+						}
+					} else {
+						if i+1 < len(args) {
+							v := args[i+1]
+							if v == "-" {
+								return "", sawFile, "awk script from stdin"
+							}
+							if isDynamicArg(v) && !isSafeDynamicDataOperand(v) {
+								return "", sawFile, "dynamic code payload"
+							}
+						}
 						i++ // file operand is the next argv
 					}
 					j = len(a)
@@ -3496,10 +4575,10 @@ func awkProgramFrags(args []string) (string, bool) {
 			}
 		}
 	}
-	if len(frags) == 0 && positional != "" {
+	if len(frags) == 0 && positional != "" && !isDynamicArg(positional) {
 		frags = append(frags, positional)
 	}
-	return strings.Join(frags, "\n"), sawFile
+	return strings.Join(frags, "\n"), sawFile, ""
 }
 
 // screenAwkSubagent extracts awk's program text for a SUB-AGENT caller and
@@ -3511,15 +4590,10 @@ func awkProgramFrags(args []string) (string, bool) {
 // text: the strict guard blocks it; the sub-agent guard has no write
 // fence to protect inside awk).
 func screenAwkSubagent(args []string, depth int, caller callerIdentity) string {
-	for _, a := range args {
-		if a == "--" {
-			break
-		}
-		if isDynamicArg(a) {
-			return "dynamic code payload"
-		}
+	program, _, hit := awkProgramFrags(args)
+	if hit != "" {
+		return hit
 	}
-	program, _ := awkProgramFrags(args)
 	if program == "" {
 		return ""
 	}
@@ -3669,25 +4743,28 @@ func programNamesBlockedAgent(prog string) bool {
 	return toks.hasIdent("herdr") || toks.hasIdent("herdsman")
 }
 
+// sedDynamicScriptSafe is gone (R4): a dynamic s/// fragment can inject
+// sed `e` commands when the expanded value contains the delimiter
+// (`p='x/g;e pig'` → s/x/g;e pig/bar/g = EXECUTION). Restricted literal
+// binds (litVars) resolve to static text BEFORE this point, so any
+// placeholder still present is unvettable and the script slot rejects it.
+
 // screenSedSubagent collects sed script text (inline -e payloads and the
 // first positional operand) for a SUB-AGENT caller and screens any GNU sed
 // `e` exec commands: `1e pig`, `sed -e 'e agy'`, `s/.*/pig/e`. The command
 // text after `e` is screened as shell text.
 func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
-	// sawFile is ignored: a script FILE is unvetted text, and unlike the
-	// strict guard the sub-agent caller keeps screening the inline/positional
-	// fragments collected alongside (the strict guard fails closed on -f).
-	for _, a := range args {
-		if a == "--" {
-			break
-		}
-		if isDynamicArg(a) {
-			return "dynamic code payload"
-		}
-	}
+	// SH11 W11-2: dynamic words are only refused in the SCRIPT slot — a
+	// script operand decides what sed executes and may arm `e`; input
+	// file operands (every positional after the script) are plain data
+	// paths and pass when split-safe. sedScripts already extracts the
+	// script fragments; re-scan the operand zone to locate and validate
+	// dynamic positionals.
 	scripts, _ := sedScripts(args)
 	for _, s := range scripts {
 		if isDynamicArg(s) {
+			// R4: only restricted literal binds reach static text; a
+			// placeholder still present means the script text is unvettable.
 			return "dynamic code payload"
 		}
 		cmds := sedExecCommands(s)
@@ -3701,6 +4778,121 @@ func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
 			// hits above are the vettable sub-set — e.g. `e pig`); the
 			// rest fail closed as a sed write/exec surface.
 			return "sed e"
+		}
+	}
+	// Dynamic operands outside the script slots must be split-safe data
+	// paths: walk the operand zone with sed's own consumption model so
+	// -e/-f/-l value slots and the first positional (the script — already
+	// screened above) are not misread as data, and input FILE operands
+	// only need to be option-incapable (SH11 W11-2).
+	sawExplicit := false
+	sawScript := false
+	endOpts := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" && !endOpts {
+			endOpts = true
+			continue
+		}
+		if !endOpts && strings.HasPrefix(a, "-") && a != "-" && !(isDynamicArg(a) && !strings.HasPrefix(a, "-f") && !strings.HasPrefix(a, "--file=") && !strings.HasPrefix(a, "--expression=")) {
+			// Option word: replicate the value consumption (e/f script or
+			// file, l wrap length — cluster tail or next argv). R13: a
+			// -f/--file=/--expression= word whose VALUE is dynamic still
+			// belongs to the option zone (the flag slot is recognisable
+			// from its static prefix); other dynamic option words are
+			// unvettable and fall through to the positional/dynamic screen.
+			switch {
+			case a == "-f" || a == "--file":
+				sawExplicit = true
+				// S3: `sed -f -` reads the SCRIPT from stdin — unvetted
+				// program text; reject it like a dynamic payload. A
+				// process-substitution target arrives as a placeholder and
+				// must still name a safe data path.
+				if i+1 < len(args) {
+					v := args[i+1]
+					if v == "-" {
+						return "sed script from stdin"
+					}
+					if isDynamicArg(v) && !isSafeDynamicDataOperand(v) {
+						return "dynamic code payload"
+					}
+				}
+				i++
+			case a == "-e" || a == "--expression" || a == "--line-length":
+				sawExplicit = sawExplicit || a != "--line-length"
+				i++
+			case strings.HasPrefix(a, "--expression=") || strings.HasPrefix(a, "--file="):
+				sawExplicit = true
+				if a == "--file=-" {
+					return "sed script from stdin"
+				}
+				// R13: the =value still names the script FILE — validate it
+				// like a separate -f operand so a dynamic/proc-subst path
+				// (--file=<(…) / --file=$X) cannot smuggle unvetted program
+				// text past the first-positional check.
+				if strings.HasPrefix(a, "--file=") {
+					v := a[len("--file="):]
+					if isDynamicArg(v) && !isSafeDynamicDataOperand(v) {
+						return "dynamic code payload"
+					}
+				}
+			case strings.HasPrefix(a, "--"):
+				// other long options: no value operand consumed
+			default:
+				for j := 1; j < len(a); j++ {
+					switch a[j] {
+					case 'e', 'f':
+						sawExplicit = true
+						if j+1 >= len(a) {
+							if a[j] == 'f' && i+1 < len(args) {
+								v := args[i+1]
+								if v == "-" {
+									return "sed script from stdin"
+								}
+								if isDynamicArg(v) && !isSafeDynamicDataOperand(v) {
+									return "dynamic code payload"
+								}
+							}
+							i++
+						} else {
+							// Glued file/script operand (cluster tail): an `f`
+							// tail names the script FILE — '-' is stdin and a
+							// dynamic tail must still be a safe data path.
+							if a[j] == 'f' {
+								v := a[j+1:]
+								if v == "-" {
+									return "sed script from stdin"
+								}
+								if isDynamicArg(v) && !isSafeDynamicDataOperand(v) {
+									return "dynamic code payload"
+								}
+							}
+						}
+						j = len(a)
+					case 'l':
+						if j+1 >= len(a) {
+							i++
+						}
+						j = len(a)
+					}
+				}
+			}
+			continue
+		}
+		// Positional operand (after --, or non-option shape, or bare "-").
+		if isDynamicArg(a) {
+			if !sawScript && !sawExplicit && a != "-" {
+				// This word IS the script slot — screened above.
+				sawScript = true
+				continue
+			}
+			if !isSafeDynamicDataOperand(a) {
+				return "dynamic code payload"
+			}
+			continue
+		}
+		if !sawScript && !sawExplicit && a != "-" {
+			sawScript = true // first static positional is the script
 		}
 	}
 	return ""
@@ -4001,14 +5193,32 @@ func sedExecCommands(s string) []string {
 
 // screenTarSubagent screens tar exec-hook options for a SUB-AGENT caller:
 // --checkpoint-action=exec=CMD, --to-command CMD and --use-compress-program
-// CMD / -I CMD carry shell text screened as a command.
+// CMD / -I CMD carry shell text screened as a command. Dynamic words are
+// refused only when they can sit in an OPTION or hook position — value
+// operands of -f/-C/-T/-X and split-safe member paths are data (W11-2).
 func screenTarSubagent(args []string, depth int, caller callerIdentity) string {
+	screenCmd := func(cmd string) string {
+		if isDynamicArg(cmd) {
+			return "dynamic code payload"
+		}
+		if hit := guardShellSubagentDepth(cmd, depth+1, caller); hit != "" {
+			return hit
+		}
+		return "tar exec hook" // any non-blocked hook command still executes
+	}
+	bsdAction := false // first operand without '-' is the BSD action word
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--" {
 			break
 		}
 		if isDynamicArg(a) {
+			// Value slots of -f/-C/-T/-X and member paths: split-safe path
+			// operands only — a word-start __ctx_dq_sub__ may expand to an
+			// option and is refused (Q1-C).
+			if isSafeDynamicDataOperand(a) {
+				continue
+			}
 			return "dynamic code payload"
 		}
 		var cmd string
@@ -4039,14 +5249,42 @@ func screenTarSubagent(args []string, depth int, caller callerIdentity) string {
 			cmd = a[len("--use-compress-program="):]
 		case strings.HasPrefix(a, "-I") && len(a) > 2 && !strings.HasPrefix(a, "--"):
 			cmd = a[2:]
+		case a == "-f" || a == "--file" || a == "-C" || a == "--directory" ||
+			a == "-T" || a == "--files-from" || a == "-X" || a == "--exclude-from" ||
+			a == "--exclude" || a == "--owner" || a == "--group" || a == "--mode" ||
+			a == "--mtime" || a == "--strip-components" || a == "--transform" ||
+			a == "--format" || a == "--index-file" || a == "--occurrence":
+			// Data value slot: the next argv is a filename/dir/pattern, not
+			// an option — a dynamic value is already screened above.
+			i++
+		case strings.HasPrefix(a, "--"):
+			// Other long options (--numeric-owner, --exclude=pat, ...).
+		case strings.HasPrefix(a, "-") && len(a) > 1:
+			// Short-option cluster: f/C/T/X take a value operand — the
+			// cluster tail or the next argv — and end the cluster.
+			for j := 1; j < len(a); j++ {
+				switch a[j] {
+				case 'f', 'C', 'T', 'X', 'b', 'L', 'H', 'h':
+					if j+1 >= len(a) {
+						i++ // value operand is the next argv
+					}
+					j = len(a)
+				}
+			}
+		default:
+			// BSD first-operand action word (tar cf / tar xf / tar tzf):
+			// when it contains 'f' the NEXT operand is the archive value.
+			if !bsdAction {
+				bsdAction = true
+				if strings.Contains(a, "f") {
+					i++
+				}
+			}
 		}
 		if cmd == "" {
 			continue
 		}
-		if isDynamicArg(cmd) {
-			return "dynamic code payload"
-		}
-		if hit := guardShellSubagentDepth(cmd, depth+1, caller); hit != "" {
+		if hit := screenCmd(cmd); hit != "" {
 			return hit
 		}
 		return "tar exec hook" // any non-blocked hook command still executes
@@ -4885,6 +6123,11 @@ func screenGitGlobalArgs(args []string) (int, string) {
 			}
 			pair := args[i+1]
 			if isDynamicArg(pair) {
+				// SH11 MF-2.2: the whole KEY=VAL word must be split-safe — an
+				// unquoted $X value can field-split a second `-c` option in.
+				if !isSplitSafeDynamicWord(pair) {
+					return i, "git dynamic global option"
+				}
 				// Key must be static; value may be split-safe dynamic for non-hook keys.
 				eq := strings.IndexByte(pair, '=')
 				if eq < 0 || isDynamicArg(pair[:eq]) {
@@ -5563,7 +6806,7 @@ func sedScriptHasWrite(s string) string {
 // (separate, =glued, or cluster tail) is an unvetted script file and
 // blocks.
 func screenAwkProgram(args []string) string {
-	program, sawFile := awkProgramFrags(args)
+	program, sawFile, _ := awkProgramFrags(args)
 	if sawFile {
 		return "awk -f" // unvetted program file
 	}
@@ -7717,6 +8960,183 @@ func splitTopLevelItems(s string, open, close byte) []string {
 	return out
 }
 
+// codeSlot is one inline-code operand slot of an interpreter argv: flag
+// is the index of the flag WORD (the operand may be glued onto it), text
+// the operand value (empty when flagOnly is set — a trailing bare flag
+// whose operand would come from words the caller appends).
+type codeSlot struct {
+	flag     int
+	text     string
+	flagOnly bool
+}
+
+// interpCodeSlots walks argv's option zone the way unwrapShellArgv /
+// unwrapInterpreterInline does — including flag CLUSTERS (`sh -lc '…'`,
+// `python3 -uc '…'`, `node -pe '…'`, `perl -pe '…'`), glued code tails and
+// value-carrying short letters that end a cluster — and returns every
+// inline-code operand slot. A non-option operand ends the zone; a "--"
+// does too.
+func interpCodeSlots(argv []string) []codeSlot {
+	if len(argv) < 2 {
+		return nil
+	}
+	base := filepath.Base(argv[0])
+	gluedCodes := ""               // cluster letters whose TAIL or next argv is code
+	bareCodes := ""                // cluster letters whose operand is always next argv
+	valShort := ""                 // cluster letters consuming a value (tail or next argv)
+	longCode := map[string]bool{}  // --name / --name=code
+	longValue := map[string]bool{} // --name consumes a separate value
+	switch {
+	case base == "python" || strings.HasPrefix(base, "python2") || strings.HasPrefix(base, "python3"):
+		gluedCodes, valShort = "cm", "WX"
+	case base == "node" || base == "nodejs":
+		// -eCODE glued; -p is a code flag whose operand is the NEXT argv
+		// (`node -pe x` = -p + -e, not -p with code "e").
+		gluedCodes, bareCodes = "e", "p"
+		longCode = map[string]bool{"--eval": true, "--print": true}
+		longValue = map[string]bool{"--require": true, "--loader": true, "--import": true, "--experimental-loader": true, "--conditions": true}
+	case base == "ts-node" || base == "tsx" || base == "bun":
+		gluedCodes = "e"
+		longCode = map[string]bool{"--eval": true}
+		longValue = map[string]bool{"--require": true, "--loader": true, "--import": true}
+	case base == "perl":
+		gluedCodes, valShort = "eE", "iFl07Mmx"
+	case base == "ruby":
+		gluedCodes, valShort = "e", "iFKC0xX"
+	case base == "php":
+		gluedCodes, valShort = "r", "cdz"
+	case shellHeads[base]:
+		// dash/bash -c; -o/-O consume an option-name operand.
+		gluedCodes, valShort = "c", "oO"
+	default:
+		return nil
+	}
+	var out []codeSlot
+	for i := 1; i < len(argv); i++ {
+		a := argv[i]
+		if a == "--" {
+			break // option terminator
+		}
+		if strings.HasPrefix(a, "--") {
+			name, val, hasVal := a[2:], "", false
+			if k := strings.IndexByte(name, '='); k >= 0 {
+				name, val, hasVal = name[:k], name[k+1:], true
+			}
+			if longCode["--"+name] {
+				if hasVal {
+					out = append(out, codeSlot{flag: i, text: val})
+				} else if i+1 < len(argv) {
+					out = append(out, codeSlot{flag: i, text: argv[i+1]})
+					i++
+				} else {
+					out = append(out, codeSlot{flag: i, flagOnly: true})
+				}
+				continue
+			}
+			if longValue["--"+name] {
+				if !hasVal {
+					i++ // consumes the separate value operand
+				}
+			}
+			continue // boolean or unknown long option
+		}
+		// A bare "-" is the stdin-script operand, not an option cluster.
+		if !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+") || a == "-" || a == "+" {
+			break // first non-option operand: the script file
+		}
+		plus := a[0] == '+'
+		for j := 1; j < len(a); j++ {
+			ch := a[j]
+			if !plus && strings.IndexByte(gluedCodes, ch) >= 0 {
+				if tail := a[j+1:]; tail != "" {
+					out = append(out, codeSlot{flag: i, text: tail})
+				} else if i+1 < len(argv) {
+					out = append(out, codeSlot{flag: i, text: argv[i+1]})
+					i++
+				} else {
+					out = append(out, codeSlot{flag: i, flagOnly: true})
+				}
+				break
+			}
+			if !plus && strings.IndexByte(bareCodes, ch) >= 0 {
+				if i+1 < len(argv) {
+					out = append(out, codeSlot{flag: i, text: argv[i+1]})
+					i++
+				} else {
+					out = append(out, codeSlot{flag: i, flagOnly: true})
+				}
+				break
+			}
+			if strings.IndexByte(valShort, ch) >= 0 {
+				if j+1 >= len(a) {
+					i++ // value is the next argv
+				}
+				break // value letters end the cluster either way
+			}
+		}
+	}
+	return out
+}
+
+// xargsFeedsCodeFlag reports whether xargs' fed words land in a shell /
+// interpreter CODE slot: the inner argv ends at a bare code flag
+// (`xargs sh -c` — the first fed word is the script) or a code flag's
+// operand carries the -I/-i/--replace replace-token (`xargs -I{} sh -c
+// {}`). R13: the inner head is wrapper-peeled first (env/nice/xargs …)
+// and the code slot is located by the interpreter's real option model —
+// clusters like `sh -lc` and `python3 -uc` count, not only bare `-c`.
+func xargsFeedsCodeFlag(inner, full []string) bool {
+	if len(inner) < 2 {
+		return false
+	}
+	// Peel wrappers off the inner command so `xargs -I{} env sh -c {}`
+	// resolves to the real interpreter argv (bounded: peelWrappers caps
+	// its own chain depth).
+	head, _, _, exhausted := peelWrappers(inner)
+	if exhausted || len(head) == 0 {
+		return false
+	}
+	slots := interpCodeSlots(head)
+	if len(slots) == 0 {
+		return false
+	}
+	// Collect xargs' replace-token when -I/-i/--replace names one. -i is
+	// the deprecated -I: a bare -i defaults the token to "{}", -iSTR is
+	// glued-only like -e.
+	repl := ""
+	for j := 1; j < len(full); j++ {
+		a := full[j]
+		switch {
+		case a == "-I" || a == "--replace":
+			if j+1 < len(full) {
+				repl = full[j+1]
+				j++
+			}
+		case a == "-i":
+			repl = "{}"
+		case strings.HasPrefix(a, "-I") && len(a) > 2:
+			repl = a[2:]
+		case strings.HasPrefix(a, "-i") && len(a) > 2:
+			repl = a[2:]
+		case strings.HasPrefix(a, "--replace="):
+			repl = a[len("--replace="):]
+		}
+	}
+	for _, s := range slots {
+		if s.flagOnly {
+			// A trailing bare code flag always takes the fed words as its
+			// operand — with or without a replace token.
+			return true
+		}
+		if repl != "" && strings.Contains(s.text, repl) {
+			// The code operand contains the replace token: xargs
+			// substitutes it INSIDE the word ('x{}y' is fed too).
+			return true
+		}
+	}
+	return false
+}
+
 // headReadsStdinProgram reports whether the peeled command head list takes
 // its PROGRAM text from stdin (a bare sh/bash/… with no -c, a bare
 // python3/node/perl with no -c/-e). Callers that screen a command stream
@@ -7726,11 +9146,11 @@ func headReadsStdinProgram(argv []string) bool {
 	if len(argv) == 0 {
 		return false
 	}
-	i, _, _, _ := peelWrappers(argv)
-	if i >= len(argv) {
+	head, _, _, _ := peelWrappers(argv)
+	if len(head) == 0 {
 		return false
 	}
-	_, isProg := stdinProgramHead(argv[i:])
+	_, isProg := stdinProgramHead(head)
 	return isProg
 }
 
@@ -9079,11 +10499,20 @@ func (g guardCall) guardCtxRunArgv(argv []string) (rule, detail string) {
 
 // guardCtxRunShell screens one shell command string for both guards.
 func (g guardCall) guardCtxRunShell(code string) (rule, detail string) {
+	return g.guardCtxRunShellEnv(code, envAssignments{})
+}
+
+// guardCtxRunShellEnv is guardCtxRunShell under the env ops peeled off the
+// calling argv (R13): `argv=["env","HOME=-exec","sh"]`+stdin must screen
+// the stdin program text with HOME already tainted — a `$HOME` inside the
+// payload is then a dynamic placeholder, never the trusted abs-dir grant.
+func (g guardCall) guardCtxRunShellEnv(code string, envAs envAssignments) (rule, detail string) {
 	if !g.subagent && !g.strictReadonly {
 		return "", "" // main agent: never enters the sub-agent parser
 	}
+	caller := currentCallerIdentity().seededWith(envAs)
 	if g.subagent {
-		if hit := guardShellSubagentDepth(code, 0, currentCallerIdentity()); hit != "" {
+		if hit := guardShellSubagentDepth(code, 0, caller); hit != "" {
 			if hit == "ctxmode index" || hit == roSSHWriteHit {
 				return ruleReadonlyWrite, hit
 			}
@@ -9091,7 +10520,7 @@ func (g guardCall) guardCtxRunShell(code string) (rule, detail string) {
 		}
 	}
 	if g.strictReadonly {
-		if hit := guardShellReadonly(code); hit != "" {
+		if hit := guardShellReadonlyDepth(code, 0, caller); hit != "" {
 			return ruleReadonlyWrite, hit
 		}
 	}
@@ -9147,12 +10576,15 @@ func hasDynamicInterpOption(head []string, base string) bool {
 			if shell {
 				return true
 			}
-			// Interpreters: split-safe / path-like / script-ext operand ends options (W-Fix-6).
-			if !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+") {
-				if (isSplitSafeDynamicWord(a) && (strings.Contains(a, "/") || hasInterpScriptExt(a))) ||
-					strings.Contains(a, "/") || hasInterpScriptExt(a) {
-					return false
-				}
+			// Interpreters: a split-safe word that is path-shaped (absolute,
+			// glob-with-safe-start containing '/', abs-dq placeholder) ends
+			// the option zone as the script-file operand (MF-2/Q1-C). A
+			// word-start __ctx_dq_sub__ may begin with '-' at runtime and is
+			// NOT a safe script operand.
+			if isSafeDynamicDataOperand(a) &&
+				(strings.Contains(a, "/") || strings.HasPrefix(a, "/") ||
+					strings.HasPrefix(a, cmdSubPlaceholderAbsDq) || hasInterpScriptExt(a)) {
+				return false
 			}
 			return true
 		}
@@ -9193,18 +10625,17 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 	if len(argv) == 0 || depth >= shellSplitMaxDepth {
 		return "", false
 	}
-	i, _, _, _ := peelWrappers(argv)
-	if i >= len(argv) {
+	head, _, _, _ := peelWrappers(argv)
+	if len(head) == 0 {
 		return "", false
 	}
-	head := argv[i:]
 	base := filepath.Base(head[0])
 	// An ssh head forwards stdin to the remote command's stdin: resolve the
 	// remote invocation and ask whether any remote head reads its program
 	// from that stream. Malformed invocations keep their argv/shell hits;
 	// here only the bare-host/missing-remote shape returns a parse hit, and
 	// with no remote command stdin is pure data for the login shell anyway.
-	if base == "ssh" || resolveHeadBase(head[0]) == "ssh" {
+	if base == "ssh" || resolveHeadBase(head[0], "") == "ssh" {
 		remoteCmd, hit := parseSSHInvocation(head)
 		if hit != "" {
 			return "", false
@@ -9213,7 +10644,7 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			if seg.depthExceeded || seg.parseErr != "" {
 				return "", true
 			}
-			if len(seg.argv) == 0 || seg.pipedStdin || len(seg.heredocText) > 0 || seg.hereString != "" {
+			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
 			if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
@@ -9239,7 +10670,7 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			if seg.depthExceeded || seg.parseErr != "" {
 				return "", true
 			}
-			if len(seg.argv) == 0 || seg.pipedStdin || len(seg.heredocText) > 0 || seg.hereString != "" {
+			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
 			if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
@@ -9251,6 +10682,124 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 	// An interpreter with -c/-e/-r/-m/-p inline code likewise.
 	if _, _, has := unwrapInterpreterInline(head); has {
 		return "", false
+	}
+	// SH11 MF-1.2: statement-level wrappers whose inner command shares this
+	// stdin. eval joins its operands as shell text; flock/script/watch and
+	// xargs resolve to an inner command argv (or -c text) which may itself
+	// be a stdin program head.
+	switch base {
+	case "eval":
+		if len(head) < 2 {
+			return "", false
+		}
+		inner := strings.Join(head[1:], " ")
+		if isDynamicArg(inner) {
+			return "", true
+		}
+		for _, seg := range splitShellSegments(inner) {
+			if seg.depthExceeded || seg.parseErr != "" {
+				return "", true
+			}
+			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
+				continue
+			}
+			if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+				return l, true
+			}
+		}
+		return "", false
+	case "flock":
+		inner, cmdText := skipFlockArgs(head, 1)
+		if cmdText != "" {
+			if isDynamicArg(cmdText) {
+				return "", true
+			}
+			for _, seg := range splitShellSegments(cmdText) {
+				if seg.depthExceeded || seg.parseErr != "" {
+					return "", true
+				}
+				if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
+					continue
+				}
+				if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+					return l, true
+				}
+			}
+			return "", false
+		}
+		if inner < len(head) {
+			return stdinProgramHeadDepth(head[inner:], depth+1)
+		}
+		return "", false
+	case "script":
+		if payload := scriptCommandArg(head); payload != "" {
+			if isDynamicArg(payload) {
+				return "", true
+			}
+			for _, seg := range splitShellSegments(payload) {
+				if seg.depthExceeded || seg.parseErr != "" {
+					return "", true
+				}
+				if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
+					continue
+				}
+				if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+					return l, true
+				}
+			}
+			return "", false
+		}
+		// script without -c spawns a login shell on the pty — it reads the
+		// forwarded stdin as commands.
+		return "", true
+	case "watch":
+		if len(head) < 2 {
+			return "", false
+		}
+		k, execMode := skipWatchArgs(head, 1)
+		if k >= len(head) {
+			return "", false
+		}
+		if execMode {
+			return stdinProgramHeadDepth(head[k:], depth+1)
+		}
+		text := strings.Join(head[k:], " ")
+		if isDynamicArg(text) {
+			return "", true
+		}
+		for _, seg := range splitShellSegments(text) {
+			if seg.depthExceeded || seg.parseErr != "" {
+				return "", true
+			}
+			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
+				continue
+			}
+			if l, isProg := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+				return l, true
+			}
+		}
+		return "", false
+	case "xargs":
+		k := xargsTargetIndex(head)
+		if k >= len(head) {
+			return "", false // xargs with no command runs echo
+		}
+		// xargs feeds the piped words as ARGV, not stdin: an inner bare
+		// `sh` is not a stdin-program (S3). But an inner `sh -c`/`python -c`
+		// whose code operand slot is FILLED from the fed words (code flag
+		// last, or the -I/-i replace-token right after it) IS fed code —
+		// the language follows the fed interpreter head so the payload is
+		// screened under the right code rules.
+		if xargsFeedsCodeFlag(head[k:], head) {
+			innerHead, _, _, _ := peelWrappers(head[k:])
+			if len(innerHead) > 0 {
+				if l, ok := heredocInterpLang(filepath.Base(innerHead[0])); ok {
+					return l, true
+				}
+			}
+			return "", true
+		}
+		return stdinProgramHeadDepth(head[k:], depth+1)
 	}
 	if shellHeads[base] {
 		// sh/bash/... without -c: commands come from a script file or
@@ -9363,13 +10912,12 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 // the local /tmp exemption at the wire and the payload gets the strict
 // read-only screen.
 func sshTunnelsStdinProgram(argv []string) bool {
-	i, _, _, _ := peelWrappers(argv)
-	if i >= len(argv) {
+	head, _, _, _ := peelWrappers(argv)
+	if len(head) == 0 {
 		return false
 	}
-	head := argv[i:]
 	base := filepath.Base(head[0])
-	if base != "ssh" && resolveHeadBase(head[0]) != "ssh" {
+	if base != "ssh" && resolveHeadBase(head[0], "") != "ssh" {
 		return false
 	}
 	remoteCmd, hit := parseSSHInvocation(head)
@@ -9392,6 +10940,9 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 	if stdin == "" || (!g.subagent && !g.strictReadonly) {
 		return "", ""
 	}
+	// Peel the argv once: the env ops the head runs under are the env the
+	// stdin PROGRAM text is parsed against (env HOME=-exec sh + stdin).
+	_, _, envAs, _ := peelWrappers(argv)
 	lang, isProg := stdinProgramHead(argv)
 	if !isProg {
 		return "", ""
@@ -9400,8 +10951,8 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 		g.strictReadonly = true
 	}
 	if lang == "" {
-		// Shell head: stdin is shell code.
-		return g.guardCtxRunShell(stdin)
+		// Shell head: stdin is shell code, screened under envAs' taint.
+		return g.guardCtxRunShellEnv(stdin, envAs)
 	}
 	return g.guardCtxRunCode(lang, stdin)
 }
@@ -9427,12 +10978,13 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 		if len(seg.argv) == 0 {
 			continue
 		}
+		_, _, envAs, _ := peelWrappers(seg.argv)
 		if lang, isProg := stdinProgramHead(seg.argv); isProg {
 			if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(seg.argv) {
 				g.strictReadonly = true
 			}
 			if lang == "" {
-				return g.guardCtxRunShell(stdin)
+				return g.guardCtxRunShellEnv(stdin, envAs)
 			}
 			return g.guardCtxRunCode(lang, stdin)
 		}
@@ -9461,7 +11013,7 @@ func (g guardCall) guardCtxRunEnv(env map[string]string) (rule, detail string) {
 		return "", ""
 	}
 	for k, v := range env {
-		if !envHookVars[k] {
+		if !isEnvHookVar(k) {
 			continue
 		}
 		if pagerSafeVars[k] && (v == "" || v == "cat") {

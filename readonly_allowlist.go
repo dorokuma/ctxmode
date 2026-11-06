@@ -309,7 +309,7 @@ func init() {
 		[]string{"all", "numeric", "tcp", "udp", "listening", "processes", "resolve",
 			"extended", "options", "memory", "info", "summary", "help", "version", "ipv4", "ipv6"},
 		[]string{"query", "family", "filter"})
-	readonlyAllowlist["journalctl"] = simple("exqrb", "unSo",
+	readonlyAllowlist["journalctl"] = simple("exqrbn", "uSo",
 		[]string{"no-pager", "catalog", "disk-usage", "help", "version", "list-boots",
 			"reverse", "utc", "quiet", "pager-end", "merge", "system", "user",
 			"dmesg", "boot"},

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -145,6 +146,8 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 	type span struct{ lo, hi int }
 	var comments []span
 	var exempt []span // sgl-quoted + quoted-heredoc bodies
+	var dblQuoted []span
+	var substitutions []span
 	var ambig string
 	syntax.Walk(f, func(n syntax.Node) bool {
 		if n == nil || ambig != "" {
@@ -214,6 +217,15 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 			if lo >= 0 && hi >= lo && hi <= len(code) {
 				exempt = append(exempt, span{lo, hi})
 			}
+		case *syntax.DblQuoted:
+			lo, hi := int(x.Pos().Offset()), int(x.End().Offset())
+			if lo >= 0 && hi >= lo && hi <= len(code) {
+				dblQuoted = append(dblQuoted, span{lo, hi})
+			}
+		case *syntax.CmdSubst:
+			substitutions = append(substitutions, span{int(x.Pos().Offset()), int(x.End().Offset())})
+		case *syntax.ProcSubst:
+			substitutions = append(substitutions, span{int(x.Pos().Offset()), int(x.End().Offset())})
 		case *syntax.Redirect:
 			// W-Fix-3: quoted heredoc bodies are pure literals at top-level dash.
 			if (x.Op == syntax.Hdoc || x.Op == syntax.DashHdoc) &&
@@ -242,7 +254,7 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 			return true
 		}
 		switch code[i-1] {
-		case ' ', '\t', '\n', ';', '|', '&', '(':
+		case ' ', '\t', '\n':
 			return true
 		}
 		return false
@@ -266,14 +278,39 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 		if inSpan(comments, i) || inSpan(exempt, i) {
 			continue
 		}
-		// $ then \\\n (G1 / MF-1)
-		if i > 0 && code[i-1] == '$' {
-			// ensure $ itself is unescaped
-			if i < 2 || !hasOddTrailingBackslash(code[:i-1]) {
-				return "ambiguous line continuation after $"
+		// $(...) starts a new shell quoting context: an enclosing double
+		// quote must not exempt its unquoted tokens. Only a double quote
+		// opened inside the innermost substitution applies there.
+		innerSub := -1
+		for _, sp := range substitutions {
+			if i >= sp.lo && i < sp.hi && sp.lo > innerSub {
+				innerSub = sp.lo
 			}
 		}
-		// Forward boundary: must follow whitespace/separator (token-external).
+		inDQ := false
+		for _, sp := range dblQuoted {
+			if i >= sp.lo && i < sp.hi && sp.lo > innerSub {
+				inDQ = true
+			}
+		}
+		// Reject operator-adjacent continuations (incl. inside dq for $ ` ( ) ; | & < >).
+		if i > 0 {
+			switch code[i-1] {
+			case '$', '`', '(', ')', ';', '|', '&', '<', '>':
+				if i < 2 || !hasOddTrailingBackslash(code[:i-1]) {
+					if code[i-1] == '$' {
+						return "ambiguous line continuation after $"
+					}
+					return "ambiguous line continuation after operator"
+				}
+			}
+		}
+		if inDQ {
+			// NTH-1: ordinary text continuation inside double quotes is fine;
+			// skip # / </> false positives that only matter outside quotes.
+			continue
+		}
+		// Forward boundary: must follow whitespace (token-external).
 		if !isSepPrev(i) {
 			return "ambiguous line continuation inside token"
 		}
@@ -741,51 +778,197 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 			if len(x.Args) == 0 {
 				return true
 			}
-			head, _ := wordToArg(x.Args[0])
+			// SH11 MF-4.3: strip leading `command`/`builtin` wrappers so
+			// `command read x` / `builtin unset BUN` cannot hide mutations
+			// from the write count. A `command -v`/`command -V` pure query
+			// wraps nothing; a dynamic word in the wrapper zone cannot be
+			// reasoned about → taint everything.
+			args := x.Args
+			sawWrapper := false
+			for len(args) > 0 {
+				h, ok := wordToArg(args[0])
+				if !ok || isDynamicArg(h) {
+					// A dynamic word is not literally command/builtin. When it
+					// appears AFTER a real command/builtin it could still be
+					// `read`/any mutator the wrapper is hiding → taint all;
+					// as the first word it is just a dynamic head, peel done.
+					if sawWrapper {
+						allTainted = true
+						return false
+					}
+					args = nil
+					break
+				}
+				base0 := h
+				if k := strings.LastIndexByte(base0, '/'); k >= 0 {
+					base0 = base0[k+1:]
+				}
+				if base0 != "command" && base0 != "builtin" {
+					break
+				}
+				sawWrapper = true
+				args = args[1:]
+				// Peel the wrapper's own option run (command -v/-V/-p; any
+				// unknown option is conservatively consumed the same way).
+				optStrs := make([]string, 0, len(args))
+				for _, w := range args {
+					os_, ook := wordToArg(w)
+					if !ook {
+						os_ = cmdSubPlaceholder
+					}
+					optStrs = append(optStrs, os_)
+				}
+				if isCommandQuery(optStrs) {
+					args = nil // pure -v/-V query: wraps no command
+					break
+				}
+				for len(args) > 0 {
+					a, aok := wordToArg(args[0])
+					if !aok || isDynamicArg(a) {
+						allTainted = true
+						return false
+					}
+					if a == "--" {
+						args = args[1:]
+						break
+					}
+					if strings.HasPrefix(a, "-") && a != "-" {
+						args = args[1:]
+						continue
+					}
+					break
+				}
+			}
+			if len(args) == 0 {
+				return true
+			}
+			head, _ := wordToArg(args[0])
 			base := head
 			if i := strings.LastIndex(base, "/"); i >= 0 {
 				base = base[i+1:]
 			}
 			switch base {
-			case "unset", "read", "export", "readonly", "declare", "typeset", "local", "getopts":
-				for _, w := range x.Args[1:] {
+			case "cd", "chdir":
+				// cd implicitly rewrites PWD/OLDPWD in the running shell.
+				inc("PWD")
+				inc("OLDPWD")
+			case "getopts":
+				// getopts always mutates OPTIND and may write OPTARG.
+				inc("OPTIND")
+				inc("OPTARG")
+				// getopts OPTSTRING NAME [args...]: the first operand is the
+				// optstring (may begin with ':' or '-'), the second is the
+				// target variable name.
+				opIdx := 0
+				for j := 1; j < len(args); j++ {
+					s, ok := wordToArg(args[j])
+					if !ok || isDynamicArg(s) {
+						allTainted = true
+						return false
+					}
+					if s == "--" {
+						if j+1 < len(args) {
+							opIdx = j + 1
+						}
+						break
+					}
+					opIdx = j
+					break
+				}
+				if opIdx > 0 && opIdx+1 < len(args) {
+					s, ok := wordToArg(args[opIdx+1])
+					if !ok || isDynamicArg(s) {
+						allTainted = true
+						return false
+					}
+					inc(s)
+				}
+			case "read":
+				// Bare read writes REPLY; -a ARRAY writes the array.
+				inc("REPLY")
+				// read option letters: boolean r s; value-carrying d n N p t u a
+				// (a separate argv when last in its cluster). -a ARRAY is itself
+				// a write target. R13: -s is a BOOLEAN (silent echo) — treating
+				// it as value-carrying hides the real write target (`read -s x`).
+				sawDashDash := false
+				j := 1
+				for j < len(args) {
+					s, ok := wordToArg(args[j])
+					if !ok || isDynamicArg(s) {
+						allTainted = true
+						return false
+					}
+					if s == "--" && !sawDashDash {
+						sawDashDash = true
+						j++
+						continue
+					}
+					if !sawDashDash && strings.HasPrefix(s, "-") && len(s) > 1 {
+						endLetter := byte(0)
+						for k := 1; k < len(s); k++ {
+							switch s[k] {
+							case 'r', 's':
+								continue
+							case 'a':
+								// -a ARRAY: the array name is a write target.
+								if k+1 < len(s) {
+									inc(s[k+1:])
+								} else if j+1 < len(args) {
+									an, aok := wordToArg(args[j+1])
+									if !aok || isDynamicArg(an) {
+										allTainted = true
+										return false
+									}
+									inc(an)
+									j++
+								}
+								endLetter = 'a'
+								k = len(s)
+							case 'd', 'n', 'N', 'p', 't', 'u':
+								endLetter = s[k]
+								k = len(s)
+							default:
+								// Unknown option letter: be conservative.
+								allTainted = true
+								return false
+							}
+						}
+						if endLetter != 0 && len(s) > 1 && s[len(s)-1] == endLetter &&
+							strings.IndexByte("dnNptu", endLetter) >= 0 && j+1 < len(args) {
+							j++ // value operand consumed
+						}
+						j++
+						continue
+					}
+					if s != "" {
+						inc(s)
+					}
+					j++
+				}
+			case "unset", "export", "readonly", "declare", "typeset", "local":
+				for _, w := range args[1:] {
 					s, ok := wordToArg(w)
 					if !ok {
 						allTainted = true
 						return false
 					}
-					if base == "unset" || base == "read" || base == "getopts" {
-						// bare names / optstring+name
-						if base == "getopts" {
-							continue // handled loosely: taint following name words
-						}
-						name := s
-						if eq := strings.IndexByte(s, '='); eq > 0 && (base == "export" || base == "readonly" || base == "declare" || base == "typeset" || base == "local") {
-							name = s[:eq]
-						}
-						if name != "" && !strings.HasPrefix(name, "-") {
-							inc(name)
-						}
-					} else {
-						// export/readonly/declare/typeset/local NAME[=VAL]
-						name := s
-						if eq := strings.IndexByte(s, '='); eq >= 0 {
-							name = s[:eq]
-						}
-						if name != "" && !strings.HasPrefix(name, "-") {
-							inc(name)
-						}
+					name := s
+					if eq := strings.IndexByte(s, '='); eq >= 0 {
+						name = s[:eq]
+					}
+					if name != "" && !strings.HasPrefix(name, "-") && !strings.HasPrefix(name, "+") {
+						inc(name)
 					}
 				}
 			case "printf":
 				// printf -v VAR ...
-				for i := 1; i+1 < len(x.Args); i++ {
-					s, ok := wordToArg(x.Args[i])
+				for i := 1; i+1 < len(args); i++ {
+					s, ok := wordToArg(args[i])
 					if !ok {
 						continue
 					}
 					if s == "-v" {
-						vn, vok := wordToArg(x.Args[i+1])
+						vn, vok := wordToArg(args[i+1])
 						if !vok {
 							allTainted = true
 							return false
@@ -802,8 +985,18 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 }
 
 // parseSubagentShellAST parses code into shellSegments for subagent guards.
-// ok=false means fail-closed (caller treats as depthExceeded).
+// ok=false means fail-closed (caller treats as depthExceeded). envTaint
+// carries environment-override knowledge from an outer envAs (HOME=/x sh -c,
+// env -i sh -c, env -u PWD ...): every named variable's expansion is treated
+// as untrusted inside this script, degrading the PATH/HOME/absolute-dir
+// placeholder grants to plain dynamic placeholders.
 func parseSubagentShellAST(code string, depth int, pipeIn bool, useBashVariant bool) ([]shellSegment, bool) {
+	return parseSubagentShellASTEnv(code, depth, pipeIn, useBashVariant, nil)
+}
+
+// parseSubagentShellASTEnv is parseSubagentShellAST plus an envTaint set
+// for the env/ssh AST descent (SH11 F3/Q5).
+func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVariant bool, envTaint map[string]bool) ([]shellSegment, bool) {
 	if hit := checkShellBytes(code, false); hit != "" {
 		return []shellSegment{{depthExceeded: true}}, false
 	}
@@ -841,7 +1034,10 @@ func parseSubagentShellAST(code string, depth int, pipeIn bool, useBashVariant b
 		}
 	}
 
-	col := &subCollector{code: code, depth: depth, staticVars: map[string]string{}, enumVars: map[string]string{}, taintedVars: map[string]bool{}, allowBind: depth == 0}
+	col := &subCollector{code: code, depth: depth, staticVars: map[string]string{}, enumVars: map[string]string{}, taintedVars: map[string]bool{}, enumCmdWords: map[string][]string{}, allowBind: true}
+	for name := range envTaint {
+		col.taintedVars[name] = true
+	}
 	primary := posixFile
 	if useBashVariant {
 		primary = bashFile
@@ -880,12 +1076,32 @@ func parseSubagentShellAST(code string, depth int, pipeIn bool, useBashVariant b
 			col.ssaBlocked[name] = true
 		}
 		col.taintedVars["*"] = true
+		// S1: the "*" sentinel means every variable may be unreadable — no
+		// bind collected so far can still be trusted.
+		col.staticVars = map[string]string{}
+		col.litVars = map[string]string{}
+		col.enumVars = map[string]string{}
+		col.enumCmdWords = map[string][]string{}
 	} else {
 		for name, n := range writes {
 			if n > 1 {
 				col.taintedVars[name] = true
 				col.ssaBlocked[name] = true
 			}
+		}
+	}
+	// SH11 F2/F3/F6: variables whose value the sentinel/placeholder grant
+	// model depends on (HOME safe-dir, PWD/OLDPWD absolute-dir, TMPDIR for
+	// mktemp, IFS for enum word-splitting) must be treated as unknown the
+	// moment the script writes them even once — a single write is already
+	// enough to invalidate "the expansion is the inherited/safe value".
+	for name := range writes {
+		if name == "PATH" {
+			continue // every PATH= value is screened by envAs ops instead
+		}
+		if sentinelTrustVars[name] {
+			col.taintedVars[name] = true
+			col.ssaBlocked[name] = true
 		}
 	}
 	col.walkStmts(primary.Stmts, pipeIn)
@@ -934,6 +1150,7 @@ func dedupeSegTail(segs []shellSegment, pre int) []shellSegment {
 func segEqual(a, b shellSegment) bool {
 	if a.depthExceeded != b.depthExceeded || a.pipedStdin != b.pipedStdin ||
 		a.backgrounded != b.backgrounded || a.processSubst != b.processSubst ||
+		a.stdinRedir != b.stdinRedir ||
 		a.redirectFile != b.redirectFile || a.hereString != b.hereString ||
 		a.parseErr != b.parseErr ||
 		len(a.argv) != len(b.argv) || len(a.heredocText) != len(b.heredocText) {
@@ -953,15 +1170,17 @@ func segEqual(a, b shellSegment) bool {
 }
 
 type subCollector struct {
-	code        string
-	depth       int
-	segs        []shellSegment
-	rejected    bool
-	staticVars  map[string]string // head-eligible abs-path binds (R-Allow-2)
-	enumVars    map[string]string // for-loop enum temporary binds (payload subst only)
-	taintedVars map[string]bool
-	ssaBlocked  map[string]bool // G3: writeCount>1 from preScan
-	allowBind   bool            // top-level sequential stmts only (R-Allow-2)
+	code         string
+	depth        int
+	segs         []shellSegment
+	rejected     bool
+	staticVars   map[string]string   // head-eligible safe-value binds (R-Allow-2)
+	litVars      map[string]string   // safe-literal binds: in-word subst only, never heads (ALW31)
+	enumVars     map[string]string   // for-loop enum temporary binds (payload subst only)
+	enumCmdWords map[string][]string // for-loop enum multi-word command binds (W11-5)
+	taintedVars  map[string]bool
+	ssaBlocked   map[string]bool // G3: writeCount>1 from preScan
+	allowBind    bool            // top-level sequential stmts only (R-Allow-2)
 }
 
 func (c *subCollector) reject() {
@@ -970,6 +1189,23 @@ func (c *subCollector) reject() {
 
 func (c *subCollector) failClosedFile(f *syntax.File) bool {
 	ok := true
+	quotedHdocLits := map[syntax.Node]bool{}
+	syntax.Walk(f, func(n syntax.Node) bool {
+		if n == nil {
+			return false
+		}
+		if r, is := n.(*syntax.Redirect); is && (r.Op == syntax.Hdoc || r.Op == syntax.DashHdoc) &&
+			isQuotedHeredocDelim(r.Word) && r.Hdoc != nil {
+			quotedHdocLits[r.Hdoc] = true
+			syntax.Walk(r.Hdoc, func(hn syntax.Node) bool {
+				if lit, okLit := hn.(*syntax.Lit); okLit {
+					quotedHdocLits[lit] = true
+				}
+				return true
+			})
+		}
+		return true
+	})
 	syntax.Walk(f, func(n syntax.Node) bool {
 		if n == nil || !ok || c.rejected {
 			return false
@@ -991,7 +1227,11 @@ func (c *subCollector) failClosedFile(f *syntax.File) bool {
 				}
 			}
 		case *syntax.Lit:
-			// G1-3: mvdan left an expand residue inside a Lit
+			// G1-3: mvdan left an expand residue inside a Lit.
+			// Quoted heredoc bodies are pure literals at top-level (W11-1).
+			if quotedHdocLits[x] {
+				return true
+			}
 			if litHasResidualExpand(x.Value) {
 				ok = false
 				return false
@@ -1085,9 +1325,13 @@ func paramExpD2Ambiguous(code string, pe *syntax.ParamExp) bool {
 				csSpans = append(csSpans, [2]int{lo, hi})
 			}
 			return false
-		case *syntax.SglQuoted, *syntax.DblQuoted:
+		case *syntax.SglQuoted:
+			// Inner single quotes diverge between mvdan and dash (G6_MF3).
 			ambig = true
 			return false
+		case *syntax.DblQuoted:
+			// Nested double quotes themselves are fine; raw scan below.
+			return true
 		}
 		return true
 	})
@@ -1099,21 +1343,35 @@ func paramExpD2Ambiguous(code string, pe *syntax.ParamExp) bool {
 		return false
 	}
 	lo := int(pe.Pos().Offset())
-	for i := 0; i < len(raw); i++ {
-		abs := lo + i
-		inCS := false
+	inCS := func(abs int) bool {
 		for _, sp := range csSpans {
 			if abs >= sp[0] && abs < sp[1] {
-				inCS = true
-				break
+				return true
 			}
 		}
-		if inCS {
+		return false
+	}
+	for i := 0; i < len(raw); i++ {
+		abs := lo + i
+		if inCS(abs) {
 			continue
 		}
 		switch raw[i] {
-		case '\'', '"', '\\':
+		case '\'':
 			return true
+		case '\n':
+			return true
+		case '\\':
+			if i+1 >= len(raw) {
+				return true
+			}
+			nxt := raw[i+1]
+			switch nxt {
+			case '"', '$', '`', '\\', '\n', '\'':
+				return true
+			}
+			// escaped slash etc. (e.g. ${p//\//_}) is fine
+			i++
 		}
 	}
 	return false
@@ -1242,7 +1500,8 @@ func (c *subCollector) heredocDelimOK(r *syntax.Redirect) bool {
 		return false
 	}
 	src := c.code[lo:hi]
-	if strings.ContainsAny(src, "\\\n") {
+	// Allow leading/in-word backslash escapes (<<\EOF) but reject cross-line cont.
+	if strings.Contains(src, "\n") || hasOddTrailingBackslash(src) {
 		return false
 	}
 	if len(r.Word.Parts) != 1 {
@@ -1250,7 +1509,7 @@ func (c *subCollector) heredocDelimOK(r *syntax.Redirect) bool {
 	}
 	switch p := r.Word.Parts[0].(type) {
 	case *syntax.Lit:
-		return isHeredocDelimName(p.Value)
+		return isHeredocDelimName(posixUnescapeLit(p.Value))
 	case *syntax.SglQuoted:
 		return !p.Dollar && isHeredocDelimName(p.Value)
 	case *syntax.DblQuoted:
@@ -1271,10 +1530,13 @@ func isHeredocDelimName(s string) bool {
 	if s == "" {
 		return false
 	}
+	if s[0] == '-' {
+		return false
+	}
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
 		ok := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-			(ch >= '0' && ch <= '9') || ch == '_'
+			(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.'
 		if !ok {
 			return false
 		}
@@ -1291,23 +1553,51 @@ func (c *subCollector) walkStmts(stmts []*syntax.Stmt, pipeIn bool) {
 	}
 }
 
+// walkStmtsAll walks every stmt of a COMPOUND body with the same pipeIn:
+// inside ( ... )/{ ...; }/if/while/for/case the whole body shares the
+// compound's stdin, so the first-executed-statement rule cannot pick a
+// single inner stmt (M4: `echo pig | (sh)` marks sh's pipedStdin).
+func (c *subCollector) walkStmtsAll(stmts []*syntax.Stmt, pipeIn bool) {
+	for _, st := range stmts {
+		if c.rejected {
+			return
+		}
+		c.walkStmt(st, pipeIn)
+	}
+}
+
+// isTainted reports the effective taint of a variable name: the wildcard
+// "*" entry (set when the pre-scan gave up) counts as EVERY name tainted
+// (S1), so authorization paths cannot consult stale binds.
+func (c *subCollector) isTainted(name string) bool {
+	return c.taintedVars[name] || c.taintedVars["*"]
+}
+
 func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 	if st == nil || c.rejected {
 		return
 	}
+	// R6: a `cmd &` subtree runs in a subshell — nothing inside it binds in
+	// the parent. Closing bind on the whole Background subtree (not only on
+	// the leaf CallExpr) keeps `x=v && true &` from arming "$x".
+	prevBind := c.allowBind
+	if st.Background {
+		c.allowBind = false
+	}
+	defer func() { c.allowBind = prevBind }()
 	if st.Cmd == nil {
 		// bare redirects — still record if they write; unquoted heredoc bodies
 		// can contain $(...) that dash expands (must emit nested CallExprs).
 		for _, r := range st.Redirs {
 			if r.Word != nil {
-				c.emitNestedFromWord(r.Word)
+				c.emitNestedFromWord(r.Word, pipeIn)
 			}
 			if r.Hdoc != nil && !isQuotedHeredocDelim(r.Word) {
-				c.emitNestedFromWord(r.Hdoc)
+				c.emitNestedFromWord(r.Hdoc, pipeIn)
 			}
 		}
 		seg := shellSegment{pipedStdin: pipeIn, backgrounded: st.Background}
-		c.applyRedirs(&seg, st.Redirs)
+		c.applyRedirs(&seg, st.Redirs, pipeIn)
 		if len(seg.argv) > 0 || seg.redirectFile != "" || len(seg.heredocText) > 0 || seg.hereString != "" || seg.depthExceeded {
 			c.segs = append(c.segs, seg)
 		}
@@ -1326,33 +1616,41 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 			c.allowBind = prevBind
 		case syntax.AndStmt, syntax.OrStmt:
 			c.walkStmt(cmd.X, pipeIn)
-			c.walkStmt(cmd.Y, false)
+			// SH11 MF-4.1: the right side is a conditional short-circuit
+			// branch — its assignments are NOT guaranteed to run, so they
+			// must never become staticVars binds. Its STDIN is still the
+			// operator's shared stream: `true && sh` fed by a pipe runs the
+			// piped bytes as sh's program (R13).
+			prevBind := c.allowBind
+			c.allowBind = false
+			c.walkStmt(cmd.Y, pipeIn)
+			c.allowBind = prevBind
 		default:
 			c.reject()
 		}
 	case *syntax.Subshell:
 		prevBind := c.allowBind
 		c.allowBind = false
-		c.walkStmts(cmd.Stmts, false)
+		c.walkStmtsAll(cmd.Stmts, pipeIn)
 		c.allowBind = prevBind
 	case *syntax.Block:
 		prevBind := c.allowBind
 		c.allowBind = false
-		c.walkStmts(cmd.Stmts, false)
+		c.walkStmtsAll(cmd.Stmts, pipeIn)
 		c.allowBind = prevBind
 	case *syntax.IfClause:
 		prevBind := c.allowBind
 		c.allowBind = false
 		for ic := cmd; ic != nil; ic = ic.Else {
-			c.walkStmts(ic.Cond, false)
-			c.walkStmts(ic.Then, false)
+			c.walkStmtsAll(ic.Cond, pipeIn)
+			c.walkStmtsAll(ic.Then, pipeIn)
 		}
 		c.allowBind = prevBind
 	case *syntax.WhileClause:
 		prevBind := c.allowBind
 		c.allowBind = false
-		c.walkStmts(cmd.Cond, false)
-		c.walkStmts(cmd.Do, false)
+		c.walkStmtsAll(cmd.Cond, pipeIn)
+		c.walkStmtsAll(cmd.Do, pipeIn)
 		c.allowBind = prevBind
 	case *syntax.ForClause:
 		prevBind := c.allowBind
@@ -1365,32 +1663,34 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 				c.taintVar(loopName) // loop var never eligible as static command head
 			}
 			for _, w := range wi.Items {
-				c.emitNestedFromWord(w)
+				c.emitNestedFromWord(w, pipeIn)
 			}
 			if loopName != "" {
-				enumDone = c.forEnumSubst(loopName, wi.Items, cmd.Do)
+				enumDone = c.forEnumSubst(loopName, wi.Items, cmd.Do, pipeIn)
 			}
 		}
 		if !enumDone {
-			c.walkStmts(cmd.Do, false)
+			c.walkStmtsAll(cmd.Do, pipeIn)
 		}
 		c.allowBind = prevBind
 	case *syntax.CaseClause:
 		prevBind := c.allowBind
 		c.allowBind = false
-		c.emitNestedFromWord(cmd.Word)
+		c.emitNestedFromWord(cmd.Word, pipeIn)
 		for _, item := range cmd.Items {
 			for _, pat := range item.Patterns {
-				c.emitNestedFromWord(pat)
+				c.emitNestedFromWord(pat, pipeIn)
 			}
-			c.walkStmts(item.Stmts, false)
+			c.walkStmtsAll(item.Stmts, pipeIn)
 		}
 		c.allowBind = prevBind
 	case *syntax.FuncDecl:
 		prevBind := c.allowBind
 		c.allowBind = false
 		if cmd.Body != nil {
-			c.walkStmt(cmd.Body, false)
+			// The body's stdin is the stdin of whatever invocation runs it —
+			// unknown at definition, so conservatively treat it as fed.
+			c.walkStmt(cmd.Body, true)
 		}
 		c.allowBind = prevBind
 	case *syntax.TimeClause:
@@ -1411,29 +1711,29 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, pipeIn bool) {
 		c.emitDecl(st, cmd, pipeIn)
 	case *syntax.ArithmCmd:
 		// Bash arithmetic command: still scan for nested CmdSubst via Walk.
-		c.emitNestedFromNode(cmd)
+		c.emitNestedFromNode(cmd, pipeIn)
 	case *syntax.TestClause:
-		c.emitNestedFromNode(cmd)
+		c.emitNestedFromNode(cmd, pipeIn)
 	case *syntax.LetClause:
-		c.emitNestedFromNode(cmd)
+		c.emitNestedFromNode(cmd, pipeIn)
 	default:
 		c.reject()
 	}
 }
 
 func (c *subCollector) emitDecl(st *syntax.Stmt, d *syntax.DeclClause, pipeIn bool) {
-	c.emitNestedFromNode(d)
+	c.emitNestedFromNode(d, pipeIn)
 	argv := make([]string, 0, 1+len(d.Args))
 	if d.Variant != nil {
 		argv = append(argv, d.Variant.Value)
 	}
+	// SH11 F9: a backgrounded statement runs in a subshell — its assigns
+	// never bind in the parent shell (walkStmt already closed allowBind on
+	// the whole subtree).
 	for _, a := range d.Args {
 		if a.Name != nil && !a.Naked {
-			argv = append(argv, assignToPrefix(a))
-			val, stOk := "", false
-			if a.Value != nil {
-				val, stOk = c.wordToArg(a.Value)
-			}
+			argv = append(argv, c.assignToPrefix(a))
+			val, stOk := c.staticAssignVal(a.Value)
 			c.noteStaticAssign(a.Name.Value, val, stOk)
 			continue
 		}
@@ -1442,12 +1742,12 @@ func (c *subCollector) emitDecl(st *syntax.Stmt, d *syntax.DeclClause, pipeIn bo
 			continue
 		}
 		if a.Value != nil {
-			s, _ := wordToArg(a.Value)
+			s, _ := c.wordToArg(a.Value)
 			argv = append(argv, s)
 		}
 	}
 	seg := shellSegment{argv: argv, pipedStdin: pipeIn, backgrounded: st.Background}
-	c.applyRedirs(&seg, st.Redirs)
+	c.applyRedirs(&seg, st.Redirs, pipeIn)
 	c.segs = append(c.segs, seg)
 }
 
@@ -1455,35 +1755,35 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, pipeIn b
 	// Nested substitutions flush BEFORE the enclosing call.
 	for _, a := range call.Assigns {
 		if a.Value != nil {
-			c.emitNestedFromWord(a.Value)
+			c.emitNestedFromWord(a.Value, pipeIn)
 		}
 		if a.Array != nil {
-			c.emitNestedFromNode(a.Array)
+			c.emitNestedFromNode(a.Array, pipeIn)
 		}
 	}
 	for _, w := range call.Args {
-		c.emitNestedFromWord(w)
+		c.emitNestedFromWord(w, pipeIn)
 	}
 	for _, r := range st.Redirs {
 		if r.Word != nil {
-			c.emitNestedFromWord(r.Word)
+			c.emitNestedFromWord(r.Word, pipeIn)
 		}
 		if r.Hdoc != nil && !isQuotedHeredocDelim(r.Word) {
-			c.emitNestedFromWord(r.Hdoc)
+			c.emitNestedFromWord(r.Hdoc, pipeIn)
 		}
 	}
 
 	argv := make([]string, 0, len(call.Assigns)+len(call.Args))
+	// SH11 F9: a backgrounded statement runs in a subshell — its assigns
+	// never bind in the parent shell (walkStmt already closed allowBind on
+	// the whole subtree).
 	for _, a := range call.Assigns {
-		argv = append(argv, assignToPrefix(a))
+		argv = append(argv, c.assignToPrefix(a))
 		if a.Name != nil && !a.Naked {
 			if len(call.Args) == 0 {
 				// Pure assignment statement — eligible for staticVars.
-				val, st := "", false
-				if a.Value != nil {
-					val, st = c.wordToArg(a.Value)
-				}
-				c.noteStaticAssign(a.Name.Value, val, st)
+				val, stOk := c.staticAssignVal(a.Value)
+				c.noteStaticAssign(a.Name.Value, val, stOk)
 			} else {
 				// Prefix env (FOO=bar cmd) does not bind in the current shell.
 				c.taintVar(a.Name.Value)
@@ -1491,20 +1791,32 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, pipeIn b
 		}
 	}
 	for i, w := range call.Args {
-		// Command head: allow enumVars only for abs-path for-loop values (W-Fix-6).
-		if i == 0 && len(c.enumVars) > 0 {
-			// Try with enumVars; if resolved value is not a safe abs path, fall back.
-			s, ok := c.wordToArg(w)
-			if ok && isSafeAbsPathVal(s) {
+		// Command head: for-loop enum binds may expand the head (W-Fix-6
+		// abs-path single words; W11-5 static multi-word command strings).
+		if i == 0 {
+			if !c.isTainted("IFS") {
+				if name, single := singleSimpleParamExp(w); single {
+					if words, ok := c.enumCmdWords[name]; ok && len(words) > 0 {
+						argv = append(argv, words...)
+						continue
+					}
+				}
+			}
+			if len(c.enumVars) > 0 {
+				// Try with enumVars; if resolved value is not a safe abs path,
+				// fall back.
+				s, ok := c.wordToArg(w)
+				if ok && isSafeAbsPathVal(s) {
+					argv = append(argv, s)
+					continue
+				}
+				saved := c.enumVars
+				c.enumVars = nil
+				s, _ = c.wordToArg(w)
+				c.enumVars = saved
 				argv = append(argv, s)
 				continue
 			}
-			saved := c.enumVars
-			c.enumVars = nil
-			s, _ = c.wordToArg(w)
-			c.enumVars = saved
-			argv = append(argv, s)
-			continue
 		}
 		s, _ := c.wordToArg(w)
 		argv = append(argv, s)
@@ -1518,15 +1830,18 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, pipeIn b
 		backgrounded: st.Background,
 		processSubst: callHasProcSubst(call),
 	}
-	c.applyRedirs(&seg, st.Redirs)
+	c.applyRedirs(&seg, st.Redirs, pipeIn)
 	if len(seg.argv) > 0 || seg.redirectFile != "" || len(seg.heredocText) > 0 ||
 		seg.hereString != "" || seg.processSubst || seg.depthExceeded {
 		c.segs = append(c.segs, seg)
 	}
 }
 
-func (c *subCollector) applyRedirs(seg *shellSegment, redirs []*syntax.Redirect) {
+func (c *subCollector) applyRedirs(seg *shellSegment, redirs []*syntax.Redirect, pipeIn bool) {
 	for _, r := range redirs {
+		// Only an fd0 redirect decides where the command's stdin comes from;
+		// 3< f or 2<<E leave stdin untouched.
+		fd0 := r.N == nil || r.N.Value == "0"
 		switch r.Op {
 		case syntax.Hdoc, syntax.DashHdoc:
 			quoted := isQuotedHeredocDelim(r.Word)
@@ -1563,6 +1878,11 @@ func (c *subCollector) applyRedirs(seg *shellSegment, redirs []*syntax.Redirect)
 					seg.heredocText = append(seg.heredocText, heredocBody{text: b.String(), quoted: false, dynamic: false})
 				}
 			}
+			// M3: an fd0 heredoc feeds stdin when it is the LAST fd0 redirect:
+			// `sh < f <<EOF` runs the body, not the file.
+			if fd0 {
+				seg.stdinRedir = false
+			}
 		case syntax.WordHdoc:
 			if r.Word != nil {
 				s, ok := wordToArg(r.Word)
@@ -1570,6 +1890,9 @@ func (c *subCollector) applyRedirs(seg *shellSegment, redirs []*syntax.Redirect)
 					s = cmdSubPlaceholder
 				}
 				seg.hereString = s
+			}
+			if fd0 {
+				seg.stdinRedir = false
 			}
 		case syntax.RdrOut, syntax.AppOut, syntax.RdrAll, syntax.AppAll, syntax.RdrClob:
 			c.setWriteRedirect(seg, r)
@@ -1586,8 +1909,14 @@ func (c *subCollector) applyRedirs(seg *shellSegment, redirs []*syntax.Redirect)
 				}
 			}
 		case syntax.RdrIn, syntax.DplIn, syntax.RdrInOut:
+			// SH11 F7/R13: only an fd0 redirect binds the command's stdin —
+			// `sh 3</dev/null` still reads the inherited stream. The LAST fd0
+			// redirect decides (an fd0 heredoc above resets the flag).
+			if fd0 {
+				seg.stdinRedir = true
+			}
 			if r.Word != nil {
-				c.emitNestedFromWord(r.Word)
+				c.emitNestedFromWord(r.Word, pipeIn)
 			}
 		}
 	}
@@ -1621,7 +1950,7 @@ func (c *subCollector) setWriteRedirect(seg *shellSegment, r *syntax.Redirect) {
 	}
 }
 
-func (c *subCollector) emitNestedFromWord(w *syntax.Word) {
+func (c *subCollector) emitNestedFromWord(w *syntax.Word, pipeIn bool) {
 	if w == nil {
 		return
 	}
@@ -1629,10 +1958,14 @@ func (c *subCollector) emitNestedFromWord(w *syntax.Word) {
 		c.reject()
 		return
 	}
-	c.emitNestedFromNode(w)
+	c.emitNestedFromNode(w, pipeIn)
 }
 
-func (c *subCollector) emitNestedFromNode(n syntax.Node) {
+// pipeIn flows into substitutions: a $(...) inherits the enclosing command's
+// stdin, so `echo pig | cat $(sh)` feeds the pipe to sh. A <(...) proc subst
+// inherits that same stdin; a >(...) subst is fed by the enclosing command's
+// stdout — also an unvetted byte stream, so its inner stmts get pipeIn too.
+func (c *subCollector) emitNestedFromNode(n syntax.Node, pipeIn bool) {
 	if n == nil || c.rejected {
 		return
 	}
@@ -1646,8 +1979,11 @@ func (c *subCollector) emitNestedFromNode(n syntax.Node) {
 				c.segs = append(c.segs, shellSegment{depthExceeded: true})
 				return false
 			}
-			sub := &subCollector{code: c.code, depth: c.depth + 1, staticVars: map[string]string{}, enumVars: map[string]string{}, taintedVars: map[string]bool{}, allowBind: false}
-			sub.walkStmts(x.Stmts, false)
+			sub := c.newSub()
+			// R13: every executable sub-statement shares the substitution's
+			// stdin — `cat $(true; sh)` feeds the pipe to sh, not only to
+			// the first statement.
+			sub.walkStmtsAll(x.Stmts, pipeIn)
 			if sub.rejected {
 				c.reject()
 				return false
@@ -1659,8 +1995,14 @@ func (c *subCollector) emitNestedFromNode(n syntax.Node) {
 				c.segs = append(c.segs, shellSegment{depthExceeded: true})
 				return false
 			}
-			sub := &subCollector{code: c.code, depth: c.depth + 1, staticVars: map[string]string{}, enumVars: map[string]string{}, taintedVars: map[string]bool{}, allowBind: false}
-			sub.walkStmts(x.Stmts, false)
+			sub := c.newSub()
+			if x.Op == syntax.CmdOut {
+				// >(...) : the inner command is fed by the enclosing command's
+				// stdout — an unvetted byte stream, treat as piped input.
+				sub.walkStmtsAll(x.Stmts, true)
+			} else {
+				sub.walkStmtsAll(x.Stmts, pipeIn)
+			}
 			if sub.rejected {
 				c.reject()
 				return false
@@ -1670,6 +2012,48 @@ func (c *subCollector) emitNestedFromNode(n syntax.Node) {
 		}
 		return true
 	})
+}
+
+// newSub creates a nested $(...)/<(...) sub-collector inheriting READ-ONLY
+// snapshots of the outer static/enum/taint binds (W11-4): `$(find $d/...)`
+// sees the enclosing for-loop's enum value and the outer top-level
+// staticVars, while the child's own writes never leak back (allowBind=false).
+func (c *subCollector) newSub() *subCollector {
+	return &subCollector{
+		code:         c.code,
+		depth:        c.depth + 1,
+		staticVars:   cloneStringMap(c.staticVars),
+		litVars:      cloneStringMap(c.litVars),
+		enumVars:     cloneStringMap(c.enumVars),
+		enumCmdWords: cloneStringsMap(c.enumCmdWords),
+		taintedVars:  cloneBoolMap(c.taintedVars),
+		ssaBlocked:   cloneBoolMap(c.ssaBlocked),
+		allowBind:    false,
+	}
+}
+
+func cloneStringMap(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneStringsMap(m map[string][]string) map[string][]string {
+	out := make(map[string][]string, len(m))
+	for k, v := range m {
+		out[k] = append([]string(nil), v...)
+	}
+	return out
+}
+
+func cloneBoolMap(m map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // posixUnescapeLit applies POSIX unquoted backslash rules to a Lit.Value:
@@ -1698,15 +2082,7 @@ func isSafeAbsPathVal(s string) bool {
 	if s == "" || !strings.HasPrefix(s, "/") {
 		return false
 	}
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		ok := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-			(ch >= '0' && ch <= '9') || ch == '_' || ch == '.' || ch == '/' || ch == '-'
-		if !ok {
-			return false
-		}
-	}
-	return true
+	return isSafeIdentOrRelPath(s)
 }
 
 func isSafeIdentOrRelPath(s string) bool {
@@ -1716,7 +2092,8 @@ func isSafeIdentOrRelPath(s string) bool {
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
 		ok := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-			(ch >= '0' && ch <= '9') || ch == '_' || ch == '.' || ch == '/' || ch == '-'
+			(ch >= '0' && ch <= '9') || ch == '_' || ch == '.' || ch == '/' ||
+			ch == '-' || ch == '@' || ch == ':' || ch == '+'
 		if !ok {
 			return false
 		}
@@ -1733,6 +2110,7 @@ func (c *subCollector) taintVar(name string) {
 	}
 	c.taintedVars[name] = true
 	delete(c.staticVars, name)
+	delete(c.litVars, name)
 }
 
 // noteDeclCallBinds records abs-path binds from POSIX-style
@@ -1764,6 +2142,9 @@ func (c *subCollector) noteStaticAssign(name, val string, static bool) {
 	if c.staticVars == nil {
 		c.staticVars = map[string]string{}
 	}
+	if c.litVars == nil {
+		c.litVars = map[string]string{}
+	}
 	if c.taintedVars == nil {
 		c.taintedVars = map[string]bool{}
 	}
@@ -1774,20 +2155,29 @@ func (c *subCollector) noteStaticAssign(name, val string, static bool) {
 		c.taintVar(name)
 		return
 	}
-	if c.taintedVars[name] {
+	if c.isTainted(name) {
 		return
 	}
-	if !static || !isSafeAbsPathVal(val) {
-		c.taintedVars[name] = true
-		delete(c.staticVars, name)
+	if !static || !isSafeIdentOrRelPath(val) {
+		c.taintVar(name)
 		return
 	}
+	// Safe-literal values (no field-split / glob / tilde chars) bind into
+	// litVars for in-word substitution; absolute-path values ALSO bind into
+	// staticVars (command-head eligible). A stale or differing earlier bind
+	// taints the name — writes must be single-assignment to stay known.
 	if prev, ok := c.staticVars[name]; ok && prev != val {
-		c.taintedVars[name] = true
-		delete(c.staticVars, name)
+		c.taintVar(name)
 		return
 	}
-	c.staticVars[name] = val
+	if prev, ok := c.litVars[name]; ok && prev != val {
+		c.taintVar(name)
+		return
+	}
+	c.litVars[name] = val
+	if isSafeAbsPathVal(val) {
+		c.staticVars[name] = val
+	}
 }
 
 func (c *subCollector) resolveStaticParam(pe *syntax.ParamExp) (string, bool) {
@@ -1797,17 +2187,32 @@ func (c *subCollector) resolveStaticParam(pe *syntax.ParamExp) (string, bool) {
 	if pe.Exp != nil || pe.Slice != nil || pe.Repl != nil || pe.Index != nil || pe.Length || pe.Excl || pe.Names != 0 {
 		return "", false
 	}
-	v, ok := c.staticVars[pe.Param.Value]
-	if !ok || !isSafeIdentOrRelPath(v) {
+	name := pe.Param.Value
+	if c.isTainted(name) {
+		return "", false // S1: the "*" give-up taint never resolves binds
+	}
+	v, ok := c.staticVars[name]
+	if !ok {
+		return "", false
+	}
+	// Guard vars may NEVER become a static command head: an attacker who
+	// managed to bind CTXMODE_ROLE must not get a screened-free head.
+	if guardTaintVars[name] {
+		return "", false
+	}
+	if !isSafeIdentOrRelPath(v) {
 		return "", false
 	}
 	return v, true
 }
 
 // resolveParamForSubst resolves a simple $VAR / ${VAR} from enumVars (for-loop
-// payload subst) or staticVars (abs-path binds). Used for in-word expansion;
-// command-head resolution stays on resolveStaticParam (staticVars only).
-func (c *subCollector) resolveParamForSubst(pe *syntax.ParamExp) (string, bool) {
+// payload subst — consulted FIRST: the loop var is deliberately tainted so it
+// can never become a static head, yet the enum walk binds it per-iteration),
+// staticVars (abs-path binds) or litVars (safe-literal binds — only when
+// litOK, i.e. never for a bare whole-word "$VAR", so `BUN=echo; "$BUN"`
+// stays a dynamic head). The "*" give-up taint blocks static/lit binds (S1).
+func (c *subCollector) resolveParamForSubst(pe *syntax.ParamExp, litOK bool) (string, bool) {
 	if pe == nil || pe.Param == nil {
 		return "", false
 	}
@@ -1823,6 +2228,9 @@ func (c *subCollector) resolveParamForSubst(pe *syntax.ParamExp) (string, bool) 
 			return v, true
 		}
 	}
+	if c.isTainted(name) {
+		return "", false // S1: "*" taint blocks every persistent bind
+	}
 	if c.staticVars != nil {
 		if v, ok := c.staticVars[name]; ok {
 			if !isSafeIdentOrRelPath(v) {
@@ -1831,38 +2239,137 @@ func (c *subCollector) resolveParamForSubst(pe *syntax.ParamExp) (string, bool) 
 			return v, true
 		}
 	}
+	if litOK && c.litVars != nil {
+		if v, ok := c.litVars[name]; ok {
+			return v, true
+		}
+	}
 	return "", false
+}
+
+// staticAssignVal computes the (value, static) pair for an assignment whose
+// RHS is w. A bare $(pwd) binds the process cwd; a bare $(mktemp -d) binds
+// the marker /tmp/__ctx_mktemp_dir__ (F8: only when TMPDIR is not tainted —
+// every other spelling keeps the value dynamic).
+func (c *subCollector) staticAssignVal(w *syntax.Word) (string, bool) {
+	if w != nil && len(w.Parts) == 1 {
+		if cs, ok := w.Parts[0].(*syntax.CmdSubst); ok && !cs.Backquotes {
+			if isPwdCallStmts(cs.Stmts) {
+				if wd, err := os.Getwd(); err == nil {
+					return wd, true
+				}
+			}
+			if !c.isTainted("TMPDIR") && isMktempDashDCallStmts(cs.Stmts) {
+				return mktempDirPlaceholder, true
+			}
+		}
+	}
+	if w == nil {
+		return "", false
+	}
+	return c.wordToArg(w)
+}
+
+// isPwdCallStmts reports whether stmts is exactly `pwd` (no operands).
+func isPwdCallStmts(stmts []*syntax.Stmt) bool {
+	return bareCallArgvIs(stmts, []string{"pwd"})
+}
+
+// isMktempDashDCallStmts reports whether stmts is exactly `mktemp -d`.
+func isMktempDashDCallStmts(stmts []*syntax.Stmt) bool {
+	return bareCallArgvIs(stmts, []string{"mktemp", "-d"})
+}
+
+// bareCallArgvIs reports whether stmts is a single plain call whose static
+// argv equals want.
+func bareCallArgvIs(stmts []*syntax.Stmt, want []string) bool {
+	if len(stmts) != 1 || stmts[0] == nil || stmts[0].Background ||
+		stmts[0].Negated || stmts[0].Coprocess || len(stmts[0].Redirs) > 0 {
+		return false
+	}
+	call, ok := stmts[0].Cmd.(*syntax.CallExpr)
+	if !ok || len(call.Assigns) > 0 || len(call.Args) != len(want) {
+		return false
+	}
+	for i, w := range call.Args {
+		s, ok := wordToArg(w)
+		if !ok || s != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // forEnumSubst substitutes each static for-list value into the Do body.
 // Returns true when the Do body was handled (either enum-walked or rejected).
 // Dynamic items leave the caller to walk Do once without binding.
-func (c *subCollector) forEnumSubst(loopName string, items []*syntax.Word, do []*syntax.Stmt) bool {
+//
+// W11-5/F6: items that are static multi-word command strings bind into
+// enumCmdWords (expanding a bare $name head word into several argv words,
+// each individually screened); this requires an untainted IFS since the
+// runtime split uses the live IFS while the model uses ASCII whitespace.
+// Items that fail even that check make the whole loop fall back to the
+// dynamic path.
+func (c *subCollector) forEnumSubst(loopName string, items []*syntax.Word, do []*syntax.Stmt, pipeIn bool) bool {
 	if len(items) == 0 {
 		return false
 	}
 	if c.ssaBlocked != nil && c.ssaBlocked[loopName] {
 		return false // G3: multi-write elsewhere → no static enum
 	}
-	vals := make([]string, 0, len(items))
+	type item struct {
+		single string
+		words  []string
+	}
+	vals := make([]item, 0, len(items))
 	for _, w := range items {
-		s, ok := wordToArg(w)
-		if !ok {
+		s, ok := c.wordToArg(w)
+		if !ok || isDynamicArg(s) {
 			return false // dynamic item → stay dynamic
 		}
-		// W-Fix-1: non-simple enum items → graceful fallback (not reject).
-		if !isSafeIdentOrRelPath(s) {
+		if isSafeIdentOrRelPath(s) {
+			vals = append(vals, item{single: s, words: []string{s}})
+			continue
+		}
+		// W11-5: multi-word static command string. Every sub-word must be a
+		// safe token; the head sub-word additionally forbids '=' (an
+		// IFS='=' split would otherwise smuggle a KEY=VAL env prefix). The
+		// whole construct is disabled when IFS is tainted.
+		if c.isTainted("IFS") {
 			return false
 		}
-		vals = append(vals, s)
+		ws := strings.Fields(s)
+		if len(ws) < 2 {
+			return false
+		}
+		safe := true
+		for i, sw := range ws {
+			if !isSafeEnumCmdWord(sw, i == 0) {
+				safe = false
+				break
+			}
+		}
+		if !safe {
+			return false
+		}
+		vals = append(vals, item{words: ws})
 	}
 	if c.enumVars == nil {
 		c.enumVars = map[string]string{}
 	}
+	if c.enumCmdWords == nil {
+		c.enumCmdWords = map[string][]string{}
+	}
 	prev, hadPrev := c.enumVars[loopName]
-	for _, v := range vals {
-		c.enumVars[loopName] = v
-		c.walkStmts(do, false)
+	prevW, hadPrevW := c.enumCmdWords[loopName]
+	for _, it := range vals {
+		if it.single != "" {
+			c.enumVars[loopName] = it.single
+		} else {
+			delete(c.enumVars, loopName)
+		}
+		c.enumCmdWords[loopName] = it.words
+		c.walkStmtsAll(do, pipeIn)
 		if c.rejected {
 			break
 		}
@@ -1872,7 +2379,52 @@ func (c *subCollector) forEnumSubst(loopName string, items []*syntax.Word, do []
 	} else {
 		delete(c.enumVars, loopName)
 	}
+	if hadPrevW {
+		c.enumCmdWords[loopName] = prevW
+	} else {
+		delete(c.enumCmdWords, loopName)
+	}
 	return true
+}
+
+// isSafeEnumCmdWord reports whether one whitespace-split token of a static
+// multi-word enum item is safe to splice into argv: no characters that a
+// plausible IFS could re-split (':' '+' ',' ';' '|'), no glob/regex bytes
+// that could re-expand at runtime (R8: '*', '?', '[', ']') and no grouping
+// parens (extglob operators) — for the HEAD sub-word no '=' either
+// (KEY=VAL env prefix via IFS='=').
+func isSafeEnumCmdWord(s string, head bool) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case ':', '+', ',', ';', '|', '*', '?', '[', ']', '(', ')':
+			return false
+		case '=':
+			if head {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// singleSimpleParamExp reports whether w is exactly one unquoted simple
+// parameter expansion ($name or ${name}) and returns the name.
+func singleSimpleParamExp(w *syntax.Word) (string, bool) {
+	if w == nil || len(w.Parts) != 1 {
+		return "", false
+	}
+	pe, ok := w.Parts[0].(*syntax.ParamExp)
+	if !ok || pe.Param == nil {
+		return "", false
+	}
+	if pe.Exp != nil || pe.Slice != nil || pe.Repl != nil || pe.Index != nil ||
+		pe.Length || pe.Excl || pe.Names != 0 {
+		return "", false
+	}
+	return pe.Param.Value, true
 }
 
 func litHasUnquotedGlobOrTilde(rawLit string, isWordStart bool, openBracket *bool) bool {
@@ -1902,6 +2454,14 @@ func litHasUnquotedGlobOrTilde(rawLit string, isWordStart bool, openBracket *boo
 // wordToArg returns the static string form of w, or (prefix+placeholder, false)
 // when the word has dynamic/glob/tilde content. Static prefixes such as -c are
 // preserved so option scanners can still see the option letter.
+//
+// Placeholder grading (SH11 G2): unquoted glob/tilde lits emit
+// cmdSubPlaceholderGlob (split-safe by POSIX definition: pathname expansion
+// never field-splits), unquoted $$ emits cmdSubPlaceholderQuoted (a PID is
+// digits — cannot field-split). Variable/command substitutions in a
+// context-free conversion keep the conservative cmdSubPlaceholder; the
+// collector method c.wordToArg is taint-aware and upgrades $HOME / $PATH /
+// $PWD / $$ / $(pwd) / $(mktemp -d).
 func wordToArg(w *syntax.Word) (string, bool) {
 	if w == nil || len(w.Parts) == 0 {
 		return "", false
@@ -1915,7 +2475,7 @@ func wordToArg(w *syntax.Word) (string, bool) {
 			if litHasUnquotedGlobOrTilde(p.Value, i == 0 && b.Len() == 0, &openBracket) {
 				static = false
 				b.WriteString(posixUnescapeLit(p.Value))
-				b.WriteString(cmdSubPlaceholder)
+				b.WriteString(cmdSubPlaceholderGlob)
 				continue
 			}
 			b.WriteString(posixUnescapeLit(p.Value))
@@ -1942,11 +2502,13 @@ func wordToArg(w *syntax.Word) (string, bool) {
 				b.WriteString(decodeDblQuotedLit(lit.Value))
 			}
 		case *syntax.ParamExp:
-			// R-Allow-2 narrow: simple $VAR / ${VAR} may resolve from staticVars
-			// when the collector context provides one; wordToArg itself stays
-			// context-free and treats ParamExp as dynamic (prefix-preserving).
+			// Context-free: only $$ (a decimal PID) is known split-safe.
 			static = false
-			b.WriteString(cmdSubPlaceholder)
+			if p.Param != nil && p.Param.Value == "$" && p.Exp == nil {
+				b.WriteString(cmdSubPlaceholderQuoted)
+			} else {
+				b.WriteString(cmdSubPlaceholder)
+			}
 		case *syntax.CmdSubst, *syntax.ArithmExp,
 			*syntax.ProcSubst, *syntax.ExtGlob, *syntax.BraceExp:
 			static = false
@@ -1985,18 +2547,31 @@ func (c *subCollector) wordToArg(w *syntax.Word) (string, bool) {
 			}
 		}
 	}
-	hasSubst := (c.enumVars != nil && len(c.enumVars) > 0) || (c.staticVars != nil && len(c.staticVars) > 0)
-	if !hasSubst {
-		return wordToArg(w)
-	}
+	// Always route through the taint-aware converter: the PATH/HOME/PWD
+	// placeholder grants depend on envTaint + script writes even when no
+	// staticVars/enumVars binds exist.
 	return c.wordToArgWithSubst(w)
 }
 
 // wordToArgWithSubst is wordToArg plus R-Allow-2 ParamExp substitution from
-// enumVars/staticVars (in-word / -c payload expansion).
+// enumVars/staticVars/litVars (in-word / -c payload expansion) and the SH11
+// taint-aware placeholder grading. A bare "$VAR" word never resolves
+// litVars (litOK=false): a plain literal head like BUN=echo must stay
+// dynamic — `x=v && "$x"` patterns are only honoured for abs-path binds.
 func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 	if w == nil || len(w.Parts) == 0 {
 		return "", false
+	}
+	litOK := true
+	if len(w.Parts) == 1 {
+		if _, ok := w.Parts[0].(*syntax.ParamExp); ok {
+			litOK = false
+		}
+		if dq, ok := w.Parts[0].(*syntax.DblQuoted); ok && len(dq.Parts) == 1 {
+			if _, ok := dq.Parts[0].(*syntax.ParamExp); ok {
+				litOK = false
+			}
+		}
 	}
 	var b strings.Builder
 	static := true
@@ -2007,7 +2582,7 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 			if litHasUnquotedGlobOrTilde(p.Value, i == 0 && b.Len() == 0, &openBracket) {
 				static = false
 				b.WriteString(posixUnescapeLit(p.Value))
-				b.WriteString(cmdSubPlaceholder)
+				b.WriteString(cmdSubPlaceholderGlob)
 				continue
 			}
 			b.WriteString(posixUnescapeLit(p.Value))
@@ -2029,19 +2604,25 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 				case *syntax.Lit:
 					b.WriteString(decodeDblQuotedLit(ipp.Value))
 				case *syntax.ParamExp:
-					if v, ok := c.resolveParamForSubst(ipp); ok {
+					if v, ok := c.resolveParamForSubst(ipp, litOK); ok {
 						b.WriteString(v)
 					} else {
-						static = false
-						b.WriteString(cmdSubPlaceholderQuoted)
+						s, ok2 := c.dqParamPlaceholder(ipp)
+						if !ok2 {
+							static = false
+						}
+						b.WriteString(s)
 					}
+				case *syntax.CmdSubst:
+					static = false
+					b.WriteString(c.dqSubstPlaceholder(ipp))
 				default:
 					static = false
 					b.WriteString(cmdSubPlaceholderQuoted)
 				}
 			}
 		case *syntax.ParamExp:
-			if v, ok := c.resolveParamForSubst(p); ok {
+			if v, ok := c.resolveParamForSubst(p, litOK); ok {
 				if openBracket {
 					// SF-4: [prefix$v] can form a glob after expansion.
 					static = false
@@ -2049,9 +2630,12 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 				b.WriteString(v)
 			} else {
 				static = false
-				b.WriteString(cmdSubPlaceholder)
+				b.WriteString(c.unquotedParamPlaceholder(p))
 			}
-		case *syntax.CmdSubst, *syntax.ArithmExp,
+		case *syntax.CmdSubst:
+			static = false
+			b.WriteString(c.unquotedSubstPlaceholder(p))
+		case *syntax.ArithmExp,
 			*syntax.ProcSubst, *syntax.ExtGlob, *syntax.BraceExp:
 			static = false
 			b.WriteString(cmdSubPlaceholder)
@@ -2067,6 +2651,112 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 		return b.String(), false
 	}
 	return b.String(), true
+}
+
+// simpleParamName returns the variable name of a simple $VAR / ${VAR}
+// expansion (no operators, indexes or lengths), or "".
+func simpleParamName(pe *syntax.ParamExp) (string, bool) {
+	if pe == nil || pe.Param == nil {
+		return "", false
+	}
+	if pe.Exp != nil || pe.Slice != nil || pe.Repl != nil || pe.Index != nil ||
+		pe.Length || pe.Excl || pe.Names != 0 {
+		return "", false
+	}
+	return pe.Param.Value, true
+}
+
+// unquotedParamPlaceholder classifies an unresolved unquoted $VAR word part.
+// $HOME expands to a known absolute path (no field-split risk from OUR
+// value) only when HOME was never written/overridden; $PATH keeps its
+// self-reference sentinel; $$ is a decimal PID (split-safe); everything
+// else is a plain splittable dynamic placeholder.
+func (c *subCollector) unquotedParamPlaceholder(pe *syntax.ParamExp) string {
+	name, simple := simpleParamName(pe)
+	if !simple {
+		return cmdSubPlaceholder
+	}
+	switch name {
+	case "PATH":
+		// The "*" give-up taint does NOT gate PATH: its grant channel is the
+		// env-op screen (envAs), not a placeholder class — sentinelTrustVars
+		// deliberately excludes it.
+		if !c.taintedVars["PATH"] && !c.ssaBlocked["PATH"] {
+			return envPathSelfPlaceholder
+		}
+		return cmdSubPlaceholder
+	case "HOME":
+		if !c.isTainted("HOME") {
+			return safeHomeDir()
+		}
+		return cmdSubPlaceholder
+	case "$":
+		return cmdSubPlaceholderQuoted // PID: digits, no field-split
+	}
+	return cmdSubPlaceholder
+}
+
+// dqParamPlaceholder classifies an unresolved $VAR inside double quotes.
+// (text, true) means the part emitted literal text that stays static;
+// (placeholder, false) marks the word dynamic.
+func (c *subCollector) dqParamPlaceholder(pe *syntax.ParamExp) (string, bool) {
+	name, simple := simpleParamName(pe)
+	if !simple {
+		return cmdSubPlaceholderQuoted, false
+	}
+	switch name {
+	case "PATH":
+		if !c.taintedVars["PATH"] && !c.ssaBlocked["PATH"] {
+			return envPathSelfPlaceholder, false
+		}
+	case "HOME":
+		if !c.isTainted("HOME") {
+			return safeHomeDir(), true // static absolute path text
+		}
+	case "PWD", "OLDPWD":
+		if !c.isTainted(name) {
+			return cmdSubPlaceholderAbsDq, false // guaranteed to start with /
+		}
+	case "$":
+		return cmdSubPlaceholderQuoted, false
+	}
+	return cmdSubPlaceholderQuoted, false
+}
+
+// dqSubstPlaceholder classifies a $(...) inside double quotes: `$(pwd)` and
+// a bare `$(mktemp -d)` (with untainted TMPDIR) are guaranteed to produce a
+// path starting with /, so they carry the absolute-dir dq placeholder.
+func (c *subCollector) dqSubstPlaceholder(cs *syntax.CmdSubst) string {
+	if cs != nil {
+		// Both backquote and $(...) forms of `pwd` / `mktemp -d` produce an
+		// absolute path (backquotes cannot smuggle a second word in dq).
+		if isPwdCallStmts(cs.Stmts) {
+			return cmdSubPlaceholderAbsDq
+		}
+		if !c.isTainted("TMPDIR") && isMktempDashDCallStmts(cs.Stmts) {
+			return cmdSubPlaceholderAbsDq
+		}
+	}
+	return cmdSubPlaceholderQuoted
+}
+
+// unquotedSubstPlaceholder keeps unquoted $(...) fully dynamic — its output
+// field-splits on IFS. A bare $(pwd) emits the dq-abs placeholder only when
+// IFS is untainted AND the result cannot begin with '-': pwd's output
+// begins with / by definition, but word-splitting could still break it, so
+// unquoted $(pwd) stays plain dynamic (conservative).
+func (c *subCollector) unquotedSubstPlaceholder(cs *syntax.CmdSubst) string {
+	return cmdSubPlaceholder
+}
+
+// safeHomeDir returns the process home as a static absolute path used for
+// $HOME expansion when the script never reassigned it. Falls back to "/root"
+// when HOME is unset/relative — matching the deployment user.
+func safeHomeDir() string {
+	if h := os.Getenv("HOME"); h != "" && strings.HasPrefix(h, "/") && !strings.Contains(h, "\x00") {
+		return h
+	}
+	return "/root"
 }
 
 func callHasProcSubst(call *syntax.CallExpr) bool {
@@ -2089,16 +2779,35 @@ func isQuotedHeredocDelim(w *syntax.Word) bool {
 	if w == nil || len(w.Parts) != 1 {
 		return false
 	}
-	switch w.Parts[0].(type) {
+	switch p := w.Parts[0].(type) {
 	case *syntax.SglQuoted, *syntax.DblQuoted:
 		return true
+	case *syntax.Lit:
+		// Any escaped delimiter byte suppresses expansion, including
+		// <<\EOF and <<E\OF. heredocDelimOK rejects escaped newlines.
+		return strings.Contains(p.Value, "\\")
 	default:
 		return false
 	}
 }
 
-// assignToPrefix formats an Assign as NAME=value (or NAME=__ctx_cmdsub__).
-func assignToPrefix(a *syntax.Assign) string {
+// withLhsUntainted evaluates fn with `name` temporarily removed from the
+// taint sets: the RHS of `PATH=$PATH:x` must still read the OLD PATH
+// value (POSIX expands the RHS before the assignment), so a whole-file
+// mutation pre-scan that already counts this assignment must not
+// contaminate the word conversion.
+func (c *subCollector) withLhsUntainted(name string, fn func()) {
+	saveT, saveS := c.taintedVars[name], c.ssaBlocked[name]
+	delete(c.taintedVars, name)
+	delete(c.ssaBlocked, name)
+	fn()
+	c.taintedVars[name], c.ssaBlocked[name] = saveT, saveS
+}
+
+// assignToPrefix formats an Assign as NAME=value (or NAME=__ctx_cmdsub__),
+// using the collector's taint-aware word conversion so $PATH/$HOME sentinels
+// and staticVars binds apply to prefix assignments exactly like env args.
+func (c *subCollector) assignToPrefix(a *syntax.Assign) string {
 	name := ""
 	if a.Name != nil {
 		name = a.Name.Value
@@ -2112,8 +2821,10 @@ func assignToPrefix(a *syntax.Assign) string {
 		}
 		return name + "="
 	}
-	s, ok := wordToArg(a.Value)
-	if !ok {
+	var s string
+	var ok bool
+	c.withLhsUntainted(name, func() { s, ok = c.wordToArg(a.Value) })
+	if !ok && !strings.Contains(s, envPathSelfPlaceholder) && !strings.HasPrefix(s, cmdSubPlaceholderAbsDq) {
 		return name + "=" + cmdSubPlaceholder
 	}
 	return name + "=" + s

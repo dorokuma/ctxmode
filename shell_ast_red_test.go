@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -11,6 +13,14 @@ type astRedCase struct {
 	role   string // "ro" or "worker"
 	reject bool   // true = must reject; false = must allow
 	reason string
+}
+
+// astRedWantCase extends a table row with `want`: when the case rejects,
+// the hit detail must contain this substring (R13 — a bare allow/deny
+// boolean can hide a wrong-reason hit).
+type astRedWantCase struct {
+	astRedCase
+	want string
 }
 
 func astMustRedCases() []astRedCase {
@@ -117,18 +127,7 @@ func TestAST_MustRed66(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.id, func(t *testing.T) {
-			setAstRole(t, c.role)
-			hit := runAstGuard(c.role, c.code)
-			allowed := hit == ""
-			if c.reject {
-				if allowed {
-					t.Fatalf("expected REJECT (%s) but guard allowed; code=%q", c.reason, c.code)
-				}
-			} else {
-				if !allowed {
-					t.Fatalf("expected ALLOW (%s) but guard rejected: %s; code=%q", c.reason, hit, c.code)
-				}
-			}
+			runAstRedCase(t, c)
 		})
 	}
 	t.Logf("must-red summary: cases=%d", len(cases))
@@ -226,18 +225,7 @@ func TestAST_MustRed_Round9(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.id, func(t *testing.T) {
-			setAstRole(t, c.role)
-			hit := runAstGuard(c.role, c.code)
-			allowed := hit == ""
-			if c.reject {
-				if allowed {
-					t.Fatalf("expected REJECT (%s) but guard allowed; code=%q", c.reason, c.code)
-				}
-			} else {
-				if !allowed {
-					t.Fatalf("expected ALLOW (%s) but guard rejected: %s; code=%q", c.reason, hit, c.code)
-				}
-			}
+			runAstRedCase(t, c)
 		})
 	}
 	t.Logf("must-red round9 summary: cases=%d", len(cases))
@@ -328,18 +316,7 @@ func TestAST_MustRed_Round10(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.id, func(t *testing.T) {
-			setAstRole(t, c.role)
-			hit := runAstGuard(c.role, c.code)
-			allowed := hit == ""
-			if c.reject {
-				if allowed {
-					t.Fatalf("expected REJECT (%s) but guard allowed; code=%q", c.reason, c.code)
-				}
-			} else {
-				if !allowed {
-					t.Fatalf("expected ALLOW (%s) but guard rejected: %s; code=%q", c.reason, hit, c.code)
-				}
-			}
+			runAstRedCase(t, c)
 		})
 	}
 	t.Logf("must-red round10 summary: cases=%d", len(cases))
@@ -367,4 +344,372 @@ func TestAST_Round10_BaselineSnapshot(t *testing.T) {
 	for _, l := range pass {
 		t.Log("PASS:", l)
 	}
+}
+
+// TestAST_Round11_Lexical checks quote scope and delimiter escaping in both
+// the guard and real dash. All executed commands are fixed, harmless builtins
+// or cat; their working directory is isolated in t.TempDir().
+func TestAST_Round11_Lexical(t *testing.T) {
+	cases := []struct {
+		name, code, output string
+		reject             bool
+	}{
+		{"dq-text", "printf '%s' \"line1 \\\n# text\"", "line1 # text", false},
+		{"dq-nested-command", "printf '%s' \"$(pri\\\nntf '%s' ok)\"", "ok", true},
+		{"dq-inner-quote", "printf '%s' \"$(printf '%s' \"a\\\nb\")\"", "ab", false},
+		{"hdoc-escape-first", "cat <<\\EOF\nliteral $HOME\nEOF\n", "literal $HOME\n", false},
+		{"hdoc-escape-middle", "cat <<E\\OF\nliteral $HOME\nEOF\n", "literal $HOME\n", false},
+		{"param-nested-dq", "printf '%s' \"${UNSET:-\"default\"}\"", "default", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setAstRole(t, "worker")
+			hit := runAstGuard("worker", tc.code)
+			if (hit != "") != tc.reject {
+				t.Errorf("guard reject=%v want=%v: %s", hit != "", tc.reject, hit)
+			}
+			cmd := exec.Command("/usr/bin/dash", "-c", tc.code)
+			cmd.Dir = t.TempDir()
+			cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + cmd.Dir, "LANG=C"}
+			out, err := cmd.CombinedOutput()
+			if err != nil || string(out) != tc.output {
+				t.Fatalf("dash err=%v output=%q want=%q", err, out, tc.output)
+			}
+		})
+	}
+}
+
+// astMustRedRound11Cases is PLAN11 §5.1: 40 cases (39 rejects and one
+// allow control, R11_MF2_07). Counts describe table entries, not passing tests.
+func astMustRedRound11Cases() []astRedCase {
+	return []astRedCase{
+		// --- MF-1: ssh remote readonly bypass + local eval/flock/script stdin ---
+		{"R11_MF1_01", "ssh -o BatchMode=yes -n dmit 'rm -rf /tmp/target; sh'", "ro", true, "MF-1.1 ro ssh multi-seg with trailing sh no heredoc"},
+		{"R11_MF1_02", "ssh -o BatchMode=yes dmit 'rm -rf /tmp/target; sh' <<'EOF'\nls -la\nEOF", "ro", true, "MF-1.1 ro ssh multi-seg piggyback write with benign heredoc"},
+		{"R11_MF1_03", "ssh -o BatchMode=yes dmit 'sh > /tmp/pwn_remote' <<'EOF'\nls -la\nEOF", "ro", true, "MF-1.1 ro ssh vehicle with remote write redirect"},
+		{"R11_MF1_04", "ssh -o BatchMode=yes dmit 'strace -o /tmp/pwn sh' <<'EOF'\nls -la\nEOF", "ro", true, "MF-1.1 ro ssh vehicle with remote strace -o"},
+		{"R11_MF1_05", "ssh -o BatchMode=yes -n dmit sh", "ro", true, "MF-1.1 ro bare remote sh without heredoc"},
+		{"R11_MF1_06", "echo pig | eval sh", "worker", true, "MF-1.2 piped code through eval sh"},
+		{"R11_MF1_07", "eval sh <<'EOF'\npig\nEOF", "worker", true, "MF-1.2 heredoc code through eval sh"},
+		{"R11_MF1_08", "echo pig | flock /tmp/lk sh", "worker", true, "MF-1.2 piped code through flock sh"},
+		{"R11_MF1_09", "flock /tmp/lk sh <<'EOF'\npig\nEOF", "worker", true, "MF-1.2 heredoc code through flock sh"},
+		{"R11_MF1_10", "echo pig | script -qc sh /dev/null", "worker", true, "MF-1.2 piped code through script -c sh"},
+
+		// --- MF-2: interpreter / git -c / find split-safety ---
+		{"R11_MF2_01", "python3 $X.py", "worker", true, "MF-2.1 unquoted python3 $X.py word-split option injection"},
+		{"R11_MF2_02", "python3 /tmp/w-$X", "worker", true, "MF-2.1 unquoted python3 /tmp/w-$X word-split option injection"},
+		{"R11_MF2_03", "node /tmp/w-$X.js", "worker", true, "MF-2.1 unquoted node /tmp/w-$X.js word-split"},
+		{"R11_MF2_04", "git -c user.name=$X log", "worker", true, "MF-2.2 unquoted git -c value word-split"},
+		{"R11_MF2_05", "X=-exec\nY=';'\nfind \"$X\" pig \"$Y\"", "worker", true, "MF-2.3 find dual dynamic words masquerading as start paths"},
+		{"R11_MF2_06", "X=-exec\nY=+\nfind . \"$X\" pig {} \"$Y\"", "worker", true, "MF-2.3 find dynamic predicate with dynamic + terminator"},
+		{"R11_MF2_07", "d=/tmp/dir; node \"$d/app.js\" --help", "worker", false, "MF-2.1 double-quoted script path must allow"},
+
+		// --- MF-3 & SF-3: G1 operator-adjacent line continuation ---
+		{"R11_MF3_01", ": $(\\\n(CTXMODE_READONLY = 0))", "worker", true, "MF-3 $( + \\\n + ( arithmetic split mutating CTXMODE_READONLY"},
+		{"R11_MF3_02", "x=/bin/true\n: $(\\\n(x = 0))\n\"$x\"", "worker", true, "MF-3 $( + \\\n + ( arithmetic split mutating staticVars"},
+		{"R11_MF3_03", "bash -c '(\\\n(CTXMODE_READONLY = 0))'", "worker", true, "MF-3 bash ( + \\\n + ( ArithmCmd split"},
+		{"R11_MF3_04", "false |\\\n| pig", "worker", true, "SF-3 | + \\\n + | operator split"},
+		{"R11_MF3_05", "true &\\\n& pig", "worker", true, "SF-3 & + \\\n + & operator split"},
+
+		// --- MF-4: G3 short-circuit / getopts / command wrapper ---
+		{"R11_MF4_01", "env BUN=pig /bin/sh -c 'false && BUN=/bin/true; \"$BUN\"'", "worker", true, "MF-4.1 AndStmt short-circuit false bind"},
+		{"R11_MF4_02", "env BUN=pig /bin/sh -c 'true || BUN=/bin/true; \"$BUN\"'", "worker", true, "MF-4.1 OrStmt short-circuit false bind"},
+		{"R11_MF4_03", "OPTARG=/bin/true\nset -- -apig\ngetopts a: dummy\n\"$OPTARG\"", "worker", true, "MF-4.2 getopts implicit OPTARG mutation"},
+		{"R11_MF4_04", "x=/bin/true\nset -- -a\ngetopts a x\n\"$x\"", "worker", true, "MF-4.2 getopts target var mutation"},
+		{"R11_MF4_05", "printf 'pig\\n' | {\n  for x in /bin/true; do\n    command read x\n    \"$x\"\n  done\n}", "worker", true, "MF-4.3 command read wrapper escaping preScanVarMutations"},
+		{"R11_MF4_06", "BUN=/bin/true; builtin unset BUN; : \"${BUN:=pig}\"; \"$BUN\"", "worker", true, "MF-4.3 builtin unset wrapper escaping preScanVarMutations"},
+
+		// --- MF-5: PATH empty/non-first/sq-literal + hook vars ---
+		{"R11_MF5_01", "PATH=\":/usr/bin\" git status", "worker", true, "MF-5.1a leading empty PATH segment (current dir .)"},
+		{"R11_MF5_02", "PATH=\"/usr/bin:\" git status", "worker", true, "MF-5.1a trailing empty PATH segment"},
+		{"R11_MF5_03", "PATH=\"/usr/sbin:/tmp/evil:/usr/bin\" git status", "worker", true, "MF-5.1b non-first segment /tmp/evil before /usr/bin"},
+		{"R11_MF5_04", "env PATH='$PATH:/tmp/evil' git status", "worker", true, "MF-5.1c single-quoted literal $PATH relative segment"},
+		{"R11_MF5_05", "GIT_CONFIG_PARAMETERS=\"'core.pager=pig'\" git log -p", "worker", true, "MF-5.2 GIT_CONFIG_PARAMETERS hook injection"},
+		{"R11_MF5_06", "GIT_CONFIG_GLOBAL=/tmp/evil_gitconfig git status", "worker", true, "MF-5.2 GIT_CONFIG_GLOBAL hook injection"},
+		{"R11_MF5_07", "LD_PROFILE=/bin/sh LD_PROFILE_OUTPUT=/tmp/pwn ls", "worker", true, "MF-5.2 LD_* prefix hook injection"},
+		{"R11_MF5_08", "NODE_PATH=/tmp/evil_modules node -e 'console.log(1)'", "worker", true, "MF-5.2 NODE_PATH module hijack"},
+
+		// --- MF-6: export -n / declare+typeset +x identity strip ---
+		{"R11_MF6_01", "bash -c 'export -n CTXMODE_ROLE; /usr/bin/python3 -V'", "worker", true, "MF-6 export -n strips CTXMODE_ROLE"},
+		{"R11_MF6_02", "bash -c 'declare +x CTXMODE_ROLE; /usr/bin/python3 -V'", "worker", true, "MF-6 declare +x strips CTXMODE_ROLE"},
+		{"R11_MF6_03", "bash -c 'typeset +rx CTXMODE_READONLY; ls'", "worker", true, "MF-6 typeset +rx strips CTXMODE_READONLY"},
+		{"R11_MF6_04", "unset GIT_PAGER", "worker", true, "MF-6 unset hook var blocked"},
+	}
+}
+
+// TestAST_MustRed_Round11 is the PLAN11 §5.1 must-red table.
+func TestAST_MustRed_Round11(t *testing.T) {
+	cases := astMustRedRound11Cases()
+	for _, c := range cases {
+		c := c
+		t.Run(c.id, func(t *testing.T) {
+			runAstRedCase(t, c)
+		})
+	}
+	t.Logf("must-red round11 summary: cases=%d", len(cases))
+}
+
+// astMustAllowRound11Cases is PLAN11 §5.2 must-allow (65 cases).
+func astMustAllowRound11Cases() []astRedCase {
+	return []astRedCase{
+		// === 1. PATH toolchain prepend + IFS idioms (15) ===
+		{"R11_ALW_01", "export PATH=\"/root/.local/share/mise/shims:$PATH\" && pnpm check", "worker", false, "mise shims prepend in export"},
+		{"R11_ALW_02", "PATH=/root/.local/share/mise/installs/node/26.7.0/bin:/root/.local/share/mise/installs/pnpm/11.9.0:$PATH pnpm exec tsc --noEmit", "worker", false, "mise node+pnpm unquoted PATH prefix"},
+		{"R11_ALW_03", "PATH=/root/.local/share/mise/installs/node/26.7.0/bin:/root/.local/share/mise/installs/pnpm/11.9.0:$PATH pnpm install --frozen-lockfile --ignore-scripts", "worker", false, "mise pnpm install"},
+		{"R11_ALW_04", "export PATH=\"/root/.local/bin:/root/go/bin:/root/.cargo/bin:$PATH\"; go version", "worker", false, "local/bin + go/bin + cargo/bin prepend"},
+		{"R11_ALW_05", "PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:$PATH\" cargo test --no-run", "worker", false, "$HOME/.cargo/bin prepend"},
+		{"R11_ALW_06", "PATH=\"/root/.nvm/versions/node/v22.0.0/bin:$PATH\" npm test", "worker", false, "nvm node bin prepend"},
+		{"R11_ALW_07", "PATH=\"/root/.pyenv/shims:/root/.pyenv/bin:$PATH\" pytest -q", "worker", false, "pyenv shims prepend"},
+		{"R11_ALW_08", "PATH=\"/root/.bun/bin:/root/.deno/bin:$PATH\" bun --version", "worker", false, "bun + deno bin prepend"},
+		{"R11_ALW_09", "PATH=\"/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin\" go env GOVERSION", "worker", false, "static system + /usr/local/go/bin PATH"},
+		{"R11_ALW_10", "PATH=\"$PATH:/root/go/bin\" go list ./...", "worker", false, "PATH append after $PATH"},
+		{"R11_ALW_11", "PATH=\"node_modules/.bin:$PATH\" tsc --noEmit", "worker", false, "node_modules/.bin relative tool prepend"},
+		{"R11_ALW_12", "PATH=\".venv/bin:$PATH\" python3 -c 'import sys; print(sys.version)'", "worker", false, ".venv/bin prepend"},
+		{"R11_ALW_13", "d=/usr/bin; PATH=\"$d:/bin\" ls -la", "worker", false, "NTH-2 staticVars expanded in prefix assignment"},
+		{"R11_ALW_14", "find . -maxdepth 1 | while IFS= read -r p; do echo \"$p\"; done", "worker", false, "IFS= read -r standard idiom"},
+		{"R11_ALW_15", "printf 'a:b:c\\n' | while IFS=: read -r f1 f2 f3; do echo \"$f1-$f2-$f3\"; done", "worker", false, "IFS=: read -r field split"},
+
+		// === 2. Heredoc script generation (10) ===
+		{"R11_ALW_16", "mkdir -p /tmp/verif/logs && cat > /tmp/verif/run.sh <<'EOF'\n#!/bin/sh\nlabel=\"$1\"; log=\"$2\"; shift 2\nstart=$(date +%s%N)\n\"$@\" >\"$log\" 2>&1\nrc=$?\necho \"${label}_exit=$rc\"\nEOF", "worker", false, "single-quoted heredoc writing wrapper script with $1/$@/$(...)"},
+		{"R11_ALW_17", "cat > /tmp/verif/snapshot_check.sh <<'EOF'\n#!/bin/bash\nWT=/root/workspace\necho \"=== WT path ===\"; ls -ld \"$WT\"\ngit -C \"$WT\" rev-parse HEAD\nEOF", "worker", false, "single-quoted heredoc writing bash script with $WT"},
+		{"R11_ALW_18", "cat > /tmp/verif/r4.sh <<'EOF'\n#!/bin/bash\nD=/tmp/realext-r4\nsha256sum \"$D\"/*.patch \"$D\"/*.bin 2>/dev/null\ncat \"$D/backup-r3.sha256\"\nEOF", "worker", false, "single-quoted heredoc with globs and $D"},
+		{"R11_ALW_19", "cat > /tmp/verif/pipx_wrap.sh <<EOF\n#!/bin/sh\nexec /usr/bin/python3 -m pipx \"\\$@\" \\$(echo ok)\nEOF", "worker", false, "unquoted heredoc with escaped \\$@ and \\$(...)"},
+		{"R11_ALW_20", "cat > /tmp/verif/doc.txt <<\\EOF\nliteral $HOME and $(id) not expanded\nEOF", "worker", false, "backslash-escaped heredoc delimiter <<\\EOF"},
+		{"R11_ALW_21", "cat > /tmp/verif/doc2.txt <<'EOF-1'\nsection $1 content\nEOF-1", "worker", false, "heredoc delimiter containing hyphen <<'EOF-1'"},
+		{"R11_ALW_22", "python3 - <<'PY'\nimport sys, json\ndata = {'k': '$1', 'v': '${UNSET}'}\nprint(json.dumps(data))\nPY", "worker", false, "python3 heredoc containing $ strings"},
+		{"R11_ALW_23", "python3 - \"$H\" \"$S\" <<'PY'\nimport sys\nprint(sys.argv[1:])\nPY", "worker", false, "python3 - with dynamic argv operands and sq heredoc"},
+		{"R11_ALW_24", "ssh -o BatchMode=yes dmit sh <<'EOF'\nls -la\ngit status --short\nEOF", "ro", false, "readonly ssh single-quoted heredoc with readonly body"},
+		{"R11_ALW_25", "ssh -o BatchMode=yes dmit python3 - <<'PY'\ndef check():\n    return 42\nprint(check())\nPY", "worker", false, "worker ssh python3 - heredoc"},
+
+		// === 3. awk/sed/tar dynamic file paths (10) ===
+		{"R11_ALW_26", "git archive HEAD | tar -x -C /tmp/r4-base", "worker", false, "tar -x -C static dir"},
+		{"R11_ALW_27", "d=/tmp/r4-base; tar -xf \"$d/pkg.tar.gz\" -C \"$d\"", "worker", false, "tar -xf and -C with double-quoted dynamic paths"},
+		{"R11_ALW_28", "out=$(mktemp -d); tar -czf \"$out/archive.tgz\" -C /tmp/src .", "worker", false, "tar -czf with dynamic archive path"},
+		{"R11_ALW_29", "f=/tmp/test.txt; sed -n '1,40p' \"$f\"", "worker", false, "sed -n with double-quoted dynamic file operand"},
+		{"R11_ALW_30", "for f in /tmp/a.txt /tmp/b.txt; do sed -i 's/foo/bar/g' \"$f\"; done", "worker", false, "sed -i in loop with dynamic file"},
+		{"R11_ALW_31", "p=foo; sed \"s/$p/bar/g\" /tmp/test.txt", "worker", false, "sed s///g without e flag and safe dq var"},
+		{"R11_ALW_32", "f=/tmp/data.log; awk '{print $1, $2}' \"$f\"", "worker", false, "awk with double-quoted dynamic file operand"},
+		{"R11_ALW_33", "val=$(date +%s); awk -v ts=\"$val\" 'BEGIN{print ts}'", "worker", false, "awk -v var=dyn assignment"},
+		{"R11_ALW_34", "git diff --cached | awk 'BEGIN { state = 0 } /^@@ / { state = 1 } END { print state }'", "worker", false, "multiline awk script in pipeline"},
+		{"R11_ALW_35", "bash -c 'WT=/tmp/wt; git -C \"$WT\" diff > /tmp/d.patch; echo \"n=$(rg -c \"^diff\" /tmp/d.patch)\"'", "worker", false, "bash -c with nested $(rg ...) inside double quotes"},
+
+		// === 4. interpreter dynamic script paths + globs (8) ===
+		{"R11_ALW_36", "H=/root/workspace/herdsman; node \"$H/dist/src/cli/herdsman.js\" help", "worker", false, "node with staticVar path prefix"},
+		{"R11_ALW_37", "d=$(pwd); node \"$d/dist/index.js\" --version", "worker", false, "node with double-quoted cmdsub script path"},
+		{"R11_ALW_38", "node --experimental-strip-types --test integrations/pi/*.test.ts", "worker", false, "node --test with path glob *.test.ts"},
+		{"R11_ALW_39", "d=$(pwd); python3 \"$d/scripts/verify.py\" --fast", "worker", false, "python3 with double-quoted dynamic script path"},
+		{"R11_ALW_40", "python3 -m unittest discover -s tests -p 'test_*.py'", "worker", false, "python3 -m unittest"},
+		{"R11_ALW_41", "tsx \"$PWD/tools/check.ts\" --json", "worker", false, "tsx with double-quoted script path"},
+		{"R11_ALW_42", "bun test tests/*.test.ts", "worker", false, "bun test with glob"},
+		{"R11_ALW_43", "perl -ne 'print if /PASS/' /tmp/*.log", "worker", false, "perl -ne with file glob after script"},
+
+		// === 5. git -C/-c/--git-dir + nested enum (8) ===
+		{"R11_ALW_44", "git diff HEAD~1 HEAD | git -C /tmp/verifier-compact-ui-$$ apply", "worker", false, "git -C with $$ PID suffix"},
+		{"R11_ALW_45", "set -u\nR=/root/workspace/herdsman\ngit -C $R status --short || { echo FAIL; exit 1; }", "worker", false, "git -C $R with top-level staticVars"},
+		{"R11_ALW_46", "for d in repo-a repo-b; do echo \"HEAD=$(git -C /root/workspace/$d rev-parse HEAD)\"; done", "worker", false, "git -C with for-enum var inside $(...)"},
+		{"R11_ALW_47", "p=$(pwd); git -C \"$p\" rev-parse --git-dir", "worker", false, "git -C double-quoted dynamic path"},
+		{"R11_ALW_48", "git -c user.name=\"$(git config user.name)\" -c user.email=\"$(git config user.email)\" commit --allow-empty -m test", "worker", false, "git -c safe metadata keys with dq dynamic values"},
+		{"R11_ALW_49", "d=$(pwd); git -c safe.directory=\"$d\" status", "worker", false, "git -c safe.directory dynamic"},
+		{"R11_ALW_50", "d=$(pwd); git --git-dir=\"$d/.git\" --work-tree=\"$d\" status -s", "worker", false, "git --git-dir and --work-tree dq dynamic"},
+		{"R11_ALW_51", "GIT_DIR=\"$PWD/.git\" GIT_WORK_TREE=\"$PWD\" git status", "worker", false, "GIT_DIR and GIT_WORK_TREE dq dynamic for worker"},
+
+		// === 6. find start paths / globs / @ paths (7) ===
+		{"R11_ALW_52", "for d in compact-on compact-off; do s=$(find $d/sessions -name '*.jsonl' | head -1); echo \"$s\"; done", "worker", false, "find $d/sessions inside $(...) inheriting for-enum"},
+		{"R11_ALW_53", "find /tmp/tmp.* -newermt '5 minutes ago' 2>/dev/null | wc -l", "worker", false, "find /tmp/tmp.* unquoted glob start path"},
+		{"R11_ALW_54", "D=/root/.pi/agent/npm/node_modules/@juicesharp/rpiv-config; find \"$D\" -name '*.ts' -type f -exec wc -l {} +", "worker", false, "find with @ in staticVars path and -exec +"},
+		{"R11_ALW_55", "d=$(mktemp -d); find \"$d\" -maxdepth 2 -newermt '-40 minutes' -type f", "worker", false, "find pure dq var start path with static predicates"},
+		{"R11_ALW_56", "d=$(pwd); find \"$d/src\" -type f -name '*.go' -exec gofmt -l {} +", "worker", false, "find \"$d/src\" with slash prefix and -exec +"},
+		{"R11_ALW_57", "find /tmp -maxdepth 1 -regextype posix-extended -iregex '.*\\.(log|txt)' -fstype ext4", "worker", false, "find -regextype and -fstype value predicates"},
+		{"R11_ALW_58", "find . -maxdepth 2 -name '*.go' -type f", "ro", false, "readonly find basic query"},
+
+		// === 7. for enum / mktemp / line cont (7) ===
+		{"R11_ALW_59", "for s in \"gofmt -l .\" \"go build ./...\" \"go vet ./...\" \"go test -count=1 ./...\"; do $s >/tmp/chk.log 2>&1; done", "worker", false, "for enum static multi-word commands"},
+		{"R11_ALW_60", "for f in /root/.local/bin/termosh /usr/local/bin/termosh; do \"$f\" --version; done", "worker", false, "for enum abs-path command heads"},
+		{"R11_ALW_61", "for p in '/tmp/' '整条不画' 'a:b' ''; do printf '%s\\n' \"$(grep -c -- \"$p\" report.md)\"; done", "worker", false, "for enum non-ident items graceful fallback"},
+		{"R11_ALW_62", "td=$(mktemp -d) && go build -o \"$td/sbx\" ./cmd/sbx && \"$td/sbx\" --help", "worker", false, "mktemp -d var used in built binary head"},
+		{"R11_ALW_63", "echo \"=== header ===\" \\\n  && git status --short \\\n  | head -n 20", "worker", false, "normal whitespace-preceded line continuations"},
+		{"R11_ALW_64", "echo \"line 1 \\\n# still inside double quotes\"", "worker", false, "NTH-1 line continuation before # inside double quotes"},
+		{"R11_ALW_65", "git log -n 5 --oneline 2>/dev/null | head -n 5", "ro", false, "readonly git log pipeline with 2>/dev/null"},
+	}
+}
+
+// TestAST_MustAllow_Round11 is the PLAN11 §5.2 must-allow hard gate.
+func TestAST_MustAllow_Round11(t *testing.T) {
+	cases := astMustAllowRound11Cases()
+	for _, c := range cases {
+		c := c
+		t.Run(c.id, func(t *testing.T) {
+			setAstRole(t, c.role)
+			hit := runAstGuard(c.role, c.code)
+			if hit != "" {
+				t.Fatalf("expected ALLOW (%s) but guard rejected: %s; code=%q", c.reason, hit, c.code)
+			}
+		})
+	}
+	t.Logf("must-allow round11 summary: cases=%d", len(cases))
+}
+
+// astMustRedRound12Cases is the review round-1 fix table: every R1-R9 / M1-M5
+// finding gets a probe, plus the S1-S4 should-fix rows and their allow
+// controls. Comment tags name the review item.
+func astMustRedRound12Cases() []astRedCase {
+	return []astRedCase{
+		// R1/M5: missing env operands fail closed (no panic, no silent skip)
+		{"FR1_01", "env --unset", "worker", true, "R1/M5 bare --unset"},
+		{"FR1_02", "env -u", "worker", true, "R1/M5 bare -u"},
+		{"FR1_03", "env --chdir", "worker", true, "R1 bare --chdir"},
+		{"FR1_04", "env --argv0", "worker", true, "R1 bare --argv0"},
+		{"FR1_05", "env -a", "worker", true, "R1 bare -a"},
+		// R2/M2: GNU env -S escapes
+		{"FR2_01", "env -S 'pig\\_x'", "worker", true, "R2/M2 \\_ word separator exposes pig head"},
+		{"FR2_02", "env -S 'id\\_x'", "worker", false, "R2/M2 \\_ separator, benign id argv"},
+		{"FR2_03", "env -S 'x\\qy'", "worker", true, "R2/M2 unknown escape fails closed"},
+		{"FR2_04", "env -S 'x\\ y'", "worker", true, "R2/M2 backslash-space invalid per GNU"},
+		{"FR2_05", "env -S 'true\\c pig'", "worker", false, "R2/M2 \\c truncates payload to true"},
+		{"FR2_06", "env -S 'pig #x'", "worker", true, "R2/M2 word-start # comment leaves pig head"},
+		{"FR2_07", "env -S 'true pig'", "worker", false, "R2/M2 plain words: exec true with arg pig"},
+		// R3/M1: word-start dq placeholder + '/' can run as -c/-e
+		{"FR3_01", "find \"$X/y\" -name n", "worker", true, "R3/M1 dq+/ start path"},
+		{"FR3_02", "node \"$X/app.js\"", "worker", true, "R3/M1 dq+/ script operand"},
+		{"FR3_03", "find \"$PWD/x\" -maxdepth 1", "worker", false, "R3/M1 abs-dq+/ stays safe"},
+		// R4: dynamic sed script may inject `e` via a delimiter byte
+		{"FR4_01", "sed \"s/$p/bar/g\" /tmp/test.txt", "worker", true, "R4 unbound dynamic s/// script"},
+		{"FR4_02", "p='x/g;e pig'; sed \"s/$p/bar/g\" /tmp/test.txt", "worker", true, "R4 lit bind carrying e command"},
+		{"FR4_03", "p=foo; sed \"s/$p/bar/g\" /tmp/test.txt", "worker", false, "R4 restricted literal bind stays free (ALW31)"},
+		{"FR4_04", "sed 's/a/b/e' /tmp/f", "worker", true, "R4 static s///e already screened"},
+		// R5: xargs -I token inside a code slot is fed, not only as a whole word
+		{"FR5_01", "echo pig | xargs -I{} sh -c 'echo {}'", "worker", true, "R5 -I{} token word after -c"},
+		{"FR5_02", "echo pig | xargs -I{} sh -c 'x{}y'", "worker", true, "R5 token embedded in code word"},
+		{"FR5_03", "echo pig | xargs -I{} sh -c\"{}\"", "worker", true, "R5 glued -c code slot"},
+		{"FR5_04", "echo pig | xargs sh -c", "worker", true, "R5 bare trailing -c fed by stream"},
+		// R6: a Background subtree never binds in the parent
+		{"FR6_01", "x=/tmp && true & find \"$x\" -maxdepth 1", "worker", true, "R6 BinaryCmd background left-bind"},
+		{"FR6_02", "{ x=/tmp; } & find \"$x\" -maxdepth 1", "worker", true, "R6 Block background bind"},
+		{"FR6_03", "(x=/tmp) & find \"$x\" -maxdepth 1", "worker", true, "R6 Subshell background bind"},
+		// R7: env context reaches heredoc / here-string / -c payloads
+		{"FR7_01", "env -u PWD sh <<'EOF'\nfind \"$PWD\" -maxdepth 1\nEOF", "worker", true, "R7 env -u PWD into heredoc"},
+		{"FR7_02", "env -i sh <<'EOF'\nfind \"$PWD\" -maxdepth 1\nEOF", "worker", true, "R7 env -i clears heredoc grants"},
+		{"FR7_03", "env -u PWD sh -c 'find \"$PWD\" -maxdepth 1'", "worker", true, "R7 env -u PWD into -c"},
+		{"FR7_04", "env HOME=/x sh <<'EOF'\ncd \"$HOME\"; pig\nEOF", "worker", true, "R7 HOME override taints heredoc"},
+		{"FR7_05", "sh <<'EOF'\nfind \"$PWD\" -maxdepth 1\nEOF", "worker", false, "R7 untouched PWD grant still passes"},
+		// R8: enum sub-words must not re-glob
+		{"FR8_01", "for s in \"git *\" \"echo ok\"; do $s; done", "worker", true, "R8 glob char in enum cmd word"},
+		{"FR8_02", "for s in \"ls -l\" \"echo ok\"; do $s; done", "worker", false, "R8 plain enum words still bind"},
+		// R9: ctx_run env API uses the unified hook table
+		// (probe lives in role_guards_test.go — needs guardCtxRunEnv)
+		// M3: last fd0 redirect decides what feeds the program
+		{"FM3_01", "sh < /tmp/x <<'EOF'\npig\nEOF", "worker", true, "M3 file-redir before heredoc still screens body"},
+		{"FM3_02", "sh <<'EOF' < /tmp/x\nls\nEOF", "worker", false, "M3 file-redir last: body is data, sh runs /tmp/x"},
+		// M4: pipeIn reaches compound bodies
+		{"FM4_01", "echo pig | (sh)", "worker", true, "M4 subshell pipe penetration"},
+		{"FM4_02", "echo pig | (cat; sh)", "worker", true, "M4 second stmt in subshell"},
+		{"FM4_03", "echo pig | { sh; }", "worker", true, "M4 brace group"},
+		{"FM4_04", "echo pig | if true; then sh; fi", "worker", true, "M4 if body"},
+		{"FM4_05", "echo pig | while read x; do sh; done", "worker", true, "M4 while body"},
+		{"FM4_06", "echo pig | cat $(sh)", "worker", true, "M4 cmdsubst inherits pipe stdin"},
+		{"FM4_07", "bash -c 'ls > >(sh)'", "worker", true, "M4 output procsubst fed by stdout"},
+		// S1: the "*" give-up taint poisons every bind
+		{"FS1_01", "command $(true) PWD; find \"$PWD\" -maxdepth 1", "worker", true, "S1 * taint blocks PWD grant"},
+		// S2: PS4/SHELLOPTS/BASHOPTS are hook vars
+		{"FS2_01", "PS4='x' bash -x -c 'id'", "worker", true, "S2 PS4 prompt-expansion hook"},
+		{"FS2_02", "BASHOPTS=xpg_echo bash -c 'id'", "worker", true, "S2 BASHOPTS startup options"},
+		// S3: -f - / -f <(...) read an unvetted script
+		{"FS3_01", "awk -f -", "worker", true, "S3 awk program from stdin"},
+		{"FS3_02", "sed -f -", "worker", true, "S3 sed script from stdin"},
+		{"FS3_03", "sed --file=-", "worker", true, "S3 sed --file=- stdin"},
+		{"FS3_04", "bash -c 'awk -f <(echo x)'", "worker", true, "S3 awk -f process subst"},
+		{"FS3_05", "bash -c 'sed -f <(echo x)'", "worker", true, "S3 sed -f process subst"},
+		// S4: journalctl -n is a legal short option
+		{"FS4_01", "journalctl -n 5", "ro", false, "S4 -n boolean + operand"},
+		{"FS4_02", "journalctl -n", "ro", false, "S4 bare -n"},
+		// M3 follow-up: local file redirect feeding an ssh stdin-program head
+		{"FSH_01", "ssh dmit sh < /tmp/x", "worker", true, "M3 local file as remote program"},
+	}
+}
+
+// TestAST_MustRed_Round12 is the review round-1 regression gate.
+func TestAST_MustRed_Round12(t *testing.T) {
+	cases := astMustRedRound12Cases()
+	for _, c := range cases {
+		c := c
+		t.Run(c.id, func(t *testing.T) {
+			runAstRedCase(t, c)
+		})
+	}
+	t.Logf("must-red round12 summary: cases=%d", len(cases))
+}
+
+// astMustRedRound13Cases is the review round-3 fix table: five must-fix
+// probes with `want` asserting the hit REASON (the why), not only the
+// allow/deny boolean. Rows whose attack lives in the ctx_run stdin API
+// (env-taint, read -s) sit in role_guards_test.go instead.
+func astMustRedRound13Cases() []astRedWantCase {
+	return []astRedWantCase{
+		// M1: only an fd0 redirect binds stdin — `sh 3</dev/null` still
+		// reads the piped bytes as its program.
+		{astRedCase{"R13_M1_01", "echo pig | sh 3</dev/null", "worker", true, "M1 non-fd0 redir still piped"}, "piped code to shell"},
+		{astRedCase{"R13_M1_02", "echo pig | sh 3<<EOF\nls\nEOF", "worker", true, "M1 non-fd0 heredoc still piped"}, "piped code to shell"},
+		// M2: the right side of && / || shares the operator's stdin —
+		// inside a compound fed by a pipe, `grep p && sh` runs the piped
+		// bytes as sh's program (the operator itself is piped).
+		{astRedCase{"R13_M2_01", "echo pig | (grep p && sh)", "worker", true, "M2 &&-right inherits pipe"}, "piped code to shell"},
+		{astRedCase{"R13_M2_02", "echo pig | { grep q || sh; }", "worker", true, "M2 ||-right inherits pipe"}, "piped code to shell"},
+		// M3: every executable sub-statement inside $(...) shares the
+		// substitution's stdin, not only the first one.
+		{astRedCase{"R13_M3_01", "echo pig | cat $(true; sh)", "worker", true, "M3 second cmdsubst stmt inherits pipe"}, "piped code to shell"},
+		// M4: xargs fed words reaching a code slot in ANY interpreter
+		// spelling — clusters (-lc), glued values and wrapper heads.
+		{astRedCase{"R13_M4_01", "echo pig | xargs -I{} sh -lc '{}'", "worker", true, "M4 sh -lc cluster code slot"}, "piped code to shell"},
+		{astRedCase{"R13_M4_02", "echo pig | xargs -i sh -c '{}'", "worker", true, "M4 deprecated -i default token"}, "piped code to shell"},
+		{astRedCase{"R13_M4_03", "echo pig | xargs -I{} env sh -c '{}'", "worker", true, "M4 inner wrapper head peel"}, "piped code to shell"},
+		{astRedCase{"R13_M4_04", "echo pig | xargs -I{} python3 -uc '{}'", "worker", true, "M4 python cluster code slot"}, "piped code to python"},
+		{astRedCase{"R13_M4_05", "echo pig | xargs -I{} node -pe '{}'", "worker", true, "M4 node cluster code slot"}, "piped code to javascript"},
+		// M6: sed --file=VALUE is a script-file slot: proc subst and
+		// unvettable dynamic values must hit the -f operand screen.
+		{astRedCase{"R13_M6_01", "bash -c 'sed --file=<(echo x)'", "worker", true, "M6 --file= proc subst script file"}, "dynamic code payload"},
+		{astRedCase{"R13_M6_02", "sed --file=$X /tmp/f", "worker", true, "M6 --file= unquoted dynamic"}, "dynamic code payload"},
+		// Allow controls: fd0 file redir still exempts the program, and a
+		// proc subst in a DATA slot stays free.
+		{astRedCase{"R13_ALW_01", "echo pig | sh < /dev/null 3</dev/null", "worker", false, "M1 fd0 file redir wins"}, ""},
+		{astRedCase{"R13_ALW_02", "bash -c 'ls <(echo x)'", "worker", false, "M6 proc subst in data slot"}, ""},
+	}
+}
+
+// TestAST_MustRed_Round13 is the review round-3 regression gate.
+func TestAST_MustRed_Round13(t *testing.T) {
+	cases := astMustRedRound13Cases()
+	for _, c := range cases {
+		c := c
+		t.Run(c.id, func(t *testing.T) {
+			runAstWantCase(t, c)
+		})
+	}
+	t.Logf("must-red round13 summary: cases=%d", len(cases))
+}
+
+// runAstWantCase executes one want-case row: an expected reject must hit,
+// and when want is set the hit detail must contain it (the WHY).
+func runAstWantCase(t *testing.T, c astRedWantCase) {
+	t.Helper()
+	setAstRole(t, c.role)
+	hit := runAstGuard(c.role, c.code)
+	allowed := hit == ""
+	if c.reject {
+		if allowed {
+			t.Fatalf("expected REJECT (%s) but guard allowed; code=%q", c.reason, c.code)
+		}
+		if c.want != "" && !strings.Contains(hit, c.want) {
+			t.Fatalf("expected hit containing %q (%s) but got %q; code=%q", c.want, c.reason, hit, c.code)
+		}
+	} else {
+		if !allowed {
+			t.Fatalf("expected ALLOW (%s) but guard rejected: %s; code=%q", c.reason, hit, c.code)
+		}
+	}
+}
+
+// runAstRedCase executes one table row: an expected reject must hit.
+func runAstRedCase(t *testing.T, c astRedCase) {
+	t.Helper()
+	runAstWantCase(t, astRedWantCase{astRedCase: c})
 }

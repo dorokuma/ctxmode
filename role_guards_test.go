@@ -363,10 +363,10 @@ func TestGuard_WrapperPrecision(t *testing.T) {
 		{name: "env -uVAR pig", argv: []string{"env", "-uHOME", "pig"}, want: "pig"},
 		{name: "env --unset=VAR pig", argv: []string{"env", "--unset=HOME", "pig"}, want: "pig"},
 		{name: "env -CDIR pig", argv: []string{"env", "-C/tmp", "pig"}, want: "pig"},
-		{name: "env -S pig", argv: []string{"env", "-S", "pig --help"}, want: "env unknown option -S/--split-string"},
-		{name: "env --split-string pig", argv: []string{"env", "--split-string", "agy"}, want: "env unknown option -S/--split-string"},
-		{name: "env --split-string= pig", argv: []string{"env", "--split-string=pi"}, want: "env unknown option -S/--split-string"},
-		{name: "env -S read-only cmd ok", argv: []string{"env", "-S", "git status"}, want: "env unknown option -S/--split-string"},
+		{name: "env -S pig", argv: []string{"env", "-S", "pig --help"}, want: "pig"},
+		{name: "env --split-string pig", argv: []string{"env", "--split-string", "agy"}, want: "agy"},
+		{name: "env --split-string= pig", argv: []string{"env", "--split-string=pi"}, want: "pi"},
+		{name: "env -S read-only cmd ok", argv: []string{"env", "-S", "git status"}, want: ""},
 		{name: "sh -c glued", argv: []string{"sh", "-cpig"}, want: "pig"},
 		{name: "bash -lc glued", argv: []string{"bash", "-lcagy"}, want: "agy"},
 		{name: "eval pig", argv: []string{"eval", "pig"}, want: "pig"},
@@ -1433,6 +1433,86 @@ func TestGuard_SSHPeel(t *testing.T) {
 	}
 }
 
+// TestGuard_CtxRunStdinEnv covers R13: the ctx_run stdin payload must be
+// screened under the env context the argv peels (env HOME=-exec sh +stdin),
+// and `read -s` must expose its real write target in BOTH stdin entries.
+func TestGuard_CtxRunStdinEnv(t *testing.T) {
+	t.Setenv(auditEnvRole, "worker")
+	t.Setenv(auditEnvReadonly, "")
+	g := currentGuardCall()
+
+	// argv=["env","HOME=-exec","sh"] + stdin `find "$HOME" -exec`: the
+	// peeled env assign must taint $HOME inside the stdin program text —
+	// a trusted-HOME expansion would read it as a benign abs path.
+	cases := []struct {
+		name    string
+		argv    []string
+		command string
+		stdin   string
+		rule    string
+		detail  string
+	}{
+		{
+			name:   "env-tainted HOME payload (argv)",
+			argv:   []string{"env", "HOME=-exec", "sh"},
+			stdin:  `find "$HOME" -maxdepth 1`,
+			rule:   ruleSubagentNestedAgent,
+			detail: "find dynamic predicate",
+		},
+		{
+			name:    "env-tainted HOME payload (command)",
+			command: "env HOME=-exec sh",
+			stdin:   `find "$HOME" -maxdepth 1`,
+			rule:    ruleSubagentNestedAgent,
+			detail:  "find dynamic predicate",
+		},
+		{
+			name:   "untainted HOME payload stays free (argv)",
+			argv:   []string{"sh"},
+			stdin:  `find "$HOME" -maxdepth 1`,
+			rule:   "",
+			detail: "",
+		},
+		{
+			name:   "read -s target is written, not consumed as option value (argv)",
+			argv:   []string{"sh"},
+			stdin:  "read -s GIT_PAGER",
+			rule:   ruleSubagentNestedAgent,
+			detail: "env GIT_PAGER",
+		},
+		{
+			name:    "read -s target is written (command)",
+			command: "sh",
+			stdin:   "read -s GIT_PAGER",
+			rule:    ruleSubagentNestedAgent,
+			detail:  "env GIT_PAGER",
+		},
+		{
+			name:   "read -t value consumed, var still target (argv)",
+			argv:   []string{"sh"},
+			stdin:  "read -t 5 GIT_PAGER",
+			rule:   ruleSubagentNestedAgent,
+			detail: "env GIT_PAGER",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var rule, detail string
+			if tc.argv != nil {
+				rule, detail = g.guardCtxRunStdin(tc.argv, tc.stdin)
+			} else {
+				rule, detail = g.guardCtxRunStdinForCommand(tc.command, tc.stdin)
+			}
+			if rule != tc.rule {
+				t.Fatalf("rule = %q detail=%q, want rule %q", rule, detail, tc.rule)
+			}
+			if tc.detail != "" && !strings.Contains(detail, tc.detail) {
+				t.Fatalf("detail = %q, want containing %q", detail, tc.detail)
+			}
+		})
+	}
+}
+
 // TestGuard_CompoundKeywords covers shell reserved words and modifier
 // keywords being peeled to the real command head.
 func TestGuard_CompoundKeywords(t *testing.T) {
@@ -1654,7 +1734,7 @@ func TestGuard_TrapSourceUnset(t *testing.T) {
 		{name: "trap - reset ok", code: "trap - INT", want: ""},
 		{name: "unset CTXMODE_ROLE", code: "unset CTXMODE_ROLE", want: "unset CTXMODE_ROLE"},
 		{name: "unset CTXMODE_READONLY", code: "unset CTXMODE_READONLY", want: "unset CTXMODE_READONLY"},
-		{name: "unset PATH ok", code: "unset PATH", want: ""},
+		{name: "unset PATH blocked", code: "unset PATH", want: "unset PATH"},
 		{name: "source ok for worker", code: ". ./env.sh", want: ""},
 		{name: "source word ok for worker", code: "source ./env.sh", want: ""},
 	}
@@ -2549,6 +2629,40 @@ func TestGuard_EnvIClearsIdentity(t *testing.T) {
 	// strict read-only guard itself (ls is read-only).
 	if got := guardArgvReadonly([]string{"env", "-i", "ls"}); got == "" {
 		t.Fatalf("guardArgvReadonly(env -i ls) must block (env wrapper removed)")
+	}
+}
+
+// TestCtxRunEnvAPI_HookTable is the R9 probe: ctx_run's env map goes through
+// the same hook table as inline env ops, so PATH/ld-preload/git-loader,
+// plugin-injection and trace-hook keys all carry "env <KEY>" details.
+func TestCtxRunEnvAPI_HookTable(t *testing.T) {
+	g := guardCall{subagent: true}
+	for _, k := range []string{
+		"PATH", "LD_PRELOAD", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_GLOBAL",
+		"NODE_PATH", "PYTHONSTARTUP", "PERL5LIB", "GIT_PAGER",
+		"PS4", "SHELLOPTS", "BASHOPTS", "GIT_DIR", "PAGER", "VISUAL",
+	} {
+		rule, detail := g.guardCtxRunEnv(map[string]string{k: "x"})
+		if rule != "subagent_nested_agent" || detail != "env "+k {
+			t.Fatalf("guardCtxRunEnv(%s) = (%q,%q), want (subagent_nested_agent, env %s)", k, rule, detail, k)
+		}
+	}
+	// Benign keys pass — the ctx_run env API is itself allowlist-gated
+	// (envAllowlist + CTXMODE_*), so entries like RUSTFLAGS reach the guard
+	// only because the server accepted them as benign build knobs.
+	for _, k := range []string{"FOO", "GOFLAGS", "RUSTFLAGS", "VERBOSE"} {
+		if rule, detail := g.guardCtxRunEnv(map[string]string{k: "x"}); rule != "" || detail != "" {
+			t.Fatalf("guardCtxRunEnv(%s) = (%q,%q), want allowed", k, rule, detail)
+		}
+	}
+	// Identity keys never reach guardCtxRunEnv: filterExecEnv's security
+	// denylist rejects them for a guarded caller before the hook screen
+	// runs — verify that upstream layer directly.
+	t.Setenv(auditEnvRole, "worker")
+	for _, k := range []string{auditEnvRole, auditEnvReadonly} {
+		if _, err := filterExecEnv(map[string]string{k: "x"}); err == nil {
+			t.Fatalf("filterExecEnv(%s) must deny identity override for a guarded caller", k)
+		}
 	}
 }
 
