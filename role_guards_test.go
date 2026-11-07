@@ -54,6 +54,13 @@ func TestGuard_SubagentNestedArgv(t *testing.T) {
 		{name: "herdr server stop", argv: []string{"herdr", "server", "stop"}, want: "herdr server stop"},
 		{name: "herdr workspace focus", argv: []string{"herdr", "workspace", "focus", "w"}, want: "herdr workspace focus"},
 		{name: "herdr agent prompt", argv: []string{"herdr", "agent", "prompt", "a"}, want: "herdr agent prompt"},
+		{name: "hc keys", argv: []string{"hc", "keys", "t2", "a"}, want: "hc keys"},
+		{name: "hc run", argv: []string{"hc", "run", "x"}, want: "hc run"},
+		{name: "hc exec", argv: []string{"hc", "exec", "x"}, want: "hc exec"},
+		{name: "hc file write", argv: []string{"hc", "file", "write", "/tmp/x", "y"}, want: "hc file"},
+		{name: "hc read", argv: []string{"hc", "read", "t2"}, want: "hc read"},
+		{name: "hc send named addr", argv: []string{"hc", "send", "review", "x"}, want: "hc send"},
+		{name: "hc send extra operand", argv: []string{"hc", "send", "t2", "x", "--force"}, want: "hc send"},
 
 		// Allowed: agent names as ARGUMENTS, not command heads.
 		{name: "echo pig", argv: []string{"echo", "pig"}, want: ""},
@@ -69,6 +76,11 @@ func TestGuard_SubagentNestedArgv(t *testing.T) {
 		{name: "herdsman status", argv: []string{"herdsman", "status"}, want: ""},
 		{name: "herdsman daemon status", argv: []string{"herdsman", "daemon", "status"}, want: ""},
 		{name: "herdsman agent list", argv: []string{"herdsman", "agent", "list"}, want: ""},
+		// Allowed: hc queries and the send channel.
+		{name: "hc send t-addr", argv: []string{"hc", "send", "t2", "hi"}, want: ""},
+		{name: "hc --help", argv: []string{"hc", "--help"}, want: ""},
+		{name: "hc --version", argv: []string{"hc", "--version"}, want: ""},
+		{name: "hc sub --help", argv: []string{"hc", "run", "--help"}, want: ""},
 		{name: "ordinary command", argv: []string{"ls", "-la"}, want: ""},
 	}
 	for _, tc := range cases {

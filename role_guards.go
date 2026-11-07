@@ -12,7 +12,10 @@ package main
 //     CTXMODE_READONLY=1. It blocks nested dispatch of agent executables (pig,
 //     pi, agy, dispatch-agent, dispatch-agent-go, grok) and orchestration
 //     mutations through herdr/herdsman from every ctx_run branch, while
-//     leaving herdr/herdsman read-only queries alone.
+//     leaving herdr/herdsman read-only queries alone. The hc terminal-control
+//     CLI is whitelisted to `hc send <t-addr> <text>` (the report channel)
+//     plus --help/--version/<sub> --help queries; every other hc verb
+//     blocks.
 //   - The read-only guard (audit rule "readonly_write_blocked") applies to
 //     read-only roles: CTXMODE_READONLY=1 or CTXMODE_ROLE ∈
 //     scout|planner|researcher|reviewer|oracle|verifier. For all of them it
@@ -1796,6 +1799,55 @@ func screenHerdsmanSubagent(headArgv []string) string {
 	return ""
 }
 
+// hcSendAddrOK reports whether s is an hc terminal address a sub-agent may
+// send to: `^t[0-9a-z]+$` — the numeric/lettered tN ids only. Named
+// terminals and machine-qualified `machine/t7` spellings are not admitted.
+func hcSendAddrOK(s string) bool {
+	if len(s) < 2 || s[0] != 't' {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z') {
+			return false
+		}
+	}
+	return true
+}
+
+// screenHcSubagent applies the hc whitelist: `hc send <addr> <text>` with
+// exactly two operand words (so --force/--if/--wait/--timeout and extra
+// operands block), plus the pure query spellings `hc --help`,
+// `hc --version` and `hc <sub> --help`. Every other verb — run/attach/read/
+// ls/get/wait/keys/exec/file/kill/rm/label/server/machine/connect/update
+// and unknown verbs — blocks; hc is a terminal-control surface like herdr,
+// and send is the only channel a sub-agent is granted (the report path).
+func screenHcSubagent(headArgv []string) string {
+	args := headArgv[1:]
+	if isPureQueryInvocation(headArgv) {
+		return "" // hc --help / hc -h / hc --version / hc -V
+	}
+	if len(args) == 0 {
+		return "hc bare"
+	}
+	sub := args[0]
+	rest := args[1:]
+	if strings.HasPrefix(sub, "-") {
+		return "hc " + sub
+	}
+	// hc <sub> --help / -h: a one-flag query on any spelled subcommand.
+	if len(rest) == 1 && (rest[0] == "--help" || rest[0] == "-h") {
+		return ""
+	}
+	if sub == "send" {
+		if len(rest) == 2 && !strings.HasPrefix(rest[0], "-") && !strings.HasPrefix(rest[1], "-") && hcSendAddrOK(rest[0]) {
+			return ""
+		}
+		return "hc send"
+	}
+	return "hc " + sub
+}
+
 // queryOnlyFlagArgs are the pure query flags of the agent-launcher heads:
 // they print and exit without dispatching anything. `--dry-run` and
 // `--print` are deliberately absent — dispatch-agent writes its combined
@@ -2023,6 +2075,10 @@ func screenNestedDispatch(headArgv []string, pathEnv string) string {
 			}
 		case "herdsman":
 			if hit := screenHerdsmanSubagent(headArgv); hit != "" {
+				return hit
+			}
+		case "hc":
+			if hit := screenHcSubagent(headArgv); hit != "" {
 				return hit
 			}
 		case "crontab":
@@ -4777,7 +4833,7 @@ func programNamesBlockedAgent(prog string) bool {
 			return true
 		}
 	}
-	return toks.hasIdent("herdr") || toks.hasIdent("herdsman")
+	return toks.hasIdent("herdr") || toks.hasIdent("herdsman") || toks.hasIdent("hc")
 }
 
 // sedDynamicScriptSafe is gone (R4): a dynamic s/// fragment can inject
@@ -8025,7 +8081,7 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 						return ruleSubagentNestedAgent, "code spawns " + name
 					}
 				}
-				// A dynamic spawn site cannot prove a herdr/herdsman argv is
+				// A dynamic spawn site cannot prove a herdr/herdsman/hc argv is
 				// on the read-only whitelist, so the mere presence of the
 				// orchestrator name fails closed — the same rule
 				// programNamesBlockedAgent applies to dynamic awk commands.
@@ -8034,6 +8090,9 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 				}
 				if rawToks.hasIdent("herdsman") {
 					return ruleSubagentNestedAgent, "code drives herdsman mutation"
+				}
+				if rawToks.hasIdent("hc") {
+					return ruleSubagentNestedAgent, "code drives hc mutation"
 				}
 			}
 		}
