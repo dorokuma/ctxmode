@@ -370,9 +370,7 @@ func checkSystemctlReadonly(argv []string) string {
 		}
 		if strings.HasPrefix(a, "--") {
 			name := a[2:]
-			if eq := strings.IndexByte(name, '='); eq >= 0 {
-				name = name[:eq]
-			} else if longValue[name] {
+			if strings.IndexByte(name, '=') < 0 && longValue[name] {
 				i++ // skip value
 			}
 			continue
@@ -1145,7 +1143,7 @@ func checkGoReadonly(argv []string) string {
 			if allowVal[name] {
 				if !glued && !strings.Contains(a, "=") && (strings.HasPrefix(a, "--") || a == "-f") {
 					i++ // consume value
-				} else if !glued && strings.HasPrefix(a, "-f") && a != "-f" && !strings.HasPrefix(a, "--") {
+				} else if !glued && strings.HasPrefix(a, "-f") && a != "-f" {
 					// glued -f{{.X}}
 				}
 				continue
