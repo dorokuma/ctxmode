@@ -2158,8 +2158,20 @@ func isTrustedExecutableOnDisk(binPath string, euid int) bool {
 	if !isTrustedPathDirOnDisk(dir, euid) {
 		return false
 	}
+	// ADAPT2: a binary in a lexical system PATH dir skips the owner-uid
+	// check, mirroring isTrustedPathDirOnDisk — system dirs are
+	// admin-managed, so a third-party image owner (e.g. uid 65534 on a
+	// container image's /opt) is normal there. Group/world-writable bits
+	// (perm & 0022) are still rejected, and a symlink's own mode is
+	// meaningless — its resolved target is checked below. User toolchain
+	// dirs keep the full owner check.
+	sysBin := isSystemPathDir(dir)
 	if lst, err := os.Lstat(binPath); err == nil {
-		if !statUIDAndPermOK(lst, euid, true) {
+		if sysBin {
+			if lst.Mode()&os.ModeSymlink == 0 && lst.Mode().Perm()&0022 != 0 {
+				return false
+			}
+		} else if !statUIDAndPermOK(lst, euid, true) {
 			return false
 		}
 	}
@@ -2175,10 +2187,17 @@ func isTrustedExecutableOnDisk(binPath string, euid int) bool {
 	if err != nil || st.IsDir() {
 		return false
 	}
-	if !statUIDAndPermOK(st, euid, false) {
+	resDir := filepath.Clean(filepath.Dir(resolved))
+	// The resolved target is judged by where it lives: a target inside a
+	// system dir gets the same ADAPT2 exemption; a target that escapes into
+	// a user dir keeps the owner check.
+	if isSystemPathDir(resDir) {
+		if st.Mode().Perm()&0022 != 0 {
+			return false
+		}
+	} else if !statUIDAndPermOK(st, euid, false) {
 		return false
 	}
-	resDir := filepath.Clean(filepath.Dir(resolved))
 	return isTrustedPathDirOnDisk(resDir, euid)
 }
 
