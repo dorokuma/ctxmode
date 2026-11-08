@@ -4267,9 +4267,6 @@ func xargsReplToken(argv []string) string {
 	}
 	return repl
 }
-func screenFindArgs(args []string, kind byte, depth int, caller callerIdentity) string {
-	return screenFindArgsSeg(args, shellSegment{}, kind, depth, caller)
-}
 
 // screenFindArgsSeg scans find's operand list with explicit stdin context
 // modelling (2.c): -exec/-execdir redirect child stdin to /dev/null
