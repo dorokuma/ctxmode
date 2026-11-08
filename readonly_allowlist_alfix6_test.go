@@ -86,7 +86,6 @@ func TestAlFix6_Audit3Table_Readonly(t *testing.T) {
 		argv []string
 		want string // "block" or "allow"
 		sub  string // optional substring in block reason
-		note string
 	}
 	cases := []tc{
 		// M1 \r
@@ -410,8 +409,7 @@ func TestAlFix6_DashArgvDiff(t *testing.T) {
 		name string
 		code string // original; head will be replaced with printer for dash & expected
 		// expectGo is a function that returns Go argv (without needing printer in parse)
-		goArgv   func() []string
-		skipDash bool
+		goArgv func() []string
 	}
 
 	cases := []tc{

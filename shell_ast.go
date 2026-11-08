@@ -860,20 +860,19 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 				// optstring (may begin with ':' or '-'), the second is the
 				// target variable name.
 				opIdx := 0
-				for j := 1; j < len(args); j++ {
-					s, ok := wordToArg(args[j])
+				if len(args) > 1 {
+					s, ok := wordToArg(args[1])
 					if !ok || isDynamicArg(s) {
 						allTainted = true
 						return false
 					}
 					if s == "--" {
-						if j+1 < len(args) {
-							opIdx = j + 1
+						if len(args) > 2 {
+							opIdx = 2
 						}
-						break
+					} else {
+						opIdx = 1
 					}
-					opIdx = j
-					break
 				}
 				if opIdx > 0 && opIdx+1 < len(args) {
 					s, ok := wordToArg(args[opIdx+1])

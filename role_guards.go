@@ -160,8 +160,9 @@ const depthExceededHit = "exceeded max shell nesting depth"
 
 // dynamicRedirectTarget is the placeholder recorded as redirectFile when an
 // output redirection's target is a command substitution or otherwise
-// unreadable statically. It is never a real path, and redirectBlocksWrite
-// treats it as blocking so `echo hi > $(printf /tmp/x)` cannot slip through.
+// unreadable statically. It is never a real path, and any non-empty
+// redirectFile blocks a read-only caller, so `echo hi > $(printf /tmp/x)`
+// cannot slip through.
 const dynamicRedirectTarget = "<dynamic>"
 
 // cmdSubPlaceholder is the word-level stand-in written for a word-position
@@ -288,9 +289,6 @@ func isSafeDynamicDataOperand(a string) bool {
 	return strings.Contains(a, "/")
 }
 
-// argHasDyn reports either placeholder (for code-payload Contains checks).
-func argHasDyn(a string) bool { return isDynamicArg(a) }
-
 // splitShellSegments parses shell text via mvdan.cc/sh (LangPOSIX + Bash cross-check).
 func splitShellSegments(code string) []shellSegment {
 	return splitShellSegmentsEnv(code, nil)
@@ -324,31 +322,6 @@ func splitShellSegmentsBashEnv(code string, envTaint map[string]bool) []shellSeg
 		return []shellSegment{{depthExceeded: true}}
 	}
 	return segs
-}
-
-// redirectBlocksWrite reports whether a write-like redirection whose flattened
-// target word is target must block for a read-only caller. The target is
-// blocked unless it is /dev/null, /dev/stdout, /dev/stderr, or an fd
-// duplication/close (>&N, >&-, N>&M). An empty target never blocks (a bare `>`
-// with no target is a shell syntax error anyway); a dynamic placeholder does.
-func redirectBlocksWrite(op, target string) bool {
-	if target == "" {
-		return false
-	}
-	if strings.HasSuffix(op, "&") || op == ">&" || op == "&>" {
-		// >&N / >&- fd duplications are never file writes. `&> file` (bash's
-		// stdout+stderr redirect) IS a write and reaches here with op "&>" and
-		// a non-numeric target, which the digit check correctly lets through to
-		// the path comparison below.
-		if target == "-" || allDigits(target) {
-			return false
-		}
-	}
-	switch target {
-	case "/dev/null", "/dev/stdout", "/dev/stderr":
-		return false
-	}
-	return true
 }
 
 func allDigits(s string) bool {
@@ -3200,21 +3173,6 @@ func remoteStdinProgramLangs(remoteCmd string) (langs []string, readsProg bool) 
 	return langs, len(langs) > 0
 }
 
-// sshStdinTexts returns the visible stdin payloads attached to the ssh
-// segment: the `<<< word` here-string and every consumed heredoc body.
-func sshStdinTexts(seg shellSegment) []string {
-	var out []string
-	if seg.hereString != "" {
-		out = append(out, seg.hereString)
-	}
-	for _, hb := range seg.heredocText {
-		if hb.text != "" {
-			out = append(out, hb.text)
-		}
-	}
-	return out
-}
-
 // sshNoArgShorts are OpenSSH short options that take no operand.
 const sshNoArgShorts = "46AaCfGgKkMNnqsTtVvXxYy"
 
@@ -3798,12 +3756,6 @@ func isSafeIFSValue(val string) bool {
 	return true
 }
 
-// effectivePATH replays the env ops over the process PATH; see
-// effectivePATHFrom.
-func (e envAssignments) effectivePATH() string {
-	return e.effectivePATHFrom(os.Getenv("PATH"))
-}
-
 // effectivePATHFrom replays the env ops over base PATH and returns the
 // PATH a spawned command would resolve against: 'c' (env -i) drops to "",
 // 'u' unsets, 'a' re-assigns. A $PATH self-reference inside an assigned
@@ -3962,16 +3914,14 @@ func screenEnvWriteTargets(head []string, base string) string {
 		// getopts OPTSTRING NAME [args...]: the second operand is the target
 		// (the optstring itself may begin with ':' or '-').
 		opIdx := 0
-		for j := 1; j < len(head); j++ {
-			a := head[j]
-			if a == "--" {
-				if j+1 < len(head) {
-					opIdx = j + 1
+		if len(head) > 1 {
+			if head[1] == "--" {
+				if len(head) > 2 {
+					opIdx = 2
 				}
-				break
+			} else {
+				opIdx = 1
 			}
-			opIdx = j
-			break
 		}
 		if opIdx > 0 && opIdx+1 < len(head) {
 			if hit := tainted(head[opIdx+1]); hit != "" {
@@ -9858,26 +9808,6 @@ func xargsFeedsCodeFlag(inner, full []string) bool {
 	return false
 }
 
-// peelToSSHHead peels both standard wrappers and statement-level stdin
-// wrappers (flock, watch -x, xargs) to reach an underlying ssh argv.
-
-// headReadsStdinProgram reports whether the peeled command head list takes
-// its PROGRAM text from stdin (a bare sh/bash/… with no -c, a bare
-// python3/node/perl with no -c/-e). Callers that screen a command stream
-// which is not part of the argv text — a ctx_run stdin payload, a heredoc or
-// a `<<<` here-string — ask this before treating those bytes as data.
-func headReadsStdinProgram(argv []string) bool {
-	if len(argv) == 0 {
-		return false
-	}
-	head, _, _, _ := peelWrappers(argv)
-	if len(head) == 0 {
-		return false
-	}
-	_, isProg := stdinProgramHead(head)
-	return isProg
-}
-
 // langHasBacktickSpawn reports whether the language's code can spawn a
 // process through a backtick / qx / %x spelling (perl, ruby, php).
 func langHasBacktickSpawn(language string) bool {
@@ -11320,9 +11250,6 @@ func hasDynamicInterpOption(head []string, base string) bool {
 			continue
 		}
 		if strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+") {
-			if strings.HasPrefix(a, "--") {
-				continue
-			}
 			continue
 		}
 		// first static non-option operand = script file → option zone ends
@@ -11648,6 +11575,9 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 	}
 	return "", false, envAs
 }
+
+// peelToSSHHead peels both standard wrappers and statement-level stdin
+// wrappers (flock, watch -x, xargs) to reach an underlying ssh argv.
 func peelToSSHHead(argv []string) []string {
 	cur := argv
 	for depth := 0; depth < peelWrapperMaxSteps && len(cur) > 0; depth++ {

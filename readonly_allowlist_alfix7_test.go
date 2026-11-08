@@ -596,16 +596,6 @@ func staticConcreteLeafArgvs(argvs [][]string) [][]string {
 	return out
 }
 
-// leafArgvDeepAgree reports whether every dash leaf whose argv[0] appears in
-// goLeaves has an exact full argv[0]+argv[1:] match among those Go leaves.
-// When Go also tracked a dynamic sibling with the same argv[0] (placeholder
-// args), a dash expansion that does not exact-match is ignored — the static
-// Go leaf is a different invocation. Unknown dash heads use dashExecutedUnknown.
-// Go-only over-parses (untaken || branches, uncalled function bodies) are ignored.
-func leafArgvDeepAgree(goLeaves, dashLeaves [][]string) bool {
-	return leafArgvDeepAgreeExt(goLeaves, dashLeaves, nil)
-}
-
 func leafArgvDeepAgreeExt(goLeaves, dashLeaves, goWithDyn [][]string) bool {
 	// When dash ran a head that Go listed as a static leaf, full argv must
 	// exact-match one static Go leaf. If Go also tracked a dynamic sibling
