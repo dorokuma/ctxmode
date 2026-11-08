@@ -2180,8 +2180,8 @@ func screenPathHeadTrust(head0, pathEnv string) string {
 
 // isTrustedExecutableOnDisk checks that an executable resolved from a
 // toolchain/system PATH directory (and its EvalSymlinks target) is owned by
-// root or euid, is not group/world-writable (perm & 0022 == 0), and does not
-// resolve into /tmp|/var/tmp|/dev/shm|/run.
+// root or euid, passes the system-dir write-bit rule (sysDirPermOK), and
+// does not resolve into /tmp|/var/tmp|/dev/shm|/run.
 func isTrustedExecutableOnDisk(binPath string, euid int) bool {
 	dir := filepath.Clean(filepath.Dir(binPath))
 	if !isTrustedPathDirOnDisk(dir, euid) {
@@ -2191,14 +2191,14 @@ func isTrustedExecutableOnDisk(binPath string, euid int) bool {
 	// check, mirroring isTrustedPathDirOnDisk — system dirs are
 	// admin-managed, so a third-party image owner (e.g. uid 65534 on a
 	// container image's /opt) is normal there. The fixed linuxbrew prefix
-	// gets the same treatment (see isTrustedPathDirOnDisk). Group/world-
-	// writable bits (perm & 0022) are still rejected, and a symlink's own
-	// mode is meaningless — its resolved target is checked below. User
-	// toolchain dirs keep the full owner check.
+	// gets the same treatment (see isTrustedPathDirOnDisk). Write bits are
+	// judged by sysDirPermOK, and a symlink's own mode is meaningless — its
+	// resolved target is checked below. User toolchain dirs keep the full
+	// owner check.
 	sysBin := isSystemPathDir(dir) || isLinuxbrewPathDir(dir)
 	if lst, err := os.Lstat(binPath); err == nil {
 		if sysBin {
-			if lst.Mode()&os.ModeSymlink == 0 && lst.Mode().Perm()&0022 != 0 {
+			if lst.Mode()&os.ModeSymlink == 0 && !sysDirPermOK(lst) {
 				return false
 			}
 		} else if !statUIDAndPermOK(lst, euid, true) {
@@ -2222,7 +2222,7 @@ func isTrustedExecutableOnDisk(binPath string, euid int) bool {
 	// system dir (or the linuxbrew prefix) gets the same ADAPT2 exemption;
 	// a target that escapes into a user dir keeps the owner check.
 	if isSystemPathDir(resDir) || isLinuxbrewPathDir(resDir) {
-		if st.Mode().Perm()&0022 != 0 {
+		if !sysDirPermOK(st) {
 			return false
 		}
 	} else if !statUIDAndPermOK(st, euid, false) {
@@ -3698,11 +3698,59 @@ func statUIDAndPermOK(fi os.FileInfo, euid int, allowSymlinkMode bool) bool {
 	return fi.Mode().Perm()&0022 == 0
 }
 
+// callerGroupIDs returns the process's effective gid plus its supplementary
+// group ids — the full set of groups whose members can write through a
+// group-write bit as this caller.
+func callerGroupIDs() []int {
+	groups := []int{os.Getegid()}
+	if extra, err := os.Getgroups(); err == nil {
+		groups = append(groups, extra...)
+	}
+	return groups
+}
+
+// sysDirPermOK judges the write bits of a directory or file at a system
+// location (a lexical system PATH dir or the fixed linuxbrew prefix, where
+// ADAPT2 already exempts the owner-uid check): world-writable never passes,
+// and group-writable passes only when the owning group is one of the
+// caller's own groups. Admin-managed images deliberately ship such trees
+// group-writable by the job user's groups — the hosted toolcache, /usr/local
+// and the linuxbrew prefix on GitHub-hosted runners are 0775 under the
+// runner's (or the linuxbrew) group so the unprivileged job user can install
+// into them; the possible writers are then root, the owner, or the caller's
+// own group, the same trust domain the owner check accepts for user
+// toolchain dirs. A group the caller does not belong to stays untrusted.
+// User toolchain dirs do NOT use this rule: they keep statUIDAndPermOK's
+// flat rejection of group-writable dirs (a 0775 ~/.local/bin stays blocked).
+func sysDirPermOK(fi os.FileInfo) bool {
+	if fi == nil {
+		return false
+	}
+	perm := fi.Mode().Perm()
+	if perm&0002 != 0 {
+		return false // world-writable: anyone can plant
+	}
+	if perm&0020 == 0 {
+		return true
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	for _, gid := range callerGroupIDs() {
+		if int(st.Gid) == gid {
+			return true
+		}
+	}
+	return false
+}
+
 // isTrustedPathDirOnDisk verifies filesystem ownership, permission bits
-// (rejecting group/world-writable 0022), and symlink target safety for a
-// PATH directory. Non-existent directories pass if their nearest existing
-// ancestor is not a scratch path or world-writable, preserving dry-run and
-// cross-machine replay compatibility.
+// (world-writable always rejected; group-writable at system locations only
+// for the caller's own groups — see sysDirPermOK), and symlink target
+// safety for a PATH directory. Non-existent directories pass if their
+// nearest existing ancestor is not a scratch path or world-writable,
+// preserving dry-run and cross-machine replay compatibility.
 func isTrustedPathDirOnDisk(norm string, euid int) bool {
 	if isTmpOrScratchPath(norm) {
 		return false
@@ -3748,11 +3796,12 @@ func isTrustedPathDirOnDisk(norm string, euid int) bool {
 	// (package/admin user), not root or the caller euid; requiring uid==0
 	// or uid==euid would reject the entire system PATH segment and break
 	// normal tooling. The linuxbrew prefix rides along via sysDir (see the
-	// note at the top of this function). Group/world-writable (perm &
-	// 0022) directories and symlinks into /tmp|/var/tmp|/dev/shm|/run are
-	// still rejected.
+	// note at the top of this function). Write bits are judged by
+	// sysDirPermOK (world-writable always rejected; group-writable only
+	// for the caller's own groups), and symlinks into
+	// /tmp|/var/tmp|/dev/shm|/run are still rejected.
 	if sysDir {
-		if lst.Mode()&os.ModeSymlink == 0 && lst.Mode().Perm()&0022 != 0 {
+		if lst.Mode()&os.ModeSymlink == 0 && !sysDirPermOK(lst) {
 			return false
 		}
 	} else if !statUIDAndPermOK(lst, euid, true) {
@@ -3774,7 +3823,7 @@ func isTrustedPathDirOnDisk(norm string, euid int) bool {
 		return false
 	}
 	if isSystemPathDir(resolved) || isLinuxbrewPathDir(resolved) || sysDir {
-		return st.Mode().Perm()&0022 == 0
+		return sysDirPermOK(st)
 	}
 	return statUIDAndPermOK(st, euid, false)
 }
