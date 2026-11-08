@@ -2072,7 +2072,29 @@ func canonicalResolvedBase(b string) string {
 			return stem
 		}
 	}
+	// GNU packages installed by Homebrew (coreutils, findutils, grep, sed,
+	// tar, ...) place the real binary under a "g"/"gnu" prefix (gdf,
+	// gnutrue, gls) and symlink the unprefixed name to it, so a resolved
+	// basename can carry the prefix. Map it back to the canonical program,
+	// but only when the unprefixed name is one the name-keyed screens
+	// actually know — an unrecognized prefixed name stays as-is.
+	for _, pref := range []string{"gnu", "g"} {
+		if rest, ok := strings.CutPrefix(b, pref); ok && isKnownCanonicalBase(rest) {
+			return rest
+		}
+	}
 	return b
+}
+
+// isKnownCanonicalBase reports whether b is a program basename the
+// name-keyed guard screens key on (the readonly allowlist or the
+// core-utility shadow set).
+func isKnownCanonicalBase(b string) bool {
+	if userDirForbiddenShadowHeads[b] {
+		return true
+	}
+	_, ok := readonlyAllowlist[b]
+	return ok
 }
 
 // isVersionSuffix reports whether s is a version tail: a digit followed by
@@ -2129,7 +2151,7 @@ func screenPathHeadTrust(head0, pathEnv string) string {
 	}
 	if inToolchainDir && userDirForbiddenShadowHeads[head0] {
 		// git may legitimately reside in /home/linuxbrew/.linuxbrew/bin,
-		// provided the directory and binary pass the ownership/mode check above.
+		// provided the directory and binary pass the trust check above.
 		if head0 == "git" && isLinuxbrewPathDir(dir) {
 			return ""
 		}
@@ -2137,10 +2159,17 @@ func screenPathHeadTrust(head0, pathEnv string) string {
 		// (e.g. ~/.local/bin/find -> /usr/bin/find, ~/.local/bin/awk ->
 		// /usr/bin/mawk via alternatives) is a PATH convenience, not a planted
 		// binary. A real file or a symlink to an unrelated program still blocks.
+		// The linuxbrew prefix has the same shape internally: its unprefixed
+		// bin links (ls, cat, df, true, ...) point at gnu-prefixed Cellar
+		// binaries, so a link resolving within the prefix under the canonical
+		// name (via isAllowedSystemReadonlyAlias) is brew's own layout, not a
+		// plant. A real file sitting in the brew bin dir still blocks: the
+		// prefix escape requires the resolved path to differ from the link.
 		if resolved, err := filepath.EvalSymlinks(p); err == nil {
 			resolved = filepath.Clean(resolved)
 			rb := filepath.Base(resolved)
-			if isSystemPathDir(filepath.Dir(resolved)) && (rb == head0 || isAllowedSystemReadonlyAlias(head0, rb, head0, pathEnv)) {
+			rdir := filepath.Dir(resolved)
+			if (isSystemPathDir(rdir) || (isLinuxbrewPathDir(rdir) && resolved != filepath.Clean(p))) && (rb == head0 || isAllowedSystemReadonlyAlias(head0, rb, head0, pathEnv)) {
 				return ""
 			}
 		}
@@ -2161,11 +2190,12 @@ func isTrustedExecutableOnDisk(binPath string, euid int) bool {
 	// ADAPT2: a binary in a lexical system PATH dir skips the owner-uid
 	// check, mirroring isTrustedPathDirOnDisk — system dirs are
 	// admin-managed, so a third-party image owner (e.g. uid 65534 on a
-	// container image's /opt) is normal there. Group/world-writable bits
-	// (perm & 0022) are still rejected, and a symlink's own mode is
-	// meaningless — its resolved target is checked below. User toolchain
-	// dirs keep the full owner check.
-	sysBin := isSystemPathDir(dir)
+	// container image's /opt) is normal there. The fixed linuxbrew prefix
+	// gets the same treatment (see isTrustedPathDirOnDisk). Group/world-
+	// writable bits (perm & 0022) are still rejected, and a symlink's own
+	// mode is meaningless — its resolved target is checked below. User
+	// toolchain dirs keep the full owner check.
+	sysBin := isSystemPathDir(dir) || isLinuxbrewPathDir(dir)
 	if lst, err := os.Lstat(binPath); err == nil {
 		if sysBin {
 			if lst.Mode()&os.ModeSymlink == 0 && lst.Mode().Perm()&0022 != 0 {
@@ -2189,9 +2219,9 @@ func isTrustedExecutableOnDisk(binPath string, euid int) bool {
 	}
 	resDir := filepath.Clean(filepath.Dir(resolved))
 	// The resolved target is judged by where it lives: a target inside a
-	// system dir gets the same ADAPT2 exemption; a target that escapes into
-	// a user dir keeps the owner check.
-	if isSystemPathDir(resDir) {
+	// system dir (or the linuxbrew prefix) gets the same ADAPT2 exemption;
+	// a target that escapes into a user dir keeps the owner check.
+	if isSystemPathDir(resDir) || isLinuxbrewPathDir(resDir) {
 		if st.Mode().Perm()&0022 != 0 {
 			return false
 		}
@@ -3677,7 +3707,11 @@ func isTrustedPathDirOnDisk(norm string, euid int) bool {
 	if isTmpOrScratchPath(norm) {
 		return false
 	}
-	sysDir := isSystemPathDir(norm)
+	// The fixed linuxbrew prefix is judged like a system dir for ownership
+	// (see the ADAPT2 note below): it is a package-manager prefix whose
+	// owner is whoever installed brew — on GitHub runners a dedicated
+	// linuxbrew user, neither root nor the caller's euid.
+	sysDir := isSystemPathDir(norm) || isLinuxbrewPathDir(norm)
 	lst, err := os.Lstat(norm)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -3713,8 +3747,10 @@ func isTrustedPathDirOnDisk(norm string, euid int) bool {
 	// owner-uid check. On this host /usr/local/bin is owned by uid 1001
 	// (package/admin user), not root or the caller euid; requiring uid==0
 	// or uid==euid would reject the entire system PATH segment and break
-	// normal tooling. Group/world-writable (perm & 0022) directories and
-	// symlinks into /tmp|/var/tmp|/dev/shm|/run are still rejected.
+	// normal tooling. The linuxbrew prefix rides along via sysDir (see the
+	// note at the top of this function). Group/world-writable (perm &
+	// 0022) directories and symlinks into /tmp|/var/tmp|/dev/shm|/run are
+	// still rejected.
 	if sysDir {
 		if lst.Mode()&os.ModeSymlink == 0 && lst.Mode().Perm()&0022 != 0 {
 			return false
@@ -3737,7 +3773,7 @@ func isTrustedPathDirOnDisk(norm string, euid int) bool {
 	if err != nil || !st.IsDir() {
 		return false
 	}
-	if isSystemPathDir(resolved) || sysDir {
+	if isSystemPathDir(resolved) || isLinuxbrewPathDir(resolved) || sysDir {
 		return st.Mode().Perm()&0022 == 0
 	}
 	return statUIDAndPermOK(st, euid, false)
