@@ -177,9 +177,8 @@ func TestReadonlyAllowlist_VerifierUnchanged(t *testing.T) {
 	}
 }
 
-// TestGuard_HcReadonlyAndSubagent registers `hc` under both real link
-// topologies (host ~/.local/bin/hc -> herdr-core; sbx <goExecDir>/hc ->
-// ~/.local/bin/sbx): strict-readonly roles get send + pure queries only.
+// TestGuard_HcReadonlyAndSubagent registers `hc` under both link topologies
+// (hc -> herdr-core / hc -> sbx): strict-readonly gets send + pure queries only.
 func TestGuard_HcReadonlyAndSubagent(t *testing.T) {
 	expect := func(t *testing.T, g guardCall, a []string, want string) {
 		ra, _ := g.guardCtxRunArgv(a)
@@ -188,8 +187,9 @@ func TestGuard_HcReadonlyAndSubagent(t *testing.T) {
 			t.Fatalf("%v want rule %q, got argv=%q shell=%q", a, want, ra, rs)
 		}
 	}
-	allow := [][]string{{"hc", "send", "t42", "ok"}, {"hc", "--help"}, {"hc", "--version"}}
-	block := [][]string{{"hc"}, {"hc", "ls"}, {"hc", "run", "--bg", "x"}, {"hc", "send", "--force", "t42", "x"},
+	allow := [][]string{{"hc", "send", "t42", "ok"}, {"hc", "--help"}, {"hc", "-h"}, {"hc", "--version"}, {"hc", "-V"}, {"hc", "send", "--help"}}
+	block := [][]string{{"hc"}, {"hc", "ls"}, {"hc", "read", "t42"}, {"hc", "get", "t42"}, {"hc", "run", "--bg", "x"},
+		{"hc", "exec", "t42", "x"}, {"hc", "keys", "t42", "a"}, {"hc", "kill", "t42"}, {"hc", "rm", "t42"}, {"hc", "send", "--force", "t42", "x"},
 		{"hc", "send", "badaddr", "x"}, {"hc", "send", "t42", "-flag"}, {"herdr-core", "send", "t42", "ok"}, {"sbx", "send", "t42", "ok"}}
 	for _, topo := range []struct{ name, target, extraDir string }{
 		{"host-hc->herdr-core", "herdr-core", ""},     // PATH=~/.local/bin: toolchain dir

@@ -8,7 +8,7 @@ supersedes: ""
 # v5.3.1 hc 只读白名单修复：Oracle/Reviewer 观察项落盘与分诊闭环
 
 ## 一句话结论
-v5.3.1 C 档守卫修复（`fix/readonly-allowlist-hc`，基线 `0bffa15`）的 Oracle `0 must fix / 0 should fix / 3 consider` 与验证期新发现项全部分诊完毕：O1/O2/O4 转为后续分支任务，O3 按设计无需改码；本轮仅将分诊结论落盘仓内，不改变守卫语义。
+v5.3.1 C 档守卫修复（`fix/readonly-allowlist-hc`，基线 `0bffa15`）的 Oracle `0 must fix / 0 should fix / 3 consider` 与验证期新发现项全部分诊完毕：O1/O2 及验证期日志碰撞项转为后续分支任务，O3 按设计无需改码；本轮仅将分诊结论落盘仓内，不改变守卫语义。
 
 ## 背景
 `hc`（herdr-core / sbx 沙箱别名）注册入严格只读白名单后，Oracle 审计与验证期共记录 4 项观察。原分诊记录存放在仓外 `/root/.dev-baseline/followup-ctxmode-v531-oracle-consider.md`，C 档 reviewer 指出仓内可见性缺口，按授权将结论入库留痕。
