@@ -122,7 +122,7 @@ func TestAlFix6_Audit3Table_Readonly(t *testing.T) {
 		// S3 herdr
 		{name: "S3_herdr_bare", argv: []string{"herdr"}, want: "block"},
 		{name: "S3_herdr_remote", argv: []string{"herdr", "--remote=u@h", "status"}, want: "block"},
-		{name: "S3_herdr_V", argv: []string{"herdr", "-V"}, want: "allow"},
+		{name: "S3_herdr_V", argv: []string{"herdr", "-V"}, want: "block"},
 		// S4 git branch
 		{name: "S4_branch_merged_D", argv: []string{"git", "branch", "--merged", "-D", "foo"}, want: "block"},
 		// S5 redirect glue / quoted cmd
@@ -347,7 +347,7 @@ func TestAlFix6_FalsePositivesPass(t *testing.T) {
 		{name: "jq_arg", argv: []string{"jq", "--arg", "k", "v", ".x == $k"}},
 		{name: "git_C_glued", argv: []string{"git", "-C/tmp", "status"}},
 		{name: "git_branch_show_current", argv: []string{"git", "branch", "--show-current"}},
-		{name: "herdr_session_status", argv: []string{"herdr", "--session", "s", "status"}},
+		{name: "hc_send", argv: []string{"hc", "send", "t42", "done"}},
 		{name: "cat", argv: []string{"cat", "f"}},
 		{name: "rg_dollar", code: "rg 'a$'"},
 		{name: "pipe_devnull_head", code: "ls 2>/dev/null | head -n 5"},

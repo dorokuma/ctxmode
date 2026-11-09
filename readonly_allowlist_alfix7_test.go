@@ -997,12 +997,7 @@ func TestAlFix7_ShouldFix_Allowlist(t *testing.T) {
 		{name: "find_prune", argv: []string{"find", ".", "-path", "./.git", "-prune", "-o", "-name", "*.go", "-print"}},
 		{name: "find_newermt", argv: []string{"find", ".", "-newermt", "2026-01-01"}},
 		{name: "git_tag_sort_desc", argv: []string{"git", "tag", "-l", "--sort", "-creatordate"}},
-		{name: "herdr_pane_current", argv: []string{"herdr", "pane", "current"}},
-		{name: "herdr_pane_help", argv: []string{"herdr", "pane", "--help"}},
-		{name: "herdr_skill", argv: []string{"herdr", "--skill"}},
-		{name: "herdr_default_config", argv: []string{"herdr", "--default-config"}},
-		{name: "herdsman_status", argv: []string{"herdsman", "status"}},
-		{name: "herdsman_agent_list", argv: []string{"herdsman", "agent", "list"}},
+		{name: "hc_send", argv: []string{"hc", "send", "t42", "done"}},
 		{name: "git_reflog_n", argv: []string{"git", "reflog", "-n", "10"}},
 		{name: "ctxmode_h", argv: []string{"ctxmode", "-h"}},
 		{name: "ctxmode_help_flag", argv: []string{"ctxmode", "--help"}},
@@ -1032,6 +1027,12 @@ func TestAlFix7_ShouldFix_Allowlist(t *testing.T) {
 		{name: "ctxmode_ddash_h", argv: []string{"ctxmode", "--", "-h"}},
 		{name: "git_tag_delete", argv: []string{"git", "tag", "-l", "-d", "foo"}},
 		{name: "git_branch_sort_D", argv: []string{"git", "branch", "-l", "--sort", "-D", "foo"}},
+		{name: "herdr_pane_current", argv: []string{"herdr", "pane", "current"}},
+		{name: "herdr_pane_help", argv: []string{"herdr", "pane", "--help"}},
+		{name: "herdr_skill", argv: []string{"herdr", "--skill"}},
+		{name: "herdr_default_config", argv: []string{"herdr", "--default-config"}},
+		{name: "herdsman_status", argv: []string{"herdsman", "status"}},
+		{name: "herdsman_agent_list", argv: []string{"herdsman", "agent", "list"}},
 	}
 	for _, c := range block {
 		t.Run("block_"+c.name, func(t *testing.T) {

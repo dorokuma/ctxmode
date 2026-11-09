@@ -5,6 +5,11 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [5.3.3] - 2026-11-10
+
+### Removed
+- **Role guards: retired `herdr`/`herdsman` strict-readonly allowlist entries (`readonly_allowlist.go`).** The `readonlyAllowlist["herdr"]`/`readonlyAllowlist["herdsman"]` entries and their `checkHerdrReadonly`/`checkHerdsmanReadonly` checks are dead code now that `hc` is the only sanctioned terminal-control surface for sub-agents; strict-readonly roles (`scout`/`planner`/`researcher`/`reviewer`/`oracle`/`CTXMODE_READONLY=1`) now get the default-deny `unknown command herdr`/`unknown command herdsman` verdict like every other unlisted command. The sub-agent screens (`screenHerdrSubagent`/`screenHerdsmanSubagent` in `role_guards.go`, driven by `screenNestedDispatch` under `subagent_nested_agent`) are unchanged: non-readonly sub-agents still get `herdr`/`herdsman` write verbs blocked and read-only queries free. `readonlyToolsDescription` (surfaced in the `ctx_run` tool description) now lists `hc` instead of the retired `herdr`/`herdsman` names, keeping `TestReadonlyAllowlist_ToolsDescriptionSync` in sync. Test updates: strict-readonly allow expectations for `herdr`/`herdsman` moved to block in `readonly_allowlist_alfix7_test.go` and `readonly_allowlist_alfix6_test.go`, and allow-list spots in `readonly_allowlist_test.go`/`readonly_allowlist_alfix4_test.go`/`readonly_allowlist_alfix5_test.go`/`readonly_allowlist_alfix6_test.go`/`readonly_allowlist_alfix7_test.go` now cover `hc send`.
+
 ## [5.3.2] - 2026-11-09
 
 ### Changed

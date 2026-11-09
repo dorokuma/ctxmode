@@ -169,7 +169,7 @@ func TestReadonlyAllowlist_AlFix4_CommonReadsStillPass(t *testing.T) {
 		{name: "date +fmt", argv: []string{"date", "+%Y-%m-%d"}},
 		{name: "file plain", argv: []string{"file", "f"}},
 		{name: "pipe", code: "ls /tmp | head -n 5"},
-		{name: "herdr pane read", argv: []string{"herdr", "pane", "read", "w1:p1"}},
+		{name: "hc send", argv: []string{"hc", "send", "t42", "done"}},
 		{name: "uniq one file", argv: []string{"uniq", "f"}},
 		{name: "journalctl -u -n", argv: []string{"journalctl", "-u", "x", "-n", "30", "--no-pager"}},
 	}
