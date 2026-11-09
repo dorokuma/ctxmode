@@ -5,6 +5,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Fixed
+- **Role guards: register `hc` in the strict-readonly allowlist and close the `herdr-core` direct-call bypass (`readonly_allowlist.go`, `role_guards.go`).** P11 live acceptance found the second layer of the sub-agent `hc` gate missing: `screenHcSubagent` already whitelisted `hc send <addr> <text>` plus the pure query spellings, but strict-readonly callers (`scout`/`planner`/`researcher`/`reviewer`/`oracle`/`CTXMODE_READONLY=1`) still failed at `screenReadonlyAllowlist` with `unknown command hc`. `readonlyAllowlist["hc"]` now reuses `screenHcSubagent` as its check; `isAllowedSystemReadonlyAlias` admits the two live symlink layouts — `hc -> herdr-core` (host `/root/.local/bin`) and `hc -> sbx` (inside `sbx --preset reviewer-agent`) — so `screenReadonlyAliasTarget` no longer rewrites the head into an unlisted binary, while `herdr-core`/`sbx` themselves stay OUT of the allowlist (direct spelling still blocks). `screenNestedDispatch` and `isStructuralGuardHead` now cover `herdr-core`, so a non-readonly sub-agent naming the symlink target directly (`herdr-core run ...`) is routed through the same `screenHcSubagent` whitelist instead of bypassing the `hc` interception. Regression coverage: `readonly_allowlist_hc_test.go` (verified red before the fix).
+
 ## [5.3.0] - 2026-11-08
 
 ### Security

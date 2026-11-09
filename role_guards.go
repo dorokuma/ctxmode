@@ -1912,7 +1912,7 @@ func isStructuralGuardHead(base string) bool {
 		"trap", "unset", "export", "readonly", "declare", "typeset", "local",
 		"read", "getopts", "printf", "command", "ctxmode",
 		"awk", "gawk", "mawk", "nawk", "sed", "gsed", "tar", "gtar", "bsdtar",
-		"npx", "bunx", "pnpx", "git", "herdr", "herdsman", "hc":
+		"npx", "bunx", "pnpx", "git", "herdr", "herdsman", "hc", "herdr-core":
 		return true
 	}
 	return false
@@ -2252,6 +2252,15 @@ func isAllowedSystemReadonlyAlias(typedBase, resolvedBase, head0, pathEnv string
 		if resolvedBase == "systemd" || resolvedBase == "systemctl" || resolvedBase == "journalctl" {
 			return true
 		}
+	case "hc":
+		// Live layouts: /root/.local/bin/hc -> herdr-core on the host, and
+		// hc -> sbx inside the `sbx --preset reviewer-agent` sandbox. Only
+		// the typed `hc` head earns the pass — herdr-core/sbx themselves are
+		// NOT readonly-allowlisted, and argv still goes through the strict
+		// screenHcSubagent whitelist keyed on the typed name.
+		if resolvedBase == "herdr-core" || resolvedBase == "sbx" {
+			return true
+		}
 	case "which":
 		if strings.Contains(resolvedBase, "which") || resolvedBase == "debianutils" {
 			return true
@@ -2314,7 +2323,10 @@ func screenNestedDispatch(headArgv []string, pathEnv string) string {
 			if hit := screenHerdsmanSubagent(headArgv); hit != "" {
 				return hit
 			}
-		case "hc":
+		// `herdr-core` is the host-side symlink target of `hc`; naming the
+		// target directly must route through the same hc whitelist so
+		// `herdr-core run ...` cannot bypass the `hc` interception.
+		case "hc", "herdr-core":
 			if hit := screenHcSubagent(headArgv); hit != "" {
 				return hit
 			}
