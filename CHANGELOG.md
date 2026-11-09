@@ -5,6 +5,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Changed
+- **L2 baseline: consolidate repository checks into `make check` (`Makefile`, `.github/workflows/ci.yml`, `AGENTS.md`).** New root `Makefile` `check` target is the single check entry: `gofmt -l .` (fails on unformatted files — baseline was clean), `staticcheck`, `go vet ./...`, `go test -race ./...`, `go build -o /dev/null .`, and `node --experimental-strip-types --test integrations/pi/*.test.ts` when `node` is on PATH; with `CI=true` and no `node` the target fails loudly instead of silently skipping the Pi extension tests, while a zero-node maintenance host skips them with a printed note. `ci.yml` keeps its checkout/setup-go/setup-node/ripgrep/staticcheck-install preparation steps and now calls `make check` as a single step. `AGENTS.md` declares `档位：L2`, documents the `make check` boundary, and replaces the verbatim global commit-rule restatement with a reference to `/root/.pig/agent/SYSTEM.md` §4. `.gitignore` gains a `!/AGENTS.md` negation to override the local global ignore (`~/.config/git/ignore`), so `AGENTS.md` is tracked in version control as the L2-required deliverable.
+
+### Fixed
+- **L2 baseline follow-up: propagate `gofmt` exit code, pin `staticcheck` precheck, root-anchor `!AGENTS.md` (`Makefile`, `.gitignore`, `AGENTS.md`).** The `check` target previously ran `files="$$(gofmt -l .)"` where the command substitution swallowed `gofmt`'s own exit code: a file carrying a syntax error hidden behind a non-local `//go:build` tag (e.g. `//go:build ignore`) reports diagnostics on stderr, prints nothing to stdout, and exits 2 — the assignment discarded that status and `make check` sailed on while `go vet`/`staticcheck`/`go test`/`go build` all skipped the tag-shielded file. The recipe now propagates the substitution's failure (`files=... || exit $$?`). A `staticcheck` executable precheck at `$(go env GOPATH)/bin/staticcheck` fails fast with the pinned install command (`go install honnef.co/go/tools/cmd/staticcheck@2025.1.1`, matching CI) instead of make's opaque "command not found"; `AGENTS.md` records the pinned version so local and CI check the same staticcheck release. The `.gitignore` negation is root-anchored to `!/AGENTS.md` so same-named files in subdirectories are not unintentionally un-ignored.
+
 ## [5.3.1] - 2026-11-09
 
 ### Fixed

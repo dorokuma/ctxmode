@@ -20,8 +20,4 @@ jobs:
           node-version: "24"
       - run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
-      - run: $(go env GOPATH)/bin/staticcheck ./...
-      - run: go test -race ./...
-      - run: go vet ./...
-      - run: node --experimental-strip-types --test integrations/pi/*.test.ts
-      - run: go build .
+      - run: make check
