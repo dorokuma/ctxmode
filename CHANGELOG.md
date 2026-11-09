@@ -5,6 +5,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [5.3.2] - 2026-11-09
+
 ### Changed
 - **L2 baseline: consolidate repository checks into `make check` (`Makefile`, `.github/workflows/ci.yml`, `AGENTS.md`).** New root `Makefile` `check` target is the single check entry: `gofmt -l .` (fails on unformatted files — baseline was clean), `staticcheck`, `go vet ./...`, `go test -race ./...`, `go build -o /dev/null .`, and `node --experimental-strip-types --test integrations/pi/*.test.ts` when `node` is on PATH; with `CI=true` and no `node` the target fails loudly instead of silently skipping the Pi extension tests, while a zero-node maintenance host skips them with a printed note. `ci.yml` keeps its checkout/setup-go/setup-node/ripgrep/staticcheck-install preparation steps and now calls `make check` as a single step. `AGENTS.md` declares `档位：L2`, documents the `make check` boundary, and replaces the verbatim global commit-rule restatement with a reference to `/root/.pig/agent/SYSTEM.md` §4. `.gitignore` gains a `!/AGENTS.md` negation to override the local global ignore (`~/.config/git/ignore`), so `AGENTS.md` is tracked in version control as the L2-required deliverable.
 
