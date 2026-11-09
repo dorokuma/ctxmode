@@ -9,4 +9,4 @@ context_mode.db-wal
 .agents/notes/INDEX.md
 # 反选覆盖：本机全局 ~/.config/git/ignore 忽略了 AGENTS.md，
 # 但 L2 档位要求 AGENTS.md 作为版本化交付物入库。
-!AGENTS.md
+!/AGENTS.md

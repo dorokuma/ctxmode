@@ -1,7 +1,8 @@
 .PHONY: check
 
 check:
-	@files="$$(gofmt -l .)"; \
+	@[ -x "$$(go env GOPATH)/bin/staticcheck" ] || { echo "staticcheck not found at $$(go env GOPATH)/bin/staticcheck (install: go install honnef.co/go/tools/cmd/staticcheck@2025.1.1)" >&2; exit 1; }
+	@files="$$(gofmt -l .)" || exit $$?; \
 	if [ -n "$$files" ]; then \
 		echo "gofmt: files not formatted:" >&2; \
 		printf '%s\n' "$$files" >&2; \
