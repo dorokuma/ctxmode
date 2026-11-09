@@ -1458,7 +1458,10 @@ func scanAllowedOpts(args []string, entry *cmdAllow) string {
 }
 
 // readonlyPrePeelHit rejects exec/eval/source/`.` / function / coproc / nohup
-// before peelWrappers can strip them into a benign head.
+// and the peelable wrapper heads before peelWrappers can strip them into a
+// benign head. `sbx` keeps the exact default-deny wording a non-peeled head
+// produces (`unknown command sbx`) so strict-readonly callers get the same
+// verdict the allowlist handed out before sbx became peelable.
 func readonlyPrePeelHit(argv []string) string {
 	i := 0
 	steps := 0
@@ -1482,6 +1485,10 @@ func readonlyPrePeelHit(argv []string) string {
 		case "env", "command", "builtin", "nice", "timeout", "stdbuf", "busybox",
 			"ionice", "taskset", "chrt", "strace", "ltrace", "setsid", "time":
 			return a
+		case "sbx":
+			// Default-deny wording preserved for the strict-readonly path
+			// ([pattern:sbx-wrapper-unwrap-asymmetry]).
+			return "unknown command sbx"
 		case "if", "then", "elif", "else", "while", "until", "do", "!",
 			"fi", "done", "for", "in", "case", "esac", "select", "[[", "]]":
 			return "control flow " + a

@@ -243,3 +243,94 @@ func TestGuard_HcReadonlyAndSubagent(t *testing.T) {
 		}
 	})
 }
+
+// TestGuard_PeelSbxWrapper covers peeling of the sbx sandbox wrapper
+// ([pattern:sbx-wrapper-unwrap-asymmetry]): a non-readonly sub-agent reaches
+// the inner command head — blocked heads, screened --env values and unknown
+// flags fail closed, benign inners pass — while a strict-readonly role still
+// gets the default-deny `unknown command sbx` first-layer verdict.
+func TestGuard_PeelSbxWrapper(t *testing.T) {
+	localBin := mustSbxBin(t)
+	t.Setenv(auditEnvRole, "worker")
+	t.Setenv(auditEnvReadonly, "")
+	t.Setenv("PATH", t.TempDir())
+	g := currentGuardCall()
+	if !g.subagent || g.strictReadonly {
+		t.Fatal("worker must be a non-strict sub-agent")
+	}
+	for _, tc := range []struct{ code, want string }{ // "" = allowed
+		{"sbx -preset reviewer-agent --workdir /tmp -- herdr-core run x", "hc run"},
+		{"sbx -- hc kill t1", "hc kill"},
+		{"sbx --env HOME=/tmp -- echo ok", depthExceededHit},
+		{"sbx --env=PATH=/tmp -- echo ok", "env PATH"}, {"sbx --env A=1,PATH=/tmp -- echo ok", "env PATH"},
+		{"sbx --env A=1,B=2 -- echo ok", ""},
+		{"sbx --env PI_SANDBOX_INTERNAL_CHILD_SPEC={} -- echo ok", "env PI_SANDBOX_INTERNAL_CHILD_SPEC"},
+		{"sbx --exec /tmp --reviewer /tmp --deny-net -- pig", "pig"},
+		{"sbx --check", ""}, {"sbx --unknown-flag echo ok", depthExceededHit},
+		{"sbx --deny-net --workdir $(printf '/tmp sh -c pig') echo ok", depthExceededHit},
+		{"echo pig | sbx --preset reviewer-agent -- sh", "piped code to shell"},
+		{"echo pig | PATH=" + localBin + " foo --preset reviewer-agent -- sh", "piped code to shell"},
+		{"sbx --preset reviewer-agent --report-to t42 -- hc send t42 done", ""},
+		{"echo x | PATH=" + localBin + " xargs ssx dmit sh", "piped stdin to ssh"},
+		{"PATH=" + localBin + " xargs ssx dmit sh -c", "dynamic code payload"},
+		{"PATH=" + localBin + " xargs -IXX foo --deny-net -- foo --deny-net -- sh -c XX", "dynamic code payload"},
+		{"PATH=" + localBin + " find . -exec ssx dmit sh -c {} ;", "find -exec dynamic code payload"},
+	} {
+		r, d := g.guardCtxRunShell(tc.code)
+		checked := !strings.Contains(tc.code, "|") && !strings.HasPrefix(tc.code, "PATH=") && !strings.Contains(tc.code, "$(")
+		ra, da := "", ""
+		if checked {
+			ra, da = g.guardCtxRunArgv(strings.Fields(tc.code))
+		}
+		ok := tc.want == "" && r == "" && ra == "" || tc.want != "" && d == tc.want && (!checked || ra != "" && da == tc.want)
+		if !ok {
+			t.Errorf("%q want %q, got shell=%s/%q argv=%s/%q", tc.code, tc.want, r, d, ra, da)
+		}
+	}
+	t.Setenv(auditEnvRole, "reviewer")
+	if r, d := currentGuardCall().guardCtxRunShell("sbx --preset reviewer-agent -- echo ok"); r != ruleReadonlyWrite || !strings.Contains(d, "unknown command sbx") {
+		t.Fatalf("reviewer sbx want unknown-command block, got %s/%q", r, d)
+	}
+	checkSbxSSHStdinTunnel(t, localBin)
+}
+
+// checkSbxSSHStdinTunnel covers S-R4-1/S-R4-2: the ctx_run stdin tunnel
+// probe and stdin-head classification must seed PATH resolution with the
+// CALLER's process PATH, never the merged envAs replayed over "" — a
+// remote `PATH=` op leaking into the base drops ssx -> ssh resolution
+// (strict upgrade lost) and a `PATH=$PATH:<dir>` prefix collapses to
+// `:<dir>` (alias unresolvable, stdin screen bypassed).
+func checkSbxSSHStdinTunnel(t *testing.T, localBin string) {
+	t.Helper()
+	t.Setenv("PATH", localBin)
+	t.Setenv(auditEnvRole, "verifier")
+	t.Setenv(auditEnvReadonly, "1")
+	vg := currentGuardCall()
+	if r, _ := vg.guardCtxRunStdinForCommand("xargs ssx dmit 'PATH=/nope sh'", "rm -rf /tmp/x"); r != ruleReadonlyWrite {
+		t.Fatalf("remote PATH= op leak: want %s strict upgrade, got %s", ruleReadonlyWrite, r)
+	}
+	t.Setenv(auditEnvReadonly, "")
+	t.Setenv(auditEnvRole, "worker")
+	if r, _ := currentGuardCall().guardCtxRunStdinForCommand("PATH=$PATH:"+localBin+" xargs ssx dmit sh", "hc kill t1"); r != ruleSubagentNestedAgent {
+		t.Fatalf("$PATH prefix collapse: want %s, got %s", ruleSubagentNestedAgent, r)
+	}
+}
+
+// mustSbxBin plants the sbx/ssh executables and their PATH aliases under
+// a trusted <home>/.local/bin: foo -> sbx (S-NEW-1) and ssx -> ssh (S-R3-1).
+func mustSbxBin(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(withTestTrustedHome(t), ".local", "bin")
+	writeTestExecutable(t, filepath.Join(dir, "sbx"), 0555)
+	writeTestExecutable(t, filepath.Join(dir, "ssh"), 0555)
+	mustSymlink(t, "sbx", filepath.Join(dir, "foo"))
+	mustSymlink(t, "ssh", filepath.Join(dir, "ssx"))
+	return dir
+}
+
+func mustSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+}
