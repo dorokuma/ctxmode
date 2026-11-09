@@ -141,7 +141,7 @@ func TestReadonlyAllowlist_CommonReadsPass(t *testing.T) {
 		{name: "pipe", code: "ls /tmp | head -n 5"},
 		{name: "and", code: "git status && git log -1"},
 		{name: "devnull", code: "ls /tmp 2>/dev/null"},
-		{name: "herdr pane read", argv: []string{"herdr", "pane", "read", "w1:p1"}},
+		{name: "hc send", argv: []string{"hc", "send", "t42", "done"}},
 		{name: "git config --get", argv: []string{"git", "config", "--get", "user.name"}},
 		{name: "git remote -v", argv: []string{"git", "remote", "-v"}},
 		{name: "git worktree list", argv: []string{"git", "worktree", "list"}},

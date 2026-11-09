@@ -346,8 +346,6 @@ func init() {
 	readonlyAllowlist["gsed"] = readonlyAllowlist["sed"]
 	readonlyAllowlist["git"] = &cmdAllow{check: checkGitReadonly}
 	readonlyAllowlist["go"] = &cmdAllow{check: checkGoReadonly}
-	readonlyAllowlist["herdr"] = &cmdAllow{check: checkHerdrReadonly}
-	readonlyAllowlist["herdsman"] = &cmdAllow{check: checkHerdsmanReadonly}
 	// hc reuses the sub-agent whitelist screen: only `hc send <addr> <text>`
 	// and the pure query spellings pass under strict readonly. The symlink
 	// targets (herdr-core on the host, sbx inside the reviewer sandbox) stay
@@ -1171,68 +1169,6 @@ func checkGoReadonly(argv []string) string {
 	}
 }
 
-func checkHerdrReadonly(argv []string) string {
-	args := argv[1:]
-	idx, query := skipToolGlobalFlags(args)
-	if idx >= len(args) {
-		if query {
-			return ""
-		}
-		return "herdr bare"
-	}
-	if query {
-		return ""
-	}
-	if strings.HasPrefix(args[idx], "-") {
-		return "herdr " + args[idx]
-	}
-	switch args[idx] {
-	case "--version", "--help", "-h", "help", "version", "list", "ls", "status", "info":
-		return ""
-	case "-v":
-		if idx+1 >= len(args) {
-			return ""
-		}
-		return "herdr " + args[idx+1]
-	case "pane":
-		rest := args[idx+1:]
-		if len(rest) == 0 {
-			return "herdr pane"
-		}
-		switch rest[0] {
-		case "read", "list", "ls", "capture", "dump", "get", "info", "status", "help",
-			"current", "--help", "-h":
-			return ""
-		default:
-			return "herdr pane " + rest[0]
-		}
-	default:
-		return "herdr " + args[idx]
-	}
-}
-
-func checkHerdsmanReadonly(argv []string) string {
-	args := argv[1:]
-	idx, query := skipToolGlobalFlags(args)
-	if idx >= len(args) {
-		if query {
-			return ""
-		}
-		return "herdsman bare"
-	}
-	if query {
-		return ""
-	}
-	if strings.HasPrefix(args[idx], "-") {
-		return "herdsman " + args[idx]
-	}
-	key := toolSubKey(args[idx:], herdsmanSecondLevel)
-	if herdsmanReadonlySubs[key] {
-		return ""
-	}
-	return "herdsman " + key
-}
-
 func checkMountReadonly(argv []string) string {
 	args := argv[1:]
 	if len(args) == 0 {
@@ -1571,6 +1507,6 @@ search: rg grep find sed
 text: sort uniq cut tr jq diff cmp echo printf true false
 vcs: git
 go_meta: go gofmt ctxmode
-ops: ps pgrep ss journalctl systemctl which date pwd mount kill herdr herdsman
+ops: ps pgrep ss journalctl systemctl which date pwd mount kill hc
 `)
 }

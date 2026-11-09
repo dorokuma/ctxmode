@@ -261,7 +261,7 @@ func TestReadonlyAllowlist_AlFix5_FalsePositivesPass(t *testing.T) {
 		{name: "jq_argjson", argv: []string{"jq", "--argjson", "k", "123", ".x"}},
 		{name: "git_C_glued", argv: []string{"git", "-C/tmp", "status"}},
 		{name: "git_branch_show_current", argv: []string{"git", "branch", "--show-current"}},
-		{name: "herdr_session_status", argv: []string{"herdr", "--session", "s", "status"}},
+		{name: "hc_send", argv: []string{"hc", "send", "t42", "done"}},
 		// green samples from TASK
 		{name: "cat", argv: []string{"cat", "f"}},
 		{name: "head_n", argv: []string{"head", "-n", "5", "f"}},
