@@ -348,6 +348,12 @@ func init() {
 	readonlyAllowlist["go"] = &cmdAllow{check: checkGoReadonly}
 	readonlyAllowlist["herdr"] = &cmdAllow{check: checkHerdrReadonly}
 	readonlyAllowlist["herdsman"] = &cmdAllow{check: checkHerdsmanReadonly}
+	// hc reuses the sub-agent whitelist screen: only `hc send <addr> <text>`
+	// and the pure query spellings pass under strict readonly. The symlink
+	// targets (herdr-core on the host, sbx inside the reviewer sandbox) stay
+	// OUT of this table — they are admitted only as hc's resolved alias in
+	// isAllowedSystemReadonlyAlias.
+	readonlyAllowlist["hc"] = &cmdAllow{check: screenHcSubagent}
 	readonlyAllowlist["mount"] = &cmdAllow{check: checkMountReadonly}
 	readonlyAllowlist["kill"] = &cmdAllow{check: checkKillReadonly}
 	readonlyAllowlist["ctxmode"] = &cmdAllow{check: checkCtxmodeReadonly}

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -173,4 +175,71 @@ func TestReadonlyAllowlist_VerifierUnchanged(t *testing.T) {
 	if g.strictReadonly {
 		t.Fatal("verifier guardCall must not be strictReadonly")
 	}
+}
+
+// TestGuard_HcReadonlyAndSubagent registers `hc` under both link topologies
+// (hc -> herdr-core / hc -> sbx): strict-readonly gets send + pure queries only.
+func TestGuard_HcReadonlyAndSubagent(t *testing.T) {
+	expect := func(t *testing.T, g guardCall, a []string, want string) {
+		ra, _ := g.guardCtxRunArgv(a)
+		rs, _ := g.guardCtxRunShell(strings.Join(a, " "))
+		if ra != want || rs != want {
+			t.Fatalf("%v want rule %q, got argv=%q shell=%q", a, want, ra, rs)
+		}
+	}
+	allow := [][]string{{"hc", "send", "t42", "ok"}, {"hc", "--help"}, {"hc", "-h"}, {"hc", "--version"}, {"hc", "-V"}, {"hc", "send", "--help"}}
+	block := [][]string{{"hc"}, {"hc", "ls"}, {"hc", "read", "t42"}, {"hc", "get", "t42"}, {"hc", "run", "--bg", "x"},
+		{"hc", "exec", "t42", "x"}, {"hc", "keys", "t42", "a"}, {"hc", "kill", "t42"}, {"hc", "rm", "t42"}, {"hc", "send", "--force", "t42", "x"},
+		{"hc", "send", "badaddr", "x"}, {"hc", "send", "t42", "-flag"}, {"herdr-core", "send", "t42", "ok"}, {"sbx", "send", "t42", "ok"}}
+	for _, topo := range []struct{ name, target, extraDir string }{
+		{"host-hc->herdr-core", "herdr-core", ""},     // PATH=~/.local/bin: toolchain dir
+		{"sbx-hc->local-bin-sbx", "sbx", "goExecDir"}, // hc outside ~/.local/bin, resolves across
+	} {
+		t.Run(topo.name, func(t *testing.T) {
+			localBin := filepath.Join(withTestTrustedHome(t), ".local", "bin")
+			writeTestExecutable(t, filepath.Join(localBin, topo.target), 0555)
+			linkDir := localBin
+			if topo.extraDir != "" {
+				linkDir = t.TempDir()
+			}
+			if err := os.Symlink(filepath.Join(localBin, topo.target), filepath.Join(linkDir, "hc")); err != nil {
+				t.Fatalf("symlink hc -> %s: %v", topo.target, err)
+			}
+			t.Setenv("PATH", linkDir+":"+localBin)
+			for _, env := range [][2]string{{"reviewer", ""}, {"scout", ""}, {"oracle", ""}, {"", "1"}} {
+				t.Setenv(auditEnvRole, env[0])
+				t.Setenv(auditEnvReadonly, env[1])
+				g := currentGuardCall()
+				if !g.strictReadonly {
+					t.Fatalf("env %v must classify as strict readonly", env)
+				}
+				for _, a := range allow {
+					expect(t, g, a, "")
+				}
+				for _, a := range block {
+					ra, _ := g.guardCtxRunArgv(a)
+					if rs, _ := g.guardCtxRunShell(strings.Join(a, " ")); ra == "" || rs == "" {
+						t.Fatalf("%v must block under strict readonly", a)
+					}
+				}
+			}
+		})
+	}
+	t.Run("worker-herdr-core", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		t.Setenv(auditEnvRole, "worker")
+		t.Setenv(auditEnvReadonly, "")
+		g := currentGuardCall()
+		if !g.subagent || g.strictReadonly {
+			t.Fatal("worker must be a non-strict sub-agent")
+		}
+		for _, c := range []struct {
+			a    []string
+			want string
+		}{{[]string{"herdr-core", "run", "x"}, ruleSubagentNestedAgent},
+			{[]string{"herdr-core", "send", "--force", "t42", "x"}, ruleSubagentNestedAgent},
+			{[]string{"herdr-core", "send", "t42", "x"}, ""}, {[]string{"hc", "send", "t42", "x"}, ""}} {
+			expect(t, g, c.a, c.want)
+		}
+	})
 }
