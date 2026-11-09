@@ -1823,3 +1823,33 @@ func TestBackground_StartMessageMentionsCtxBg(t *testing.T) {
 		t.Fatalf("start message must reference ctx_bg action=list|kill|log|wait, got: %q", result.Stdout)
 	}
 }
+
+func TestBackground_LogPathInstanceScoped(t *testing.T) {
+	// [pattern:ctxmode-bg-log-collision]: log file names must carry the
+	// per-process bgInstanceID, so concurrent ctxmode instances (or an
+	// inner go test sharing os.TempDir()) never collide on a bare
+	// ctxmode_bg_bg-1.log path.
+	result, err := runShell(context.Background(), "sleep 30", "/tmp", 0, true)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := parseBgID(t, result.Stdout)
+	defer killBackground(id)
+	entry := findBackground(id)
+	if entry == nil || entry.LogPath == "" {
+		t.Fatalf("entry %s missing log path", id)
+	}
+	if filepath.Dir(entry.LogPath) != filepath.Clean(os.TempDir()) {
+		t.Fatalf("log must live in os.TempDir(): %q", entry.LogPath)
+	}
+	base := filepath.Base(entry.LogPath)
+	if !strings.HasPrefix(base, bgTempPrefix+bgInstanceID+"_") {
+		t.Fatalf("log name must start with %q, got %q", bgTempPrefix+bgInstanceID+"_", base)
+	}
+	if !strings.HasSuffix(base, "_"+id+".log") {
+		t.Fatalf("log name must end with %q, got %q", "_"+id+".log", base)
+	}
+	if base == bgTempPrefix+id+".log" {
+		t.Fatalf("log name must be instance-scoped, got bare %q", base)
+	}
+}

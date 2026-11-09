@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -205,7 +206,24 @@ var (
 	bgTombstones = map[string]bgTombstone{}
 	bgSeq        atomic.Uint64
 	bgReaper     sync.Once
+	// bgInstanceID scopes background log file names to this process
+	// instance: job IDs restart at bg-1 in every process, so a bare
+	// ctxmode_bg_<id>.log would collide when multiple ctxmode processes
+	// (or an inner `go test` suite sharing os.TempDir()) run background
+	// jobs concurrently — each would rename/remove the same fixed path.
+	// [pattern:ctxmode-bg-log-collision]
+	bgInstanceID = newBGInstanceID()
 )
+
+// newBGInstanceID returns "<pid>_<8-hex>" from crypto/rand, falling back
+// to the current time in nanoseconds if the CSPRNG is unavailable.
+func newBGInstanceID() string {
+	var buf [4]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return fmt.Sprintf("%d_%x", os.Getpid(), time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%d_%x", os.Getpid(), buf)
+}
 
 // registerBackground records a live background process.
 // logPath/logFile/logWriter may be empty/nil when capture is unavailable.
@@ -260,7 +278,7 @@ func registerBackground(cmd *exec.Cmd, language, command string, temps []string,
 	// Rename + LogPath update stay under bgMu so list/log snapshots cannot
 	// race with the assignment (detected by -race at e.LogPath).
 	if logFile != nil && logPath != "" {
-		finalPath := filepath.Join(os.TempDir(), fmt.Sprintf("%s%s.log", bgTempPrefix, id))
+		finalPath := filepath.Join(os.TempDir(), fmt.Sprintf("%s%s_%s.log", bgTempPrefix, bgInstanceID, id))
 		if logPath != finalPath {
 			if err := os.Rename(logPath, finalPath); err == nil {
 				e.LogPath = finalPath
