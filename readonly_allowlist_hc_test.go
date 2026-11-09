@@ -135,6 +135,82 @@ func TestGuard_HcReadonlyAllowlist(t *testing.T) {
 	}
 }
 
+// TestGuard_HcReadonlyRealPathLayouts covers the two real filesystem layouts
+// found during P11 acceptance, this time exercising screenPathHeadTrust's
+// inToolchainDir resolution inside a fake trusted home (layout A: host
+// ~/.local/bin/hc -> herdr-core) and a cross-directory symlink whose link
+// lives in a non-toolchain PATH dir outside the fake home (layout B: inside
+// `sbx --preset reviewer-agent`, PATH=<goExecDir>:~/.local/bin with
+// <goExecDir>/hc -> ~/.local/bin/sbx).
+func TestGuard_HcReadonlyRealPathLayouts(t *testing.T) {
+	mustPass := func(t *testing.T, g guardCall) {
+		t.Helper()
+		if rule, detail := g.guardCtxRunArgv([]string{"hc", "send", "t42", "ok"}); rule != "" {
+			t.Fatalf("argv [hc send t42 ok] must pass, got rule=%q detail=%q", rule, detail)
+		}
+		if rule, detail := g.guardCtxRunShell(`hc send t42 "ok"`); rule != "" {
+			t.Fatalf("shell `hc send t42 \"ok\"` must pass, got rule=%q detail=%q", rule, detail)
+		}
+	}
+	mustBlock := func(t *testing.T, g guardCall, argv []string) {
+		t.Helper()
+		if rule, _ := g.guardCtxRunArgv(argv); rule == "" {
+			t.Fatalf("argv %v must block under strict readonly", argv)
+		}
+	}
+
+	// Layout A: host PATH — the winning segment IS ~/.local/bin under the
+	// trusted fake home, so inToolchainDir is true and screenPathHeadTrust
+	// runs the on-disk binary trust check on the symlink.
+	t.Run("host-hc->herdr-core-in-~/.local/bin", func(t *testing.T) {
+		fakeHome := withTestTrustedHome(t)
+		localBin := filepath.Join(fakeHome, ".local", "bin")
+		writeTestExecutable(t, filepath.Join(localBin, "herdr-core"), 0555)
+		if err := os.Symlink(filepath.Join(localBin, "herdr-core"), filepath.Join(localBin, "hc")); err != nil {
+			t.Fatalf("symlink hc -> herdr-core: %v", err)
+		}
+		t.Setenv("PATH", localBin)
+
+		t.Setenv(auditEnvRole, "reviewer")
+		t.Setenv(auditEnvReadonly, "")
+		g := currentGuardCall()
+		if !g.strictReadonly {
+			t.Fatalf("reviewer must classify as strict readonly")
+		}
+		mustPass(t, g)
+		mustBlock(t, g, []string{"hc", "ls"})
+		mustBlock(t, g, []string{"herdr-core", "send", "t42", "ok"})
+	})
+
+	// Layout B: sbx sandbox PATH — hc lives in a non-toolchain dir (the Go
+	// executable dir analogue) and resolves ACROSS directories into
+	// ~/.local/bin/sbx inside the trusted fake home.
+	t.Run("sbx-hc->~/.local/bin/sbx-via-goexecdir", func(t *testing.T) {
+		fakeHome := withTestTrustedHome(t)
+		localBin := filepath.Join(fakeHome, ".local", "bin")
+		writeTestExecutable(t, filepath.Join(localBin, "sbx"), 0555)
+		goExecDir := t.TempDir()
+		if err := os.Symlink(filepath.Join(localBin, "sbx"), filepath.Join(goExecDir, "hc")); err != nil {
+			t.Fatalf("symlink hc -> sbx: %v", err)
+		}
+		t.Setenv("PATH", goExecDir+":"+localBin)
+
+		for _, role := range []string{"reviewer", "scout", "oracle"} {
+			t.Run(role, func(t *testing.T) {
+				t.Setenv(auditEnvRole, role)
+				t.Setenv(auditEnvReadonly, "")
+				g := currentGuardCall()
+				if !g.strictReadonly {
+					t.Fatalf("role %q must classify as strict readonly", role)
+				}
+				mustPass(t, g)
+				mustBlock(t, g, []string{"hc", "run", "--bg", "x"})
+				mustBlock(t, g, []string{"sbx", "send", "t42", "ok"})
+			})
+		}
+	})
+}
+
 // TestGuard_HcReadonlyAllowlistLexical exercises the allowlist keyed on the
 // typed basename alone — no PATH resolution — proving `hc` itself is the
 // registered head while `herdr-core`/`sbx` stay unlisted.
