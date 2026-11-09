@@ -233,12 +233,11 @@ func TestGuard_HcReadonlyAndSubagent(t *testing.T) {
 		if !g.subagent || g.strictReadonly {
 			t.Fatal("worker must be a non-strict sub-agent")
 		}
-		nested := ruleSubagentNestedAgent
 		for _, c := range []struct {
 			a    []string
 			want string
-		}{{[]string{"herdr-core", "run", "x"}, nested},
-			{[]string{"herdr-core", "send", "--force", "t42", "x"}, nested},
+		}{{[]string{"herdr-core", "run", "x"}, ruleSubagentNestedAgent},
+			{[]string{"herdr-core", "send", "--force", "t42", "x"}, ruleSubagentNestedAgent},
 			{[]string{"herdr-core", "send", "t42", "x"}, ""}, {[]string{"hc", "send", "t42", "x"}, ""}} {
 			expect(t, g, c.a, c.want)
 		}
