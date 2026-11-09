@@ -414,6 +414,9 @@ var envHookVars = map[string]bool{
 	"GIT_PROXY_COMMAND": true, "GIT_DIFF_OPTS": true,
 	"GIT_CONFIG_COUNT": true, "GIT_CONFIG_KEY_0": true, "GIT_CONFIG_VALUE_0": true,
 	"GIT_TRACE2_PARENT_SID": true, "GIT_EXEC_PATH": true,
+	// sbx internal child-process spec: a forged value makes sbx execute the
+	// injected JSON spec instead of the CLI args (S-NEW-2).
+	"PI_SANDBOX_INTERNAL_CHILD_SPEC": true,
 }
 
 // pagerSafeVars may be set to "" or "cat" — disabling the pager is the
@@ -432,6 +435,11 @@ func isEnvHookVar(key string) bool {
 	}
 	if strings.HasPrefix(key, "LD_") || strings.HasPrefix(key, "DYLD_") ||
 		strings.HasPrefix(key, "GIT_CONFIG") {
+		return true
+	}
+	// PI_SANDBOX_* carries sbx internal child-process state
+	// (PI_SANDBOX_INTERNAL_CHILD_SPEC); a sub-agent must never forge it.
+	if strings.HasPrefix(key, "PI_SANDBOX_") {
 		return true
 	}
 	switch key {
@@ -465,15 +473,18 @@ var guardTaintVars = map[string]bool{
 // blindly, and stripped KEY=VAL / env -u operands are collected for the
 // execution-hook env screen.
 //
-// Wrappers handled: env (with its options and NAME=val assignments), command
-// (-v/-V stay as a read-only builtin query), exec, nohup, timeout (with
-// duration and option args), nice, setsid, stdbuf, busybox, ionice, taskset,
-// chrt, watch, flock (options + lock file), script (without -c), sudo/doas
-// (with option args), strace/ltrace, builtin, shell reserved/modifier words
-// (`if`/`then`/`elif`/`else`/`while`/`until`/`do`/`coproc`/`time`/`!`), and
-// `--` terminators. Recursion is bounded by peelWrapperMaxSteps (bare KEY=VAL
-// prefixes do not consume steps); a chain that never resolves returns an
-// index past the end.
+// Wrappers handled by peelWrappers itself: env (with its options and
+// NAME=val assignments), command (-v/-V stay as a read-only builtin
+// query), exec, nohup, timeout (with duration and option args), nice,
+// setsid, stdbuf, busybox, ionice, taskset, chrt, time, strace/ltrace,
+// builtin, sbx (flag-style options, --env screened like env operands),
+// shell reserved/modifier words (`if`/`then`/`elif`/`else`/`while`/
+// `until`/`do`/`coproc`/`time`/`!`), and `--` terminators. watch, flock,
+// script and sudo/doas are NOT peeled here — they need stdin-context and
+// privilege semantics, so the downstream peelResolvedSegDepth /
+// stdinProgramHeadDepth helpers unwrap them. Recursion is bounded by
+// peelWrapperMaxSteps (bare KEY=VAL prefixes do not consume steps); a
+// chain that never resolves returns an index past the end.
 
 // skipExecArgs advances past bash `exec` options matching internal_getopt
 // optstring "cla:": -c/-l are boolean; -a takes a name (separate argv,
@@ -520,6 +531,32 @@ func skipExecArgs(argv []string, i int) int {
 		}
 	}
 	return i
+}
+
+// screenSbxEnvValue screens one `sbx --env`/`--env=` operand and records
+// it into envAs. The real sbx stringSlice.Set splits each value on `,` and
+// trims every segment, so a single argv slot can inject several KEY=VAL
+// assignments — screening the whole word as one assignment would let
+// `A=1,PATH=/x` smuggle a PATH (or sentinel) write past the env screens.
+// Returns false when any segment must fail closed: an empty segment (the
+// real sbx silently drops it, but rejecting is simpler and safer), a
+// dynamic word, a non-KEY=VAL word, or a sentinelTrustVars key (HOME/PWD/
+// TMPDIR/IFS re-base the trusted path anchors the env screen relies on).
+func screenSbxEnvValue(val string, envAs *envAssignments) bool {
+	if val == "" {
+		return false
+	}
+	for _, rawPart := range strings.Split(val, ",") {
+		part := strings.TrimSpace(rawPart)
+		if part == "" || isDynamicArg(part) || !isAssignWord(part) {
+			return false
+		}
+		if sentinelTrustVars[part[:strings.IndexByte(part, '=')]] {
+			return false
+		}
+		envAs.addAssign(part)
+	}
+	return true
 }
 
 func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, envAs envAssignments, exhausted bool) {
@@ -672,6 +709,91 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 		case "chrt":
 			i++
 			i = skipChrtArgs(argv, i)
+		case "sbx":
+			// sbx is a Go flag.FlagSet tool: single- AND double-dash option
+			// spellings work (-preset/--preset, -env/--env, --flag=val /
+			// -flag=val and the two-slot --flag val forms), and a bare `--`
+			// ends option parsing so the NEXT word is the inner command head.
+			// The flag table mirrors the real sbx parseArgs
+			// (pi-extensions/go/sandbox/cmd/sbx): value options
+			// preset/workdir/ro/rw/exec/reviewer/report-to/env, booleans
+			// deny-net/best-effort (+check/-version as pure queries below).
+			// Every other `-` word fails closed rather than guessing its
+			// arity — an unknown flag could consume the slot meant for the
+			// inner command and smuggle it past the head screens
+			// ([pattern:sbx-wrapper-unwrap-asymmetry]).
+			start := i
+			i++
+			if len(argv[start:]) == 2 &&
+				(isPureQueryInvocation(argv[start:]) || argv[start+1] == "-check" ||
+					argv[start+1] == "--check" || argv[start+1] == "-version") {
+				// `sbx -h`/`sbx --version`/`sbx --check`: prints and exits,
+				// nothing unwraps — keep `sbx` as the head like `command -v`.
+				return argv[start:], splitPayloads, envAs, false
+			}
+			for i < len(argv) {
+				a := argv[i]
+				if a == "--" {
+					i++
+					break
+				}
+				if isDynamicArg(a) {
+					return argv[i:], splitPayloads, envAs, true
+				}
+				if !strings.HasPrefix(a, "-") || a == "-" {
+					break // first operand: the inner command head
+				}
+				// Strip one or two leading dashes; Go's flag package accepts
+				// both, but three or more is not a flag spelling it recognises.
+				name := a
+				name = strings.TrimPrefix(name, "-")
+				name = strings.TrimPrefix(name, "-")
+				if strings.HasPrefix(name, "-") {
+					return argv[i:], splitPayloads, envAs, true
+				}
+				if strings.HasPrefix(name, "env=") {
+					// --env=KEY=VAL[,KEY=VAL...] glued form: screen each
+					// comma-split assignment like an env operand.
+					if !screenSbxEnvValue(name[len("env="):], &envAs) {
+						return argv[i:], splitPayloads, envAs, true
+					}
+					i++
+					continue
+				}
+				switch name {
+				case "env":
+					if i+1 >= len(argv) {
+						return argv[i:], splitPayloads, envAs, true
+					}
+					if !screenSbxEnvValue(argv[i+1], &envAs) {
+						return argv[i:], splitPayloads, envAs, true
+					}
+					i += 2
+				case "preset", "workdir", "ro", "rw", "exec", "reviewer", "report-to":
+					// The value slot itself must be screened: a dynamic word
+					// consumed unchecked can split at runtime and shift the inner
+					// command out of its slot (M-REV-1).
+					if i+1 >= len(argv) || isDynamicArg(argv[i+1]) {
+						return argv[i:], splitPayloads, envAs, true
+					}
+					i += 2
+				case "deny-net", "best-effort":
+					i++
+				default:
+					// Known =glued value options consume one slot; Go bool flags
+					// also accept the =glued spelling (--deny-net=false).
+					switch {
+					case strings.HasPrefix(name, "preset="), strings.HasPrefix(name, "workdir="),
+						strings.HasPrefix(name, "ro="), strings.HasPrefix(name, "rw="),
+						strings.HasPrefix(name, "exec="), strings.HasPrefix(name, "reviewer="),
+						strings.HasPrefix(name, "report-to="),
+						strings.HasPrefix(name, "deny-net="), strings.HasPrefix(name, "best-effort="):
+						i++
+					default:
+						return argv[i:], splitPayloads, envAs, true // unknown flag: fail closed
+					}
+				}
+			}
 		case "strace", "ltrace":
 			i++
 			i = skipStraceArgs(argv, i)
@@ -687,6 +809,35 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 		return argv[i:], splitPayloads, envAs, true
 	}
 	return argv[i:], splitPayloads, envAs, depth >= peelWrapperMaxSteps
+}
+
+// peelWrappersAndSbxAliases is peelWrappers plus a bounded, repeated
+// `foo -> sbx` PATH-alias rewrite: every peeled head resolving to sbx is
+// rewritten to `sbx` and peeled again (each alias level consumes one
+// peelWrapperMaxSteps-bounded step), so a nested
+// `foo --deny-net -- foo --deny-net -- CMD` cannot hide CMD behind a
+// second alias the caller only unwrapped once (M-REV-2). env ops
+// accumulate across all levels and the returned effPath replays them
+// over pathEnv — each alias resolves under the PATH its own level's
+// env ops install. Exhausted peels and alias chains hitting the bound
+// return exhausted (fail-closed) like peelWrappers.
+func peelWrappersAndSbxAliases(argv []string, pathEnv string) (head []string, envAs envAssignments, effPath string, exhausted bool) {
+	cur := argv
+	effPath = pathEnv
+	for steps := 0; steps < peelWrapperMaxSteps; steps++ {
+		h, _, ea, ex := peelWrappers(cur)
+		envAs = envAs.merged(ea)
+		effPath = ea.effectivePATHFrom(effPath)
+		if ex || len(h) == 0 {
+			return h, envAs, effPath, ex
+		}
+		if filepath.Base(h[0]) != "sbx" && resolveHeadBase(h[0], effPath) == "sbx" {
+			cur = append([]string{"sbx"}, h[1:]...)
+			continue
+		}
+		return h, envAs, effPath, false
+	}
+	return cur, envAs, effPath, true
 }
 
 // skipTimeoutArgs consumes timeout's option arguments and its duration.
@@ -1910,7 +2061,7 @@ func isStructuralGuardHead(base string) bool {
 	switch base {
 	case "ssh", "xargs", "find", "eval", "watch", "flock", "script",
 		"trap", "unset", "export", "readonly", "declare", "typeset", "local",
-		"read", "getopts", "printf", "command", "ctxmode",
+		"read", "getopts", "printf", "command", "ctxmode", "sbx",
 		"awk", "gawk", "mawk", "nawk", "sed", "gsed", "tar", "gtar", "bsdtar",
 		"npx", "bunx", "pnpx", "git", "herdr", "herdsman", "hc", "herdr-core":
 		return true
@@ -2734,6 +2885,15 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		}
 		return screenSSHHead(head, seg, kind, depth, caller)
 	}
+	// A symlink target promoted to `sbx` (PATH entry foo -> sbx) was not
+	// peeled — peelWrappers ran on the TYPED name before the alias
+	// resolution rewrote head[0]. Re-screen the promoted argv so the
+	// sandbox options and inner command head get the same treatment a
+	// directly typed `sbx` invocation receives. A real `sbx` head
+	// (typedHead[0] == sbx) already peeled above and must not re-enter.
+	if base == "sbx" && filepath.Base(typedHead[0]) != "sbx" {
+		return peelResolvedSegDepth(head, seg, kind, depth+1, caller.seededWith(envAs))
+	}
 	// Strict readonly: allowlist before shell/interpreter unwrap, plus
 	// C10 alias target allowlist verification.
 	if kind == 'r' {
@@ -2858,13 +3018,13 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	// then screen the target command argv.
 	if base == "xargs" {
 		if k := xargsTargetIndex(head); k >= 0 && k < len(head) {
-			if xargsFeedsCodeFlag(head[k:], head) {
+			if xargsFeedsCodeFlag(head[k:], head, caller.pathEnv) {
 				return "dynamic code payload"
 			}
-			if repl := xargsReplToken(head); repl != "" && replTokenInExecSlot(head[k:], repl) {
+			if repl := xargsReplToken(head); repl != "" && replTokenInExecSlot(head[k:], repl, caller.pathEnv) {
 				return "dynamic code payload"
 			}
-			innerSeg := xargsDerivedSeg(head[:k], head[k:], seg)
+			innerSeg := xargsDerivedSeg(head[:k], head[k:], seg, caller.pathEnv)
 			return peelResolvedSegDepth(head[k:], innerSeg, kind, depth+1, caller.seededWith(envAs))
 		}
 		return "" // `xargs` with no command runs echo: read-only
@@ -3014,13 +3174,13 @@ func xargsHasArgFile(xargsOpts []string) bool {
 // an ssh invocation whose remote command reads a program from stdin
 // (`echo code | xargs ssh dmit sh`), where OpenSSH joins xargs-appended
 // words into the remote login shell command string.
-func xargsDerivedSeg(xargsOpts, targetArgv []string, outerSeg shellSegment) shellSegment {
+func xargsDerivedSeg(xargsOpts, targetArgv []string, outerSeg shellSegment, pathEnv string) shellSegment {
 	if xargsHasArgFile(xargsOpts) {
 		return outerSeg
 	}
 	hasOuterInput := outerSeg.pipedStdin || outerSeg.stdinRedir ||
 		outerSeg.hereString != "" || len(outerSeg.heredocText) > 0
-	if hasOuterInput && sshTunnelsStdinProgram(targetArgv) {
+	if hasOuterInput && sshTunnelsStdinProgram(targetArgv, pathEnv) {
 		return shellSegment{pipedStdin: true}
 	}
 	return shellSegment{}
@@ -3032,11 +3192,11 @@ func xargsDerivedSeg(xargsOpts, targetArgv []string, outerSeg shellSegment) shel
 // remote command head / code slot inside an ssh invocation. Data operand
 // positions (`grep foo {}`, `git -C {} status`, `sh -c 'echo "$1"' _ {}`)
 // return false.
-func replTokenInExecSlot(innerArgv []string, token string) bool {
+func replTokenInExecSlot(innerArgv []string, token, pathEnv string) bool {
 	if token == "" || len(innerArgv) == 0 {
 		return false
 	}
-	head, _, _, exhausted := peelWrappers(innerArgv)
+	head, _, effPath, exhausted := peelWrappersAndSbxAliases(innerArgv, pathEnv)
 	if exhausted || len(head) == 0 {
 		return true
 	}
@@ -3055,7 +3215,7 @@ func replTokenInExecSlot(innerArgv []string, token string) bool {
 		}
 	}
 	base := filepath.Base(head[0])
-	if base == "ssh" || resolveHeadBase(head[0], "") == "ssh" {
+	if base == "ssh" || resolveHeadBase(head[0], effPath) == "ssh" {
 		remoteCmd, hit := parseSSHInvocation(head)
 		if hit != "" {
 			return true
@@ -3066,7 +3226,7 @@ func replTokenInExecSlot(innerArgv []string, token string) bool {
 			}
 			// In POSIX sh, a lone "{}" is parsed into shellNoopWords or a
 			// command head containing the token.
-			if replTokenInExecSlot(rseg.argv, token) {
+			if replTokenInExecSlot(rseg.argv, token, os.Getenv("PATH")) {
 				return true
 			}
 		}
@@ -4382,7 +4542,7 @@ func screenFindArgsSeg(args []string, outerSeg shellSegment, kind byte, depth in
 			}
 			if j > i+1 {
 				inner := args[i+1 : j]
-				if replTokenInExecSlot(inner, "{}") {
+				if replTokenInExecSlot(inner, "{}", caller.pathEnv) {
 					return "find " + a + " dynamic code payload"
 				}
 				innerSeg := shellSegment{}
@@ -4471,8 +4631,8 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 	// REMOTE command reads its program from stdin is left for the ssh
 	// model (screenSSHHead) — it returns the remote-aware roSSHWriteHit /
 	// "piped stdin to ssh" verdict.
-	if seg.pipedStdin && !seg.stdinRedir && !sshTunnelsStdinProgram(seg.argv) {
-		if lang, isProg := stdinProgramHead(seg.argv); isProg {
+	if seg.pipedStdin && !seg.stdinRedir && !sshTunnelsStdinProgram(seg.argv, caller.pathEnv) {
+		if lang, isProg, _ := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv); isProg {
 			if lang == "" {
 				return "piped code to shell"
 			}
@@ -4486,15 +4646,12 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 	// (`cat <<< 'pig'`) it is plain data. A later fd0 file redirect
 	// (stdinRedir) means the here-string never reaches the program.
 	if seg.hereString != "" && !seg.stdinRedir {
-		head, _, envAs, _ := peelWrappers(seg.argv)
-		if len(head) > 0 {
-			// R15: the program head may itself hide inside wrappers
-			// (flock/watch/xargs/env) — env ops found at ANY recursion
-			// level are the env the here-string text runs under.
-			if lang, isProg, inner := stdinProgramHeadEnv(head); isProg {
-				if hit := screenStdinProgram(seg.hereString, lang, kind, depth, caller.seededWith(envAs.merged(inner))); hit != "" {
-					return hit
-				}
+		// R15: the program head may itself hide inside wrappers
+		// (flock/watch/xargs/env) — env ops found at ANY recursion
+		// level are the env the here-string text runs under.
+		if lang, isProg, envAs := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv); isProg {
+			if hit := screenStdinProgram(seg.hereString, lang, kind, depth, caller.seededWith(envAs)); hit != "" {
+				return hit
 			}
 		}
 	}
@@ -4504,17 +4661,17 @@ func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller c
 	if len(seg.heredocText) == 0 {
 		return ""
 	}
-	lang, isProg := "", false
-	var envAs envAssignments
-	{
-		head, _, ea, _ := peelWrappers(seg.argv)
-		envAs = ea
-		if len(head) > 0 && !seg.stdinRedir {
-			var inner envAssignments
-			lang, isProg, inner = stdinProgramHeadEnv(head)
-			envAs = envAs.merged(inner)
-		}
+	// The tunnel probe runs on the UNPEELED argv against the caller's PATH
+	// BEFORE seeding: peelToSSHHead replays the argv's own env ops per
+	// layer, so neither the caller's seeded envAs nor remote PATH ops may
+	// feed its base (R4: a remote `PATH=` op leaking into the base drops
+	// the ssx -> ssh resolution; a `PATH=$PATH:` prefix replayed twice
+	// collapses to `:<dir>`).
+	sshTunnel := sshTunnelsStdinProgram(seg.argv, caller.pathEnv)
+	if seg.stdinRedir {
+		return ""
 	}
+	lang, isProg, envAs := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv)
 	if !isProg {
 		return ""
 	}
@@ -4523,7 +4680,6 @@ func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller c
 	// flock) to a remote stdin-program head, a read-only caller (verifier /
 	// CTXMODE_READONLY=1) loses its local /tmp write exemption at the wire.
 	bodyKind := kind
-	sshTunnel := sshTunnelsStdinProgram(seg.argv)
 	if kind == 's' && callerReadonlyRole(caller) && sshTunnel {
 		bodyKind = 'r'
 	}
@@ -8409,8 +8565,8 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 					}
 					return ruleSubagentNestedAgent, hit
 				}
-				if _, isProg := stdinProgramHead(argv); isProg {
-					if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(argv) {
+				if _, isProg, _ := stdinProgramHeadWithEnv(argv, 0, envAssignments{}, caller.pathEnv); isProg {
+					if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(argv, caller.pathEnv) {
 						return ruleReadonlyWrite, roSSHWriteHit
 					}
 					allResolved = false
@@ -9822,11 +9978,11 @@ func consumeNumOptTail(a string, j int, ch byte) int {
 func isHexDigit(b byte) bool {
 	return b >= '0' && b <= '9' || b >= 'a' && b <= 'f' || b >= 'A' && b <= 'F'
 }
-func xargsFeedsCodeFlag(inner, full []string) bool {
+func xargsFeedsCodeFlag(inner, full []string, pathEnv string) bool {
 	if len(inner) == 0 {
 		return false
 	}
-	head, _, _, exhausted := peelWrappers(inner)
+	head, _, effPath, exhausted := peelWrappersAndSbxAliases(inner, pathEnv)
 	if exhausted || len(head) == 0 {
 		return false
 	}
@@ -9838,7 +9994,7 @@ func xargsFeedsCodeFlag(inner, full []string) bool {
 	// code flag (`xargs ssh dmit sh -c`) or a replace-token in the remote
 	// command head / code slot (`xargs -I{} ssh dmit {}`).
 	base := filepath.Base(head[0])
-	if base == "ssh" || resolveHeadBase(head[0], "") == "ssh" {
+	if base == "ssh" || resolveHeadBase(head[0], effPath) == "ssh" {
 		remoteCmd, hit := parseSSHInvocation(head)
 		if hit != "" {
 			return false
@@ -9850,7 +10006,7 @@ func xargsFeedsCodeFlag(inner, full []string) bool {
 			if len(rseg.argv) == 0 {
 				continue
 			}
-			if xargsFeedsCodeFlag(rseg.argv, full) {
+			if xargsFeedsCodeFlag(rseg.argv, full, os.Getenv("PATH")) {
 				return true
 			}
 		}
@@ -11350,25 +11506,53 @@ func stdinProgramHeadEnv(argv []string) (lang string, isInterp bool, envAs envAs
 }
 
 func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool, envAs envAssignments) {
+	return stdinProgramHeadWithEnv(argv, depth, envAssignments{}, os.Getenv("PATH"))
+}
+
+// stdinProgramHeadWithEnv is stdinProgramHeadDepth carrying the env ops
+// accumulated above this recursion level: a peeled `PATH=...` prefix (or an
+// `sbx --env PATH=...` op) rewires name resolution for every wrapper the
+// command nests into, so `echo pig | PATH=dir foo -- sh` (dir/foo -> sbx)
+// resolves the alias under the peeled PATH instead of the process PATH.
+// The ssh remote-command branch drops it — remote heads resolve under the
+// remote login env, so only the remote ops feed their PATH replay.
+// basePath seeds the PATH the accumulated env ops replay over (the
+// caller's effective PATH — its own process PATH at depth 0): a peeled
+// `PATH=$PATH:<dir>` prefix then expands $PATH like the runtime instead
+// of collapsing to `:<dir>` ([pattern:sbx-wrapper-unwrap-asymmetry]).
+func stdinProgramHeadWithEnv(argv []string, depth int, inherited envAssignments, basePath string) (lang string, isInterp bool, envAs envAssignments) {
 	if len(argv) == 0 || depth >= shellSplitMaxDepth {
-		return "", false, envAs
+		return "", false, inherited
 	}
 	head, _, ea, _ := peelWrappers(argv)
 	// R14: the env ops peeled at every recursion level are the environment
 	// the stdin program text actually runs under — `sh -c 'env HOME=-exec
 	// sh'` hands stdin a head whose HOME is overridden. Accumulate them so
 	// the caller screens the payload under the consumed position's env.
-	envAs = envAs.merged(ea)
+	envAs = inherited.merged(ea)
 	if len(head) == 0 {
 		return "", false, envAs
 	}
 	base := filepath.Base(head[0])
+	// Alias resolution runs against the PATH the peeled env ops install
+	// over the caller's base PATH, not the process PATH alone — the
+	// runtime resolves the head the same way.
+	effPath := envAs.effectivePATHFrom(basePath)
+	// A PATH alias resolving to sbx (foo -> sbx) skipped the sbx option
+	// peel because peelWrappers saw only the typed name — rewrite the
+	// head to `sbx` and recurse once so the inner command (after its
+	// own -- separator) is classified as the stdin program instead of
+	// the unpeeled wrapper ([pattern:sbx-wrapper-unwrap-asymmetry]).
+	if base != "sbx" && resolveHeadBase(head[0], effPath) == "sbx" {
+		l, isProg, inner := stdinProgramHeadWithEnv(append([]string{"sbx"}, head[1:]...), depth+1, envAs, basePath)
+		return l, isProg, inner
+	}
 	// An ssh head forwards stdin to the remote command's stdin: resolve the
 	// remote invocation and ask whether any remote head reads its program
 	// from that stream. Malformed invocations keep their argv/shell hits;
 	// here only the bare-host/missing-remote shape returns a parse hit, and
 	// with no remote command stdin is pure data for the login shell anyway.
-	if base == "ssh" || resolveHeadBase(head[0], "") == "ssh" {
+	if base == "ssh" || resolveHeadBase(head[0], effPath) == "ssh" {
 		remoteCmd, hit := parseSSHInvocation(head)
 		if hit != "" {
 			return "", false, envAs
@@ -11380,7 +11564,7 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
-			if l, isProg, inner := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
+			if l, isProg, inner := stdinProgramHeadWithEnv(seg.argv, depth+1, envAssignments{}, os.Getenv("PATH")); isProg {
 				return l, true, envAs.merged(inner)
 			}
 		}
@@ -11406,8 +11590,8 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
-			if l, isProg, inner := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
-				return l, true, envAs.merged(inner)
+			if l, isProg, inner := stdinProgramHeadWithEnv(seg.argv, depth+1, envAs, basePath); isProg {
+				return l, true, inner
 			}
 		}
 		return "", false, envAs
@@ -11436,8 +11620,8 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
-			if l, isProg, inner := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
-				return l, true, envAs.merged(inner)
+			if l, isProg, inner := stdinProgramHeadWithEnv(seg.argv, depth+1, envAs, basePath); isProg {
+				return l, true, inner
 			}
 		}
 		return "", false, envAs
@@ -11454,16 +11638,16 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 				if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 					continue
 				}
-				if l, isProg, inner := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
-					return l, true, envAs.merged(inner)
+				if l, isProg, inner := stdinProgramHeadWithEnv(seg.argv, depth+1, envAs, basePath); isProg {
+					return l, true, inner
 				}
 			}
 			return "", false, envAs
 		}
 		if inner < len(head) {
 			// The inner command still inherits this level's peeled env.
-			l, isProg, inner := stdinProgramHeadDepth(head[inner:], depth+1)
-			return l, isProg, envAs.merged(inner)
+			l, isProg, inner := stdinProgramHeadWithEnv(head[inner:], depth+1, envAs, basePath)
+			return l, isProg, inner
 		}
 		return "", false, envAs
 	case "script":
@@ -11478,8 +11662,8 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 				if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 					continue
 				}
-				if l, isProg, inner := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
-					return l, true, envAs.merged(inner)
+				if l, isProg, inner := stdinProgramHeadWithEnv(seg.argv, depth+1, envAs, basePath); isProg {
+					return l, true, inner
 				}
 			}
 			return "", false, envAs
@@ -11496,8 +11680,8 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			return "", false, envAs
 		}
 		if execMode {
-			l, isProg, inner := stdinProgramHeadDepth(head[k:], depth+1)
-			return l, isProg, envAs.merged(inner)
+			l, isProg, inner := stdinProgramHeadWithEnv(head[k:], depth+1, envAs, basePath)
+			return l, isProg, inner
 		}
 		text := strings.Join(head[k:], " ")
 		if isDynamicArg(text) {
@@ -11510,8 +11694,8 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
-			if l, isProg, inner := stdinProgramHeadDepth(seg.argv, depth+1); isProg {
-				return l, true, envAs.merged(inner)
+			if l, isProg, inner := stdinProgramHeadWithEnv(seg.argv, depth+1, envAs, basePath); isProg {
+				return l, true, inner
 			}
 		}
 		return "", false, envAs
@@ -11526,18 +11710,18 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 		// last, or the -I/-i replace-token right after it) IS fed code —
 		// the language follows the fed interpreter head so the payload is
 		// screened under the right code rules.
-		if xargsFeedsCodeFlag(head[k:], head) {
-			innerHead, _, innerEnv, _ := peelWrappers(head[k:])
+		if xargsFeedsCodeFlag(head[k:], head, effPath) {
+			innerHead, innerEnv, _, innerExhausted := peelWrappersAndSbxAliases(head[k:], effPath)
 			envAs = envAs.merged(innerEnv) // fed code runs under the inner wrapper env too
-			if len(innerHead) > 0 {
+			if !innerExhausted && len(innerHead) > 0 {
 				if l, ok := heredocInterpLang(filepath.Base(innerHead[0])); ok {
 					return l, true, envAs
 				}
 			}
 			return "", true, envAs
 		}
-		l, isProg, inner := stdinProgramHeadDepth(head[k:], depth+1)
-		return l, isProg, envAs.merged(inner)
+		l, isProg, inner := stdinProgramHeadWithEnv(head[k:], depth+1, envAs, basePath)
+		return l, isProg, inner
 	}
 	if shellHeads[base] {
 		// sh/bash/... without -c: commands come from a script file or
@@ -11644,15 +11828,27 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 
 // peelToSSHHead peels both standard wrappers and statement-level stdin
 // wrappers (flock, watch -x, xargs) to reach an underlying ssh argv.
-func peelToSSHHead(argv []string) []string {
+// pathEnv is the effective PATH the peeled head resolves against: the
+// env ops peeled at each layer replay over it so PATH-injected aliases
+// (foo -> sbx, ssx -> ssh) resolve like the runtime would.
+func peelToSSHHead(argv []string, pathEnv string) []string {
 	cur := argv
+	effPath := pathEnv
 	for depth := 0; depth < peelWrapperMaxSteps && len(cur) > 0; depth++ {
-		head, _, _, exhausted := peelWrappers(cur)
+		head, _, ea, exhausted := peelWrappers(cur)
+		effPath = ea.effectivePATHFrom(effPath)
 		if exhausted || len(head) == 0 {
 			return nil
 		}
 		base := filepath.Base(head[0])
-		if base == "ssh" || resolveHeadBase(head[0], "") == "ssh" {
+		// A PATH alias resolving to sbx skipped the sbx option peel because
+		// peelWrappers saw only the typed name — rewrite the head to `sbx`
+		// and loop so the inner command after its -- separator is peeled.
+		if base != "sbx" && resolveHeadBase(head[0], effPath) == "sbx" {
+			cur = append([]string{"sbx"}, head[1:]...)
+			continue
+		}
+		if base == "ssh" || resolveHeadBase(head[0], effPath) == "ssh" {
 			return head
 		}
 		switch base {
@@ -11680,8 +11876,8 @@ func peelToSSHHead(argv []string) []string {
 	}
 	return nil
 }
-func sshTunnelsStdinProgram(argv []string) bool {
-	head := peelToSSHHead(argv)
+func sshTunnelsStdinProgram(argv []string, pathEnv string) bool {
+	head := peelToSSHHead(argv, pathEnv)
 	if len(head) == 0 {
 		return false
 	}
@@ -11713,7 +11909,7 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 	if !isProg {
 		return "", ""
 	}
-	if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(argv) {
+	if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(argv, os.Getenv("PATH")) {
 		g.strictReadonly = true
 	}
 	if lang == "" {
@@ -11745,7 +11941,7 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 			continue
 		}
 		if lang, isProg, envAs := stdinProgramHeadEnv(seg.argv); isProg {
-			if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(seg.argv) {
+			if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(seg.argv, os.Getenv("PATH")) {
 				g.strictReadonly = true
 			}
 			if lang == "" {
