@@ -356,6 +356,128 @@ func TestRT_A4_HcSendCtrlAndDynamic(t *testing.T) {
 	}
 }
 
+// R4-C1: C1 control runes (U+0080-U+009F, incl. 0x9B CSI) must also block
+// hc send text — decided on the decoded rune so legal multi-byte UTF-8
+// (whose continuation bytes land in 0x80-0x9F) keeps passing.
+func TestRT_A4_HcSendC1Rune(t *testing.T) {
+	if !hasHcControlChars("a\u009bb") { // 0x9B = ANSI CSI
+		t.Error("hasHcControlChars misses U+009B (CSI)")
+	}
+	if !hasHcControlChars("x\u0085y") { // NEL
+		t.Error("hasHcControlChars misses U+0085 (NEL)")
+	}
+	// Multi-byte UTF-8 continuation bytes are >= 0x80 — a byte-level check
+	// would reject all of these; the rune-level check must not.
+	for _, s := range []string{
+		"中文报告", "caf\u00e9", "emoji \U0001f600 ok",
+		"nbsp\u00a0here",  // C2 A0 — second byte is 0xA0
+		"\u00a1 inverted", // C2 A1
+		"line1\nline2\t中文",
+	} {
+		if hasHcControlChars(s) {
+			t.Errorf("hasHcControlChars(%q)=true (rune-level must not misfire)", s)
+		}
+	}
+	argv := []string{"hc", "send", "t5", "a\u009bb"}
+	rule, detail := rtArgvRule("scout", "", argv, "")
+	if rule == "" {
+		t.Errorf("%v: got ALLOW, want block (CSI in send text)", argv)
+	} else {
+		t.Logf("%v: BLOCK %s: %s", argv, rule, detail)
+	}
+	// Sanity: a clean multiline send still passes.
+	argv = []string{"hc", "send", "t5", "done\n多行 ok"}
+	if rule, detail := rtArgvRule("scout", "", argv, ""); rule != "" {
+		t.Errorf("%v: got BLOCK %s: %s, want ALLOW", argv, rule, detail)
+	}
+}
+
+// R4-fd00: zero-padded fd spellings (fd/00, fd/000) reach fd 0 through
+// Linux open() — isStdinDevicePath must compare the trailing fd number
+// numerically after filepath.Clean, while fd/1 and non-numeric tails
+// stay free.
+func TestRT_A5_StdinDevicePathPadded(t *testing.T) {
+	for _, p := range []string{
+		"/proc/self/fd/00", "/proc/self/fd/000",
+		"/dev/fd/00", "/dev/fd/0000",
+		"/proc/thread-self/fd/000",
+		"/dev/fd/./00", "/proc/self/fd/./0",
+	} {
+		if !isStdinDevicePath(p) {
+			t.Errorf("isStdinDevicePath(%q)=false, want true", p)
+		}
+	}
+	for _, p := range []string{
+		"/dev/fd/1", "/proc/self/fd/1", "/dev/fd/x",
+		"/proc/self/fd/0/extra", "/dev/fd0", "/dev/fd",
+	} {
+		if isStdinDevicePath(p) {
+			t.Errorf("isStdinDevicePath(%q)=true, want false", p)
+		}
+	}
+	// End-to-end argv: padded spellings must hit the same stdin block.
+	argvBlock := [][]string{
+		{"python3", "/proc/self/fd/00"},
+		{"sh", "/dev/fd/00"},
+		{"python3", "/proc/thread-self/fd/000"},
+	}
+	for _, argv := range argvBlock {
+		rule, detail := rtArgvRule("worker", "", argv, "import os\nos.system('pig')")
+		if rule == "" {
+			t.Errorf("%v: got ALLOW, want block (fd 0 via padded spelling)", argv)
+		} else {
+			t.Logf("%v: BLOCK %s: %s", argv, rule, detail)
+		}
+	}
+	// fd/1 is not stdin: a python3 script arg of /proc/self/fd/1 must not
+	// be treated as a stdin program source (it may still block for other
+	// reasons — the unit check above is the precise assertion).
+}
+
+// R4-npm-prefix: npm/pnpm/yarn `exec`/`dlx` reach the same unvetted-code
+// surface as npx/bunx/pnpx — the sub-agent layer must re-dispatch the
+// exec operand through screenNestedDispatch. A value-taking option before
+// the verb (`npm --prefix /tmp exec pig`) must not hide it behind the
+// option's operand word; npmFamilyExecArgs skips option VALUES.
+func TestRT_A9_NpmExecBehindValueFlag(t *testing.T) {
+	block := []string{
+		"npm --prefix /tmp exec pig",
+		"npm --prefix=/tmp exec pig",
+		"pnpm --dir /tmp dlx pig",
+		"pnpm -C /tmp exec pig",
+		"yarn --cwd /tmp dlx pig",
+		"npm -y exec pig",
+		"npm --workspace pkg exec pig",
+		"npm --registry https://x exec pig",
+		"npm exec pig", "pnpm dlx pig", "npm exec -- pig",
+	}
+	for _, cmd := range block {
+		rule, detail := rtCmdRule("worker", "", cmd, "")
+		if rule != ruleSubagentNestedAgent {
+			t.Errorf("%q: got (%q,%q), want %s", cmd, rule, detail, ruleSubagentNestedAgent)
+		} else {
+			t.Logf("%q: BLOCK %s: %s", cmd, rule, detail)
+		}
+	}
+	// Ordinary npm use for a worker sub-agent stays free — npm install/run
+	// are write commands inside the worker's mandate, and a non-blocked
+	// exec spec (tsc/vitest) is no different from `npx tsc`.
+	allow := []string{
+		"npm install", "npm run build", "pnpm -C /tmp install",
+		"npm --version", "npm view typescript",
+		"npm --prefix /tmp view typescript", "pnpm --dir /tmp list",
+		"npm exec tsc", "pnpm dlx vitest", "npm --prefix /tmp exec tsc",
+	}
+	for _, cmd := range allow {
+		if rule, detail := rtCmdRule("worker", "", cmd, ""); rule != "" {
+			t.Errorf("%q: got BLOCK %s: %s, want ALLOW", cmd, rule, detail)
+		}
+	}
+	// The readonly write-table twin path also stops hiding exec/dlx
+	// behind a value flag (defence in depth; npm already fails the
+	// readonly allowlist, so this is the subagent layer that mattered).
+}
+
 // A-1: ssh remote stdin vehicle is narrowed to pure shells; read-only
 // callers lose piped ssh exfiltration and StrictHostKeyChecking without
 // UserKnownHostsFile=/dev/null.

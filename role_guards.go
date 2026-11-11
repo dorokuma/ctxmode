@@ -41,6 +41,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"unicode/utf8"
@@ -1922,13 +1923,18 @@ func hcSendAddrOK(s string) bool {
 // ls/get/wait/keys/exec/file/kill/rm/label/server/machine/connect/update
 // and unknown verbs — blocks; hc is a terminal-control surface like herdr,
 // and send is the only channel a sub-agent is granted (the report path).
-// hasHcControlChars reports bytes that inject terminal control into a
+// hasHcControlChars reports code points that inject terminal control into a
 // pasted `hc send` text: C0 controls other than \n/\t (\x00-\x08,
-// \x0b-\x1f including \r, \x03 ETX and \x1b ESC) and DEL. UTF-8
-// continuation bytes are all >= 0x80, so multi-byte text passes.
+// \x0b-\x1f including \r, \x03 ETX and \x1b ESC), DEL and the C1 set
+// (U+0080-U+009F — 0x9B is the ANSI CSI, a second escape-sequence lead-in).
+// C1 must be rejected on the decoded RUNE, not on the byte value: every
+// UTF-8 continuation byte is >= 0x80, so a byte-level 0x80-0x9F check would
+// also reject the second byte of legal multi-byte encodings (U+00A0 is
+// `C2 A0`) and break ordinary multilingual text.
 func hasHcControlChars(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if (s[i] < 0x20 && s[i] != '\n' && s[i] != '\t') || s[i] == 0x7f {
+	for _, r := range s {
+		if (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f ||
+			(r >= 0x80 && r <= 0x9f) {
 			return true
 		}
 	}
@@ -2601,6 +2607,30 @@ func screenNestedDispatch(headArgv []string, pathEnv string) string {
 			}
 			if hit := screenGitSubagentExecArgs(headArgv[1:]); hit != "" {
 				return hit
+			}
+		// npm/pnpm/yarn `exec`/`dlx` fetch-and-run a package binary — the
+		// same unvetted-code surface as npx/bunx/pnpx. Re-dispatch the exec
+		// operand through screenNestedDispatch so `npm exec pig` hits the
+		// agent whitelist; scan ALL non-flag operands so a value-taking
+		// option (`npm --prefix /tmp exec pig`) cannot hide the verb.
+		case "npm", "pnpm", "yarn":
+			nonflag := npmFamilyExecArgs(headArgv[1:])
+			for i, a := range nonflag {
+				if a != "exec" && a != "dlx" {
+					continue
+				}
+				// Operands after the verb: [--] <pkg> [args...]. Only a spec
+				// naming a blocked executable is a sub-agent hit — an ordinary
+				// `npm exec tsc`/`pnpm dlx vitest` stays free like `npx tsc`.
+				for _, spec := range nonflag[i+1:] {
+					if spec == "--" {
+						continue
+					}
+					if hit := screenNestedDispatch([]string{filepath.Base(nodePkgSpecBase(spec))}, pathEnv); hit != "" {
+						return base + " " + a + " " + hit
+					}
+					break // only the package spec word is the dispatched head
+				}
 			}
 		}
 	}
@@ -5343,6 +5373,63 @@ func screenReadonlyWritePath(headArgv []string, pathEnv string) string {
 	return ""
 }
 
+// npmFamilyValueFlags are the npm/pnpm/yarn/bun options that consume the
+// NEXT argv word as their value (--prefix DIR, -w NAME, ...). Their
+// `--flag=value` spellings are handled inline. The table only needs to be
+// complete enough that a value word can never be mistaken for the exec/dlx
+// subcommand: an unlisted value-taking option makes the scan fail open at
+// worst (its value reads as a positional), never fail closed.
+var npmFamilyValueFlags = map[string]bool{
+	"--prefix": true, "--dir": true, "-C": true, "--cwd": true,
+	"--workspace": true, "-w": true, "--userconfig": true,
+	"--globalconfig": true, "--cache": true, "--registry": true,
+	"--loglevel": true,
+}
+
+// npmFamilyExecArgs returns the non-flag arguments of an npm-family argv,
+// skipping the value operand of the known value-taking options and every
+// `--flag=value` glued spelling. `--` ends the option run (what follows is
+// the package spec / exec operands, still non-flag for our purpose).
+func npmFamilyExecArgs(args []string) []string {
+	var out []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "--") {
+			name, _, hasEq := strings.Cut(a, "=")
+			if hasEq {
+				continue // --prefix=/tmp carries its own value
+			}
+			if npmFamilyValueFlags[name] && i+1 < len(args) {
+				i++ // consume the value operand
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "-") && a != "-" {
+			// Short flag or cluster; the value-taking ones only take a
+			// separate value when they stand alone (npm has no glued -wNAME).
+			if npmFamilyValueFlags[a] && i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// npmFamilyExecSub reports whether an npm-family argv invokes the exec/dlx
+// subcommand past any leading option run (`npm --prefix /tmp exec pig`).
+// It scans every non-flag operand, not just the first, so a value-taking
+// option cannot hide the verb behind its operand word.
+func npmFamilyExecSub(args []string) string {
+	for _, a := range npmFamilyExecArgs(args) {
+		if a == "exec" || a == "dlx" {
+			return a
+		}
+	}
+	return ""
+}
+
 // screenReadonlyWriteAlias applies the whole strict read-only head model to
 // ONE candidate name for the command head: base is the spelling under test
 // (the name as typed, or the basename of the symlink behind it) and args are
@@ -5469,7 +5556,10 @@ func screenReadonlyWriteAlias(headArgv []string, base string, args []string) str
 		}
 		// `npm exec`/`pnpm dlx`/`pnpm exec`/`yarn dlx` run a downloaded
 		// package binary: an unvetted code path, block for strict roles.
-		if sub := firstNonFlagArg(args); sub == "exec" || sub == "dlx" {
+		// Scan ALL non-flag operands (npmFamilyExecSub): firstNonFlagArg
+		// stops at a value-taking option's operand — `npm --prefix /tmp
+		// exec pig` would otherwise hide `exec` behind the /tmp word.
+		if sub := npmFamilyExecSub(args); sub != "" {
 			return base + " " + sub
 		}
 	case "npx", "bunx", "pnpx":
@@ -5502,9 +5592,19 @@ func isStdinDevicePath(p string) bool {
 	if p == "" || isDynamicArg(p) {
 		return false
 	}
-	switch filepath.Clean(p) {
-	case "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0", "/proc/thread-self/fd/0":
+	p = filepath.Clean(p) // /dev/fd/./0 -> /dev/fd/0
+	if p == "/dev/stdin" {
 		return true
+	}
+	// Compare the trailing fd number numerically: Linux open() accepts
+	// padded spellings (fd/00, fd/000) that filepath.Clean does NOT fold,
+	// while non-numeric tails (fd/x) and other fds (fd/1) stay free.
+	for _, prefix := range []string{"/dev/fd", "/proc/self/fd", "/proc/thread-self/fd"} {
+		if tail, ok := strings.CutPrefix(p, prefix+"/"); ok && tail != "" && !strings.Contains(tail, "/") {
+			if n, err := strconv.Atoi(tail); err == nil {
+				return n == 0
+			}
+		}
 	}
 	return false
 }
