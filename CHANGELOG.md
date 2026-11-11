@@ -5,6 +5,21 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Security
+- **Role guards: rt1111 red-team batch — 12 findings fixed (`role_guards.go`, `readonly_allowlist.go`).**
+  - A-1: `isPureRemoteStdinVehicle` now only exempts a pure remote SHELL stdin vehicle (`sh`), not `node -`/`python3 -`; `screenSSHHead` blocks piped stdin and `StrictHostKeyChecking=no|accept-new` without `UserKnownHostsFile=/dev/null|none` for read-only callers (local known_hosts write + file exfiltration); `guardCtxRunCode` counts a raw `child_process` identifier (JS/TS) and a masked `open` identifier without an `open(` call site (Python `f = open` rebind) as spawn/write evidence.
+  - A-2: `journalctl --lines` requires the glued `--lines=N` form (new `longEqOnly` allowlist field); a bare `--lines` no longer smuggles `--rotate`/`--vacuum-size`.
+  - A-3: `git tag`/`git branch` `--sort`/`--format` are display options only — they no longer mark the invocation a listing, so `git tag --sort refname pwned-tag` blocks as a create while operand-less queries stay free.
+  - A-4: `hc send` rejects control characters (`\x00-\x08`, `\x0b-\x1f` incl. `\r`/`\x03`/`\x1b`, `\x7f`) in the text operand and any dynamic word in either operand (unquoted `$x` and double-quoted `"$x"`/`"$(…)"` alike); multiline `\n`/`\t` text stays free.
+  - A-5: new `isStdinDevicePath` recognises `/dev/stdin`, `/dev/fd/0`, `/proc/self/fd/0`, `/proc/thread-self/fd/0` as stdin program sources for shells, interpreters, `awk -f` and `sed -f` (incl. glued/`--file=` forms).
+  - A-6: `guardCtxRunStdinForCommand` scans EVERY segment — segments with their own stdin (pipe, `<`/`<<`/`<<<`) are skipped, and a clean stdin-program segment no longer ends the scan early (`python3 -; sh` + stdin screens the `sh` segment).
+  - A-7: wrapper option/value slots fail closed on dynamic words (`timeout $(…)`, `nice -n $(…)`, `command -$x`, `watch -x -n $(…)`, `timeout "$T"`): `skipExecArgs`/`skipTimeoutArgs`/`skipStdbufArgs`/`skipIoniceArgs`/`skipTasksetArgs`/`skipChrtArgs`/`skipStraceArgs`/`skipWatchArgs`/`skipToolGlobalFlags` report a fail-closed flag instead of silently skipping the word; `stdinProgramHeadWithEnv` honours `peelWrappers`' `exhausted`.
+  - A-8: symlink alias handling rewritten — new `isPeeledWrapperBase` re-peels a resolved wrapper name (`myenv -> env`, `mytimeout -> timeout`), new `sameStructuralFamily` keeps same-family aliases (`sh -> dash`, `python3 -> python3.13`, `awk -> mawk`, `hc -> herdr-core|sbx`) while a cross-family structural alias (`python3 -> dash`, `sed -> env`) returns `conflicting structural alias`; `-c` payloads parse under the resolved shell dialect; `canonicalResolvedBase`'s `g`/`gnu` prefix strip is restricted to the real Homebrew GNU set (`gnuCanonicalSet`) so `gps`/`ghc` no longer alias to `ps`/`hc`, and typed `genv`/`gfind` normalize to `env`/`find`.
+  - A-9: new `screenNodeRunnerSubagent` vets npx/bunx/pnpx — `-c`/`--call`, `-p`/`--package` package specs (version-stripped), and a blocked executable as the first positional all fail closed; `npx tsc`/`npx -y -p typescript tsc`/`bunx vitest` stay free.
+  - A-10: `isEnvHookVar` adds `CTXMODE_AUDIT_LOG`, `CTXMODE_ENV_PASSTHROUGH`, `CTXMODE_DB`, `CTXMODE_CONFIG` — env prefixes, `export` and `sbx --env` can no longer rewrite a sub-agent's identity/audit path.
+  - A-11: `herdr`/`herdsman` join `blockedAgentExecutableList` and their dedicated screens/whitelists are removed (dead code); every spelling now blocks on the bare name.
+  - W-5: `screenPathHeadTrust` resolves relative-PATH hits through `EvalSymlinks` — a `.venv/bin`/`node_modules/.bin` symlink escaping the resolved cwd must land in a trusted system/linuxbrew/user-toolchain dir passing `isTrustedExecutableOnDisk`, else `untrusted path binary` (`pathIsUnsafeForSubagent` unchanged, so ordinary relative-PATH toolchains stay free).
+
 ## [5.3.3] - 2026-11-10
 
 ### Removed
