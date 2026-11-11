@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -42,6 +45,63 @@ func extractDeployFragment(t *testing.T, src string) string {
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// verifyTimeoutRe matches the verify pipeline's `timeout <N> "$VAR"`
+// invocation. N must be a bare integer argument (rejects `timeout 15s`,
+// `timeout -k 1 15`, `command -v timeout`, and comment prose like
+// "timeout 15 必须…" because the "15" there is followed by a space, not
+// a quoted variable).
+var verifyTimeoutRe = regexp.MustCompile(`\btimeout[ \t]+([0-9]+)[ \t]+"`)
+
+// verifyTimeoutFloor is the minimum acceptable verify timeout in
+// deploy.sh. It must strictly exceed stdioDrainMaxWait (the drain cap,
+// read from the source constant rather than redeclared here): when the
+// stdio drain holds EOF for the full cap, a verify `timeout` of the same
+// value would kill the process at the same instant (rc=124) and the
+// bounded retries would reject a working binary.
+const verifyTimeoutFloor = 15 * time.Second
+
+// assertVerifyTimeoutAboveDrainCap extracts the verify `timeout` argument
+// from a shell fragment and asserts it is a numeric value >=
+// verifyTimeoutFloor (which itself must exceed stdioDrainMaxWait).
+// Parsing is anchored on the verify invocation shape `timeout <N> "$VAR"`,
+// so non-numeric uses like `command -v timeout` and prose inside comments
+// cannot satisfy it; finding no such invocation is a hard failure, never
+// a skip.
+func assertVerifyTimeoutAboveDrainCap(t *testing.T, frag, scope string) {
+	t.Helper()
+	if err := verifyTimeoutErr(frag, scope); err != nil {
+		t.Error(err)
+	}
+}
+
+// verifyTimeoutErr is the pure-check core of
+// assertVerifyTimeoutAboveDrainCap so the false-green regression test can
+// drive it with constructed fragments without a real *testing.T failure.
+func verifyTimeoutErr(frag, scope string) error {
+	if verifyTimeoutFloor <= stdioDrainMaxWait {
+		return fmt.Errorf("%s: test floor bug: verifyTimeoutFloor=%v must exceed stdioDrainMaxWait=%v",
+			scope, verifyTimeoutFloor, stdioDrainMaxWait)
+	}
+	var vals []int
+	for _, m := range verifyTimeoutRe.FindAllStringSubmatch(frag, -1) {
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			return fmt.Errorf("%s: cannot parse verify timeout value %q: %v", scope, m[1], err)
+		}
+		vals = append(vals, n)
+	}
+	if len(vals) == 0 {
+		return fmt.Errorf("%s: 未能从 fragment 解析出 verify timeout 值 (want `timeout <N> \"$VAR\"`)", scope)
+	}
+	for _, n := range vals {
+		if time.Duration(n)*time.Second < verifyTimeoutFloor {
+			return fmt.Errorf("%s: verify timeout %ds must be >= %ds (> stdioDrainMaxWait=%v)",
+				scope, n, int(verifyTimeoutFloor/time.Second), stdioDrainMaxWait)
+		}
+	}
+	return nil
 }
 
 // runFragment writes the extracted fragment into a temp copy with BUILD_OUT /
@@ -134,12 +194,17 @@ func TestDeployScript_StaticConstraints(t *testing.T) {
 	if initAt < 0 || mvAt < 0 || initAt > mvAt {
 		t.Error("fragment must run initialize on the staged binary before mv")
 	}
-	if strings.Contains(frag, `timeout 5 "$BINARY"`) {
+	if strings.Contains(frag, `timeout 15 "$BINARY"`) {
 		t.Error("fragment must not initialize the live target; verify the staged file first")
 	}
-	if !strings.Contains(frag, `timeout 5 "$TMP_FILE"`) && !strings.Contains(frag, `timeout 5 "$BUILD_OUT"`) {
+	if !strings.Contains(frag, `timeout 15 "$TMP_FILE"`) && !strings.Contains(frag, `timeout 15 "$BUILD_OUT"`) {
 		t.Error("fragment must initialize $TMP_FILE or $BUILD_OUT before replace")
 	}
+	// The verify timeout must exceed the drain cap: when the stdio drain
+	// holds EOF for the full stdioDrainMaxWait (5s), a verify `timeout` of
+	// the same value would kill the process at the same instant (rc=124)
+	// and reject a working binary after the bounded retries.
+	assertVerifyTimeoutAboveDrainCap(t, frag, "deploy fragment")
 	if strings.Contains(frag, "部署成功") {
 		t.Error("fragment must not print 部署成功 (verify-failure path must never claim success)")
 	}
@@ -543,12 +608,13 @@ func TestDeployScript_RollbackStaticConstraints(t *testing.T) {
 	if initAt < 0 || mvAt < 0 || initAt > mvAt {
 		t.Error("rollback must run initialize on the backup before mv")
 	}
-	if strings.Contains(frag, `timeout 5 "$BINARY"`) {
+	if strings.Contains(frag, `timeout 15 "$BINARY"`) {
 		t.Error("rollback must not initialize the live target; verify the backup instead")
 	}
-	if !strings.Contains(frag, `timeout 5 "$PREV"`) {
+	if !strings.Contains(frag, `timeout 15 "$PREV"`) {
 		t.Error("rollback must initialize the staged backup with timeout")
 	}
+	assertVerifyTimeoutAboveDrainCap(t, frag, "rollback fragment")
 	// The restored binary stays under the same protection as a deployed one:
 	// read+execute mode and the immutable lock (after unlocking the target,
 	// which a rename over an immutable file could not otherwise replace).

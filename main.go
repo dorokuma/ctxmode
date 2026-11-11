@@ -214,7 +214,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := srv.Run(ctx, &mcp.StdioTransport{}); err != nil && !errors.Is(err, context.Canceled) {
+	// stdioTransport wraps the stock StdioTransport byte streams with the
+	// immediate-EOF drain (stdio_drain.go): an io.EOF is only delivered to
+	// the SDK's ioConn after every in-flight request's response bytes have
+	// been written to stdout, so a client that closes stdin right after its
+	// last request can no longer make Run fail with "server is closing: EOF"
+	// while losing the response.
+	if err := srv.Run(ctx, stdioTransport(ctx)); err != nil && !errors.Is(err, context.Canceled) {
 		fatal(store, "server exited: %v", err)
 	}
 }
