@@ -268,8 +268,15 @@ func (g *stdinGate) Close() error {
 // stdout verbatim; each completed outbound line is scanned AFTER the write
 // so a response releases its in-flight request only once it is on the wire.
 type stdoutTracker struct {
-	d   *stdioDrain
-	wc  io.WriteCloser
+	d  *stdioDrain
+	wc io.WriteCloser
+
+	// mu guards buf only. ioConn serializes Write under its own writeMu but
+	// Close takes no such lock, so Close can run while a handler goroutine
+	// is mid-Write; without mu the two would tear buf (and a lost release
+	// stalls the drain for the full stdioDrainMaxWait). The underlying
+	// wc.Write/wc.Close never run under mu: they may block or call back.
+	mu  sync.Mutex
 	buf []byte // partial outbound line
 }
 
@@ -279,7 +286,11 @@ func newStdoutTracker(stdout io.WriteCloser, d *stdioDrain) *stdoutTracker {
 
 func (t *stdoutTracker) Write(p []byte) (int, error) {
 	// Line-buffer for scanning only; the bytes themselves pass through
-	// unmodified and in order.
+	// unmodified and in order. The buffering and line split run under t.mu;
+	// the underlying write and the scan do not, so a concurrent Close only
+	// ever waits on the short buffered section and a blocked wc.Write can
+	// never hold the lock.
+	t.mu.Lock()
 	t.buf = append(t.buf, p...)
 	var lines [][]byte
 	for {
@@ -290,9 +301,11 @@ func (t *stdoutTracker) Write(p []byte) (int, error) {
 		lines = append(lines, t.buf[:i+1])
 		t.buf = t.buf[i+1:]
 	}
+	t.mu.Unlock()
 	n, err := t.wc.Write(p)
 	// Scan only after the write: the drain must observe the response on the
-	// wire, not merely enqueued.
+	// wire, not merely enqueued. t.buf is append-only from here on, so the
+	// detached line slices stay valid while a later Write mutates buf.
 	for _, line := range lines {
 		scanDrainLine(line, nil, t.d.release)
 	}
@@ -302,9 +315,12 @@ func (t *stdoutTracker) Write(p []byte) (int, error) {
 // Close scans a trailing unterminated response line (defensive: ioConn
 // always terminates messages with '\n') and closes the underlying writer.
 func (t *stdoutTracker) Close() error {
-	if len(t.buf) > 0 {
-		scanDrainLine(t.buf, nil, t.d.release)
-		t.buf = nil
+	t.mu.Lock()
+	rest := t.buf
+	t.buf = nil
+	t.mu.Unlock()
+	if len(rest) > 0 {
+		scanDrainLine(rest, nil, t.d.release)
 	}
 	return t.wc.Close()
 }

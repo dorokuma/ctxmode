@@ -65,13 +65,16 @@ if [ "${1:-}" = "rollback" ]; then
   # stdio_drain.go 的字节流排空修复），stdin 立即 EOF 仍可能竞态让响应
   # 丢失、rc=1（"server is closing: EOF"），因此管道仍需注入 sleep 1
   # 保持 stdin；这与下方验新二进制（已含修复）的写法不同。
+  # timeout 15 必须明显大于排空上界 stdioDrainMaxWait(5s)：一旦排空
+  # 真等满上界，进程 5 秒内不会退出，同值的 timeout 会抢先判 124，
+  # 3 次重试后误拒一个功能正常的备份二进制。
   # 保留 3 次有界重试作为兜底。
   VERIFY=""
   VERIFY_RC=1
   # 验证失败是预期分支，先关 set -e（与 deploy fragment 相同），循环后再恢复。
   set +e
   for attempt in 1 2 3; do
-    VERIFY=$( (echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"deploy-check","version":"1"}}}'; sleep 1) | timeout 5 "$PREV" 2>"$ROLL_ERR" )
+    VERIFY=$( (echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"deploy-check","version":"1"}}}'; sleep 1) | timeout 15 "$PREV" 2>"$ROLL_ERR" )
     VERIFY_RC=$?
     if [ "$VERIFY_RC" -eq 0 ] && printf '%s' "$VERIFY" | grep -qE '"version"[[:space:]]*:[[:space:]]*"[^"]+"'; then
       break
@@ -173,6 +176,9 @@ fi
 # in-flight 响应写完才向 SDK 上报 io.EOF，不再偶发
 # "server is closing: EOF" 让验证进程 rc=1，因此验证管道可以撤掉
 # sleep 注入（与上方验旧备份仍需 sleep 的写法不同）。
+# timeout 15 必须明显大于排空上界 stdioDrainMaxWait(5s)：一旦排空
+# 真等满上界，进程 5 秒内不会退出，同值的 timeout 会抢先判 124，
+# 3 次重试后误拒一个功能正常的新二进制。
 # 保留 3 次有界重试作为兜底。
 trap - ERR
 trap - EXIT
@@ -180,7 +186,7 @@ set +e
 VERIFY=""
 VERIFY_RC=1
 for attempt in 1 2 3; do
-  VERIFY=$( echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"deploy-check","version":"1"}}}' | timeout 5 "$TMP_FILE" 2>"$TMP_FILE.err" )
+  VERIFY=$( echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"deploy-check","version":"1"}}}' | timeout 15 "$TMP_FILE" 2>"$TMP_FILE.err" )
   VERIFY_RC=$?
   if [ "$VERIFY_RC" -eq 0 ] && printf '%s' "$VERIFY" | grep -qE '"version"[[:space:]]*:[[:space:]]*"[^"]+"'; then
     break

@@ -134,11 +134,18 @@ func TestDeployScript_StaticConstraints(t *testing.T) {
 	if initAt < 0 || mvAt < 0 || initAt > mvAt {
 		t.Error("fragment must run initialize on the staged binary before mv")
 	}
-	if strings.Contains(frag, `timeout 5 "$BINARY"`) {
+	if strings.Contains(frag, `timeout 15 "$BINARY"`) {
 		t.Error("fragment must not initialize the live target; verify the staged file first")
 	}
-	if !strings.Contains(frag, `timeout 5 "$TMP_FILE"`) && !strings.Contains(frag, `timeout 5 "$BUILD_OUT"`) {
+	if !strings.Contains(frag, `timeout 15 "$TMP_FILE"`) && !strings.Contains(frag, `timeout 15 "$BUILD_OUT"`) {
 		t.Error("fragment must initialize $TMP_FILE or $BUILD_OUT before replace")
+	}
+	// The verify timeout must exceed the drain cap: when the stdio drain
+	// holds EOF for the full stdioDrainMaxWait (5s), a verify `timeout` of
+	// the same value would kill the process at the same instant (rc=124)
+	// and reject a working binary after the bounded retries.
+	if strings.Contains(frag, "timeout 5 ") {
+		t.Error("verify timeout must exceed stdioDrainMaxWait(5s); use timeout 15")
 	}
 	if strings.Contains(frag, "部署成功") {
 		t.Error("fragment must not print 部署成功 (verify-failure path must never claim success)")
@@ -543,11 +550,14 @@ func TestDeployScript_RollbackStaticConstraints(t *testing.T) {
 	if initAt < 0 || mvAt < 0 || initAt > mvAt {
 		t.Error("rollback must run initialize on the backup before mv")
 	}
-	if strings.Contains(frag, `timeout 5 "$BINARY"`) {
+	if strings.Contains(frag, `timeout 15 "$BINARY"`) {
 		t.Error("rollback must not initialize the live target; verify the backup instead")
 	}
-	if !strings.Contains(frag, `timeout 5 "$PREV"`) {
+	if !strings.Contains(frag, `timeout 15 "$PREV"`) {
 		t.Error("rollback must initialize the staged backup with timeout")
+	}
+	if strings.Contains(frag, "timeout 5 ") {
+		t.Error("rollback verify timeout must exceed stdioDrainMaxWait(5s); use timeout 15")
 	}
 	// The restored binary stays under the same protection as a deployed one:
 	// read+execute mode and the immutable lock (after unlocking the target,

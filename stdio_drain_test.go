@@ -213,3 +213,80 @@ func TestStdioDrain_PipelinedImmediateEOF(t *testing.T) {
 		t.Fatalf("stdout missing slow_echo result text, got: %s", stdout)
 	}
 }
+
+// gatedWriteCloser blocks inside Write until a token arrives on gate;
+// closing gate releases every subsequent Write. It holds Write calls in
+// flight so stdoutTracker.Close overlaps them deterministically instead of
+// relying on scheduler luck.
+type gatedWriteCloser struct {
+	gate chan struct{}
+}
+
+func (w *gatedWriteCloser) Write(p []byte) (int, error) {
+	<-w.gate
+	return len(p), nil
+}
+
+func (w *gatedWriteCloser) Close() error { return nil }
+
+// Regression for the stdoutTracker Write/Close data race: the SDK serializes
+// ioConn.Write with writeMu but ioConn.Close does NOT take writeMu
+// (transport.go), so while a handler goroutine sits inside Write the
+// shutdown path can call stdoutTracker.Close concurrently. Both paths
+// touched t.buf unsynchronized — a torn buf can also drop the release() of a
+// completed line and stall the drain for the full stdioDrainMaxWait.
+// Under -race this test fails on the unguarded implementation; with the
+// mutex it must pass and the writer goroutine must never deadlock.
+func TestStdoutTracker_WriteCloseRace(t *testing.T) {
+	const rounds = 4
+	for r := 0; r < rounds; r++ {
+		d := newStdioDrain()
+		w := &gatedWriteCloser{gate: make(chan struct{})}
+		tr := newStdoutTracker(w, d)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for i := 0; i < 1000; i++ {
+				// Newline-free fragments stay in t.buf, so every Write mutates
+				// the same state that Close scans.
+				_, _ = tr.Write([]byte("x"))
+			}
+		}()
+
+		// Let a few writes get in flight, then Close mid-stream — the exact
+		// overlap ioConn permits.
+		for i := 0; i < 8; i++ {
+			w.gate <- struct{}{}
+		}
+		_ = tr.Close()
+		close(w.gate) // release the remaining blocked writes
+
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("round %d: writer goroutine stuck — deadlock after Close", r)
+		}
+	}
+}
+
+// Probe for the "id":null release-fallback concern: an inbound request whose
+// id is literally null is a notification per JSON-RPC (the SDK decodes it
+// that way and — per conn.go processResult — never writes a response for
+// it), so no outbound "id":null error response should appear and the
+// in-flight tools/call must not be released early. If the SDK ever did emit
+// an "id":null response here, the drain's release fallback would decrement
+// id=2's count and this session would regress to "server is closing"/rc=1.
+// The test is the arbiter: green pins the unreachable path, red proves the
+// fallback bug reachable.
+func TestStdioDrain_NullIDRequestDoesNotStealRelease(t *testing.T) {
+	input := drainInitializeRequest + "\n" +
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}` + "\n" +
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow_echo","arguments":{"text":"x"}}}` + "\n" +
+		`{"jsonrpc":"2.0","id":null,"method":"bogus"}` + "\n"
+	stdout, runErr := runMCPStdioSession(t, newDrainTestServer(), newStdioDrainTransport, []byte(input))
+	assertDrainSessionOK(t, runErr, stdout, `"id":1`, `"id":2`)
+	if !strings.Contains(stdout, `"id":null`) {
+		t.Logf("no \"id\":null response on the wire (null-id inbound handled as notification): %s", stdout)
+	}
+}
