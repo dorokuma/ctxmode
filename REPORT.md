@@ -84,38 +84,45 @@ Dynamic **text** in `hc send` was **not** found in real main-agent flows. `$HC_T
 
 ## 4. Must-allow / intentional new blocks
 
-**Evidence authority:** gate evidence is the asserted test tables —
+**Evidence authority:** 门禁判定以测试文件中的断言为准；`rt1111-logs/` 属开发过程、本地未跟踪、不在提交内、不可复核。Gate evidence is the asserted test tables and test functions —
 `TestRTAudit` and `TestRTAuditPath` (`zz_rtaudit_test.go`),
-`TestR3_RelativePATH_SymlinkToTmp` and `TestR3_hcSendAddrAndCtrl`
-(`zz_r3path_test.go`). Each `t.Run` case carries `wantAllow` and fails on
+`TestR3_RelativePATH_SymlinkToTmp` and `TestR3_hcSendAddrAndCtrl` (`zz_r3path_test.go`),
+as well as the `TestRT_A*` test suites (`role_guards_rt1111_test.go`).
+Each `t.Run` case carries explicit expected rule/allow assertions and fails on
 mismatch; the "Evidence" column names the asserting test function / sub-case.
-`rt1111-logs/` is an untracked local dev log directory — **not part of the
-commit and not gate evidence**; its print lines were only the pre-assertion
-scratch record.
 
 ### Must-allow (representative; asserted ALLOW on fixed tree)
 | Case | Evidence |
 |------|----------|
-| M-hc-send-ok / M-hc-send-t42 | `TestRTAudit/M-hc-send-ok`, `…/M-hc-send-t42` |
+| M-hc-send-ok / M-hc-send-t42 | `TestRTAudit/M-hc-send-ok`, `…/M-hc-send-t42`, `TestR3_hcSendAddrAndCtrl`, `TestRT_A4_HcSendCtrlAndDynamic` |
 | M-ls / M-rg | `TestRTAudit/M-ls`, `…/M-rg` |
-| M-git-tag-list / M-git-tag-l-sort / M-git-tag-contains | `TestRTAudit/M-git-tag-list`, `…/M-git-tag-l-sort`, `…/M-git-tag-contains` |
-| M-journalctl-n / M-journalctl-lines-eq | `TestRTAudit/M-journalctl-n`, `…/M-journalctl-lines-eq` |
-| M-worker-go-test / M-worker-timeout / M-worker-nice / M-worker-env | `TestRTAudit/M-worker-*` |
-| M-worker-npx-tsc / M-worker-npx-p | `TestRTAudit/M-worker-npx-tsc`, `…/M-worker-npx-p` |
+| M-git-tag-list / M-git-tag-l-sort / M-git-tag-contains | `TestRTAudit/M-git-tag-list`, `…/M-git-tag-l-sort`, `…/M-git-tag-contains`, `TestRT_A3_GitTagSort` |
+| M-journalctl-n / M-journalctl-lines-eq | `TestRTAudit/M-journalctl-n`, `…/M-journalctl-lines-eq`, `TestRT_A2_JournalctlLinesEqOnly` |
+| M-worker-go-test / M-worker-timeout / M-worker-nice / M-worker-env | `TestRTAudit/M-worker-*`, `TestRT_A7_WrapperDynamicSlots` |
+| M-worker-npx-tsc / M-worker-npx-p | `TestRTAudit/M-worker-npx-tsc`, `…/M-worker-npx-p`, `TestRT_A9_NodeRunner` |
 | M-verifier-pipe-sh-file | `TestRTAudit/M-verifier-pipe-sh-file` |
-| M-worker-ssh-heredoc-sh / M-worker-python-stdin / M-worker-js | `TestRTAudit/M-worker-*` |
+| M-worker-ssh-heredoc-sh / M-worker-python-stdin / M-worker-js | `TestRTAudit/M-worker-*`, `TestRT_A1_SSHTightening`, `TestRT_A5_StdinDevicePath`, `TestRT_A6_StdinPerSegment` |
 | M-rel-venv-normal / M-rel-nodemod-normal / M-mise-pnpm-prepend | `TestRTAuditPath/M-*` |
-| X-A4-hc-send-multiline-report / X-git-*-sort / X-worker-python-stdin-then-ls | `TestRTAudit/X-*` |
+| X-A4-hc-send-multiline-report / X-git-*-sort / X-worker-python-stdin-then-ls | `TestRTAudit/X-*`, `TestRT_A4_HcSendCtrlAndDynamic`, `TestRT_A3_GitTagSort`, `TestRT_A6_StdinPerSegment` |
 | R3PATH M-rel-venv-pytest-file / M-rel-nodemod-tsc / M-rel-venv-python3-sys-{nontmp,intmp} | `TestR3_RelativePATH_SymlinkToTmp/M-*` |
 
 ### Intentional new blocks (asserted BLOCK; not regressions)
 | Case | Evidence | Note |
 |------|----------|------|
-| M-journalctl-lines-sep (`journalctl --lines 50`) | `TestRTAudit/M-journalctl-lines-sep` | A-2: bare `--lines` is no longer allowed; use `--lines=N` or `-n` |
-| X-worker-timeout-var-ok (`timeout "$T" …`) | `TestRTAudit/X-worker-timeout-var-ok` | A-7 agreed fail-closed |
-| X-A11-herdr-pane-list / X-A11-herdsman-agent-list | `TestRTAudit/X-A11-*` | A-11 retirement |
+| M-journalctl-lines-sep (`journalctl --lines 50`) | `TestRTAudit/M-journalctl-lines-sep`, `TestRT_A2_JournalctlLinesEqOnly` | A-2: bare `--lines` is no longer allowed; use `--lines=N` or `-n` |
+| X-worker-timeout-var-ok (`timeout "$T" …`) | `TestRTAudit/X-worker-timeout-var-ok`, `TestRT_A7_WrapperDynamicSlots` | A-7 agreed fail-closed |
+| X-A11-herdr-pane-list / X-A11-herdsman-agent-list | `TestRTAudit/X-A11-*`, `TestRT_A11_HerdrHerdsmanRetired` | A-11 retirement |
 | M-scout-mise-pnpm-ls (scout `PATH=… ls`) | `TestRTAuditPath/M-scout-mise-pnpm-ls` | scout forbids `VAR=val` env prefixes (pre-existing rule); also listed as a B-group known block |
 | A9a-rel-venv-0777 (0777 .venv/bin real file) | `TestRTAuditPath/A9a-rel-venv-0777` | **asserts ALLOW** — a relative `.venv/bin` segment is exempt from on-disk trust checks entirely; only symlinks escaping the workspace are screened (W-5). Dir/file write bits in a whitelisted rel segment are not judged. Listed here so the expectation is explicit. |
+
+### Oracle 第二意见补充条目（三条同族修复）
+以下 3 条同族修复为 oracle 第二意见追加发现并闭合。门禁判定以测试断言为准，先红后绿证据已包含在 `role_guards_rt1111_test.go` 的单元与端到端断言中：
+
+| Item | Description | Evidence (Asserted Tests) | Outcome / Rule |
+|------|-------------|---------------------------|----------------|
+| R4-C1 (`hasHcControlChars`) | 按 rune 拒绝 C1 控制字符（U+0080–U+009F，含 ANSI CSI `0x9B`、NEL `0x85`），同时保证合法多字节 UTF-8（如中文、emoji、NBSP `\u00a0` 等）正常放行 | `TestRT_A4_HcSendC1Rune` (`role_guards_rt1111_test.go`) | BLOCK `subagent_nested_agent: hc send` on C1; ALLOW valid multi-byte UTF-8 |
+| R4-fd00 (`isStdinDevicePath`) | 尾部 fd 编号转整数数值比较，闭合 `/dev/fd/00`、`/proc/self/fd/000`、`/proc/thread-self/fd/000` 等 Linux `open()` 接受的前导零变体；`fd/1` 及非数字尾部继续放行 | `TestRT_A5_StdinDevicePathPadded` (`role_guards_rt1111_test.go`) | BLOCK stdin program on padded `fd/00`; ALLOW `fd/1` |
+| R4-npm-prefix (`npmFamilyExecArgs`) | 对 `npm`/`pnpm`/`yarn` 的 `exec`/`dlx` 扫描全部非 flag 操作数并跳过带值 option（`--prefix DIR`、`-C DIR` 等）及 `--flag=value` 粘连形式，闭合 `npm --prefix /tmp exec pig` 等嵌套逃逸；`npm install`/`run`/`view` 与 `npm exec tsc` 仍放行 | `TestRT_A9_NpmExecBehindValueFlag` (`role_guards_rt1111_test.go`) | BLOCK `subagent_nested_agent: npm exec pig` etc.; ALLOW worker `npm install` / `npm exec tsc` |
 
 ### B-group known blocks (pre-existing allowlist semantics, asserted BLOCK)
 `git reflog HEAD` (any ref operand hits `git reflog HEAD` — reflog delete/exist/expire reach it),
@@ -127,12 +134,10 @@ cannot silently regress either way.
 
 ## 5. Check results
 
-**Caveat:** `rt1111-logs/` below is **untracked and not part of this commit** —
-rc values copied here are historical local-log values, not reproducible from
-the commit. Gate evidence is the asserted tests in §4 plus the rc lines each
-reviewer/verifier re-runs independently.
+**Caveat:** 门禁判定以测试文件中的断言为准；`rt1111-logs/` 属开发过程、本地未跟踪、不在提交内、不可复核。
+下表记录的 rc 值仅为开发过程的历史本地日志快照，不随 commit 提交，无法从 git 历史中复核。门禁证据以 §4 具有硬断言的测试用例及审阅者/验证者独立重跑结果为准。
 
-### Earlier logs (pre-packaging tree; untracked, unverifiable from commit)
+### Earlier logs (pre-packaging tree; 本地未跟踪，不可复核)
 | Check | Log | Result |
 |-------|-----|--------|
 | gofmt | (pig session; reconfirmed empty before commit) | rc=0, no files listed |
@@ -158,7 +163,7 @@ GOTMPDIR=/root/go-tmp-rt1111 TMPDIR=/root/go-tmp-rt1111 \
 
 Race and staticcheck were already green on this tree (`race2.log`, `staticcheck3.log`); re-run only if cheap after commit.
 
-### §5b Final-HEAD exit codes (after impl commit `89032c1`; untracked log values)
+### §5b Final-HEAD exit codes (after impl commit `89032c1`; 本地未跟踪，不可复核)
 
 | Check | Log | rc | Notes |
 |-------|-----|----|-------|
@@ -169,7 +174,7 @@ Race and staticcheck were already green on this tree (`race2.log`, `staticcheck3
 | go test -skip TestAlFix7_FuzzArgvDiff | `rt1111-logs/final-test-skip-alfix7.log` | **0** | confirms all other tests green |
 | go test -run TestAlFix7_FuzzArgvDiff with `TMPDIR=/root/go-tmp-rt1111` | `rt1111-logs/final-alfix7-disk.tmp.log` | **0** | same test passes off tmpfs |
 
-Race (`race2.log`) and staticcheck (`staticcheck3.log`, `GOTOOLCHAIN=go1.26.0`) were already green on this tree and were not re-run. All `rt1111-logs/` entries are untracked local logs — values here are historical, not gate evidence.
+Race (`race2.log`) and staticcheck (`staticcheck3.log`, `GOTOOLCHAIN=go1.26.0`) were already green on this tree and were not re-run. All `rt1111-logs/` entries are untracked local logs — 门禁判定以测试文件中的断言为准；`rt1111-logs/` 属开发过程、本地未跟踪、不在提交内、不可复核，数值为历史记录，不作为门禁凭证。
 
 Snapshot check: tracked implementation `.go` files after commit match `/tmp/rt1111-snapshot/` (pre-packaging copy).
 
