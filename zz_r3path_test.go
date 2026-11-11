@@ -198,18 +198,21 @@ func TestR3_hcSendAddrAndCtrl(t *testing.T) {
 		}
 	}
 	cases := []rtCase{
-		{id: "A4-ctrl-x03-argv", role: "scout", argv: []string{"hc", "send", "t1", "\x03touch /tmp/x\r"}},
-		{id: "A4-ctrl-esc-argv", role: "scout", argv: []string{"hc", "send", "t1", "\x1b[Ahello"}},
-		{id: "A4-newline-shell", role: "scout", cmd: "hc send t1 'line1\nline2'"},
-		{id: "A4-named-test", role: "scout", cmd: "hc send test hello"},
-		{id: "A4-named-tmux", role: "scout", cmd: "hc send tmux hello"},
-		{id: "A4-plain-t1", role: "scout", cmd: "hc send t1 'done: report ready'"},
+		{id: "A4-ctrl-x03-argv", role: "scout", argv: []string{"hc", "send", "t1", "\x03touch /tmp/x\r"}, wantAllow: false},
+		{id: "A4-ctrl-esc-argv", role: "scout", argv: []string{"hc", "send", "t1", "\x1b[Ahello"}, wantAllow: false},
+		{id: "A4-newline-shell", role: "scout", cmd: "hc send t1 'line1\nline2'", wantAllow: true},
+		{id: "A4-named-test", role: "scout", cmd: "hc send test hello", wantAllow: true},
+		{id: "A4-named-tmux", role: "scout", cmd: "hc send tmux hello", wantAllow: true},
+		{id: "A4-plain-t1", role: "scout", cmd: "hc send t1 'done: report ready'", wantAllow: true},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(c.id, func(t *testing.T) {
 			got := rtGuard(t, c)
 			fmt.Printf("R3HC\t%s\t%s\n", c.id, got)
+			if allow := rtAllow(got); allow != c.wantAllow {
+				t.Errorf("%s: got %q, wantAllow=%v", c.id, got, c.wantAllow)
+			}
 		})
 	}
 }

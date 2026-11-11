@@ -84,33 +84,55 @@ Dynamic **text** in `hc send` was **not** found in real main-agent flows. `$HC_T
 
 ## 4. Must-allow / intentional new blocks
 
-Evidence: `rt1111-logs/full-test-1.log` RT/R3PATH lines (post-fix tree; package-level FAIL in that log was mid-flight A-11 expectation drift + `TestAlFix7_FuzzArgvDiff` ENOSPC — later cleared on race2). Compare column context also in `/tmp/rt1111-inputs/audit-evidence/rt-compare.tsv`.
+**Evidence authority:** gate evidence is the asserted test tables —
+`TestRTAudit` and `TestRTAuditPath` (`zz_rtaudit_test.go`),
+`TestR3_RelativePATH_SymlinkToTmp` and `TestR3_hcSendAddrAndCtrl`
+(`zz_r3path_test.go`). Each `t.Run` case carries `wantAllow` and fails on
+mismatch; the "Evidence" column names the asserting test function / sub-case.
+`rt1111-logs/` is an untracked local dev log directory — **not part of the
+commit and not gate evidence**; its print lines were only the pre-assertion
+scratch record.
 
-### Must-allow (representative; all ALLOW on fixed tree)
-| Case | Outcome |
-|------|---------|
-| M-hc-send-ok / M-hc-send-t42 | ALLOW |
-| M-ls / M-rg | ALLOW |
-| M-git-tag-list / M-git-tag-l-sort / M-git-tag-contains | ALLOW |
-| M-journalctl-n / M-journalctl-lines-eq | ALLOW |
-| M-worker-go-test / M-worker-timeout / M-worker-nice / M-worker-env | ALLOW |
-| M-worker-npx-tsc / M-worker-npx-p | ALLOW |
-| M-verifier-pipe-sh-file | ALLOW |
-| M-worker-ssh-heredoc-sh / M-worker-python-stdin / M-worker-js | ALLOW |
-| M-rel-venv-normal / M-rel-nodemod-normal / M-mise-pnpm-prepend | ALLOW |
-| X-A4-hc-send-multiline-report / X-git-*-sort / X-worker-python-stdin-then-ls | ALLOW |
-| R3PATH M-rel-venv-pytest-file / M-rel-nodemod-tsc / M-rel-venv-python3-sys-{nontmp,intmp} | ALLOW |
+### Must-allow (representative; asserted ALLOW on fixed tree)
+| Case | Evidence |
+|------|----------|
+| M-hc-send-ok / M-hc-send-t42 | `TestRTAudit/M-hc-send-ok`, `…/M-hc-send-t42` |
+| M-ls / M-rg | `TestRTAudit/M-ls`, `…/M-rg` |
+| M-git-tag-list / M-git-tag-l-sort / M-git-tag-contains | `TestRTAudit/M-git-tag-list`, `…/M-git-tag-l-sort`, `…/M-git-tag-contains` |
+| M-journalctl-n / M-journalctl-lines-eq | `TestRTAudit/M-journalctl-n`, `…/M-journalctl-lines-eq` |
+| M-worker-go-test / M-worker-timeout / M-worker-nice / M-worker-env | `TestRTAudit/M-worker-*` |
+| M-worker-npx-tsc / M-worker-npx-p | `TestRTAudit/M-worker-npx-tsc`, `…/M-worker-npx-p` |
+| M-verifier-pipe-sh-file | `TestRTAudit/M-verifier-pipe-sh-file` |
+| M-worker-ssh-heredoc-sh / M-worker-python-stdin / M-worker-js | `TestRTAudit/M-worker-*` |
+| M-rel-venv-normal / M-rel-nodemod-normal / M-mise-pnpm-prepend | `TestRTAuditPath/M-*` |
+| X-A4-hc-send-multiline-report / X-git-*-sort / X-worker-python-stdin-then-ls | `TestRTAudit/X-*` |
+| R3PATH M-rel-venv-pytest-file / M-rel-nodemod-tsc / M-rel-venv-python3-sys-{nontmp,intmp} | `TestR3_RelativePATH_SymlinkToTmp/M-*` |
 
-### Intentional new blocks (not regressions)
-| Case | Outcome | Note |
-|------|---------|------|
-| M-journalctl-lines-sep (`journalctl --lines 50`) | BLOCK unknown option `--lines` | A-2: bare `--lines` is no longer allowed; use `--lines=N` or `-n` |
-| X-worker-timeout-var-ok (`timeout "$T" …`) | BLOCK (nesting/exhausted) | A-7 agreed fail-closed |
-| X-A11-herdr-pane-list / X-A11-herdsman-agent-list | BLOCK bare herdr/herdsman | A-11 retirement |
+### Intentional new blocks (asserted BLOCK; not regressions)
+| Case | Evidence | Note |
+|------|----------|------|
+| M-journalctl-lines-sep (`journalctl --lines 50`) | `TestRTAudit/M-journalctl-lines-sep` | A-2: bare `--lines` is no longer allowed; use `--lines=N` or `-n` |
+| X-worker-timeout-var-ok (`timeout "$T" …`) | `TestRTAudit/X-worker-timeout-var-ok` | A-7 agreed fail-closed |
+| X-A11-herdr-pane-list / X-A11-herdsman-agent-list | `TestRTAudit/X-A11-*` | A-11 retirement |
+| M-scout-mise-pnpm-ls (scout `PATH=… ls`) | `TestRTAuditPath/M-scout-mise-pnpm-ls` | scout forbids `VAR=val` env prefixes (pre-existing rule); also listed as a B-group known block |
+| A9a-rel-venv-0777 (0777 .venv/bin real file) | `TestRTAuditPath/A9a-rel-venv-0777` | **asserts ALLOW** — a relative `.venv/bin` segment is exempt from on-disk trust checks entirely; only symlinks escaping the workspace are screened (W-5). Dir/file write bits in a whitelisted rel segment are not judged. Listed here so the expectation is explicit. |
+
+### B-group known blocks (pre-existing allowlist semantics, asserted BLOCK)
+`git reflog HEAD` (any ref operand hits `git reflog HEAD` — reflog delete/exist/expire reach it),
+`git remote show [-n] origin` (network fetch; `role_guards_test.go` already expects "deleted"),
+scout `VAR=val` env-prefix assigns (`env assign forbidden`),
+`git branch --sort refname newbr` / `git tag --format x pwned-tag` (operand = create).
+These were already BLOCK on baseline too; they are pinned so the audit table
+cannot silently regress either way.
 
 ## 5. Check results
 
-### Earlier logs (pre-packaging tree)
+**Caveat:** `rt1111-logs/` below is **untracked and not part of this commit** —
+rc values copied here are historical local-log values, not reproducible from
+the commit. Gate evidence is the asserted tests in §4 plus the rc lines each
+reviewer/verifier re-runs independently.
+
+### Earlier logs (pre-packaging tree; untracked, unverifiable from commit)
 | Check | Log | Result |
 |-------|-----|--------|
 | gofmt | (pig session; reconfirmed empty before commit) | rc=0, no files listed |
@@ -118,12 +140,12 @@ Evidence: `rt1111-logs/full-test-1.log` RT/R3PATH lines (post-fix tree; package-
 | go build | pig | BUILD_OK / rc=0 |
 | go test (mid) | `rt1111-logs/full-test-1.log` | rc≠0: A-11 expectation updates still pending in that snapshot + ENOSPC on `TestAlFix7_FuzzArgvDiff` |
 | go test -race (short timeout) | `rt1111-logs/race.log` | FAIL at ~600s timeout (not a logic fail) |
-| go test -race (30m) | `rt1111-logs/race2.log` | **ok** `github.com/dorokuma/ctxmode` 696.242s, rc=0 |
+| go test -race (30m) | `rt1111-logs/race2.log` | **ok** `github.com/dorokuma/ctxmode` 696.242s, rc=0 (historical log value; untracked — not reproducible from commit, verifier re-ran independently) |
 | staticcheck (wrong toolchain) | `rt1111-logs/staticcheck.log` | compile error go1.24 vs go1.26 |
 | staticcheck (U1000 mid) | `rt1111-logs/staticcheck2.log` | U1000 on unused helpers (cleaned) |
 | staticcheck final | `rt1111-logs/staticcheck3.log` | empty, rc=0 with `GOTOOLCHAIN=go1.26.0` |
 
-### Final-HEAD logs (this packaging pass)
+### Final-HEAD logs (this packaging pass; untracked, unverifiable from commit)
 Recorded under `rt1111-logs/final-*.log` after commits (see §5b below once filled). Commands:
 
 ```bash
@@ -136,7 +158,7 @@ GOTMPDIR=/root/go-tmp-rt1111 TMPDIR=/root/go-tmp-rt1111 \
 
 Race and staticcheck were already green on this tree (`race2.log`, `staticcheck3.log`); re-run only if cheap after commit.
 
-### §5b Final-HEAD exit codes (after impl commit `89032c1`)
+### §5b Final-HEAD exit codes (after impl commit `89032c1`; untracked log values)
 
 | Check | Log | rc | Notes |
 |-------|-----|----|-------|
@@ -147,7 +169,7 @@ Race and staticcheck were already green on this tree (`race2.log`, `staticcheck3
 | go test -skip TestAlFix7_FuzzArgvDiff | `rt1111-logs/final-test-skip-alfix7.log` | **0** | confirms all other tests green |
 | go test -run TestAlFix7_FuzzArgvDiff with `TMPDIR=/root/go-tmp-rt1111` | `rt1111-logs/final-alfix7-disk.tmp.log` | **0** | same test passes off tmpfs |
 
-Race (`race2.log`) and staticcheck (`staticcheck3.log`, `GOTOOLCHAIN=go1.26.0`) were already green on this tree and were not re-run.
+Race (`race2.log`) and staticcheck (`staticcheck3.log`, `GOTOOLCHAIN=go1.26.0`) were already green on this tree and were not re-run. All `rt1111-logs/` entries are untracked local logs — values here are historical, not gate evidence.
 
 Snapshot check: tracked implementation `.go` files after commit match `/tmp/rt1111-snapshot/` (pre-packaging copy).
 
