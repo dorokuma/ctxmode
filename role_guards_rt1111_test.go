@@ -524,6 +524,13 @@ func TestRT_A9_NpmExecCallAndViewField(t *testing.T) {
 // unlisted options/-c/--call Reject, the exec/dlx child recurses whole
 // through the shared peel budget, and an exec without a child fails
 // closed. want: "" = allow for a worker sub-agent; non-empty = block.
+// cls labels the verdict against the pre-parser baseline (parent commit
+// npmFamily* word-scan model): "R" = baseline red / candidate green (the
+// case only fails closed under the new grammar); "G" = green on both
+// models (unchanged expectation). Every case is asserted through BOTH
+// public entries — rtCmdRule (shell command) and rtArgvRule (argv form).
+// The strict-readonly screenReadonlyWriteAlias check at the bottom is a
+// direct internal-helper assertion, NOT a third public entry.
 func TestRT_A9_NpmArgvModel(t *testing.T) {
 	words := func(s string) []string { return strings.Fields(s) }
 	// (npm exec --)×23 + tsc: stays inside peelChainMaxDepth (24).
@@ -547,66 +554,89 @@ func TestRT_A9_NpmArgvModel(t *testing.T) {
 
 	cases := []struct {
 		name string
+		cls  string // "R" = baseline red/candidate green; "G" = green on both
 		argv []string
 		want string // "" allow, else block
 	}{
-		{"npm-install", words("npm install"), ""},
-		{"npm-run-build", words("npm run build"), ""},
-		{"npm-version", words("npm --version"), ""},
-		{"npm-exec-tsc", words("npm exec tsc"), ""},
-		{"pnpm-dlx-vitest", words("pnpm dlx vitest"), ""},
-		{"npm-view-exec-pig", words("npm view exec pig"), ""},
-		{"npm-view-exec-field", words("npm view exec bin.version"), ""},
-		{"npm-prefix-exec-pig", words("npm --prefix /tmp exec pig"), "B"},
-		{"npm-prefixeq-exec-pig", words("npm --prefix=/tmp exec pig"), "B"},
-		{"npm-exec-calleq-pig", words("npm exec --call=pig"), "B"},
-		{"npm-exec-call-pig", words("npm exec --call pig"), "B"},
-		{"npm-exec-c-pig", words("npm exec -c pig"), "B"},
-		{"npm-exec-cpig", words("npm exec -cpig"), "B"},
-		{"pnpm-dlx-calleq-pig", words("pnpm dlx --call=pig"), "B"},
-		{"npm-tag-exec-pig", words("npm --tag latest exec pig"), "B"},
-		{"npm-tag-exec-tsc", words("npm --tag latest exec tsc"), ""},
-		{"npm-exec-nested-npm-pig", words("npm exec -- npm exec pig"), "B"},
-		{"npm-unknown-opt-pig", words("npm --future-root /x exec pig"), "B"},
-		{"npm-unknown-opteq-tsc", words("npm --future-root=/x exec tsc"), "B"},
-		{"npm-strict-exec-pig", words("npm --strict exec pig"), "B"},
-		{"npm-strict-exec-tsc", words("npm --strict exec tsc"), "B"},
-		{"npm-yw-cluster-pig", words("npm -yw /tmp exec pig"), "B"},
-		{"pnpm-w-exec-pig", words("pnpm -w exec pig"), "B"},
-		{"npm-exec-tsc-call-tail", words("npm exec -- tsc --call=pig"), ""},
-		{"npm-exec-tsc-exec-tail", words("npm exec -- tsc exec pig"), ""},
-		{"npm-exec-nested-call", words("npm exec -- npm exec --call=pig"), "B"},
-		{"npm-exec-npx-pig", words("npm exec -- npx pig"), "B"},
-		{"npm-exec-sh-c-pig", words("npm exec -- sh -c pig"), "B"},
-		{"npm-exec-package-pig-tsc", words("npm exec --package=pig -- tsc"), "B"},
-		{"npm-exec-package-ts-tsc", words("npm exec --package=typescript -- tsc"), ""},
-		{"npm-yes-sep-false-pig", words("npm --yes false exec pig"), "B"},
-		{"npm-yeseq-false-tsc", words("npm --yes=false exec tsc"), ""},
-		{"npm-prefix-missing-val", words("npm --prefix"), "B"},
-		{"npm-exec-bare", words("npm exec"), "B"},
-		{"deep-npm-exec-23", deepNpm, ""},
-		{"deep-npx-chain-13", deepNpx, "B"},
+		{"npm-install", "G", words("npm install"), ""},
+		{"npm-run-build", "G", words("npm run build"), ""},
+		{"npm-version", "G", words("npm --version"), ""},
+		{"npm-exec-tsc", "G", words("npm exec tsc"), ""},
+		{"pnpm-dlx-vitest", "G", words("pnpm dlx vitest"), ""},
+		{"npm-view-exec-pig", "G", words("npm view exec pig"), ""},
+		{"npm-view-exec-field", "G", words("npm view exec bin.version"), ""},
+		{"npm-prefix-exec-pig", "G", words("npm --prefix /tmp exec pig"), "B"},
+		{"npm-prefixeq-exec-pig", "G", words("npm --prefix=/tmp exec pig"), "B"},
+		{"npm-exec-calleq-pig", "G", words("npm exec --call=pig"), "B"},
+		{"npm-exec-call-pig", "G", words("npm exec --call pig"), "B"},
+		{"npm-exec-c-pig", "G", words("npm exec -c pig"), "B"},
+		{"npm-exec-cpig", "G", words("npm exec -cpig"), "B"},
+		{"pnpm-dlx-calleq-pig", "G", words("pnpm dlx --call=pig"), "B"},
+		{"npm-tag-exec-pig", "R", words("npm --tag latest exec pig"), "B"},
+		{"npm-tag-exec-tsc", "G", words("npm --tag latest exec tsc"), ""},
+		{"npm-exec-nested-npm-pig", "R", words("npm exec -- npm exec pig"), "B"},
+		{"npm-unknown-opt-pig", "R", words("npm --future-root /x exec pig"), "B"},
+		{"npm-unknown-opteq-tsc", "R", words("npm --future-root=/x exec tsc"), "B"},
+		{"npm-strict-exec-pig", "G", words("npm --strict exec pig"), "B"},
+		{"npm-strict-exec-tsc", "R", words("npm --strict exec tsc"), "B"},
+		{"npm-yw-cluster-pig", "R", words("npm -yw /tmp exec pig"), "B"},
+		{"pnpm-w-exec-pig", "R", words("pnpm -w exec pig"), "B"},
+		{"npm-exec-tsc-call-tail", "G", words("npm exec -- tsc --call=pig"), ""},
+		{"npm-exec-tsc-exec-tail", "G", words("npm exec -- tsc exec pig"), ""},
+		{"npm-exec-nested-call", "R", words("npm exec -- npm exec --call=pig"), "B"},
+		{"npm-exec-npx-pig", "R", words("npm exec -- npx pig"), "B"},
+		{"npm-exec-sh-c-pig", "R", words("npm exec -- sh -c pig"), "B"},
+		{"npm-exec-package-pig-tsc", "R", words("npm exec --package=pig -- tsc"), "B"},
+		{"npm-exec-package-ts-tsc", "G", words("npm exec --package=typescript -- tsc"), ""},
+		{"npm-yes-sep-false-pig", "R", words("npm --yes false exec pig"), "B"},
+		{"npm-yeseq-false-tsc", "G", words("npm --yes=false exec tsc"), ""},
+		{"npm-prefix-missing-val", "R", words("npm --prefix"), "B"},
+		{"npm-exec-bare", "R", words("npm exec"), "B"},
+		{"deep-npm-exec-23", "G", deepNpm, ""},
+		{"deep-npx-chain-13", "R", deepNpx, "B"},
+		// R7 gate-review must fix: the child's first positional is the
+		// fetched package spec — strip its version/tag like the
+		// -p/--package specs so `pig@latest` still hits the agent
+		// blacklist. scoped spec: nodePkgSpecBase+filepath.Base leave
+		// `pig`, which IS the blocked name; a scoped spec whose base is
+		// NOT blocked (e.g. @scope/agent-cli) is honestly NOT in the
+		// blacklist and stays free (same semantics as npx -p).
+		{"npm-exec-pig-tag", "G", words("npm exec pig@latest"), "B"},
+		{"yarn-dlx-pig-tag", "G", words("yarn dlx pig@latest"), "B"},
+		{"npm-exec-scoped-pig", "G", words("npm exec @scope/pig@1.2"), "B"},
+		{"npm-exec-scoped-free", "G", words("npm exec @scope/agent-cli@1.2"), ""},
+		{"npm-exec-tsc-tag", "G", words("npm exec tsc@latest"), ""},
+		{"npm-exec-nested-npm-pig-tag", "G", words("npm exec -- npm exec pig@latest"), "B"},
+		// R7 gate-review must fix: after the child locks, `--` is child
+		// data — it must pass through verbatim, not be deleted or restart
+		// manager option parsing.
+		{"pnpm-exec-npm-exec-dd-tsc", "G", words("pnpm exec npm exec -- tsc --noEmit"), ""},
+		{"npm-dd-exec-tsc-noemit", "G", words("npm -- exec tsc --noEmit"), ""},
+		{"npm-exec-dd-npm-call", "G", words("npm exec -- npm exec --call=pig"), "B"},
 	}
 	for _, tc := range cases {
 		want := tc.want != ""
 		cmd := strings.Join(tc.argv, " ")
 		if rule, detail := rtCmdRule("worker", "", cmd, ""); (rule != "") != want {
-			t.Errorf("cmd %q: got (%q,%q), want allow=%v", cmd, rule, detail, !want)
+			t.Errorf("[%s] cmd %q: got (%q,%q), want allow=%v", tc.cls, cmd, rule, detail, !want)
 		} else {
-			t.Logf("cmd %q: %s %s", cmd, map[bool]string{true: "BLOCK", false: "ALLOW"}[rule != ""], detail)
+			t.Logf("[%s] cmd %q: %s %s", tc.cls, cmd, map[bool]string{true: "BLOCK", false: "ALLOW"}[rule != ""], detail)
 		}
 		if rule, detail := rtArgvRule("worker", "", tc.argv, ""); (rule != "") != want {
-			t.Errorf("argv %q: got (%q,%q), want allow=%v", cmd, rule, detail, !want)
+			t.Errorf("[%s] argv %q: got (%q,%q), want allow=%v", tc.cls, cmd, rule, detail, !want)
 		}
 	}
 	// Strict read-only twin path (screenReadonlyWriteAlias): an option
 	// whose value slot hides the verb must not fool the write table —
 	// the same parser Rejects it instead of reading `/tmp` as the verb.
+	// (Direct internal-helper call, not one of the two public entries
+	// above — kept as a single dedicated check, R-classified like the
+	// value-flag Reject it covers.)
 	if hit := screenReadonlyWriteAlias([]string{"npm", "--prefix", "/tmp", "run", "build"}, "npm",
 		[]string{"--prefix", "/tmp", "run", "build"}); hit == "" {
-		t.Error("readonly npm --prefix /tmp run build: got ALLOW, want block")
+		t.Error("[R] readonly npm --prefix /tmp run build: got ALLOW, want block")
 	} else {
-		t.Logf("readonly npm --prefix /tmp run build: BLOCK %s", hit)
+		t.Logf("[R] readonly npm --prefix /tmp run build: BLOCK %s", hit)
 	}
 }
 

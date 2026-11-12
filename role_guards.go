@@ -2632,7 +2632,20 @@ func screenNestedDispatch(headArgv []string, pathEnv string, depth int, caller c
 						return base + " " + r.verb + " " + spec
 					}
 				}
-				if hit := peelResolvedSegDepth(r.child, shellSegment{}, 's', depth+1, caller); hit != "" {
+				// The child's FIRST positional is the package spec the runner
+				// fetch-and-runs: normalize it like the -p/--package specs
+				// above (`pig@latest` -> `pig`, `@scope/pig@1.2` -> `pig`) or
+				// the version tag hides the blocked name from the PATH lookup
+				// and the agent blacklist. A non-scoped spec containing `/`
+				// is a path, not a registry name, and stays verbatim (the
+				// recursion's own filepath.Base still sees `pig`). The tail
+				// always stays verbatim so a nested
+				// `npm exec -- npm exec pig` still recurses.
+				child := r.child
+				if head0 := child[0]; strings.HasPrefix(head0, "@") || !strings.Contains(head0, "/") {
+					child = append([]string{filepath.Base(nodePkgSpecBase(head0))}, child[1:]...)
+				}
+				if hit := peelResolvedSegDepth(child, shellSegment{}, 's', depth+1, caller); hit != "" {
 					return base + " " + r.verb + " " + hit
 				}
 			case npmArgvReject:
@@ -2730,10 +2743,13 @@ var npmFamilyExecOptTable = map[string]map[string]npmOptKind{
 // only exec/dlx enter the exec state (every other verb is Other, so
 // `npm view exec pig`'s `exec` stays field data, and no trailing scan can
 // resurrect it). exec/dlx then collect the child command the manager
-// would fetch-and-run: npm keeps consuming its manager options
-// interleaved among child words until the first `--` (which is removed;
-// everything after it joins the child verbatim), while pnpm/yarn consume
-// options only before the first child word and keep the tail verbatim.
+// would fetch-and-run: manager options are consumed up front (npm's own
+// `--`, like pnpm/yarn's first child word, ends the option zone), and
+// the child's first positional is version/tag-stripped like a
+// -p/--package spec so `pig@latest` still hits the blacklist. Once the
+// child locks, `--` and every later word are child data passed through
+// verbatim — `pnpm exec npm exec -- tsc --noEmit` and
+// `npm -- exec tsc --noEmit` keep `--noEmit` as tsc's own option.
 // `-c`/`--call` in the option zone, every unlisted option spelling, a
 // dynamic operand and a malformed value slot all Reject — the grammar
 // fails closed everywhere instead of guessing.
@@ -2769,10 +2785,19 @@ func parseNpmFamilyArgv(base string, args []string) npmArgvParse {
 	}
 
 	inExec := false
-	childLocked := false // pnpm/yarn: option consumption ends at the first child word
+	childLocked := false // option consumption ends at the first child word
 	for i := 0; i < len(args); {
 		a := args[i]
 		if a == "--" {
+			if childLocked {
+				// The child command is already locked: this `--` belongs to
+				// the child, not to the manager. Pass it — and every word
+				// after it — through verbatim so `pnpm exec npm exec -- tsc
+				// --noEmit` keeps `--noEmit` as tsc's own data instead of
+				// reopening manager option parsing on it.
+				r.child = append(r.child, args[i:]...)
+				break
+			}
 			if !inExec {
 				// `--` closes manager option parsing; the NEXT word is the
 				// verb (a dynamic verb cannot be judged — fail closed).
@@ -2801,11 +2826,12 @@ func parseNpmFamilyArgv(base string, args []string) npmArgvParse {
 		switch {
 		case !inExec:
 			// GLOBAL: option-looking words are manager options.
-		case base == "npm":
-			// npm exec: manager options may interleave with child words
-			// until the first `--`.
 		case childLocked:
-			treatAsOpt = false // pnpm/yarn: the tail is a verbatim child
+			// Every manager: once the first child word locks the fetched
+			// command, the tail is the child's own argv — an option-looking
+			// word there is the CHILD's option (`tsc --noEmit`), never a
+			// manager option. The same rule governs `--` above.
+			treatAsOpt = false
 		}
 		if treatAsOpt {
 			endBool := false // last consumed kind was a bare boolean
