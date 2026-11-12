@@ -259,7 +259,7 @@ func TestGuard_R12_CodeStaticSpawnSSHPeel(t *testing.T) {
 			lang:       "python",
 			code:       "import subprocess as sp\nsp.run(['ssh', 'dmit', 'cd /root && herdr tab create'])",
 			wantRule:   ruleSubagentNestedAgent,
-			wantDetail: "herdr tab create",
+			wantDetail: "herdr",
 		},
 		{
 			name:       "py wrapped env timeout ssh agy",

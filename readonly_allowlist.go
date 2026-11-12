@@ -31,6 +31,11 @@ type cmdAllow struct {
 	shortValue string          // bytes of short opts that take a value
 	longBool   map[string]bool // --flag
 	longValue  map[string]bool // --flag VAL / --flag=VAL
+	// longEqOnly: --flag=VAL only — the value MUST be glued (journalctl
+	// --lines=N); a bare --flag stays a flag and must not consume the next
+	// argv as a value (a bare `journalctl --lines` would otherwise smuggle
+	// --rotate/--vacuum-size past the option scan).
+	longEqOnly map[string]bool
 	// longTwoValue: --flag KEY VAL (e.g. jq --arg / --argjson).
 	longTwoValue map[string]bool
 	// allowLegacyNumOpt permits a lone -[0-9]+ token (head -20 / tail -5).
@@ -309,12 +314,16 @@ func init() {
 		[]string{"all", "numeric", "tcp", "udp", "listening", "processes", "resolve",
 			"extended", "options", "memory", "info", "summary", "help", "version", "ipv4", "ipv6"},
 		[]string{"query", "family", "filter"})
-	readonlyAllowlist["journalctl"] = simple("exqrbn", "uSo",
+	readonlyAllowlist["journalctl"] = simple("exqrb", "uSon",
 		[]string{"no-pager", "catalog", "disk-usage", "help", "version", "list-boots",
 			"reverse", "utc", "quiet", "pager-end", "merge", "system", "user",
 			"dmesg", "boot"},
 		[]string{"unit", "user-unit", "identifier", "priority", "grep", "output",
-			"directory", "since", "until", "lines", "facility"})
+			"directory", "since", "until", "facility"})
+	// journalctl --lines takes an OPTIONAL argument: only --lines=N is
+	// safe — a bare --lines leaves the next argv (e.g. --rotate,
+	// --vacuum-size=1) free to execute. -n N / -nN / --lines=N pass.
+	readonlyAllowlist["journalctl"].longEqOnly = longSet("lines")
 	readonlyAllowlist["systemctl"] = &cmdAllow{
 		shortBool: "qal",
 		longBool:  longSet("no-pager", "no-legend", "all", "full", "failed", "quiet", "help", "version", "user", "system"),
@@ -924,7 +933,9 @@ func gitTagAllow(rest []string) string {
 			if !ok {
 				return "git tag unknown " + a
 			}
-			if isQ || a == "--sort" || a == "--format" || a == "--contains" ||
+			// --sort/--format are display options only — they do NOT make a
+			// name operand a listing (matches gitBranchAllow:864).
+			if isQ || a == "--contains" ||
 				a == "--no-contains" || a == "--merged" || a == "--no-merged" ||
 				a == "--points-at" {
 				listish = true
@@ -1259,8 +1270,12 @@ func screenReadonlyAllowlist(argv []string) string {
 	if strings.Contains(argv[0], "/") {
 		return "path command"
 	}
+	// Key on the TYPED basename: the g-prefixed GNU names (gfind, gawk,
+	// gsed, ...) are in the allowlist explicitly, and stripping the 'g'
+	// here would smuggle real unrelated tools (gps, ghc) through the
+	// ps/hc entries. Resolved-alias canonicalisation happens separately
+	// in peelResolvedSegDepth.
 	base := filepath.Base(argv[0])
-	base = canonicalResolvedBase(base)
 	switch base {
 	case "eval", "exec", "source", ".", "coproc", "nohup":
 		return base
@@ -1354,7 +1369,9 @@ func scanAllowedOpts(args []string, entry *cmdAllow) string {
 		if strings.HasPrefix(a, "--") {
 			name := a[2:]
 			valGlued := false
+			val := ""
 			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				val = name[eq+1:]
 				name = name[:eq]
 				valGlued = true
 			}
@@ -1363,6 +1380,12 @@ func scanAllowedOpts(args []string, entry *cmdAllow) string {
 					return "unknown option --" + name + " (glued two-value)"
 				}
 				i += 2 // KEY VAL
+				continue
+			}
+			if entry.longEqOnly[name] {
+				if !valGlued || val == "" || strings.HasPrefix(val, "-") {
+					return "unknown option --" + name + " (use --" + name + "=N)"
+				}
 				continue
 			}
 			if entry.longBool[name] || entry.longValue[name] {
