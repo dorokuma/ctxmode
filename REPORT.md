@@ -199,3 +199,31 @@ Workarounds verified without code edits:
 2. **Docs** — `CHANGELOG.md` + `REPORT.md`.
 
 `rt1111-logs/` and the local `ctxmode` binary remain untracked / uncommitted.
+
+## 7. Closure-review residuals (post-6986a25 re-review)
+
+### W-5 `isUserToolchainPathDir` residual — refuted-with-evidence, no code change
+
+**Tag:** `[pattern:trusted-user-toolchain-same-euid]` (first record, count 1/2)
+
+The closure re-review triaged the remaining `isUserToolchainPathDir` attack
+surface as **refuted-with-evidence**, not a live finding — no guard
+tightening was requested or made:
+
+- The dot (project-local `.venv/bin` / `node_modules/.bin`) branch is a
+  conjunction of *directory category* ∧ `isTrustedExecutableOnDisk`, so a
+  bare user-writable dir does not pass on location alone.
+- `allowSymlinkMode=true` only skips the link's own permission bits — it
+  does NOT skip the UID check, so a foreign-owned symlink is still
+  rejected.
+- The nearest-existing-ancestor branch cannot reach an escape: the trust
+  path requires the target `Stat` to succeed, which already anchors the
+  resolution inside an allowed dir.
+
+**Accepted policy boundary (recorded, not introduced by this diff):** a
+toolchain dir writable by the SAME euid remains part of the trust domain,
+and ADAPT2 keeps its positional exemption. A same-euid process that can
+already write `~/.local/bin` can also run the planted binary directly, so
+tightening this edge buys nothing inside the non-sandbox threat model —
+same class as the archived `[pattern:path-trust-user-writable]` / C10
+boundary (`.agents/notes/2026-11-01-role-guards-non-sandbox-boundaries.md`).

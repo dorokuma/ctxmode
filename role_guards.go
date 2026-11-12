@@ -2609,28 +2609,53 @@ func screenNestedDispatch(headArgv []string, pathEnv string) string {
 				return hit
 			}
 		// npm/pnpm/yarn `exec`/`dlx` fetch-and-run a package binary — the
-		// same unvetted-code surface as npx/bunx/pnpx. Re-dispatch the exec
-		// operand through screenNestedDispatch so `npm exec pig` hits the
-		// agent whitelist; scan ALL non-flag operands so a value-taking
-		// option (`npm --prefix /tmp exec pig`) cannot hide the verb.
+		// same unvetted-code surface as npx/bunx/pnpx. The verb is the
+		// first non-flag operand (`npm --prefix /tmp exec pig` counts,
+		// `npm view exec pig` does not); `-c`/`--call` payloads fail
+		// closed, and the exec package spec re-dispatches through
+		// screenNestedDispatch so `npm exec pig` hits the agent
+		// whitelist.
 		case "npm", "pnpm", "yarn":
-			nonflag := npmFamilyExecArgs(headArgv[1:])
-			for i, a := range nonflag {
-				if a != "exec" && a != "dlx" {
+			args := headArgv[1:]
+			// The verb is the FIRST non-flag operand only: operands that
+			// follow it belong to the subcommand, so `npm view exec pig`'s
+			// `exec` is a `view` field name, not the exec verb.
+			vi := npmFamilyVerbIndex(args)
+			if vi < 0 || (args[vi] != "exec" && args[vi] != "dlx") {
+				break
+			}
+			verb := args[vi]
+			rest := args[vi+1:]
+			// npm exec/dlx -c/--call hands npm a raw command string to run
+			// through a shell — the same unvettable payload `npx -c`/`--call`
+			// already fails closed on. Both the glued `--call=CMD` and the
+			// separate `-c CMD`/`--call CMD` spellings must hit; `--` ends
+			// npm's own option parsing.
+			for _, a := range rest {
+				if a == "--" {
+					break
+				}
+				if strings.HasPrefix(a, "--") {
+					if a == "--call" || strings.HasPrefix(a, "--call=") {
+						return base + " " + verb + " --call"
+					}
 					continue
 				}
-				// Operands after the verb: [--] <pkg> [args...]. Only a spec
-				// naming a blocked executable is a sub-agent hit — an ordinary
-				// `npm exec tsc`/`pnpm dlx vitest` stays free like `npx tsc`.
-				for _, spec := range nonflag[i+1:] {
-					if spec == "--" {
-						continue
-					}
-					if hit := screenNestedDispatch([]string{filepath.Base(nodePkgSpecBase(spec))}, pathEnv); hit != "" {
-						return base + " " + a + " " + hit
-					}
-					break // only the package spec word is the dispatched head
+				if strings.HasPrefix(a, "-c") {
+					return base + " " + verb + " -c"
 				}
+			}
+			// Operands after the verb: [--] <pkg> [args...]. Only a spec
+			// naming a blocked executable is a sub-agent hit — an ordinary
+			// `npm exec tsc`/`pnpm dlx vitest` stays free like `npx tsc`.
+			for _, spec := range npmFamilyExecArgs(rest) {
+				if spec == "--" {
+					continue
+				}
+				if hit := screenNestedDispatch([]string{filepath.Base(nodePkgSpecBase(spec))}, pathEnv); hit != "" {
+					return base + " " + verb + " " + hit
+				}
+				break // only the package spec word is the dispatched head
 			}
 		}
 	}
@@ -5417,15 +5442,40 @@ func npmFamilyExecArgs(args []string) []string {
 	return out
 }
 
-// npmFamilyExecSub reports whether an npm-family argv invokes the exec/dlx
-// subcommand past any leading option run (`npm --prefix /tmp exec pig`).
-// It scans every non-flag operand, not just the first, so a value-taking
-// option cannot hide the verb behind its operand word.
-func npmFamilyExecSub(args []string) string {
-	for _, a := range npmFamilyExecArgs(args) {
-		if a == "exec" || a == "dlx" {
-			return a
+// npmFamilyVerbIndex returns the index in args of the npm-family
+// subcommand word: the FIRST non-flag operand after skipping every option
+// and the value operand of the known value-taking options (`npm --prefix
+// /tmp exec pig` → the `exec` index). -1 when the argv is flag-only. Only
+// this word may be the exec/dlx verb — later operands are the
+// subcommand's own arguments (`npm view exec pig` reports `view`).
+func npmFamilyVerbIndex(args []string) int {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "--") {
+			name, _, hasEq := strings.Cut(a, "=")
+			if !hasEq && npmFamilyValueFlags[name] && i+1 < len(args) {
+				i++
+			}
+			continue
 		}
+		if strings.HasPrefix(a, "-") && a != "-" {
+			if npmFamilyValueFlags[a] && i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+// npmFamilyExecSub reports whether an npm-family argv's REAL subcommand —
+// the first non-flag operand past any leading option run — is exec/dlx.
+// Operands after the verb are the subcommand's own arguments, so `npm view
+// exec pig` reports the `view` verb and no exec-head screen applies.
+func npmFamilyExecSub(args []string) string {
+	if i := npmFamilyVerbIndex(args); i >= 0 && (args[i] == "exec" || args[i] == "dlx") {
+		return args[i]
 	}
 	return ""
 }
@@ -5556,9 +5606,9 @@ func screenReadonlyWriteAlias(headArgv []string, base string, args []string) str
 		}
 		// `npm exec`/`pnpm dlx`/`pnpm exec`/`yarn dlx` run a downloaded
 		// package binary: an unvetted code path, block for strict roles.
-		// Scan ALL non-flag operands (npmFamilyExecSub): firstNonFlagArg
-		// stops at a value-taking option's operand — `npm --prefix /tmp
-		// exec pig` would otherwise hide `exec` behind the /tmp word.
+		// The verb must be the first non-flag operand (npmFamilyExecSub):
+		// `npm view exec pig`'s `exec` is a `view` field, while
+		// `npm --prefix /tmp exec pig` still counts.
 		if sub := npmFamilyExecSub(args); sub != "" {
 			return base + " " + sub
 		}

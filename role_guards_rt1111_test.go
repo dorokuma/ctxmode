@@ -478,6 +478,47 @@ func TestRT_A9_NpmExecBehindValueFlag(t *testing.T) {
 	// readonly allowlist, so this is the subagent layer that mattered).
 }
 
+// R5-npm-call: `npm exec -c CMD`/`--call CMD`/`--call=CMD` run a raw
+// command string through a shell — the same unvettable payload
+// `npx -c`/`--call` already fails closed on. The glued `--call=pig`
+// spelling previously landed in the `--flag=value` drop rule and let
+// `npm exec --call=pig` sail past the exec-head screen entirely. And the
+// exec/dlx verb must be the FIRST non-flag operand (the real npm
+// subcommand): `npm view exec pig`'s `exec` is a `view` field name, not
+// the exec verb — scanning every operand misread it and blocked a legal
+// metadata query.
+func TestRT_A9_NpmExecCallAndViewField(t *testing.T) {
+	block := []string{
+		"npm exec --call=pig",
+		"npm exec -c pig",
+		"npm exec --call=pig tsc",
+		"npm exec --call pig",
+		"npm exec -cpig",
+		"pnpm dlx --call=pig",
+		"yarn dlx -c pig",
+		"npm --prefix /tmp exec --call=pig",
+	}
+	for _, cmd := range block {
+		rule, detail := rtCmdRule("worker", "", cmd, "")
+		if rule != ruleSubagentNestedAgent {
+			t.Errorf("%q: got (%q,%q), want %s", cmd, rule, detail, ruleSubagentNestedAgent)
+		} else {
+			t.Logf("%q: BLOCK %s: %s", cmd, rule, detail)
+		}
+	}
+	allow := []string{
+		"npm exec tsc",
+		"npm exec -- tsc",
+		"npm view exec pig",         // `exec` is a `view` field name
+		"npm view exec bin.version", // field lookups stay free
+	}
+	for _, cmd := range allow {
+		if rule, detail := rtCmdRule("worker", "", cmd, ""); rule != "" {
+			t.Errorf("%q: got BLOCK %s: %s, want ALLOW", cmd, rule, detail)
+		}
+	}
+}
+
 // A-1: ssh remote stdin vehicle is narrowed to pure shells; read-only
 // callers lose piped ssh exfiltration and StrictHostKeyChecking without
 // UserKnownHostsFile=/dev/null.
