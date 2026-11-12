@@ -2781,6 +2781,9 @@ func parseNpmFamilyArgv(base string, args []string) npmArgvParse {
 			return "", 0, reject("missing option value")
 		}
 		v := args[i+1]
+		if v == "" {
+			return "", 0, reject("empty option value")
+		}
 		if strings.HasPrefix(v, "-") || isDynamicArg(v) {
 			return "", 0, reject("missing option value")
 		}
@@ -2793,14 +2796,19 @@ func parseNpmFamilyArgv(base string, args []string) npmArgvParse {
 	for i := 0; i < len(args); {
 		a := args[i]
 		if a == "--" {
-			if childLocked || managerDD {
+			if (childLocked && base != "npm") || managerDD {
 				// pnpm/yarn: the first child word already ended the manager
-				// option zone, so this `--` belongs to the child. npm (in an
-				// exec, where `--` is the zone boundary): a second `--` after
-				// the manager's own is child data. Either way pass it — and
-				// every word after it — through verbatim so
-				// `pnpm exec npm exec -- tsc --noEmit` keeps `--noEmit` as
-				// tsc's own data instead of reopening manager option parsing.
+				// option zone, so this `--` belongs to the child. Any manager
+				// (incl. npm): a `--` after the manager's own is child data.
+				// Either way pass it — and every word after it — through
+				// verbatim so `pnpm exec npm exec -- tsc --noEmit` keeps
+				// `--noEmit` as tsc's own data instead of reopening manager
+				// option parsing. npm's FIRST `--` is deliberately excluded
+				// here even when a child word already locked: it is the
+				// manager's own zone boundary (removed below), not child
+				// data — keeping it verbatim would hand the inner npm a
+				// separator that lets `npm exec npm exec -- --call=pig`
+				// smuggle the option past the outer screen.
 				r.child = append(r.child, args[i:]...)
 				break
 			}

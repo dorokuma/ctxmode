@@ -629,10 +629,38 @@ func TestRT_A9_NpmArgvModel(t *testing.T) {
 		// restores the fail-closed verdict the old scan always had.
 		{"npm-exec-tsc-call-pig", "G", words("npm exec tsc --call=pig"), "B"},
 		{"npm-exec-dd-tsc-call", "G", words("npm exec -- tsc --call=pig"), ""},
+		// R10 oracle second-opinion must fix: npm's own `--` must be
+		// REMOVED even when a child word already locked — keeping it
+		// verbatim handed the inner npm a real separator, so the inner
+		// parse consumed `--call=pig` as a child word and let the nested
+		// exec through. G-classified like the R9 `--call` rows: the
+		// pre-parser call-scan already failed `--call` on trailing
+		// operands, so only the verbatim-`--` model let it through.
+		{"npm-exec-npm-dd-call", "G", words("npm exec npm exec -- --call=pig"), "B"},
+		// R10 oracle second-opinion should fix: a SEPARATED empty option
+		// value now Rejects with `empty option value` like the inline
+		// `--package=` spelling — `isDynamicArg("")` is false, so the
+		// empty word previously entered r.packages unscreened and the
+		// exec sailed through on `tsc`. R-classified: the pre-parser
+		// model never saw an empty value slot as a reject. argv only: an
+		// empty word cannot be spelled in the cmd form — strings.Fields
+		// would drop it, so the loop below skips rtCmdRule for this row
+		// and asserts the argv entry alone.
+		{"npm-exec-package-empty-sep", "R", []string{"npm", "exec", "--package", "", "--", "tsc"}, "B"},
 	}
 	for _, tc := range cases {
 		want := tc.want != ""
 		cmd := strings.Join(tc.argv, " ")
+		if len(cmd) != len(strings.Join(strings.Fields(cmd), " ")) {
+			// argv-only case: the argv form carries a word the cmd
+			// spelling cannot express (an empty string operand).
+			if rule, detail := rtArgvRule("worker", "", tc.argv, ""); (rule != "") != want {
+				t.Errorf("[%s] argv %q: got (%q,%q), want allow=%v", tc.cls, tc.argv, rule, detail, !want)
+			} else {
+				t.Logf("[%s] argv %q: %s %s", tc.cls, tc.argv, map[bool]string{true: "BLOCK", false: "ALLOW"}[rule != ""], detail)
+			}
+			continue
+		}
 		if rule, detail := rtCmdRule("worker", "", cmd, ""); (rule != "") != want {
 			t.Errorf("[%s] cmd %q: got (%q,%q), want allow=%v", tc.cls, cmd, rule, detail, !want)
 		} else {
@@ -641,6 +669,14 @@ func TestRT_A9_NpmArgvModel(t *testing.T) {
 		if rule, detail := rtArgvRule("worker", "", tc.argv, ""); (rule != "") != want {
 			t.Errorf("[%s] argv %q: got (%q,%q), want allow=%v", tc.cls, cmd, rule, detail, !want)
 		}
+	}
+	// S1 parser-level evidence: the separated empty value Rejects at
+	// the grammar level (state npmArgvReject, reason `empty option
+	// value`) and never reaches r.packages.
+	if r := parseNpmFamilyArgv("npm", []string{"exec", "--package", "", "--", "tsc"}); r.state != npmArgvReject || len(r.packages) != 0 {
+		t.Errorf("[R] parser npm exec --package '' -- tsc: got state=%v packages=%v reason=%q, want npmArgvReject with no packages", r.state, r.packages, r.reason)
+	} else {
+		t.Logf("[R] parser npm exec --package '' -- tsc: state=%v reason=%q", r.state, r.reason)
 	}
 	// Strict read-only twin path (screenReadonlyWriteAlias): an option
 	// whose value slot hides the verb must not fool the write table —
