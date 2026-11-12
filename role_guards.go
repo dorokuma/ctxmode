@@ -2743,11 +2743,14 @@ var npmFamilyExecOptTable = map[string]map[string]npmOptKind{
 // only exec/dlx enter the exec state (every other verb is Other, so
 // `npm view exec pig`'s `exec` stays field data, and no trailing scan can
 // resurrect it). exec/dlx then collect the child command the manager
-// would fetch-and-run: manager options are consumed up front (npm's own
-// `--`, like pnpm/yarn's first child word, ends the option zone), and
-// the child's first positional is version/tag-stripped like a
-// -p/--package spec so `pig@latest` still hits the blacklist. Once the
-// child locks, `--` and every later word are child data passed through
+// would fetch-and-run: manager options are consumed up front — the
+// option-zone boundary differs per manager (npm's own `--` ends its
+// option zone so `--package`/`--call` still parse BETWEEN the first
+// child word and that `--`; pnpm/yarn's first child word locks the
+// child command and ends their option zone) — and the child's first
+// positional is version/tag-stripped like a -p/--package spec so
+// `pig@latest` still hits the blacklist. Once the zone ends, `--` and
+// every later word are child data passed through
 // verbatim — `pnpm exec npm exec -- tsc --noEmit` and
 // `npm -- exec tsc --noEmit` keep `--noEmit` as tsc's own option.
 // `-c`/`--call` in the option zone, every unlisted option spelling, a
@@ -2785,22 +2788,29 @@ func parseNpmFamilyArgv(base string, args []string) npmArgvParse {
 	}
 
 	inExec := false
-	childLocked := false // option consumption ends at the first child word
+	childLocked := false // a child word was seen (pnpm/yarn: ends the option zone)
+	managerDD := false   // the manager's own `--` was consumed (npm exec: zone end)
 	for i := 0; i < len(args); {
 		a := args[i]
 		if a == "--" {
-			if childLocked {
-				// The child command is already locked: this `--` belongs to
-				// the child, not to the manager. Pass it — and every word
-				// after it — through verbatim so `pnpm exec npm exec -- tsc
-				// --noEmit` keeps `--noEmit` as tsc's own data instead of
-				// reopening manager option parsing on it.
+			if childLocked || managerDD {
+				// pnpm/yarn: the first child word already ended the manager
+				// option zone, so this `--` belongs to the child. npm (in an
+				// exec, where `--` is the zone boundary): a second `--` after
+				// the manager's own is child data. Either way pass it — and
+				// every word after it — through verbatim so
+				// `pnpm exec npm exec -- tsc --noEmit` keeps `--noEmit` as
+				// tsc's own data instead of reopening manager option parsing.
 				r.child = append(r.child, args[i:]...)
 				break
 			}
 			if !inExec {
 				// `--` closes manager option parsing; the NEXT word is the
-				// verb (a dynamic verb cannot be judged — fail closed).
+				// verb (a dynamic verb cannot be judged — fail closed). This
+				// pre-verb `--` is also the manager's own separator: for npm
+				// it ends the option zone, so `npm -- exec tsc --noEmit`
+				// keeps `--noEmit` as the child's data once `tsc` locks.
+				managerDD = true
 				i++
 				if i >= len(args) {
 					r.state = npmArgvNoVerb
@@ -2819,6 +2829,10 @@ func parseNpmFamilyArgv(base string, args []string) npmArgvParse {
 				return r
 			}
 			// exec: `--` removes itself; everything after joins the child.
+			// For npm this is also the manager's own option-zone boundary:
+			// `--package`/`--call` found BEFORE it are still manager options
+			// even when a child word already appeared.
+			managerDD = true
 			r.child = append(r.child, args[i+1:]...)
 			break
 		}
@@ -2826,8 +2840,13 @@ func parseNpmFamilyArgv(base string, args []string) npmArgvParse {
 		switch {
 		case !inExec:
 			// GLOBAL: option-looking words are manager options.
+		case base == "npm" && !managerDD:
+			// npm's own `--` — not the first child word — ends the option
+			// zone: `--package`/`--call` between the child head and `--`
+			// are still manager options, so `npm exec tsc --package=pig`
+			// cannot hide a spec behind the locked command.
 		case childLocked:
-			// Every manager: once the first child word locks the fetched
+			// pnpm/yarn: once the first child word locks the fetched
 			// command, the tail is the child's own argv — an option-looking
 			// word there is the CHILD's option (`tsc --noEmit`), never a
 			// manager option. The same rule governs `--` above.

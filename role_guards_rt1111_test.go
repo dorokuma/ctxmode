@@ -612,7 +612,23 @@ func TestRT_A9_NpmArgvModel(t *testing.T) {
 		// manager option parsing.
 		{"pnpm-exec-npm-exec-dd-tsc", "G", words("pnpm exec npm exec -- tsc --noEmit"), ""},
 		{"npm-dd-exec-tsc-noemit", "G", words("npm -- exec tsc --noEmit"), ""},
-		{"npm-exec-dd-npm-call", "G", words("npm exec -- npm exec --call=pig"), "B"},
+		// R9 gate-review must fix: npm's option zone ends at its own `--`,
+		// NOT at the first child word — manager options may legally
+		// interleave with the command before that separator, so
+		// `--package`/`--call` after the child head are still parsed.
+		// R/G stay measured against the pre-parser baseline (10e1841's
+		// npmFamily* word-scan model): `--package=pig` is R (the old model
+		// never screened it), while `--call=pig` is G — the old call-scan
+		// already failed it closed, so only the de59b4b childLocked model
+		// let it through and the R9 fix restores the baseline verdict.
+		{"npm-exec-tsc-pkg-pig", "R", words("npm exec tsc --package=pig"), "B"},
+		{"npm-exec-tsc-pkg-ts", "G", words("npm exec tsc --package=typescript"), ""},
+		// G, not R: the PRE-PARSER baseline already failed `--call` closed
+		// on trailing operands (its call-scan ran after `--`), so this row
+		// only went red on the de59b4b childLocked model — the R9 fix
+		// restores the fail-closed verdict the old scan always had.
+		{"npm-exec-tsc-call-pig", "G", words("npm exec tsc --call=pig"), "B"},
+		{"npm-exec-dd-tsc-call", "G", words("npm exec -- tsc --call=pig"), ""},
 	}
 	for _, tc := range cases {
 		want := tc.want != ""
@@ -630,8 +646,8 @@ func TestRT_A9_NpmArgvModel(t *testing.T) {
 	// whose value slot hides the verb must not fool the write table —
 	// the same parser Rejects it instead of reading `/tmp` as the verb.
 	// (Direct internal-helper call, not one of the two public entries
-	// above — kept as a single dedicated check, R-classified like the
-	// value-flag Reject it covers.)
+	// above — kept as a single dedicated check. R-classified: the
+	// value-flag Reject it covers only exists under the new grammar.)
 	if hit := screenReadonlyWriteAlias([]string{"npm", "--prefix", "/tmp", "run", "build"}, "npm",
 		[]string{"--prefix", "/tmp", "run", "build"}); hit == "" {
 		t.Error("[R] readonly npm --prefix /tmp run build: got ALLOW, want block")
