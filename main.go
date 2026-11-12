@@ -209,6 +209,7 @@ func main() {
 	}
 
 	srv := mcp.NewServer(&mcp.Implementation{Name: "ctxmode", Version: Version}, &mcp.ServerOptions{Instructions: serverInstructions})
+	srv.AddReceivingMiddleware(argUnwrapMiddleware)
 	s.registerCategoryTools(srv)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
