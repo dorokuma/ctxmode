@@ -2574,9 +2574,13 @@ func screenReadonlyAliasTarget(typedHead []string, pathEnv string) string {
 
 // screenNestedDispatch returns the guard hit for ONE resolved command head
 // (already wrapper-peeled), or "" when allowed. headArgv starts at the head.
+// depth carries the enclosing peel budget (peelChainMaxDepth) so a nested
+// recursion — `npm exec -- npm exec -- …`, `npm exec -- npx …` — consumes
+// the SAME budget instead of restarting it; caller is the env-seeded
+// identity the inner command inherits.
 // `git` heads also get the global exec-config screen: a sub-agent must not
 // arm a pager/ssh/hook command through `git -c`/`--config-env`/`--exec-path`.
-func screenNestedDispatch(headArgv []string, pathEnv string) string {
+func screenNestedDispatch(headArgv []string, pathEnv string, depth int, caller callerIdentity) string {
 	if len(headArgv) == 0 {
 		return ""
 	}
@@ -2609,57 +2613,308 @@ func screenNestedDispatch(headArgv []string, pathEnv string) string {
 				return hit
 			}
 		// npm/pnpm/yarn `exec`/`dlx` fetch-and-run a package binary — the
-		// same unvetted-code surface as npx/bunx/pnpx. The verb is the
-		// first non-flag operand (`npm --prefix /tmp exec pig` counts,
-		// `npm view exec pig` does not); `-c`/`--call` payloads fail
-		// closed, and the exec package spec re-dispatches through
-		// screenNestedDispatch so `npm exec pig` hits the agent
-		// whitelist.
+		// same unvetted-code surface as npx/bunx/pnpx. The argv is parsed
+		// once by parseNpmFamilyArgv's finite accept grammar: the verb is
+		// the FIRST positional (`npm view exec pig`'s `exec` is a `view`
+		// field name), `-c`/`--call` and every unlisted option Reject, and
+		// the WHOLE child argv recurses through peelResolvedSegDepth at
+		// depth+1 so `npm exec -- npm exec pig` and `npm exec -- npx pig`
+		// are screened under the shared budget.
 		case "npm", "pnpm", "yarn":
-			args := headArgv[1:]
-			// The verb is the FIRST non-flag operand only: operands that
-			// follow it belong to the subcommand, so `npm view exec pig`'s
-			// `exec` is a `view` field name, not the exec verb.
-			vi := npmFamilyVerbIndex(args)
-			if vi < 0 || (args[vi] != "exec" && args[vi] != "dlx") {
-				break
-			}
-			verb := args[vi]
-			rest := args[vi+1:]
-			// npm exec/dlx -c/--call hands npm a raw command string to run
-			// through a shell — the same unvettable payload `npx -c`/`--call`
-			// already fails closed on. Both the glued `--call=CMD` and the
-			// separate `-c CMD`/`--call CMD` spellings must hit; `--` ends
-			// npm's own option parsing.
-			for _, a := range rest {
-				if a == "--" {
-					break
-				}
-				if strings.HasPrefix(a, "--") {
-					if a == "--call" || strings.HasPrefix(a, "--call=") {
-						return base + " " + verb + " --call"
+			r := parseNpmFamilyArgv(base, headArgv[1:])
+			switch r.state {
+			case npmArgvExec:
+				// A -p/--package spec naming a blocked executable is a hit
+				// whatever the child command is: `tsc` cannot launder
+				// `--package=pig`.
+				for _, spec := range r.packages {
+					if blockedAgentExecutables[filepath.Base(nodePkgSpecBase(spec))] {
+						return base + " " + r.verb + " " + spec
 					}
-					continue
 				}
-				if strings.HasPrefix(a, "-c") {
-					return base + " " + verb + " -c"
+				if hit := peelResolvedSegDepth(r.child, shellSegment{}, 's', depth+1, caller); hit != "" {
+					return base + " " + r.verb + " " + hit
 				}
-			}
-			// Operands after the verb: [--] <pkg> [args...]. Only a spec
-			// naming a blocked executable is a sub-agent hit — an ordinary
-			// `npm exec tsc`/`pnpm dlx vitest` stays free like `npx tsc`.
-			for _, spec := range npmFamilyExecArgs(rest) {
-				if spec == "--" {
-					continue
-				}
-				if hit := screenNestedDispatch([]string{filepath.Base(nodePkgSpecBase(spec))}, pathEnv); hit != "" {
-					return base + " " + verb + " " + hit
-				}
-				break // only the package spec word is the dispatched head
+			case npmArgvReject:
+				return r.rejectHit(base)
 			}
 		}
 	}
 	return ""
+}
+
+// npmArgvState is the verdict of parseNpmFamilyArgv.
+type npmArgvState int
+
+const (
+	npmArgvNoVerb npmArgvState = iota // flag-only argv: no subcommand
+	npmArgvOther                      // a non-exec/dlx verb
+	npmArgvExec                       // verb is exec/dlx: child/packages filled
+	npmArgvReject                     // argv does not fit the accepted grammar
+)
+
+// npmArgvParse is the result of parseNpmFamilyArgv: the locked verb (and
+// its argv index), the exec/dlx child command plus -p/--package specs, or
+// the rejection reason.
+type npmArgvParse struct {
+	state    npmArgvState
+	verbIx   int      // argv index of the subcommand word (-1 when none)
+	verb     string   // the subcommand word
+	child    []string // exec/dlx: the fetched command argv to re-screen
+	packages []string // exec/dlx: package specs named by -p/--package
+	reason   string   // Reject detail
+}
+
+// rejectHit formats the guard hit for a rejected parse.
+func (r npmArgvParse) rejectHit(base string) string {
+	if r.verb != "" {
+		return base + " " + r.verb + " " + r.reason
+	}
+	return base + " " + r.reason
+}
+
+// npmOptKind classifies an accepted npm-family option spelling.
+type npmOptKind byte
+
+const (
+	npmOptBool    npmOptKind = 'B' // boolean: no operand
+	npmOptValue   npmOptKind = 'V' // consumes one operand value
+	npmOptPackage npmOptKind = 'S' // consumes a package spec operand
+)
+
+// npmFamilyOptTable is the FINITE accepted set of npm/pnpm/yarn option
+// spellings keyed by manager: a boolean, a value-taker or (in exec mode)
+// a package-spec taker. Anything not listed — long or short — is a
+// Reject, never a guessed pass: the guard deliberately does not emulate
+// the full CLI surface.
+var npmFamilyOptTable = map[string]map[string]npmOptKind{
+	"npm": {
+		"help": npmOptBool, "h": npmOptBool,
+		"version": npmOptBool, "v": npmOptBool,
+		"yes": npmOptBool, "y": npmOptBool,
+		"global": npmOptBool, "g": npmOptBool,
+		"parseable": npmOptBool, "p": npmOptBool,
+		"prefix": npmOptValue, "workspace": npmOptValue, "w": npmOptValue,
+		"userconfig": npmOptValue, "globalconfig": npmOptValue,
+		"cache": npmOptValue, "registry": npmOptValue,
+		"loglevel": npmOptValue, "tag": npmOptValue,
+	},
+	"pnpm": {
+		"help": npmOptBool, "h": npmOptBool,
+		"version": npmOptBool, "v": npmOptBool,
+		"workspace-root": npmOptBool, "w": npmOptBool,
+		"recursive": npmOptBool, "r": npmOptBool,
+		"dir": npmOptValue, "C": npmOptValue,
+		"filter": npmOptValue, "F": npmOptValue,
+	},
+	"yarn": {
+		"help": npmOptBool, "h": npmOptBool,
+		"version": npmOptBool, "v": npmOptBool,
+		"cwd": npmOptValue,
+	},
+}
+
+// npmFamilyExecOptTable lists the extra options exec/dlx accept on top of
+// the common set: -p/--package name a fetched package spec. npm's own `-p`
+// stays boolean (parseable): unlike pnpm's/yarn's it is NOT a --package
+// alias, so `npm exec -p pig` cannot smuggle a spec — and only yarn gets
+// `-p` as a spec taker here.
+var npmFamilyExecOptTable = map[string]map[string]npmOptKind{
+	"npm":  {"package": npmOptPackage},
+	"pnpm": {"package": npmOptPackage},
+	"yarn": {"package": npmOptPackage, "p": npmOptPackage},
+}
+
+// parseNpmFamilyArgv parses an npm/pnpm/yarn argv under the guard's
+// finite accept grammar. The first positional locks the subcommand verb —
+// only exec/dlx enter the exec state (every other verb is Other, so
+// `npm view exec pig`'s `exec` stays field data, and no trailing scan can
+// resurrect it). exec/dlx then collect the child command the manager
+// would fetch-and-run: npm keeps consuming its manager options
+// interleaved among child words until the first `--` (which is removed;
+// everything after it joins the child verbatim), while pnpm/yarn consume
+// options only before the first child word and keep the tail verbatim.
+// `-c`/`--call` in the option zone, every unlisted option spelling, a
+// dynamic operand and a malformed value slot all Reject — the grammar
+// fails closed everywhere instead of guessing.
+func parseNpmFamilyArgv(base string, args []string) npmArgvParse {
+	r := npmArgvParse{verbIx: -1}
+	reject := func(reason string) npmArgvParse {
+		return npmArgvParse{state: npmArgvReject, verbIx: r.verbIx, verb: r.verb, reason: reason}
+	}
+	common := npmFamilyOptTable[base]
+	execOpts := npmFamilyExecOptTable[base]
+
+	// takeValue consumes an inline or separate option value; it returns
+	// the value and the index of the next unconsumed word, or a Reject.
+	takeValue := func(i int, inline string, hasInline bool) (string, int, npmArgvParse) {
+		if hasInline {
+			v := strings.TrimPrefix(inline, "=") // short cluster may glue -C=dir
+			if v == "" {
+				return "", 0, reject("empty option value")
+			}
+			if isDynamicArg(v) {
+				return "", 0, reject("dynamic option value")
+			}
+			return v, i + 1, npmArgvParse{}
+		}
+		if i+1 >= len(args) || args[i+1] == "--" {
+			return "", 0, reject("missing option value")
+		}
+		v := args[i+1]
+		if strings.HasPrefix(v, "-") || isDynamicArg(v) {
+			return "", 0, reject("missing option value")
+		}
+		return v, i + 2, npmArgvParse{}
+	}
+
+	inExec := false
+	childLocked := false // pnpm/yarn: option consumption ends at the first child word
+	for i := 0; i < len(args); {
+		a := args[i]
+		if a == "--" {
+			if !inExec {
+				// `--` closes manager option parsing; the NEXT word is the
+				// verb (a dynamic verb cannot be judged — fail closed).
+				i++
+				if i >= len(args) {
+					r.state = npmArgvNoVerb
+					return r
+				}
+				if isDynamicArg(args[i]) {
+					return reject("dynamic operand")
+				}
+				r.verbIx, r.verb = i, args[i]
+				if r.verb == "exec" || r.verb == "dlx" {
+					inExec, r.state = true, npmArgvExec
+					i++
+					continue
+				}
+				r.state = npmArgvOther
+				return r
+			}
+			// exec: `--` removes itself; everything after joins the child.
+			r.child = append(r.child, args[i+1:]...)
+			break
+		}
+		treatAsOpt := strings.HasPrefix(a, "-") && a != "-"
+		switch {
+		case !inExec:
+			// GLOBAL: option-looking words are manager options.
+		case base == "npm":
+			// npm exec: manager options may interleave with child words
+			// until the first `--`.
+		case childLocked:
+			treatAsOpt = false // pnpm/yarn: the tail is a verbatim child
+		}
+		if treatAsOpt {
+			endBool := false // last consumed kind was a bare boolean
+			if strings.HasPrefix(a, "--") {
+				name, val, hasEq := strings.Cut(a[2:], "=")
+				switch {
+				case name == "c" || name == "call":
+					return reject("option --" + name)
+				}
+				kind, ok := common[name]
+				if !ok && inExec {
+					kind, ok = execOpts[name]
+				}
+				if !ok {
+					return reject("option --" + name)
+				}
+				switch kind {
+				case npmOptBool:
+					if hasEq {
+						if val != "true" && val != "false" {
+							return reject("option --" + name + " value")
+						}
+					} else {
+						endBool = true
+					}
+					i++
+				case npmOptValue:
+					_, ni, rr := takeValue(i, val, hasEq)
+					if rr.state == npmArgvReject {
+						return rr
+					}
+					i = ni
+				case npmOptPackage:
+					v, ni, rr := takeValue(i, val, hasEq)
+					if rr.state == npmArgvReject {
+						return rr
+					}
+					r.packages = append(r.packages, v)
+					i = ni
+				}
+			} else {
+				// Short option or cluster: B letters continue; a V/S letter
+				// eats the cluster tail (an optional leading `=` is dropped)
+				// or the next word, then the word is done. `c` and unknown
+				// letters Reject.
+				valueEnd := false
+				for j := 1; j < len(a); j++ {
+					ch := a[j : j+1]
+					if ch == "c" {
+						return reject("option -c")
+					}
+					kind, ok := common[ch]
+					if !ok && inExec {
+						kind, ok = execOpts[ch]
+					}
+					if !ok {
+						return reject("option -" + ch)
+					}
+					if kind == npmOptBool {
+						endBool = true
+						continue
+					}
+					v, ni, rr := takeValue(i, a[j+1:], j+1 < len(a))
+					if rr.state == npmArgvReject {
+						return rr
+					}
+					if kind == npmOptPackage {
+						r.packages = append(r.packages, v)
+					}
+					i = ni
+					valueEnd = true
+					break
+				}
+				if !valueEnd {
+					i++
+				}
+			}
+			if endBool && i < len(args) && (args[i] == "true" || args[i] == "false") {
+				// An optional boolean value must be glued; a separated
+				// true/false word would misparse as the verb or a child
+				// word — fail closed rather than guess the arity.
+				return reject("separated boolean value")
+			}
+			continue
+		}
+		// Positional word.
+		if isDynamicArg(a) {
+			return reject("dynamic operand")
+		}
+		if !inExec {
+			r.verbIx, r.verb = i, a
+			if a == "exec" || a == "dlx" {
+				inExec, r.state = true, npmArgvExec
+				i++
+				continue
+			}
+			r.state = npmArgvOther
+			return r
+		}
+		r.child = append(r.child, a)
+		childLocked = true
+		i++
+	}
+	if r.state == npmArgvExec && len(r.child) == 0 {
+		// `npm exec` with no command: do not guess a manifest default bin
+		// or an interactive shell — fail closed.
+		return reject("missing command")
+	}
+	return r
 }
 
 // nodePkgSpecBase strips the version/tag suffix from an npm package
@@ -2681,7 +2936,7 @@ func nodePkgSpecBase(spec string) string {
 // package spec is re-dispatched through screenNestedDispatch so
 // `npx pig@latest` and `bunx hc kill t1` cannot dodge the agent/terminal
 // whitelists.
-func screenNodeRunnerSubagent(base string, args []string, effPath string) string {
+func screenNodeRunnerSubagent(base string, args []string, effPath string, depth int, caller callerIdentity) string {
 	const boolShort = "ynq"
 	const valueShort = "pw"
 	i := 0
@@ -2767,7 +3022,11 @@ func screenNodeRunnerSubagent(base string, args []string, effPath string) string
 	}
 	spec := filepath.Base(nodePkgSpecBase(args[i]))
 	inner := append([]string{spec}, args[i+1:]...)
-	if hit := screenNestedDispatch(inner, effPath); hit != "" {
+	// The fetched command argv re-enters the shared peel at depth+1: the
+	// inner head may itself be a manager/runner (`npx npx pig`,
+	// `npm exec -- npx pig`) or a shell (`npx sh -c pig`), and every such
+	// hop consumes the SAME peel budget.
+	if hit := peelResolvedSegDepth(inner, shellSegment{}, 's', depth+1, caller); hit != "" {
 		return base + " " + hit
 	}
 	return ""
@@ -3153,7 +3412,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	}
 	if base == "command" && isCommandQuery(head[1:]) {
 		if kind == 's' {
-			if hit := screenNestedDispatch(typedHead, effPath); hit != "" {
+			if hit := screenNestedDispatch(typedHead, effPath, depth, caller); hit != "" {
 				return hit
 			}
 		}
@@ -3166,7 +3425,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	// unwrap branch (ssh, sh -c, python -c, xargs, find, etc.) so a symlink
 	// `pig -> sh` or `pig -> ssh` cannot bypass the blocked-head check.
 	if kind == 's' && filepath.Base(typedHead[0]) != base {
-		if hit := screenNestedDispatch(typedHead, effPath); hit != "" {
+		if hit := screenNestedDispatch(typedHead, effPath, depth, caller); hit != "" {
 			return hit
 		}
 	}
@@ -3423,12 +3682,12 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		}
 	}
 	if kind == 's' && (base == "npx" || base == "bunx" || base == "pnpx") {
-		if hit := screenNodeRunnerSubagent(base, head[1:], effPath); hit != "" {
+		if hit := screenNodeRunnerSubagent(base, head[1:], effPath, depth, caller); hit != "" {
 			return hit
 		}
 	}
 	if kind == 's' {
-		return screenNestedDispatch(typedHead, effPath)
+		return screenNestedDispatch(typedHead, effPath, depth, caller)
 	}
 	if hit := screenReadonlyAllowlist(typedHead); hit != "" {
 		return allowlistDetail(hit)
@@ -5398,88 +5657,6 @@ func screenReadonlyWritePath(headArgv []string, pathEnv string) string {
 	return ""
 }
 
-// npmFamilyValueFlags are the npm/pnpm/yarn/bun options that consume the
-// NEXT argv word as their value (--prefix DIR, -w NAME, ...). Their
-// `--flag=value` spellings are handled inline. The table only needs to be
-// complete enough that a value word can never be mistaken for the exec/dlx
-// subcommand: an unlisted value-taking option makes the scan fail open at
-// worst (its value reads as a positional), never fail closed.
-var npmFamilyValueFlags = map[string]bool{
-	"--prefix": true, "--dir": true, "-C": true, "--cwd": true,
-	"--workspace": true, "-w": true, "--userconfig": true,
-	"--globalconfig": true, "--cache": true, "--registry": true,
-	"--loglevel": true,
-}
-
-// npmFamilyExecArgs returns the non-flag arguments of an npm-family argv,
-// skipping the value operand of the known value-taking options and every
-// `--flag=value` glued spelling. `--` ends the option run (what follows is
-// the package spec / exec operands, still non-flag for our purpose).
-func npmFamilyExecArgs(args []string) []string {
-	var out []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if strings.HasPrefix(a, "--") {
-			name, _, hasEq := strings.Cut(a, "=")
-			if hasEq {
-				continue // --prefix=/tmp carries its own value
-			}
-			if npmFamilyValueFlags[name] && i+1 < len(args) {
-				i++ // consume the value operand
-			}
-			continue
-		}
-		if strings.HasPrefix(a, "-") && a != "-" {
-			// Short flag or cluster; the value-taking ones only take a
-			// separate value when they stand alone (npm has no glued -wNAME).
-			if npmFamilyValueFlags[a] && i+1 < len(args) {
-				i++
-			}
-			continue
-		}
-		out = append(out, a)
-	}
-	return out
-}
-
-// npmFamilyVerbIndex returns the index in args of the npm-family
-// subcommand word: the FIRST non-flag operand after skipping every option
-// and the value operand of the known value-taking options (`npm --prefix
-// /tmp exec pig` → the `exec` index). -1 when the argv is flag-only. Only
-// this word may be the exec/dlx verb — later operands are the
-// subcommand's own arguments (`npm view exec pig` reports `view`).
-func npmFamilyVerbIndex(args []string) int {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if strings.HasPrefix(a, "--") {
-			name, _, hasEq := strings.Cut(a, "=")
-			if !hasEq && npmFamilyValueFlags[name] && i+1 < len(args) {
-				i++
-			}
-			continue
-		}
-		if strings.HasPrefix(a, "-") && a != "-" {
-			if npmFamilyValueFlags[a] && i+1 < len(args) {
-				i++
-			}
-			continue
-		}
-		return i
-	}
-	return -1
-}
-
-// npmFamilyExecSub reports whether an npm-family argv's REAL subcommand —
-// the first non-flag operand past any leading option run — is exec/dlx.
-// Operands after the verb are the subcommand's own arguments, so `npm view
-// exec pig` reports the `view` verb and no exec-head screen applies.
-func npmFamilyExecSub(args []string) string {
-	if i := npmFamilyVerbIndex(args); i >= 0 && (args[i] == "exec" || args[i] == "dlx") {
-		return args[i]
-	}
-	return ""
-}
-
 // screenReadonlyWriteAlias applies the whole strict read-only head model to
 // ONE candidate name for the command head: base is the spelling under test
 // (the name as typed, or the basename of the symlink behind it) and args are
@@ -5601,16 +5778,22 @@ func screenReadonlyWriteAlias(headArgv []string, base string, args []string) str
 			return hit
 		}
 	case "npm", "pnpm", "yarn":
-		if sub := firstNonFlagArg(args); sub != "" && npmFamilyWriteSubs[sub] {
-			return base + " " + sub
-		}
-		// `npm exec`/`pnpm dlx`/`pnpm exec`/`yarn dlx` run a downloaded
-		// package binary: an unvetted code path, block for strict roles.
-		// The verb must be the first non-flag operand (npmFamilyExecSub):
-		// `npm view exec pig`'s `exec` is a `view` field, while
-		// `npm --prefix /tmp exec pig` still counts.
-		if sub := npmFamilyExecSub(args); sub != "" {
-			return base + " " + sub
+		// npm/pnpm/yarn run under the same finite accept grammar as the
+		// sub-agent screen (parseNpmFamilyArgv): an argv that does not fit
+		// the grammar Rejects here too (fail closed — the value slot of an
+		// unlisted option could masquerade as a read-only verb), the
+		// exec/dlx verbs fetch-and-run unvetted code, and the remaining
+		// verbs hit the write table. A flag-only or other-verb argv falls
+		// through unchanged.
+		switch r := parseNpmFamilyArgv(base, args); r.state {
+		case npmArgvReject:
+			return base + " " + r.reason
+		case npmArgvExec:
+			return base + " " + r.verb
+		default:
+			if r.verb != "" && npmFamilyWriteSubs[r.verb] {
+				return base + " " + r.verb
+			}
 		}
 	case "npx", "bunx", "pnpx":
 		return base // package-runner: always executes a fetched binary

@@ -519,6 +519,97 @@ func TestRT_A9_NpmExecCallAndViewField(t *testing.T) {
 	}
 }
 
+// R6-npm-model: the npm/pnpm/yarn argv screen is one finite accept
+// grammar (parseNpmFamilyArgv): the first positional locks the verb,
+// unlisted options/-c/--call Reject, the exec/dlx child recurses whole
+// through the shared peel budget, and an exec without a child fails
+// closed. want: "" = allow for a worker sub-agent; non-empty = block.
+func TestRT_A9_NpmArgvModel(t *testing.T) {
+	words := func(s string) []string { return strings.Fields(s) }
+	// (npm exec --)×23 + tsc: stays inside peelChainMaxDepth (24).
+	deepNpm := append([]string{}, func() []string {
+		var a []string
+		for i := 0; i < 23; i++ {
+			a = append(a, "npm", "exec", "--")
+		}
+		return a
+	}()...)
+	deepNpm = append(deepNpm, "tsc")
+	// (npm exec -- npx)×13 + tsc: 26 nested hops exceed the budget.
+	deepNpx := append([]string{}, func() []string {
+		var a []string
+		for i := 0; i < 13; i++ {
+			a = append(a, "npm", "exec", "--", "npx")
+		}
+		return a
+	}()...)
+	deepNpx = append(deepNpx, "tsc")
+
+	cases := []struct {
+		name string
+		argv []string
+		want string // "" allow, else block
+	}{
+		{"npm-install", words("npm install"), ""},
+		{"npm-run-build", words("npm run build"), ""},
+		{"npm-version", words("npm --version"), ""},
+		{"npm-exec-tsc", words("npm exec tsc"), ""},
+		{"pnpm-dlx-vitest", words("pnpm dlx vitest"), ""},
+		{"npm-view-exec-pig", words("npm view exec pig"), ""},
+		{"npm-view-exec-field", words("npm view exec bin.version"), ""},
+		{"npm-prefix-exec-pig", words("npm --prefix /tmp exec pig"), "B"},
+		{"npm-prefixeq-exec-pig", words("npm --prefix=/tmp exec pig"), "B"},
+		{"npm-exec-calleq-pig", words("npm exec --call=pig"), "B"},
+		{"npm-exec-call-pig", words("npm exec --call pig"), "B"},
+		{"npm-exec-c-pig", words("npm exec -c pig"), "B"},
+		{"npm-exec-cpig", words("npm exec -cpig"), "B"},
+		{"pnpm-dlx-calleq-pig", words("pnpm dlx --call=pig"), "B"},
+		{"npm-tag-exec-pig", words("npm --tag latest exec pig"), "B"},
+		{"npm-tag-exec-tsc", words("npm --tag latest exec tsc"), ""},
+		{"npm-exec-nested-npm-pig", words("npm exec -- npm exec pig"), "B"},
+		{"npm-unknown-opt-pig", words("npm --future-root /x exec pig"), "B"},
+		{"npm-unknown-opteq-tsc", words("npm --future-root=/x exec tsc"), "B"},
+		{"npm-strict-exec-pig", words("npm --strict exec pig"), "B"},
+		{"npm-strict-exec-tsc", words("npm --strict exec tsc"), "B"},
+		{"npm-yw-cluster-pig", words("npm -yw /tmp exec pig"), "B"},
+		{"pnpm-w-exec-pig", words("pnpm -w exec pig"), "B"},
+		{"npm-exec-tsc-call-tail", words("npm exec -- tsc --call=pig"), ""},
+		{"npm-exec-tsc-exec-tail", words("npm exec -- tsc exec pig"), ""},
+		{"npm-exec-nested-call", words("npm exec -- npm exec --call=pig"), "B"},
+		{"npm-exec-npx-pig", words("npm exec -- npx pig"), "B"},
+		{"npm-exec-sh-c-pig", words("npm exec -- sh -c pig"), "B"},
+		{"npm-exec-package-pig-tsc", words("npm exec --package=pig -- tsc"), "B"},
+		{"npm-exec-package-ts-tsc", words("npm exec --package=typescript -- tsc"), ""},
+		{"npm-yes-sep-false-pig", words("npm --yes false exec pig"), "B"},
+		{"npm-yeseq-false-tsc", words("npm --yes=false exec tsc"), ""},
+		{"npm-prefix-missing-val", words("npm --prefix"), "B"},
+		{"npm-exec-bare", words("npm exec"), "B"},
+		{"deep-npm-exec-23", deepNpm, ""},
+		{"deep-npx-chain-13", deepNpx, "B"},
+	}
+	for _, tc := range cases {
+		want := tc.want != ""
+		cmd := strings.Join(tc.argv, " ")
+		if rule, detail := rtCmdRule("worker", "", cmd, ""); (rule != "") != want {
+			t.Errorf("cmd %q: got (%q,%q), want allow=%v", cmd, rule, detail, !want)
+		} else {
+			t.Logf("cmd %q: %s %s", cmd, map[bool]string{true: "BLOCK", false: "ALLOW"}[rule != ""], detail)
+		}
+		if rule, detail := rtArgvRule("worker", "", tc.argv, ""); (rule != "") != want {
+			t.Errorf("argv %q: got (%q,%q), want allow=%v", cmd, rule, detail, !want)
+		}
+	}
+	// Strict read-only twin path (screenReadonlyWriteAlias): an option
+	// whose value slot hides the verb must not fool the write table —
+	// the same parser Rejects it instead of reading `/tmp` as the verb.
+	if hit := screenReadonlyWriteAlias([]string{"npm", "--prefix", "/tmp", "run", "build"}, "npm",
+		[]string{"--prefix", "/tmp", "run", "build"}); hit == "" {
+		t.Error("readonly npm --prefix /tmp run build: got ALLOW, want block")
+	} else {
+		t.Logf("readonly npm --prefix /tmp run build: BLOCK %s", hit)
+	}
+}
+
 // A-1: ssh remote stdin vehicle is narrowed to pure shells; read-only
 // callers lose piped ssh exfiltration and StrictHostKeyChecking without
 // UserKnownHostsFile=/dev/null.
