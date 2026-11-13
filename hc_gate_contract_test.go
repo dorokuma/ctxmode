@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -300,35 +299,39 @@ func TestT_EX2_ArgvLiteralVsShell(t *testing.T) {
 	}
 }
 
+// TestT_EF1_ExecuteFilePrepareThenInject asserts the prepare+inject
+// ordering contract: prepareCtxRunShellWithTaint must NOT block on
+// FILE_CONTENT as data (taint marks it dynamic, the text slot accepts a
+// guaranteed-single-arg word), and injectFileContent must splice the
+// content above the prepared code. The full delivery path (stub receives
+// the hostile body verbatim and embedded fragments never run) is covered
+// by TestT_EF1_HostileFileContent in hc_gate_e2e_test.go.
 func TestT_EF1_ExecuteFilePrepareThenInject(t *testing.T) {
-	dir := t.TempDir()
-	report := filepath.Join(dir, "report.txt")
 	body := "line with `hc kill t1` and $(pig) and 'a'\\''b' and \"$HOME\"\n中文多行\n"
-	if err := os.WriteFile(report, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	os.Setenv("CTXMODE_ROLE", "worker")
 	defer os.Unsetenv("CTXMODE_ROLE")
 
-	s, _ := auditTestServer(t)
-	_, out, err := s.toolExecuteFile(context.Background(), nil, executeFileArgs{
-		Path:     report,
-		Language: "shell",
-		Code:     `hc send t11j "$FILE_CONTENT"`,
-	})
-	// Without a real hc on PATH under gate, execution may fail at runtime;
-	// the important invariant is prepare+inject ordering did not block on
-	// FILE_CONTENT data and did not execute backticks from the file.
-	if err != nil {
-		// Accept guard-pass but exec failure against missing gate target in CI.
-		if strings.Contains(err.Error(), "subagent_nested_agent") &&
-			strings.Contains(err.Error(), "hc send") &&
-			!strings.Contains(err.Error(), "FILE_CONTENT") {
-			// prepare may fail if selfExe unresolved in tests — soft check
-			t.Logf("execute_file err (may be env): %v", err)
-			return
-		}
-		t.Logf("execute_file result err=%v out=%v", err, out)
+	g := currentGuardCall()
+	prep := g.prepareCtxRunShellWithTaint(`hc send t11j "$FILE_CONTENT"`, map[string]bool{"FILE_CONTENT": true})
+	if prep.rule != "" {
+		t.Fatalf("prepare with FILE_CONTENT taint blocked: %s (%s)", prep.rule, prep.detail)
+	}
+	if !strings.Contains(prep.execCode, "--hc-gate") {
+		t.Fatalf("expected --hc-gate rewrite, got %q", prep.execCode)
+	}
+	if !strings.Contains(prep.execCode, "$FILE_CONTENT") {
+		t.Fatalf("FILE_CONTENT word lost in %q", prep.execCode)
+	}
+	injected := injectFileContent("shell", prep.execCode, body)
+	if !strings.HasSuffix(injected, "\n"+prep.execCode) {
+		t.Fatalf("injected code lost prepared suffix: %q", injected)
+	}
+	if !strings.HasPrefix(injected, "FILE_CONTENT=") {
+		t.Fatalf("missing FILE_CONTENT decl: %q", injected)
+	}
+	verdict, rule := screenShellBlock(injected)
+	if verdict == shellBlock {
+		t.Fatalf("injected code blocked: %s", rule)
 	}
 }
 

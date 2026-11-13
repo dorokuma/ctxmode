@@ -21,6 +21,23 @@ import (
 // It uses os.Setenv rather than t.Setenv on purpose: TestMain has no *testing.T,
 // and t.Setenv only works inside a test (it registers a cleanup with that test).
 func TestMain(m *testing.M) {
+	// Restore the test-only trusted-home pin BEFORE the --hc-gate short-
+	// circuit: a --hc-gate child of this binary is a fresh process whose
+	// package-level testTrustedHomeRoot is empty, so the fake test home
+	// (under /tmp) would otherwise look like scratch and the gate would
+	// fall through to the REAL hc on PATH. CTXMODE_TEST_TRUSTED_HOME is a
+	// test-binary-only escape hatch; production builds never see it.
+	if v := os.Getenv("CTXMODE_TEST_TRUSTED_HOME"); v != "" {
+		testTrustedHomeRoot = v
+	}
+	// --hc-gate short-circuit: contract e2e tests rewrite `hc send` to
+	// `<selfExe> --hc-gate send ...`, and selfExe is THIS test binary, so
+	// exec'ing it must reach runHcGate exactly like the real ctxmode main
+	// does. Without this branch the spawned copy would try to run the go
+	// test flag parser on the gate argv and the delivery chain would break.
+	if len(os.Args) >= 2 && os.Args[1] == "--hc-gate" {
+		os.Exit(runHcGate(os.Args[2:]))
+	}
 	dir, err := os.MkdirTemp("", "ctxmode-audit-test")
 	if err != nil {
 		os.Exit(1)
