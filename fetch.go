@@ -42,6 +42,7 @@ type fetchResultData struct {
 	chunkCount int
 	truncated  bool
 	indexError string
+	cached     bool
 }
 
 // ---------- data types ----------
@@ -712,41 +713,12 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 	cacheSource := source + "|" + format
 
 	if !skipCacheRead {
-		cached, err := s.store.GetCached(rawURL, cacheSource)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "cache lookup error: %v\n", err)
-		}
-		if cached != nil {
-			age := time.Now().Unix() - cached.FetchedAt
-			if time.Duration(age)*time.Second < effectiveTTL {
-				result.Content = cached.Content
-				result.Cached = true
-				result.ChunkCount = countChunks(cached.Content)
-
-				// The cache can outlive the indexed documents (e.g. after a
-				// purge). Verify the document for this exact format still exists
-				// in the KB and re-index it when missing, otherwise we'd report
-				// a cache hit for content that search cannot find. Only this
-				// format's document is checked/backfilled.
-				docPath := s.fetchDocPath(source, format, rawURL)
-				count, err := s.store.CountExactAndChunks(docPath)
-				if err != nil || count == 0 {
-					if _, err := s.indexContentLocked(docPath, cached.Content); err != nil {
-						result.IndexError = fmt.Sprintf("cache hit re-index failed: %v", err)
-						fmt.Fprintf(os.Stderr, "cache hit re-index failed for %q: %v\n", docPath, err)
-						// The cached plaintext was refused by the index fence (it holds secrets,
-						// or the row was written before the fence existed). Drop the row so the
-						// rejected plaintext cannot linger for the full cache TTL or be served
-						// again through the cache later.
-						s.mu.Lock()
-						if derr := s.store.DeleteCached(rawURL, cacheSource); derr != nil {
-							fmt.Fprintf(os.Stderr, "cache delete failed: %v\n", derr)
-						}
-						s.mu.Unlock()
-					}
-				}
-				return result, nil
-			}
+		if data, ok := s.lookupFreshCache(rawURL, source, format, cacheSource, effectiveTTL); ok {
+			result.Content = data.content
+			result.Cached = data.cached
+			result.ChunkCount = data.chunkCount
+			result.IndexError = data.indexError
+			return result, nil
 		}
 	}
 
@@ -794,76 +766,150 @@ func (s *server) fetchAndIndex(ctx context.Context, rawURL, source, format strin
 	}
 
 	// skipCacheWrite=false: use singleflight to merge concurrent fetches.
-	sfKey := rawURL + "|" + cacheSource
-	sfResult, err, _ := fetchGroup.Do(sfKey, func() (interface{}, error) {
-		// Use a context that does not inherit the caller's cancel: when the
-		// first caller of a shared singleflight key times out or is cancelled,
-		// later callers waiting on the same key must not be cancelled with it.
-		// An independent timeout is still applied by fetchURL below.
-		sfCtx := context.WithoutCancel(ctx)
-
-		body, contentType, truncated, err := s.fetchURL(sfCtx, requestURL, timeout)
-		if err != nil {
-			// Error results still carry their state through the shared return
-			// value (singleflight hands the same value to every waiter), so all
-			// callers agree on Truncated instead of reading a closure-outer local.
-			return &fetchResultData{truncated: truncated}, fmt.Errorf("fetch failed: %s", redactUserinfoInText(err.Error()))
+	// Re-check the TTL cache inside fetchGroup.Do (when !skipCacheRead) to close
+	// the check-then-act gap where a caller misses GetCached before an earlier
+	// flight writes SetCache and enters Do after that flight has already exited.
+	// If a force=true caller (skipCacheRead=true) coalesces onto a non-forced
+	// flight that satisfied Do from cache, retry on a force-scoped key so force
+	// always performs an origin re-fetch.
+	baseSFKey := rawURL + "|" + cacheSource
+	for attempt := 0; attempt < 2; attempt++ {
+		sfKey := baseSFKey
+		if attempt > 0 {
+			sfKey = baseSFKey + "|force"
 		}
-
-		content, err := processContent(body, contentType, format, truncated)
-		if err != nil {
-			return &fetchResultData{truncated: truncated}, fmt.Errorf("content processing failed: %w", err)
-		}
-
-		// Index into store: clear stale chunks for this source:format:url first
-		// so a re-fetch with fewer chunks does not leave old chunks searchable.
-		docPath := s.fetchDocPath(source, format, rawURL)
-		chunkCount, indexErr := s.indexContentLocked(docPath, content)
-		var indexErrString string
-		if indexErr != nil {
-			indexErrString = indexErr.Error()
-			fmt.Fprintf(os.Stderr, "index %q failed: %v\n", docPath, indexErr)
-		}
-
-		// Write to cache (with mutex protection) -- but never when indexing
-		// was rejected (indexErr != nil, e.g. the sensitive-content fence):
-		// caching rejected plaintext would persist it for the whole cache TTL
-		// and let it resurrect into the KB through the cache-hit re-index
-		// path. indexErrString still travels to the caller unchanged.
-		// When indexing was rejected, also drop any existing cache row for
-		// this URL: skipping SetCache only stops new writes, while a row
-		// written before the fence existed (or by an older version) would
-		// otherwise linger until the 7-day TTL and resurrect through the
-		// cache-hit re-index path.
-		s.mu.Lock()
-		if indexErr == nil {
-			if err := s.store.SetCache(rawURL, cacheSource, content); err != nil {
-				fmt.Fprintf(os.Stderr, "cache write failed: %v\n", err)
+		sfResult, err, _ := fetchGroup.Do(sfKey, func() (interface{}, error) {
+			if !skipCacheRead {
+				if cachedData, ok := s.lookupFreshCache(rawURL, source, format, cacheSource, effectiveTTL); ok {
+					return cachedData, nil
+				}
 			}
-			_ = s.store.PruneCache(7 * 24 * time.Hour)
-		} else if derr := s.store.DeleteCached(rawURL, cacheSource); derr != nil {
-			fmt.Fprintf(os.Stderr, "cache delete failed: %v\n", derr)
-		}
-		s.mu.Unlock()
 
-		return &fetchResultData{content: content, chunkCount: chunkCount, truncated: truncated, indexError: indexErrString}, nil
-	})
-	if err != nil {
-		result.Error = redactUserinfoInText(err.Error())
-		// The error's state travels in the shared singleflight return value, so
-		// the executing caller and every waiter see the same Truncated value.
-		if data, ok := sfResult.(*fetchResultData); ok {
-			result.Truncated = data.truncated
+			// Use a context that does not inherit the caller's cancel: when the
+			// first caller of a shared singleflight key times out or is cancelled,
+			// later callers waiting on the same key must not be cancelled with it.
+			// An independent timeout is still applied by fetchURL below.
+			sfCtx := context.WithoutCancel(ctx)
+
+			body, contentType, truncated, err := s.fetchURL(sfCtx, requestURL, timeout)
+			if err != nil {
+				// Error results still carry their state through the shared return
+				// value (singleflight hands the same value to every waiter), so all
+				// callers agree on Truncated instead of reading a closure-outer local.
+				return &fetchResultData{truncated: truncated}, fmt.Errorf("fetch failed: %s", redactUserinfoInText(err.Error()))
+			}
+
+			content, err := processContent(body, contentType, format, truncated)
+			if err != nil {
+				return &fetchResultData{truncated: truncated}, fmt.Errorf("content processing failed: %w", err)
+			}
+
+			// Index into store: clear stale chunks for this source:format:url first
+			// so a re-fetch with fewer chunks does not leave old chunks searchable.
+			docPath := s.fetchDocPath(source, format, rawURL)
+			chunkCount, indexErr := s.indexContentLocked(docPath, content)
+			var indexErrString string
+			if indexErr != nil {
+				indexErrString = indexErr.Error()
+				fmt.Fprintf(os.Stderr, "index %q failed: %v\n", docPath, indexErr)
+			}
+
+			// Write to cache (with mutex protection) -- but never when indexing
+			// was rejected (indexErr != nil, e.g. the sensitive-content fence):
+			// caching rejected plaintext would persist it for the whole cache TTL
+			// and let it resurrect into the KB through the cache-hit re-index
+			// path. indexErrString still travels to the caller unchanged.
+			// When indexing was rejected, also drop any existing cache row for
+			// this URL: skipping SetCache only stops new writes, while a row
+			// written before the fence existed (or by an older version) would
+			// otherwise linger until the 7-day TTL and resurrect through the
+			// cache-hit re-index path.
+			s.mu.Lock()
+			if indexErr == nil {
+				if err := s.store.SetCache(rawURL, cacheSource, content); err != nil {
+					fmt.Fprintf(os.Stderr, "cache write failed: %v\n", err)
+				}
+				_ = s.store.PruneCache(7 * 24 * time.Hour)
+			} else if derr := s.store.DeleteCached(rawURL, cacheSource); derr != nil {
+				fmt.Fprintf(os.Stderr, "cache delete failed: %v\n", derr)
+			}
+			s.mu.Unlock()
+
+			return &fetchResultData{content: content, chunkCount: chunkCount, truncated: truncated, indexError: indexErrString}, nil
+		})
+		if err != nil {
+			result.Error = redactUserinfoInText(err.Error())
+			// The error's state travels in the shared singleflight return value, so
+			// the executing caller and every waiter see the same Truncated value.
+			if data, ok := sfResult.(*fetchResultData); ok {
+				result.Truncated = data.truncated
+			}
+			return result, nil
 		}
+		data := sfResult.(*fetchResultData)
+		if skipCacheRead && data.cached {
+			continue
+		}
+		result.Content = data.content
+		result.Cached = data.cached
+		result.ChunkCount = data.chunkCount
+		result.Truncated = data.truncated
+		result.IndexError = data.indexError
+
 		return result, nil
 	}
-	data := sfResult.(*fetchResultData)
-	result.Content = data.content
-	result.ChunkCount = data.chunkCount
-	result.Truncated = data.truncated
-	result.IndexError = data.indexError
 
 	return result, nil
+}
+
+// lookupFreshCache checks the TTL cache under s.mu and backfills the KB document
+// for this exact format if a prior purge removed it while the cache row survived.
+func (s *server) lookupFreshCache(rawURL, source, format, cacheSource string, effectiveTTL time.Duration) (*fetchResultData, bool) {
+	s.mu.Lock()
+	cached, err := s.store.GetCached(rawURL, cacheSource)
+	s.mu.Unlock()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cache lookup error: %v\n", err)
+	}
+	if cached == nil {
+		return nil, false
+	}
+	age := time.Now().Unix() - cached.FetchedAt
+	if time.Duration(age)*time.Second >= effectiveTTL {
+		return nil, false
+	}
+
+	data := &fetchResultData{
+		content:    cached.Content,
+		cached:     true,
+		chunkCount: countChunks(cached.Content),
+	}
+
+	// The cache can outlive the indexed documents (e.g. after a
+	// purge). Verify the document for this exact format still exists
+	// in the KB and re-index it when missing, otherwise we'd report
+	// a cache hit for content that search cannot find. Only this
+	// format's document is checked/backfilled.
+	docPath := s.fetchDocPath(source, format, rawURL)
+	s.mu.Lock()
+	count, err := s.store.CountExactAndChunks(docPath)
+	s.mu.Unlock()
+	if err != nil || count == 0 {
+		if _, err := s.indexContentLocked(docPath, cached.Content); err != nil {
+			data.indexError = fmt.Sprintf("cache hit re-index failed: %v", err)
+			fmt.Fprintf(os.Stderr, "cache hit re-index failed for %q: %v\n", docPath, err)
+			// The cached plaintext was refused by the index fence (it holds secrets,
+			// or the row was written before the fence existed). Drop the row so the
+			// rejected plaintext cannot linger for the full cache TTL or be served
+			// again through the cache later.
+			s.mu.Lock()
+			if derr := s.store.DeleteCached(rawURL, cacheSource); derr != nil {
+				fmt.Fprintf(os.Stderr, "cache delete failed: %v\n", derr)
+			}
+			s.mu.Unlock()
+		}
+	}
+	return data, true
 }
 
 // countChunks counts how many chunks a content would produce (for reporting).
