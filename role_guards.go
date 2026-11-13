@@ -11990,37 +11990,6 @@ func pythonStdlibWriteTailHit(code, masked string) string {
 	return ""
 }
 
-// singleArgDotReplace reports whether masked code calls `.replace(` with a
-// single positional operand — the filesystem RENAME signature (Python
-// Path.replace(target), JS fsp.rename-style single-target call).
-// str.replace(old, new[, count]) and JS str.replace(pat, repl) take at
-// least two operands and stay free.
-func singleArgDotReplace(masked string) bool {
-	idx := 0
-	for {
-		j := strings.Index(masked[idx:], ".replace(")
-		if j < 0 {
-			return false
-		}
-		pos := idx + j
-		openParen := pos + len(".replace")
-		lo, hi, closed := callInnerBounds(masked, openParen)
-		if !closed {
-			return true // unclosed .replace( — fail closed
-		}
-		argc := 0
-		for _, p := range splitCallArgs(masked[lo:hi]) {
-			if strings.TrimSpace(p) != "" {
-				argc++
-			}
-		}
-		if argc <= 1 {
-			return true
-		}
-		idx = openParen + 1
-	}
-}
-
 // jsFsOpenWriteHit checks JS/TS fs.openSync/fs.open/fsPromises.open call
 // sites: a SECOND argument containing 'w'/'a'/'x'/'+' or an O_WRONLY /
 // O_RDWR / O_CREAT / O_TRUNC / O_APPEND constant — or a non-literal mode
@@ -12317,43 +12286,6 @@ func isIdentName(s string) bool {
 		}
 	}
 	return true
-}
-
-// splitCallArgs splits a call's argument text on top-level commas, honouring
-// quotes and bracket nesting.
-func splitCallArgs(args string) []string {
-	var out []string
-	depth := 0
-	inStr := byte(0)
-	start := 0
-	for i := 0; i < len(args); i++ {
-		c := args[i]
-		if inStr != 0 {
-			if c == '\\' {
-				i++
-				continue
-			}
-			if c == inStr {
-				inStr = 0
-			}
-			continue
-		}
-		switch c {
-		case '\'', '"':
-			inStr = c
-		case '(', '[', '{':
-			depth++
-		case ')', ']', '}':
-			depth--
-		case ',':
-			if depth == 0 {
-				out = append(out, args[start:i])
-				start = i + 1
-			}
-		}
-	}
-	out = append(out, args[start:])
-	return out
 }
 
 // leadingStringLiteral extracts a quoted string literal's contents and
@@ -14792,9 +14724,7 @@ func (t sroPyTok) isId(v string) bool {
 }
 
 func sroNormNL(code string) string {
-	if strings.HasPrefix(code, "\xef\xbb\xbf") {
-		code = code[3:]
-	}
+	code = strings.TrimPrefix(code, "\xef\xbb\xbf")
 	if strings.IndexByte(code, '\r') < 0 {
 		return code
 	}
@@ -15648,10 +15578,6 @@ func sroPyCheckDbmOpenArgs(args []sroPyCallArg) (string, bool) {
 		}
 	}
 	return "", true
-}
-
-func sroPyCheckOpenArgs(args []sroPyCallArg, isBuiltinOrFileIO, allowTarStream bool) (string, bool) {
-	return sroPyCheckOpenArgsExt(args, isBuiltinOrFileIO, allowTarStream, false, false, false)
 }
 
 func sroPyCheckOpenArgsExt(args []sroPyCallArg, isBuiltinOrFileIO, allowTarStream, isMethod, isDbm, isLegacyModOpen bool) (string, bool) {
