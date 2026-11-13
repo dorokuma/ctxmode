@@ -27,10 +27,15 @@ func allowlistDetail(reason string) string {
 
 // cmdAllow is the allowlist entry for one command basename.
 type cmdAllow struct {
-	shortBool  string          // bytes of allowed boolean short opts
-	shortValue string          // bytes of short opts that take a value
-	longBool   map[string]bool // --flag
-	longValue  map[string]bool // --flag VAL / --flag=VAL
+	shortBool  string // bytes of allowed boolean short opts
+	shortValue string // bytes of short opts that take a value
+	// shortOptNum: optional numeric short opts (journalctl -n [N] / -nN):
+	// glued tail must be [+]digits or "all"; separate next argv is consumed
+	// ONLY when it is [+]digits or "all", so bare `journalctl -n --rotate`
+	// never swallows `--rotate` while `journalctl -n -u -.mount` stays allowed.
+	shortOptNum string
+	longBool    map[string]bool // --flag
+	longValue   map[string]bool // --flag VAL / --flag=VAL
 	// longEqOnly: --flag=VAL only — the value MUST be glued (journalctl
 	// --lines=N); a bare --flag stays a flag and must not consume the next
 	// argv as a value (a bare `journalctl --lines` would otherwise smuggle
@@ -314,7 +319,7 @@ func init() {
 		[]string{"all", "numeric", "tcp", "udp", "listening", "processes", "resolve",
 			"extended", "options", "memory", "info", "summary", "help", "version", "ipv4", "ipv6"},
 		[]string{"query", "family", "filter"})
-	readonlyAllowlist["journalctl"] = simple("exqrb", "uSon",
+	readonlyAllowlist["journalctl"] = simple("exqrb", "uSo",
 		[]string{"no-pager", "catalog", "disk-usage", "help", "version", "list-boots",
 			"reverse", "utc", "quiet", "pager-end", "merge", "system", "user",
 			"dmesg", "boot"},
@@ -323,6 +328,9 @@ func init() {
 	// journalctl --lines takes an OPTIONAL argument: only --lines=N is
 	// safe — a bare --lines leaves the next argv (e.g. --rotate,
 	// --vacuum-size=1) free to execute. -n N / -nN / --lines=N pass.
+	// -n uses shortOptNum so bare `journalctl -n --rotate` does not swallow
+	// --rotate, while `journalctl -n -u -.mount` still works.
+	readonlyAllowlist["journalctl"].shortOptNum = "n"
 	readonlyAllowlist["journalctl"].longEqOnly = longSet("lines")
 	readonlyAllowlist["systemctl"] = &cmdAllow{
 		shortBool: "qal",
@@ -1270,12 +1278,12 @@ func screenReadonlyAllowlist(argv []string) string {
 	if strings.Contains(argv[0], "/") {
 		return "path command"
 	}
-	// Key on the TYPED basename: the g-prefixed GNU names (gfind, gawk,
-	// gsed, ...) are in the allowlist explicitly, and stripping the 'g'
-	// here would smuggle real unrelated tools (gps, ghc) through the
-	// ps/hc entries. Resolved-alias canonicalisation happens separately
-	// in peelResolvedSegDepth.
-	base := filepath.Base(argv[0])
+	// Normalize through canonicalResolvedBase (backed by the closed
+	// gnuCanonicalSet): real Homebrew GNU names (gfind, ggrep, gls, gsed, ...)
+	// map to their canonical allowlist entries without mutating readonlyAllowlist
+	// keys, while unrelated tools (gps, ghc, gss) are NOT in gnuCanonicalSet
+	// and remain unknown commands.
+	base := canonicalResolvedBase(filepath.Base(argv[0]))
 	switch base {
 	case "eval", "exec", "source", ".", "coproc", "nohup":
 		return base
@@ -1302,7 +1310,8 @@ func screenReadonlyAllowlist(argv []string) string {
 		return "unknown command " + base
 	}
 	if entry.check != nil && entry.shortBool == "" && entry.shortValue == "" &&
-		len(entry.longBool) == 0 && len(entry.longValue) == 0 {
+		entry.shortOptNum == "" && len(entry.longBool) == 0 && len(entry.longValue) == 0 &&
+		len(entry.longEqOnly) == 0 && len(entry.longTwoValue) == 0 {
 		return entry.check(argv)
 	}
 	if hit := scanAllowedOpts(argv[1:], entry); hit != "" {
@@ -1403,6 +1412,18 @@ func scanAllowedOpts(args []string, entry *cmdAllow) string {
 			if strings.IndexByte(entry.shortBool, ch) >= 0 {
 				continue
 			}
+			if strings.IndexByte(entry.shortOptNum, ch) >= 0 {
+				if j+1 < len(a) {
+					if !optNumValueOK(a[j+1:]) {
+						return "unknown option -" + string(ch)
+					}
+					break
+				}
+				if i+1 < len(args) && optNumValueOK(args[i+1]) {
+					i++
+				}
+				break
+			}
 			if strings.IndexByte(entry.shortValue, ch) >= 0 {
 				if j+1 < len(a) {
 					break // glued value in rest of cluster
@@ -1436,17 +1457,16 @@ func readonlyPrePeelHit(argv []string) string {
 			i++
 			continue
 		}
-		switch a {
+		canon := canonicalResolvedBase(a)
+		switch canon {
 		case "exec", "eval", "source", ".", "coproc", "nohup":
-			return a
+			return canon
 		case "function":
 			return "function definition"
 		case "env", "command", "builtin", "nice", "timeout", "stdbuf", "busybox",
 			"ionice", "taskset", "chrt", "strace", "ltrace", "setsid", "time":
-			return a
+			return canon
 		case "sbx":
-			// Default-deny wording preserved for the strict-readonly path
-			// ([pattern:sbx-wrapper-unwrap-asymmetry]).
 			return "unknown command sbx"
 		case "if", "then", "elif", "else", "while", "until", "do", "!",
 			"fi", "done", "for", "in", "case", "esac", "select", "[[", "]]":

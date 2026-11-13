@@ -582,14 +582,14 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 		if isAssignWord(a) {
 			envAs.addAssign(a)
 			i++
-			depth-- // bare KEY=VAL prefixes do not consume a wrapper step
+			depth--
 			continue
 		}
 		if shellNoopWords[a] {
 			if i+1 >= len(argv) {
-				return argv[len(argv):], splitPayloads, envAs, false // trailing `}`/`fi`/`done`
+				return argv[len(argv):], splitPayloads, envAs, false
 			}
-			i++ // leading `{` / `(` group opener: peel to the inner head
+			i++
 			depth--
 			continue
 		}
@@ -602,17 +602,10 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 			continue
 		}
 		if isDynamicArg(a) {
-			// Dynamic word in head position: stop peeling so peelResolvedSegDepth
-			// can return "dynamic command head". Wrapper option loops have their
-			// own isDynamicArg->exhausted checks.
 			return argv[i:], splitPayloads, envAs, false
 		}
 		switch filepath.Base(a) {
 		case "time":
-			// Bash reserved word AND /usr/bin/time: peel its options
-			// (-p/-v/--verbose/--portability/-a boolean; -o FILE/--output
-			// FILE/-f FMT/--format FMT two-slot; --output=*/--format=*
-			// single-slot) so `time -v pig` peels to `pig`.
 			i++
 			for i < len(argv) {
 				a := argv[i]
@@ -627,27 +620,24 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 					break
 				}
 				if a == "-o" || a == "--output" || a == "-f" || a == "--format" {
-					i += 2 // separate value
+					if i+1 < len(argv) && isDynamicArg(argv[i+1]) {
+						return argv[i:], splitPayloads, envAs, true
+					}
+					i += 2
 					continue
 				}
-				i++ // -p/-v/-a/--verbose/--portability/--output=*/--format=*
+				i++
 			}
 		case "env":
 			i++
 			rest, payloads, ea := skipEnvOperands(argv, i, envAs)
 			envAs = ea
 			splitPayloads = append(splitPayloads, payloads...)
-			// -S re-parses payload words INTO argv: continue peeling on the
-			// residual argv (may be a new slice when -S injected words).
 			argv = rest
 			i = 0
 		case "command":
 			start := i
 			i++
-			// `command` followed by a pure query option run (-v/-V, with
-			// optional -p) reports the command path/type without executing
-			// it: keep `command` as the resolved head so peelResolvedDepth
-			// can allow it outright. Anything else peels to the real head.
 			if isCommandQuery(argv[i:]) {
 				return argv[start:], splitPayloads, envAs, false
 			}
@@ -659,8 +649,6 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 			}
 			i = skipDashDash(argv, i)
 		case "builtin":
-			// builtin has no -v/-V query semantics: it always wraps a real
-			// builtin name, so peel its option run to the command head.
 			i++
 			for i < len(argv) && strings.HasPrefix(argv[i], "-") && argv[i] != "--" {
 				if isDynamicArg(argv[i]) {
@@ -680,9 +668,6 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 			i++
 			i = skipDashDash(argv, i)
 		case "setsid":
-			// setsid [-c|-f|-w|--ctty|--fork|--wait] [--] cmd: its short
-			// options are all boolean single-slot flags; peel until `--` or
-			// the first non-option operand (the command).
 			i++
 			for i < len(argv) {
 				a := argv[i]
@@ -699,8 +684,6 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 				i++
 			}
 		case "nice":
-			// nice [-n N|--adjustment N|-N|--adjustment=N] [--] cmd: loop
-			// through every leading option, not just the first.
 			i++
 			for i < len(argv) {
 				a := argv[i]
@@ -721,7 +704,7 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 					i += 2 // separate value
 					continue
 				}
-				i++ // -nN / -n-N / --adjustment=N / -N glued level / boolean
+				i++
 			}
 		case "timeout":
 			i++
@@ -761,25 +744,11 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 				return argv[i:], splitPayloads, envAs, true
 			}
 		case "sbx":
-			// sbx is a Go flag.FlagSet tool: single- AND double-dash option
-			// spellings work (-preset/--preset, -env/--env, --flag=val /
-			// -flag=val and the two-slot --flag val forms), and a bare `--`
-			// ends option parsing so the NEXT word is the inner command head.
-			// The flag table mirrors the real sbx parseArgs
-			// (pi-extensions/go/sandbox/cmd/sbx): value options
-			// preset/workdir/ro/rw/exec/reviewer/report-to/env, booleans
-			// deny-net/best-effort (+check/-version as pure queries below).
-			// Every other `-` word fails closed rather than guessing its
-			// arity — an unknown flag could consume the slot meant for the
-			// inner command and smuggle it past the head screens
-			// ([pattern:sbx-wrapper-unwrap-asymmetry]).
 			start := i
 			i++
 			if len(argv[start:]) == 2 &&
 				(isPureQueryInvocation(argv[start:]) || argv[start+1] == "-check" ||
 					argv[start+1] == "--check" || argv[start+1] == "-version") {
-				// `sbx -h`/`sbx --version`/`sbx --check`: prints and exits,
-				// nothing unwraps — keep `sbx` as the head like `command -v`.
 				return argv[start:], splitPayloads, envAs, false
 			}
 			for i < len(argv) {
@@ -792,10 +761,8 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 					return argv[i:], splitPayloads, envAs, true
 				}
 				if !strings.HasPrefix(a, "-") || a == "-" {
-					break // first operand: the inner command head
+					break
 				}
-				// Strip one or two leading dashes; Go's flag package accepts
-				// both, but three or more is not a flag spelling it recognises.
 				name := a
 				name = strings.TrimPrefix(name, "-")
 				name = strings.TrimPrefix(name, "-")
@@ -803,8 +770,6 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 					return argv[i:], splitPayloads, envAs, true
 				}
 				if strings.HasPrefix(name, "env=") {
-					// --env=KEY=VAL[,KEY=VAL...] glued form: screen each
-					// comma-split assignment like an env operand.
 					if !screenSbxEnvValue(name[len("env="):], &envAs) {
 						return argv[i:], splitPayloads, envAs, true
 					}
@@ -813,17 +778,11 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 				}
 				switch name {
 				case "env":
-					if i+1 >= len(argv) {
-						return argv[i:], splitPayloads, envAs, true
-					}
-					if !screenSbxEnvValue(argv[i+1], &envAs) {
+					if i+1 >= len(argv) || !screenSbxEnvValue(argv[i+1], &envAs) {
 						return argv[i:], splitPayloads, envAs, true
 					}
 					i += 2
 				case "preset", "workdir", "ro", "rw", "exec", "reviewer", "report-to":
-					// The value slot itself must be screened: a dynamic word
-					// consumed unchecked can split at runtime and shift the inner
-					// command out of its slot (M-REV-1).
 					if i+1 >= len(argv) || isDynamicArg(argv[i+1]) {
 						return argv[i:], splitPayloads, envAs, true
 					}
@@ -831,8 +790,6 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 				case "deny-net", "best-effort":
 					i++
 				default:
-					// Known =glued value options consume one slot; Go bool flags
-					// also accept the =glued spelling (--deny-net=false).
 					switch {
 					case strings.HasPrefix(name, "preset="), strings.HasPrefix(name, "workdir="),
 						strings.HasPrefix(name, "ro="), strings.HasPrefix(name, "rw="),
@@ -841,7 +798,7 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 						strings.HasPrefix(name, "deny-net="), strings.HasPrefix(name, "best-effort="):
 						i++
 					default:
-						return argv[i:], splitPayloads, envAs, true // unknown flag: fail closed
+						return argv[i:], splitPayloads, envAs, true
 					}
 				}
 			}
@@ -997,7 +954,17 @@ func skipTasksetArgs(argv []string, i int) (int, bool) {
 		}
 		switch {
 		case a == "--":
-			return i + 1, false
+			i++
+			if sawList {
+				return i, false
+			}
+			if i < len(argv) {
+				if isDynamicArg(argv[i]) {
+					return i, true
+				}
+				return i + 1, false
+			}
+			return i, false
 		case a == "-c" || a == "--cpu-list":
 			sawList = true
 			if i+1 < len(argv) && isDynamicArg(argv[i+1]) {
@@ -1030,7 +997,14 @@ func skipChrtArgs(argv []string, i int) (int, bool) {
 		}
 		switch {
 		case a == "--":
-			return i + 1, false
+			i++
+			if i < len(argv) {
+				if isDynamicArg(argv[i]) {
+					return i, true
+				}
+				return i + 1, false
+			}
+			return i, false
 		case a == "-p" || a == "--pid":
 			return len(argv), false // pid operand, no inner command
 		case strings.HasPrefix(a, "-"):
@@ -1107,12 +1081,18 @@ func skipFlockArgs(argv []string, i int) (int, string) {
 	for i < len(argv) {
 		a := argv[i]
 		if isDynamicArg(a) {
-			// Dynamic option/lock/command in flock zone → treat as code payload.
 			return len(argv), cmdSubPlaceholder
 		}
 		switch {
 		case a == "--":
-			return i + 1, ""
+			i++
+			if i < len(argv) {
+				if isDynamicArg(argv[i]) {
+					return len(argv), cmdSubPlaceholder
+				}
+				i++
+			}
+			return i, ""
 		case a == "-c" || a == "--command":
 			if i+1 < len(argv) {
 				return len(argv), argv[i+1]
@@ -1120,7 +1100,11 @@ func skipFlockArgs(argv []string, i int) (int, string) {
 			return len(argv), ""
 		case strings.HasPrefix(a, "--command="):
 			return len(argv), a[len("--command="):]
-		case a == "-w" || a == "--timeout" || a == "-E" || a == "--conflict-exit-code":
+		case a == "-w" || a == "--timeout" || a == "-E" || a == "--conflict-exit-code" ||
+			a == "-F" || a == "--fcntl" || a == "-d" || a == "--fd":
+			if i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
+				return len(argv), cmdSubPlaceholder
+			}
 			i += 2
 		case a == "-o" || a == "--close" || a == "-s" || a == "--shared" ||
 			a == "-x" || a == "--exclusive" || a == "-u" || a == "--unlock" ||
@@ -1129,7 +1113,7 @@ func skipFlockArgs(argv []string, i int) (int, string) {
 		case strings.HasPrefix(a, "-"):
 			i++
 		default:
-			i++ // lock operand (file or fd) consumed
+			i++
 			if i < len(argv) && (argv[i] == "-c" || argv[i] == "--command") {
 				if i+1 < len(argv) {
 					return len(argv), argv[i+1]
@@ -1139,7 +1123,7 @@ func skipFlockArgs(argv []string, i int) (int, string) {
 			if i < len(argv) && strings.HasPrefix(argv[i], "--command=") {
 				return len(argv), argv[i][len("--command="):]
 			}
-			return i, "" // argv-form command follows the lock operand
+			return i, ""
 		}
 	}
 	return i, ""
@@ -1488,12 +1472,9 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) ([]string, []st
 		case a == "--":
 			return argv[i+1:], payloads, envAs
 		case a == "-":
-			// GNU: a mere "-" implies -i (clear inherited environment).
 			envAs.ops = append(envAs.ops, envOp{kind: 'c'})
 			i++
 		case strings.HasPrefix(a, "--"):
-			// GNU unique-prefix long options. Ambiguous/unknown => fail-closed
-			// via envUnknownLong so subagent/readonly guards can reject.
 			name, val, hasVal := envSplitLong(a)
 			switch envMatchLong(name) {
 			case "ignore-environment":
@@ -1509,8 +1490,6 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) ([]string, []st
 					envAs.ops = append(envAs.ops, envOp{kind: 'u', key: argv[i+1]})
 					i += 2
 				} else {
-					// R1/M5: missing operand — GNU errors; fail closed and do
-					// NOT advance past the end (i+=2 would slice out of bounds).
 					payloads = append(payloads, envUnknownLongPrefix+"missing operand "+a)
 					i++
 				}
@@ -1518,16 +1497,16 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) ([]string, []st
 				if hasVal {
 					i++
 				} else if i+1 < len(argv) {
+					if isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
+						payloads = append(payloads, envUnknownLongPrefix+"dynamic option")
+						return argv[i+1:], payloads, envAs
+					}
 					i += 2
 				} else {
 					payloads = append(payloads, envUnknownLongPrefix+"missing operand "+a)
 					i++
 				}
 			case "split-string":
-				// GNU env -S/--split-string: the payload is re-parsed by env
-				// itself as its own argv — split it and feed the words back
-				// through the operand scanner so options, assignments and the
-				// real command head all resolve exactly like env (SH11 F5).
 				var payload string
 				havePayload := false
 				if hasVal {
@@ -1552,24 +1531,17 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) ([]string, []st
 					payloads = append(payloads, envUnknownLongPrefix+"-S/--split-string")
 					continue
 				}
-				// The -S argv restarts env's operand parse (options first),
-				// then the remaining real argv continues after it.
 				rest := append(append([]string{}, words...), argv[i:]...)
 				rem, moreP, envAs := skipEnvOperands(rest, 0, envAs)
 				payloads = append(payloads, moreP...)
 				return rem, payloads, envAs
 			case "block-signal", "default-signal", "ignore-signal":
-				// GNU optional_argument: only consume a value with '='.
 				i++
 			default:
-				// Unknown or ambiguous long option: record and consume one argv
-				// so the command head is not mistaken; guards see the marker.
 				payloads = append(payloads, envUnknownLongPrefix+a)
 				i++
 			}
 		case strings.HasPrefix(a, "-"):
-			// Character-by-character short-option cluster scan (GNU env).
-			// Boolean: i/0/v; value: u/C/S/a (rest of cluster or next argv).
 			consumedNext := false
 			unknown := false
 			for j := 1; j < len(a); j++ {
@@ -1577,7 +1549,6 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) ([]string, []st
 				case 'i':
 					envAs.ops = append(envAs.ops, envOp{kind: 'c'})
 				case '0', 'v':
-					// boolean
 				case 'u', 'C', 'S', 'a':
 					opt := a[j]
 					var optVal string
@@ -1585,15 +1556,13 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) ([]string, []st
 					if j+1 < len(a) {
 						optVal = a[j+1:]
 						hasOptVal = true
-						j = len(a) // consume rest of cluster as value
+						j = len(a)
 					} else if i+1 < len(argv) {
 						optVal = argv[i+1]
 						hasOptVal = true
 						consumedNext = true
 					}
 					if !hasOptVal {
-						// R1/M5: trailing value-option without an operand — GNU
-						// errors; fail closed instead of slicing past the end.
 						payloads = append(payloads, envUnknownLongPrefix+"missing operand "+a)
 						unknown = true
 						j = len(a)
@@ -1602,9 +1571,13 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) ([]string, []st
 					switch opt {
 					case 'u':
 						envAs.ops = append(envAs.ops, envOp{kind: 'u', key: optVal})
+					case 'C', 'a':
+						if consumedNext && isDynamicArg(optVal) && !isSplitSafeDynamicWord(optVal) {
+							payloads = append(payloads, envUnknownLongPrefix+"dynamic option")
+							unknown = true
+							j = len(a)
+						}
 					case 'S':
-						// See the --split-string branch: the payload restarts
-						// env's operand parse.
 						start := i
 						if consumedNext {
 							start = i + 1
@@ -1620,9 +1593,7 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) ([]string, []st
 						payloads = append(payloads, moreP...)
 						return rem, payloads, envAs
 					}
-					// 'C' (chdir) and 'a' (argv0): value consumed only
 				default:
-					// Unknown short letter: fail-closed; do not silently skip.
 					payloads = append(payloads, envUnknownLongPrefix+a)
 					unknown = true
 					j = len(a)
@@ -2097,7 +2068,7 @@ func sameStructuralFamily(a, b string) bool {
 	if (a == "npm" || a == "npm-cli.js") && (b == "npm" || b == "npm-cli.js") {
 		return true
 	}
-	if a == "hc" && (b == "herdr-core" || b == "sbx") {
+	if (a == "hc" || a == "herdr-core") && (b == "herdr-core" || b == "sbx") {
 		return true
 	}
 	return false
@@ -2404,6 +2375,9 @@ func screenPathHeadTrust(head0, pathEnv string) string {
 			(resolved == realCwd || strings.HasPrefix(resolved, realCwd+string(filepath.Separator))) {
 			return "" // resolved target stays inside the workspace
 		}
+		if isTrustedRelToolchainTarget(resolved, realCwd, euid) {
+			return ""
+		}
 		resDir := filepath.Clean(filepath.Dir(resolved))
 		if (isSystemPathDir(resDir) || isLinuxbrewPathDir(resDir) || isUserToolchainPathDir(resDir)) &&
 			isTrustedExecutableOnDisk(resolved, euid) {
@@ -2412,9 +2386,6 @@ func screenPathHeadTrust(head0, pathEnv string) string {
 		return "untrusted path binary " + head0
 	}
 	dir := filepath.Clean(filepath.Dir(p))
-	// Only enforce planted-binary / shadowing checks when the winning PATH
-	// segment is a user-home or linuxbrew toolchain directory (as opposed to
-	// an explicit test-injected temp PATH segment that is not a home dir).
 	inToolchainDir := isUserToolchainPathDir(dir) || isLinuxbrewPathDir(dir)
 	if !isSystemPathDir(dir) && !inToolchainDir {
 		return ""
@@ -2423,26 +2394,15 @@ func screenPathHeadTrust(head0, pathEnv string) string {
 		return "untrusted path binary " + head0
 	}
 	if inToolchainDir && userDirForbiddenShadowHeads[head0] {
-		// git may legitimately reside in /home/linuxbrew/.linuxbrew/bin,
-		// provided the directory and binary pass the trust check above.
 		if head0 == "git" && isLinuxbrewPathDir(dir) {
 			return ""
 		}
-		// Same-basename or distro-alias symlink into a system directory
-		// (e.g. ~/.local/bin/find -> /usr/bin/find, ~/.local/bin/awk ->
-		// /usr/bin/mawk via alternatives) is a PATH convenience, not a planted
-		// binary. A real file or a symlink to an unrelated program still blocks.
-		// The linuxbrew prefix has the same shape internally: its unprefixed
-		// bin links (ls, cat, df, true, ...) point at gnu-prefixed Cellar
-		// binaries, so a link resolving within the prefix under the canonical
-		// name (via isAllowedSystemReadonlyAlias) is brew's own layout, not a
-		// plant. A real file sitting in the brew bin dir still blocks: the
-		// prefix escape requires the resolved path to differ from the link.
 		if resolved, err := filepath.EvalSymlinks(p); err == nil {
 			resolved = filepath.Clean(resolved)
 			rb := filepath.Base(resolved)
 			rdir := filepath.Dir(resolved)
-			if (isSystemPathDir(rdir) || (isLinuxbrewPathDir(rdir) && resolved != filepath.Clean(p))) && (rb == head0 || isAllowedSystemReadonlyAlias(head0, rb, head0, pathEnv)) {
+			if (isSystemPathDir(rdir) || (isLinuxbrewPathDir(rdir) && resolved != filepath.Clean(p))) &&
+				(rb == head0 || isAllowedSystemReadonlyAlias(head0, rb, head0, pathEnv)) {
 				return ""
 			}
 		}
@@ -2508,6 +2468,9 @@ func isAllowedSystemReadonlyAlias(typedBase, resolvedBase, head0, pathEnv string
 	if canonicalResolvedBase(resolvedBase) == typedBase {
 		return true
 	}
+	if shellHeads[typedBase] && shellHeads[resolvedBase] {
+		return true
+	}
 	switch typedBase {
 	case "awk", "gawk", "mawk", "nawk":
 		if resolvedBase == "awk" || resolvedBase == "gawk" || resolvedBase == "mawk" || resolvedBase == "nawk" {
@@ -2526,11 +2489,6 @@ func isAllowedSystemReadonlyAlias(typedBase, resolvedBase, head0, pathEnv string
 			return true
 		}
 	case "hc":
-		// Live layouts: /root/.local/bin/hc -> herdr-core on the host, and
-		// hc -> sbx inside the `sbx --preset reviewer-agent` sandbox. Only
-		// the typed `hc` head earns the pass — herdr-core/sbx themselves are
-		// NOT readonly-allowlisted, and argv still goes through the strict
-		// screenHcSubagent whitelist keyed on the typed name.
 		if resolvedBase == "herdr-core" || resolvedBase == "sbx" {
 			return true
 		}
@@ -2990,8 +2948,6 @@ func nodePkgSpecBase(spec string) string {
 // `npx pig@latest` and `bunx hc kill t1` cannot dodge the agent/terminal
 // whitelists.
 func screenNodeRunnerSubagent(base string, args []string, effPath string, depth int, caller callerIdentity) string {
-	const boolShort = "ynq"
-	const valueShort = "pw"
 	i := 0
 	for ; i < len(args); i++ {
 		a := args[i]
@@ -3028,27 +2984,49 @@ func screenNodeRunnerSubagent(base string, args []string, effPath string, depth 
 				if spec := filepath.Base(nodePkgSpecBase(val)); blockedAgentExecutables[spec] {
 					return base + " " + spec
 				}
-			case "prefix", "cache", "userconfig", "registry", "workspace":
-				if !glued {
-					i++ // consume the value operand
+			case "prefix", "userconfig":
+				if !glued && i+1 < len(args) {
+					i++
+					val = args[i]
 				}
-			case "yes", "no", "no-install", "quiet", "offline",
-				"prefer-offline", "workspaces", "include-workspace-root",
-				"help", "version":
-				// boolean / query flags: no operand consumed
+				if !isSingleWordOptionValue(val) {
+					return "dynamic code payload"
+				}
+				if _, ok := resolveNodeRunnerPathOpt(val); !ok {
+					return base + " --" + name
+				}
+			case "cache", "registry", "workspace":
+				if !glued && i+1 < len(args) {
+					i++
+					val = args[i]
+				}
+				if !isSingleWordOptionValue(val) {
+					return "dynamic code payload"
+				}
+			case "yes", "no", "no-install", "quiet", "silent", "offline",
+				"prefer-offline", "workspaces", "workspace-root",
+				"include-workspace-root", "help", "version":
+				if glued && isDynamicArg(val) {
+					return "dynamic code payload"
+				}
+			case "bun":
+				if base != "bunx" || (glued && isDynamicArg(val)) {
+					return base + " " + a
+				}
 			default:
 				return base + " " + a // fail closed on unknown long flags
 			}
 			continue
 		}
-		// Short-option cluster: c is -c (arbitrary command); p/w carry a
-		// value (cluster tail or next argv); y/n/q are boolean.
+		// Short-option cluster: c is -c (arbitrary command); p carries a
+		// value; -w is value-taking for npx and boolean for pnpx; y/n/q/s/v/h
+		// and bunx -b are boolean.
 		for j := 1; j < len(a); j++ {
 			ch := a[j]
 			switch {
 			case ch == 'c':
 				return base + " -c"
-			case strings.IndexByte(valueShort, ch) >= 0:
+			case ch == 'p' || (ch == 'w' && base == "npx"):
 				val := a[j+1:]
 				if val == "" && i+1 < len(args) {
 					i++
@@ -3063,8 +3041,9 @@ func screenNodeRunnerSubagent(base string, args []string, effPath string, depth 
 					}
 				}
 				j = len(a) // value ends the cluster
-			case strings.IndexByte(boolShort, ch) >= 0:
-				// keep scanning the cluster
+			case ch == 'y' || ch == 'n' || ch == 'q' || ch == 's' || ch == 'v' || ch == 'h' ||
+				(ch == 'w' && base == "pnpx") || (ch == 'b' && base == "bunx"):
+				// boolean short flags
 			default:
 				return base + " " + a // fail closed on unknown short flags
 			}
@@ -3074,6 +3053,9 @@ func screenNodeRunnerSubagent(base string, args []string, effPath string, depth 
 		return "" // bare npx / flag-only invocation
 	}
 	spec := filepath.Base(nodePkgSpecBase(args[i]))
+	if isDynamicArg(spec) || spec == "." || spec == ".." {
+		return "dynamic code payload"
+	}
 	inner := append([]string{spec}, args[i+1:]...)
 	// The fetched command argv re-enters the shared peel at depth+1: the
 	// inner head may itself be a manager/runner (`npx npx pig`,
@@ -3083,6 +3065,24 @@ func screenNodeRunnerSubagent(base string, args []string, effPath string, depth 
 		return base + " " + hit
 	}
 	return ""
+}
+
+// isSingleWordOptionValue reports whether a value operand of a known two-slot
+// option cannot split into multiple argv words at runtime: static words,
+// split-safe dynamic words ("$HOME/...", "$PWD/..."), and pure tilde paths
+// (`~/.npmrc` — carries a single cmdSubPlaceholderGlob at leading '~' with no
+// unquoted $/cmdsub and no wildcard characters).
+func isSingleWordOptionValue(val string) bool {
+	if !isDynamicArg(val) || isSplitSafeDynamicWord(val) {
+		return true
+	}
+	if strings.HasPrefix(val, "~") &&
+		!strings.Contains(val, cmdSubPlaceholder) &&
+		!strings.ContainsAny(val, "*?[") &&
+		strings.Count(val, cmdSubPlaceholderGlob) == 1 {
+		return true
+	}
+	return false
 }
 
 // callerIdentity is the role identity a spawned child would inherit: the
@@ -3383,23 +3383,22 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		if hit := wrapperWriteOpHit(argv); hit != "" {
 			return hit
 		}
-		// Reject exec/eval/source before peelWrappers strips them.
 		if hit := readonlyPrePeelHit(argv); hit != "" {
 			return allowlistDetail(hit)
 		}
 	}
 	head, splitPayloads, envAs, exhausted := peelWrappers(argv)
 	if exhausted {
-		return depthExceededHit // fail closed: wrapper chain never resolved
+		return depthExceededHit
 	}
+	effCaller := caller.seededWith(envAs)
 	screenPayloads := func() string {
 		for _, payload := range splitPayloads {
 			if strings.HasPrefix(payload, envUnknownLongPrefix) {
 				return "env unknown option " + strings.TrimPrefix(payload, envUnknownLongPrefix)
 			}
 			if kind == 's' {
-				seeded := caller.seededWith(envAs)
-				if hit := guardShellSubagentDepthEnv(payload, depth+1, seeded, seeded.envTaint); hit != "" {
+				if hit := guardShellSubagentDepthEnv(payload, depth+1, effCaller, effCaller.envTaint); hit != "" {
 					return hit
 				}
 			} else {
@@ -3447,7 +3446,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 				// rules no longer match what will actually run. Same-family
 				// aliases (/bin/sh -> dash, python3 -> python3.13) keep the
 				// typed base.
-				if (isStructuralGuardHead(rb) || isPeeledWrapperBase(rb)) && !sameStructuralFamily(base, rb) {
+				if (isStructuralGuardHead(rb) || isPeeledWrapperBase(rb) || blockedAgentExecutables[rb]) && !sameStructuralFamily(base, rb) {
 					return "conflicting structural alias " + filepath.Base(typedHead[0]) + " -> " + rb
 				}
 			} else {
@@ -3459,7 +3458,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	if hit := screenEnvAssignments(envAs, kind, caller.role, caller.readonly, base); hit != "" {
 		return hit
 	}
-	caller = caller.seededWith(envAs)
+	caller = effCaller
 	if hit := screenPayloads(); hit != "" {
 		return hit
 	}
@@ -3482,7 +3481,6 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return hit
 		}
 	}
-	// ssh: peel OpenSSH options and screen remote command.
 	if base == "ssh" {
 		if kind == 'r' && filepath.Base(typedHead[0]) != "ssh" {
 			if hit := screenReadonlyAllowlist(typedHead); hit != "" {
@@ -3588,7 +3586,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 				return allowlistDetail("python interpreter")
 			}
 			if modArgv := pythonModuleArgvFrom(head); len(modArgv) > 0 {
-				if hit := peelResolvedDepth(modArgv, 's', depth+1, caller.seededWith(envAs)); hit != "" {
+				if hit := peelResolvedDepth(modArgv, 's', depth+1, caller); hit != "" {
 					return hit
 				}
 			}
@@ -3618,7 +3616,6 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		}
 		return ""
 	}
-	// eval: join remaining args and screen as shell text.
 	if base == "eval" && len(head) > 1 {
 		if kind == 'r' {
 			return allowlistDetail("eval")
@@ -3628,12 +3625,10 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return "dynamic code payload"
 		}
 		if kind == 's' {
-			return guardShellSubagentDepth(text, depth+1, caller.seededWith(envAs))
+			return guardShellSubagentDepth(text, depth+1, caller)
 		}
 		return guardShellReadonlyDepth(text, depth+1, caller)
 	}
-	// xargs: peel xargs options, model derived stdin/fed-code context (2.c),
-	// then screen the target command argv.
 	if base == "xargs" {
 		if k := xargsTargetIndex(head); k >= 0 && k < len(head) {
 			if xargsFeedsCodeFlag(head[k:], head, caller.pathEnv) {
@@ -3643,12 +3638,10 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 				return "dynamic code payload"
 			}
 			innerSeg := xargsDerivedSeg(head[:k], head[k:], seg, caller.pathEnv)
-			return peelResolvedSegDepth(head[k:], innerSeg, kind, depth+1, caller.seededWith(envAs))
+			return peelResolvedSegDepth(head[k:], innerSeg, kind, depth+1, caller)
 		}
-		return "" // `xargs` with no command runs echo: read-only
+		return ""
 	}
-	// find: scan for -exec/-execdir/-ok/-okdir (inner command recursion, with
-	// explicit stdin context modelling for -ok vs -exec) and -delete/-fprint*.
 	if base == "find" {
 		if kind == 'r' {
 			if hit := screenReadonlyAllowlist(typedHead); hit != "" {
@@ -3656,18 +3649,14 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			}
 			return screenFindArgsSeg(head[1:], seg, kind, depth+1, caller)
 		}
-		return screenFindArgsSeg(head[1:], seg, kind, depth+1, caller.seededWith(envAs))
+		return screenFindArgsSeg(head[1:], seg, kind, depth+1, caller)
 	}
-	// trap: a non-print action argument is shell text to screen.
 	if base == "trap" {
 		return screenTrapArgs(head[1:], kind, depth+1, caller)
 	}
-	// unset: clearing CTXMODE_ROLE/CTXMODE_READONLY sheds the guard.
 	if base == "unset" {
 		return screenUnsetArgs(head[1:], kind)
 	}
-	// watch: GNU watch runs its operands through `sh -c` by default; only
-	// -x/--exec makes them a direct exec argv (which inherits fd 0).
 	if base == "watch" && len(head) > 1 {
 		k, execMode, fc := skipWatchArgs(head, 1)
 		if fc {
@@ -3677,19 +3666,17 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return ""
 		}
 		if execMode {
-			return peelResolvedSegDepth(head[k:], seg, kind, depth+1, caller.seededWith(envAs))
+			return peelResolvedSegDepth(head[k:], seg, kind, depth+1, caller)
 		}
 		text := strings.Join(head[k:], " ")
 		if isDynamicArg(text) {
 			return "dynamic code payload"
 		}
 		if kind == 's' {
-			return guardShellSubagentDepth(text, depth+1, caller.seededWith(envAs))
+			return guardShellSubagentDepth(text, depth+1, caller)
 		}
 		return guardShellReadonlyDepth(text, depth+1, caller)
 	}
-	// flock: peel its own options + lock operand, then screen the inner
-	// command while preserving the enclosing segment's stdin context (2.c).
 	if base == "flock" {
 		if kind == 'r' {
 			return "flock"
@@ -3699,14 +3686,13 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			if isDynamicArg(cmdText) {
 				return "dynamic code payload"
 			}
-			return guardShellSubagentDepth(cmdText, depth+1, caller.seededWith(envAs))
+			return guardShellSubagentDepth(cmdText, depth+1, caller)
 		}
 		if inner < len(head) {
-			return peelResolvedSegDepth(head[inner:], seg, kind, depth+1, caller.seededWith(envAs))
+			return peelResolvedSegDepth(head[inner:], seg, kind, depth+1, caller)
 		}
 		return ""
 	}
-	// script: `-c cmd` runs cmd through a shell inside a pty.
 	if base == "script" {
 		if kind == 'r' {
 			return "script"
@@ -3715,7 +3701,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			if isDynamicArg(payload) {
 				return "dynamic code payload"
 			}
-			return guardShellSubagentDepth(payload, depth+1, caller.seededWith(envAs))
+			return guardShellSubagentDepth(payload, depth+1, caller)
 		}
 		return ""
 	}
@@ -3866,12 +3852,11 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 		return hit
 	}
 	if kind == 'r' || callerReadonlyRole(caller) {
-		// A read-only caller must not use ssh as a write/exfil channel:
-		// piped bytes reach the remote shell unaudited (local file
-		// exfiltration), and StrictHostKeyChecking=no|accept-new without
-		// UserKnownHostsFile=/dev/null|none makes ssh WRITE the local
-		// ~/.ssh/known_hosts. Worker (kind 's' non-readonly) is unaffected.
-		if seg.pipedStdin {
+		// Block piped stdin and local file input redirection (< file) to
+		// prevent local file exfiltration; inline heredoc/here-string data
+		// (`ssh dmit cat <<'EOF'`) has no local file-read reach and stays
+		// allowed (program heredocs are screened via screenBody below).
+		if seg.pipedStdin || seg.stdinRedir {
 			return roSSHWriteHit
 		}
 		if h := sshKnownHostsHit(head); h != "" {
@@ -3933,12 +3918,6 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 			}
 		}
 	}
-	// Exemption from remote readonly screening applies ONLY when a local
-	// static stdin payload (already screened above) feeds a single pure
-	// remote stdin-program vehicle (`sh`, `python3 -`). Both kind == 'r' and
-	// read-only callers under kind == 's' (verifier / CTXMODE_READONLY=1)
-	// share this exact gate so `ssh dmit "rm -rf /tmp/x; sh"` or bare
-	// `find . -exec ssh dmit sh \;` can never slip past readonly screening.
 	vehicleOnly := stdinIsProg &&
 		(seg.hereString != "" || len(seg.heredocText) > 0) &&
 		isPureRemoteStdinVehicle(remoteCmd)
@@ -4110,60 +4089,86 @@ func sshOValueOK(key, val string) bool {
 // is ignored here because parseSSHInvocation already vetted it.
 func sshKnownHostsHit(head []string) string {
 	shkc := ""
+	seenSHKC := false
 	ukhSink := false
+	seenUKH := false
 	endOpts := false
+	sawDest := false
 	for i := 1; i < len(head); i++ {
 		a := head[i]
 		if isDynamicArg(a) {
-			continue // placeholder words already gated by parseSSHInvocation
+			if !endOpts && !sawDest {
+				sawDest = true
+				continue
+			}
+			if sawDest {
+				break
+			}
+			continue
 		}
 		if !endOpts && a == "--" {
 			endOpts = true
 			continue
 		}
-		if endOpts || len(a) < 2 || a[0] != '-' {
-			continue // destination or remote command words
-		}
-		if strings.HasPrefix(a, "--") {
+		if !endOpts && strings.HasPrefix(a, "--") {
 			continue
 		}
-		for j := 1; j < len(a); j++ {
-			c := a[j]
-			if c == 'o' {
-				var v string
-				if j+1 < len(a) {
-					v = a[j+1:]
-				} else if i+1 < len(head) {
-					i++
-					v = head[i]
-				} else {
+		if !endOpts && len(a) >= 2 && a[0] == '-' {
+			for j := 1; j < len(a); j++ {
+				c := a[j]
+				if c == 'o' {
+					var v string
+					if j+1 < len(a) {
+						v = a[j+1:]
+					} else if i+1 < len(head) {
+						i++
+						v = head[i]
+					} else {
+						j = len(a)
+						continue
+					}
+					v = strings.Trim(v, " \t\r\n")
+					if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+						v = v[1 : len(v)-1]
+					}
+					key, val := v, ""
+					if k := strings.IndexAny(v, "= \t"); k >= 0 {
+						key = v[:k]
+						val = strings.Trim(v[k+1:], " \t\r\n\"")
+					}
+					switch strings.ToLower(strings.Trim(key, " \t\r\n\"")) {
+					case "stricthostkeychecking":
+						if !seenSHKC {
+							seenSHKC = true
+							shkc = strings.ToLower(val)
+						}
+					case "userknownhostsfile":
+						if !seenUKH {
+							seenUKH = true
+							if val == "/dev/null" || strings.EqualFold(val, "none") {
+								ukhSink = true
+							}
+						}
+					}
 					j = len(a)
 					continue
 				}
-				key, val := v, ""
-				if k := strings.IndexAny(v, "= \t"); k >= 0 {
-					key, val = v[:k], strings.Trim(v[k+1:], " \t\r\n")
-				}
-				switch strings.ToLower(strings.Trim(key, " \t\r\n")) {
-				case "stricthostkeychecking":
-					shkc = strings.ToLower(val)
-				case "userknownhostsfile":
-					if val == "/dev/null" || strings.EqualFold(val, "none") {
-						ukhSink = true
+				if sshShortTakesValue(c) {
+					if j+1 >= len(a) && i+1 < len(head) {
+						i++
 					}
+					j = len(a)
 				}
-				j = len(a)
-				continue
 			}
-			if sshShortTakesValue(c) {
-				if j+1 >= len(a) && i+1 < len(head) {
-					i++ // separate operand
-				}
-				j = len(a)
-			}
+			continue
 		}
+		if !sawDest {
+			sawDest = true
+			continue
+		}
+		break // remote command starts here
 	}
-	if (shkc == "no" || shkc == "accept-new") && !ukhSink {
+	if (shkc == "no" || shkc == "off" || shkc == "accept-new") && !ukhSink {
 		return roSSHWriteHit
 	}
 	return ""
@@ -4359,8 +4364,6 @@ func scriptCommandArg(head []string) string {
 		case a == "--":
 			return ""
 		case strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && len(a) > 2:
-			// Short-option cluster: a 'c' letter carries the command text
-			// (rest of the cluster, or the next argv when 'c' ends it).
 			for j := 1; j < len(a); j++ {
 				if a[j] == 'c' {
 					if tail := a[j+1:]; tail != "" {
@@ -4374,6 +4377,9 @@ func scriptCommandArg(head []string) string {
 			}
 		case a == "-O" || a == "-I" || a == "-B" || a == "-T" ||
 			a == "--log-out" || a == "--log-in" || a == "--log-timing" || a == "--timing":
+			if i+1 < len(head) && isDynamicArg(head[i+1]) && !isSplitSafeDynamicWord(head[i+1]) {
+				return cmdSubPlaceholder
+			}
 			i++
 		}
 	}
@@ -5096,32 +5102,35 @@ func xargsTargetIndex(argv []string) int {
 		if a == "--" {
 			return i + 1
 		}
+		if isDynamicArg(a) && strings.HasPrefix(a, "-") {
+			return i
+		}
 		if strings.HasPrefix(a, "--") {
 			if j := strings.IndexByte(a, '='); j > 0 {
-				i++ // --opt=value
+				i++
 			} else if xargsLongWithValue[a] {
-				i += 2 // --opt value
+				if i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
+					return i + 1
+				}
+				i += 2
 			} else {
-				i++ // boolean long option
+				i++
 			}
 			continue
 		}
 		if strings.HasPrefix(a, "-") && len(a) > 1 {
-			// Short-option cluster: value-carrying letters take the rest of
-			// the cluster or the next arg; bare clusters (-0, -r, -t, -p, -x)
-			// consume one slot. R13: -i is the deprecated -I spelling — it
-			// takes only a GLUED optional repl-str (-iSTR), never a separate
-			// argv, so like -e it ends the cluster and consumes nothing.
 			consumedNext := false
 			for j := 1; j < len(a); j++ {
 				if a[j] == 'e' || a[j] == 'i' {
-					break // -e/-i take only a glued optional operand: the rest of
-					// the cluster is its operand, never the next argv slot.
+					break
 				}
 				if xargsShortWithValue[a[j]] {
 					consumedNext = j+1 >= len(a)
 					break
 				}
+			}
+			if consumedNext && i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
+				return i + 1
 			}
 			i++
 			if consumedNext {
@@ -5875,8 +5884,16 @@ func screenReadonlyWriteAlias(headArgv []string, base string, args []string) str
 // all consume the piped/redirected stream as PROGRAM text. Dynamic words
 // are handled by the callers' own placeholder checks.
 func isStdinDevicePath(p string) bool {
-	if p == "" || isDynamicArg(p) {
+	if p == "" {
 		return false
+	}
+	// Dynamic words under /dev or /proc can resolve to the stdin device at
+	// runtime (`/dev/stdi?`, `/dev/$(printf stdin)`): treat them as stdin
+	// program paths so sed/awk -f cannot smuggle unvetted script text.
+	if isDynamicArg(p) {
+		clean := filepath.Clean(p)
+		return clean == "/dev" || clean == "/proc" ||
+			strings.HasPrefix(clean, "/dev/") || strings.HasPrefix(clean, "/proc/")
 	}
 	p = filepath.Clean(p) // /dev/fd/./0 -> /dev/fd/0
 	if p == "/dev/stdin" {
@@ -5906,28 +5923,58 @@ func awkProgramFrags(args []string) (string, bool, string) {
 			if !endOpts && strings.HasPrefix(a, "-") {
 				return "", sawFile, "dynamic code payload"
 			}
-			// Data-position dynamic word: only a split-safe path/data value
-			// may pass — a word-start __ctx_dq_sub__ could be -f/-e at
-			// runtime.
-			if !isSafeDynamicDataOperand(a) {
+			if !isSafeDynamicDataOperand(a) || isStdinDevicePath(a) {
 				return "", sawFile, "dynamic code payload"
 			}
 			if !endOpts && positional == "" && len(frags) == 0 {
-				// Dynamic program slot is unvettable.
 				return "", sawFile, "dynamic code payload"
 			}
 			if positional == "" {
-				positional = a // kept so a later non-option stays a file too
+				positional = a
 			}
 			continue
 		}
+		if !endOpts && strings.HasPrefix(a, "--") && a != "--" {
+			name, val, hasEq := strings.Cut(a[2:], "=")
+			switch {
+			case isLongOptAbbrev(name, "file", 3):
+				sawFile = true
+				if !hasEq {
+					if i+1 < len(args) {
+						val = args[i+1]
+					}
+					i++
+				}
+				if val == "-" || isStdinDevicePath(val) {
+					return "", sawFile, "awk script from stdin"
+				}
+				if isDynamicArg(val) && !isSafeDynamicDataOperand(val) {
+					return "", sawFile, "dynamic code payload"
+				}
+				continue
+			case isLongOptAbbrev(name, "source", 2):
+				if hasEq {
+					frags = append(frags, val)
+				} else if i+1 < len(args) {
+					frags = append(frags, args[i+1])
+					i++
+				}
+				continue
+			case name == "assign" || name == "field-separator" || isLongOptAbbrev(name, "include", 3):
+				if !hasEq {
+					i++
+				}
+				continue
+			case strings.HasPrefix("file", name) || strings.HasPrefix("include", name):
+				return "", sawFile, "dynamic code payload"
+			default:
+				continue
+			}
+		}
 		switch {
 		case a == "--" && !endOpts:
-			// Option terminator: everything after is a positional operand —
-			// the first one is still the program text
-			// (`awk -- '-1 {system("pig")}' f`).
 			endOpts = true
-		case a == "-f" || a == "--file":
+		case a == "-f":
 			sawFile = true
 			if i+1 < len(args) {
 				v := args[i+1]
@@ -5955,14 +6002,9 @@ func awkProgramFrags(args []string) (string, bool, string) {
 				frags = append(frags, args[i+1])
 				i++
 			}
-		case strings.HasPrefix(a, "--source="):
-			frags = append(frags, a[len("--source="):])
-		case a == "-F" || a == "-v" || a == "--assign" || a == "--field-separator" ||
-			a == "-i" || a == "--include":
-			i++ // consume the value operand
-		case !endOpts && strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && len(a) > 1:
-			// Short-option cluster: f/e/F/v/i carry an operand — the cluster
-			// tail or the next argv — and end the cluster.
+		case a == "-F" || a == "-v" || a == "-i":
+			i++
+		case !endOpts && strings.HasPrefix(a, "-") && len(a) > 1:
 			for j := 1; j < len(a); j++ {
 				switch a[j] {
 				case 'e':
@@ -5993,18 +6035,16 @@ func awkProgramFrags(args []string) (string, bool, string) {
 								return "", sawFile, "dynamic code payload"
 							}
 						}
-						i++ // file operand is the next argv
+						i++
 					}
 					j = len(a)
 				case 'F', 'v', 'i':
 					if j+1 >= len(a) {
-						i++ // value operand is the next argv
+						i++
 					}
 					j = len(a)
 				}
 			}
-		case !endOpts && strings.HasPrefix(a, "-"):
-			continue // other long options (--posix, --lint, ...)
 		default:
 			if positional == "" && len(frags) == 0 {
 				positional = a
@@ -6190,17 +6230,9 @@ func programNamesBlockedAgent(prog string) bool {
 // `e` exec commands: `1e pig`, `sed -e 'e agy'`, `s/.*/pig/e`. The command
 // text after `e` is screened as shell text.
 func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
-	// SH11 W11-2: dynamic words are only refused in the SCRIPT slot — a
-	// script operand decides what sed executes and may arm `e`; input
-	// file operands (every positional after the script) are plain data
-	// paths and pass when split-safe. sedScripts already extracts the
-	// script fragments; re-scan the operand zone to locate and validate
-	// dynamic positionals.
 	scripts, _ := sedScripts(args)
 	for _, s := range scripts {
 		if isDynamicArg(s) {
-			// R4: only restricted literal binds reach static text; a
-			// placeholder still present means the script text is unvettable.
 			return "dynamic code payload"
 		}
 		cmds := sedExecCommands(s)
@@ -6210,17 +6242,9 @@ func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
 			}
 		}
 		if len(cmds) > 0 {
-			// An e command arms text the guard cannot vet (the screened
-			// hits above are the vettable sub-set — e.g. `e pig`); the
-			// rest fail closed as a sed write/exec surface.
 			return "sed e"
 		}
 	}
-	// Dynamic operands outside the script slots must be split-safe data
-	// paths: walk the operand zone with sed's own consumption model so
-	// -e/-f/-l value slots and the first positional (the script — already
-	// screened above) are not misread as data, and input FILE operands
-	// only need to be option-incapable (SH11 W11-2).
 	sawExplicit := false
 	sawScript := false
 	endOpts := false
@@ -6231,22 +6255,11 @@ func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
 			continue
 		}
 		dynOptVal, dynOptKind := sedDynamicOptValue(a)
-		if !endOpts && strings.HasPrefix(a, "-") && a != "-" && (!isDynamicArg(a) || dynOptKind != 0 || strings.HasPrefix(a, "--file=") || strings.HasPrefix(a, "--expression=")) {
-			// Option word: replicate the value consumption (e/f script or
-			// file, l wrap length — cluster tail or next argv). R13/R14: a
-			// -f/--file=/-nfV word whose VALUE is dynamic still belongs to
-			// the option zone (the flag slot is recognisable from its
-			// static prefix) and its value gets the same independent /
-			// glued / long-option validation; any OTHER dynamic option word
-			// is unvettable and fails closed instead of being skipped as a
-			// checked positional.
+		if !endOpts && strings.HasPrefix(a, "-") && a != "-" && (!isDynamicArg(a) || dynOptKind != 0 || strings.HasPrefix(a, "--")) {
 			if isDynamicArg(a) && dynOptKind == 0 {
 				return "dynamic code payload"
 			}
 			if dynOptKind != 0 {
-				// Dynamic cluster value: dynOptVal is the dynamic tail
-				// (the glued operand). '-' feeds the script from stdin;
-				// a safe data path is the only other allowed value.
 				switch {
 				case dynOptVal == "-" || isStdinDevicePath(dynOptVal):
 					return "sed script from stdin"
@@ -6256,8 +6269,39 @@ func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
 				sawExplicit = true
 				continue
 			}
+			if strings.HasPrefix(a, "--") {
+				name, val, hasEq := strings.Cut(a[2:], "=")
+				switch {
+				case isLongOptAbbrev(name, "file", 2):
+					sawExplicit = true
+					if !hasEq {
+						if i+1 < len(args) {
+							val = args[i+1]
+						}
+						i++
+					}
+					if val == "-" || isStdinDevicePath(val) {
+						return "sed script from stdin"
+					}
+					if isDynamicArg(val) && !isSafeDynamicDataOperand(val) {
+						return "dynamic code payload"
+					}
+				case isLongOptAbbrev(name, "expression", 1):
+					sawExplicit = true
+					if !hasEq {
+						i++
+					}
+				case isLongOptAbbrev(name, "line-length", 1):
+					if !hasEq {
+						i++
+					}
+				case name == "f":
+					return "dynamic code payload"
+				}
+				continue
+			}
 			switch {
-			case a == "-f" || a == "--file":
+			case a == "-f":
 				sawExplicit = true
 				// S3: `sed -f -` (and the /dev/stdin family) reads the SCRIPT
 				// from stdin — unvetted program text; reject it like a
@@ -6273,10 +6317,7 @@ func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
 					}
 				}
 				i++
-			case a == "-e" || a == "--expression" || a == "--line-length":
-				sawExplicit = sawExplicit || a != "--line-length"
-				i++
-			case strings.HasPrefix(a, "--expression=") || strings.HasPrefix(a, "--file="):
+			case a == "-e":
 				sawExplicit = true
 				// R13: the =value still names the script FILE — validate it
 				// like a separate -f operand so a dynamic/proc-subst path
@@ -6336,10 +6377,8 @@ func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
 			}
 			continue
 		}
-		// Positional operand (after --, or non-option shape, or bare "-").
 		if isDynamicArg(a) {
 			if !sawScript && !sawExplicit && a != "-" {
-				// This word IS the script slot — screened above.
 				sawScript = true
 				continue
 			}
@@ -6349,7 +6388,7 @@ func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
 			continue
 		}
 		if !sawScript && !sawExplicit && a != "-" {
-			sawScript = true // first static positional is the script
+			sawScript = true
 		}
 	}
 	return ""
@@ -6405,35 +6444,46 @@ func sedScripts(args []string) (scripts []string, sawFile bool) {
 			endOpts = true
 			continue
 		}
+		if !endOpts && strings.HasPrefix(a, "--") {
+			name, val, hasEq := strings.Cut(a[2:], "=")
+			switch {
+			case isLongOptAbbrev(name, "expression", 1):
+				sawExplicit = true
+				if hasEq {
+					scripts = append(scripts, val)
+				} else if i+1 < len(args) {
+					scripts = append(scripts, args[i+1])
+					i++
+				}
+			case isLongOptAbbrev(name, "file", 2):
+				sawExplicit = true
+				sawFile = true
+				if !hasEq {
+					i++
+				}
+			case isLongOptAbbrev(name, "line-length", 1):
+				if !hasEq {
+					i++
+				}
+			case name == "f":
+				sawExplicit = true
+				sawFile = true
+			}
+			continue
+		}
 		if !endOpts {
 			switch {
-			case a == "-e" || a == "--expression":
+			case a == "-e":
 				sawExplicit = true
 				if i+1 < len(args) {
 					scripts = append(scripts, args[i+1])
 					i++
 				}
-			case strings.HasPrefix(a, "--expression="):
-				sawExplicit = true
-				scripts = append(scripts, a[len("--expression="):])
-			case a == "-f" || a == "--file":
+			case a == "-f":
 				sawExplicit = true
 				sawFile = true
-				i++ // consume the script-file operand
-			case strings.HasPrefix(a, "--file="):
-				sawExplicit = true
-				sawFile = true
-			case a == "--line-length":
-				i++ // consume the length operand
-			case strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && len(a) > 1:
-				// Short-option cluster: 'e' carries the script (cluster tail
-				// or next argv), 'f' names a script file, 'l' (GNU -l N
-				// wrap length) carries a value — all three end the cluster.
-				// R14: the scan stops at the first placeholder byte so a
-				// dynamic tail lands on the value letter's slot (-nf<V>
-				// marks sawFile, -ne<V> feeds the script); an option word
-				// whose OPTION ZONE is dynamic is unvettable and is fed to
-				// the caller's script screen as a dynamic payload.
+				i++
+			case strings.HasPrefix(a, "-") && len(a) > 1:
 				lim := len(a)
 				for _, ph := range []string{cmdSubPlaceholder, cmdSubPlaceholderQuoted,
 					cmdSubPlaceholderGlob, cmdSubPlaceholderAbsDq} {
@@ -6458,37 +6508,23 @@ func sedScripts(args []string) (scripts []string, sawFile bool) {
 						sawExplicit = true
 						sawFile = true
 						sawValLetter = true
-						// R15: a dynamic TAIL is the glued file operand —
-						// argv advance is decided by the real word length,
-						// not the placeholder boundary (lim). Skipping the
-						// next argv here would let a following -e land in
-						// the positional slot where sawExplicit ignores it.
 						if j+1 >= len(a) {
-							i++ // file operand is the next argv
+							i++
 						}
 						j = lim
 					case 'l':
 						sawValLetter = true
 						if j+1 >= len(a) {
-							i++ // length operand is the next argv
+							i++
 						}
 						j = lim
 					}
 				}
 				if isDynamicArg(a) && !sawValLetter {
-					// -$X / -n$X: the dynamic part could expand into option
-					// letters (nf script file, e script) or a script — feed
-					// it to the caller's dynamic rejection instead of
-					// silently skipping it as "first script already seen".
 					scripts = append(scripts, a)
 				}
-			case strings.HasPrefix(a, "-"):
-				continue // other long options (--posix, --regexp-extended, ...)
 			}
 		}
-		// Positional operand (after --, or not option-shaped, or bare "-"):
-		// only the very first positional is a script, and only when no
-		// -e/-f ever appeared; everything else is an input file name.
 		if endOpts || !strings.HasPrefix(a, "-") || a == "-" {
 			if !sawExplicit && len(scripts) == 0 && a != "-" {
 				scripts = append(scripts, a)
@@ -9125,19 +9161,15 @@ func normCallSpace(s string) string {
 // commands from inside an interpreter).
 var codeSpawnPrims = []string{
 	"subprocess", "os.system", "os.popen", "os.exec", "os.spawn",
-	"pty.spawn", "child_process", "execSync", "spawnSync", "execFile",
-	"spawnFile",
+	"posix_spawn", "pty.spawn", "child_process", "execSync", "spawnSync",
+	"execFile", "spawnFile",
 	"Deno.Command", "Bun.spawn", "os/exec", "exec.Command",
 	"syscall.Exec", "syscall.ForkExec", "std::process::Command",
 	"shell_exec", "proc_open", "passthru", "Kernel.system", "Open3",
 	"Process.spawn", "popen(", "Runtime.exec", "ProcessBuilder",
 	"system(", "backticks", "IO.popen", "spawn(", "pcntl_exec",
-	// Bare exec-family / spawn-lv spawn entry points (os.execv*,
-	// os.spawnl*/os.spawnv* reached through dynamic attribute access).
 	"execv(", "execve(", "execl(", "execle(", "execlp(", "execvp(",
 	"execvpe(", "spawnl", "spawnv",
-	// Dynamic import / native-code / eval escape hatches: each one can
-	// re-enter a process or execute arbitrary code.
 	"__import__", "importlib", "ctypes", "cffi",
 	"eval(", "exec(", "Function(",
 	"process.binding", "process.dlopen",
@@ -9290,22 +9322,20 @@ func stringHasCmdWord(s, name string) bool {
 }
 func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) {
 	if !g.subagent && !g.strictReadonly {
-		return "", "" // main agent: no role guard runs at all
+		return "", ""
 	}
 	masked := code
+	var jsBinds codeSpawnBindings
 	switch language {
 	case "python":
 		masked = pythonMask(code)
 	case "javascript", "typescript":
 		masked = jsMask(code)
+		jsBinds = jsSpawnBindings(code, masked)
 	}
 	toks := codeTokens(normCallSpace(masked))
 	caller := g.callerIdentity()
 
-	// Sub-agent nested-dispatch screening runs BEFORE the blanket strict
-	// read-only spawn block on static spawns so `subprocess.run(['ssh','dmit','pig'])`
-	// and `subprocess.run(['pig'])` report ruleSubagentNestedAgent first,
-	// matching guardCtxRunArgv and guardCtxRunShell.
 	if g.subagent {
 		rawToks := codeTokens(code)
 		spawn := false
@@ -9321,20 +9351,13 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 		if !spawn && (language == "perl" || language == "ruby" || language == "php") {
 			spawn = scriptingLexicalSpawnHit(language, code) != ""
 		}
-		// Computed member access (`cp['exec'+'Sync'](…)`) defeats the
-		// masked-token scan — the brackets hide `execSync` — so the raw
-		// (unmasked) presence of the child_process module identifier
-		// counts as a spawn site too.
 		if !spawn && (language == "javascript" || language == "typescript") &&
-			rawToks.hasIdent("child_process") {
+			(rawToks.hasIdent("child_process") || len(jsBinds.names) > 0 || jsBinds.unresolved) {
 			spawn = true
 		}
 		if spawn {
 			argvs, shellCmds, allResolved := codeStaticSpawnsDetailed(language, code)
 			for _, argv := range argvs {
-				// peelResolvedDepth routes ssh (and wrapped ssh like
-				// ['env','ssh','dmit','pig']) through screenSSHHead /
-				// parseSSHInvocation so remote commands inherit caller guards.
 				if hit := peelResolvedDepth(argv, 's', 0, caller); hit != "" {
 					if hit == "ctxmode index" || hit == roSSHWriteHit {
 						return ruleReadonlyWrite, hit
@@ -9401,6 +9424,9 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 			return ruleReadonlyWrite, "spawn primitive " + filepath.Base(argv[0])
 		}
 		for _, prim := range codeSpawnPrims {
+			if (language == "javascript" || language == "typescript") && prim == "exec(" {
+				continue
+			}
 			if toks.hasTokenLike(prim) {
 				return ruleReadonlyWrite, "spawn primitive " + prim
 			}
@@ -9420,19 +9446,18 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 			if hit := pythonWriteModeHit(code); hit != "" {
 				return ruleReadonlyWrite, hit
 			}
-			// `f = open` rebinds the builtin so the call-site scan never
-			// sees `open(`: an `open` IDENTIFIER in the masked code without
-			// any `open(` call fails closed (string literals are masked, so
-			// `print("open('/tmp/x','w')")` stays free).
-			if toks.hasIdent("open") && !toks.hasTokenLike("open(") {
+			if pythonHasBareOpenIdent(masked) {
 				return ruleReadonlyWrite, "write primitive open"
 			}
 		}
 		if (language == "javascript" || language == "typescript") &&
-			codeTokens(code).hasIdent("child_process") {
+			(len(jsBinds.names) > 0 || jsBinds.unresolved || toks.hasTokenLike("child_process")) {
 			return ruleReadonlyWrite, "spawn primitive child_process"
 		}
 		if language == "javascript" || language == "typescript" {
+			if hit := jsUnicodeIdentEscapeHit(code); hit != "" {
+				return ruleReadonlyWrite, hit
+			}
 			if hit := jsFsOpenWriteHit(code); hit != "" {
 				return ruleReadonlyWrite, hit
 			}
@@ -9442,55 +9467,37 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 				return ruleReadonlyWrite, "write primitive " + prim
 			}
 		}
-		if language == "python" || language == "javascript" || language == "typescript" {
-			if singleArgDotReplace(normCallSpace(masked)) {
-				return ruleReadonlyWrite, "write primitive .replace("
-			}
+		if hit := strictReadonlyCodeAllowlistHit(language, code); hit != "" {
+			return ruleReadonlyWrite, hit
 		}
 	}
 	return "", ""
 }
 
-// codeSpawnKeywords are the primitive spellings whose call arguments carry
-// the command to run. The lookup walks the rest of the dotted attribute path
-// (callOpenAfter), so `subprocess` reaches `subprocess.run/.Popen`,
-// `child_process` reaches `require('child_process').execFileSync`, and
-// `os.exec` reaches `os.execvp`. `subprocess` and `child_process` are also
-// MODULE roots: import/require alias bindings (`import subprocess as sp`,
-// `const cp = require('child_process')`) add the bound name to the scan, and
-// any non-call use of a module root (`getattr(subprocess, 'run')`,
-// `f = subprocess.run`) is an unresolved spawn-capability escape.
-//
-// What the operand MEANS decides the screen: a literal list is an argv and is
-// screened at the command position; a string operand is a command line the
-// interpreter hands to a shell (os.system, subprocess.run("a | b"),
-// execSync) and is screened as shell text.
 var codeSpawnKeywords = map[string][]string{
 	"python": {
 		"subprocess", // subprocess.run / .Popen / .call / .check_output
-		"os.system", "os.popen", "os.exec", "os.spawn", "pty.spawn",
-		"system", "popen",
+		"os.system", "os.popen", "os.exec", "os.spawn",
+		"os.posix_spawn", "os.posix_spawnp", "pty.spawn",
+		"system", "popen", "posix_spawn", "posix_spawnp",
 		"execv", "execve", "execl", "execle", "execlp", "execvp", "execvpe",
-		"spawnl", "spawnv",
+		"spawnl", "spawnle", "spawnlp", "spawnlpe",
+		"spawnv", "spawnve", "spawnvp", "spawnvpe", "spawn",
 	},
 	"javascript": {
-		"child_process", // require('child_process').execFileSync / .execSync
-		"execSync", "spawnSync", "execFileSync", "spawnFileSync", "execFile",
-		"spawn", "Bun.spawn", "Bun.spawnSync", "Deno.Command",
+		"child_process", // require('child_process').execFileSync / .execSync / .fork
+		"exec", "execSync", "spawnSync", "execFileSync", "spawnFileSync",
+		"execFile", "spawn", "fork", "Bun.spawn", "Bun.spawnSync", "Deno.Command",
 	},
 }
 
-// codeSpawnNonCallNeutral are the loose bare-word keywords whose non-call
-// occurrences stay INERT: they exist to catch `from os import system`-style
-// calls, and a plain mention (`system = platform.system()`) is too common a
-// word to count as a spawn-capability escape. Module roots (subprocess,
-// child_process) and every import/require bound name are NOT neutral — a
-// non-call use of those fails closed.
 var codeSpawnNonCallNeutral = map[string]bool{
-	"system": true, "popen": true,
+	"system": true, "popen": true, "posix_spawn": true, "posix_spawnp": true,
 	"execv": true, "execve": true, "execl": true, "execle": true,
 	"execlp": true, "execvp": true, "execvpe": true,
-	"spawnl": true, "spawnv": true,
+	"spawnl": true, "spawnle": true, "spawnlp": true, "spawnlpe": true,
+	"spawnv": true, "spawnve": true, "spawnvp": true, "spawnvpe": true,
+	"spawn": true, "exec": true, "fork": true,
 }
 
 // codeSpawnBindings is what the import/require scan learned about a code
@@ -9538,14 +9545,15 @@ func identEndAt(s string, i int) int {
 
 // pythonSpawnSym reports whether a name imported FROM subprocess/os/pty is a
 // spawn-capable function (run, Popen, call, check_*, getoutput,
-// getstatusoutput, system, popen, exec*, spawn*).
+// getstatusoutput, system, popen, exec*, spawn*, posix_spawn*).
 func pythonSpawnSym(name string) bool {
 	switch name {
 	case "run", "Popen", "call", "check_call", "check_output",
 		"getoutput", "getstatusoutput", "system", "popen":
 		return true
 	}
-	return strings.HasPrefix(name, "exec") || strings.HasPrefix(name, "spawn")
+	return strings.HasPrefix(name, "exec") || strings.HasPrefix(name, "spawn") ||
+		strings.HasPrefix(name, "posix_spawn")
 }
 
 // jsSpawnFunc reports whether a child_process member name is spawn-capable.
@@ -10143,42 +10151,6 @@ func codeStaticSpawns(language, code string) [][]string {
 	return argvs
 }
 
-// codeStaticSpawnsDetailed extracts the command argv (or shell command text)
-// of every spawn call whose command words are statically readable in python
-// / JS code — including import/require alias bindings:
-//
-//	subprocess.run(['herdsman', 'daemon', 'start'])          → [herdsman daemon start]
-//	import subprocess as sp; sp.run(['herdr', 'pane', 'list']) → [herdr pane list]
-//	from subprocess import run as r; r(['echo', 'ok'])       → [echo ok]
-//	const cp = require('child_process'); cp.execSync('ls')   → [ls]
-//	child_process.execFileSync('git', ['log', '-1'])         → [git log -1]
-//	os.system("ls")                                          → [ls]
-//	os.system("cat f | grep x")                              → shell text
-//
-// A call is extracted only when its RECEIVER is spawn-bearing: the dotted
-// path left of the function name must be a spawn module (subprocess,
-// os/pty member chains, require('child_process')) or a bound module alias
-// — otherwise a bound fn name is checked as a bare call only. This keeps
-// `platform.system()`, `os.path.join('system', 'x')`, and
-// `m.execSync('ls')` on an arbitrary receiver out of the spawn set.
-//
-// allResolved reports whether EVERY spawn-capable site in the code was
-// statically accounted for: it is true only when at least one call was
-// resolved AND no spawn site resisted static reading. A site counts as
-// unresolved when
-//   - a primitive/alias is called with a non-literal command (a variable, an
-//     f-string, a template literal, a concatenation — `subprocess.run(cmd)`),
-//   - a call opener never closes (`subprocess.run(` at EOF),
-//   - `from subprocess|os|pty import *`, a dynamic `require(...)`/
-//     `import(...)`, or a child_process module object escapes into an
-//     expression the binding model cannot follow, or
-//   - a module root or bound spawn name is used WITHOUT being its parsed
-//     declaration or a call site (`getattr(subprocess, 'run')`,
-//     `f = subprocess.run`, `x = cp.execSync`).
-//
-// The caller uses allResolved to decide whether the conservative
-// co-occurrence fallback still applies: one resolved argv must NOT let an
-// adjacent dynamic spawn slip through.
 func codeStaticSpawnsDetailed(language, code string) (argvs [][]string, shellCmds []string, allResolved bool) {
 	var keywords []string
 	var masked string
@@ -10204,7 +10176,8 @@ func codeStaticSpawnsDetailed(language, code string) (argvs [][]string, shellCmd
 			moduleRoots[name] = true
 		case "os":
 			keywords = append(keywords,
-				name+".system", name+".popen", name+".exec", name+".spawn")
+				name+".system", name+".popen", name+".exec", name+".spawn",
+				name+".posix_spawn", name+".posix_spawnp")
 		case "pty":
 			keywords = append(keywords, name+".spawn")
 		default: // "fn": a bound spawn function name
@@ -10212,19 +10185,12 @@ func codeStaticSpawnsDetailed(language, code string) (argvs [][]string, shellCmd
 		}
 	}
 	unresolved := binds.unresolved
-	// One spawn CALL is reached by several keyword spellings at once
-	// (`subprocess` and `run`, `o.system` and `system`, `cp.execSync` and
-	// `execSync`): dedupe on the call-open offset so each site is resolved
-	// exactly once.
 	seenCalls := map[int]bool{}
 	for _, kw := range keywords {
 		bare := true
 		if d := strings.IndexByte(kw, '.'); d >= 0 {
 			bare = false
 			if !strings.Contains(kw[d+1:], ".") {
-				// `o.system`-shaped alias members: the receiver is the
-				// module name before the dot — the bare `system` keyword
-				// would double-count the call.
 				continue
 			}
 		}
@@ -10236,17 +10202,10 @@ func codeStaticSpawnsDetailed(language, code string) (argvs [][]string, shellCmd
 			off = i + len(kw)
 			end := i + len(kw)
 			if binds.isAccounted(i, end) || isFromImportAccounted(i, end, binds.accounted) {
-				// A declaration token (`import subprocess`, the module path
-				// of a from-import) never calls: `from subprocess import (`
-				// must not be read as a subprocess( call.
 				continue
 			}
 			open := callOpenAfter(masked, end)
 			if open < 0 {
-				// Named, not called: inert at its binding declaration,
-				// or in a receiver position (`platform.system()`) —
-				// every other use of a spawn-capable name is an
-				// escape the argv model cannot follow.
 				p := i - 1
 				for p >= 0 && (masked[p] == ' ' || masked[p] == '\t') {
 					p--
@@ -10264,21 +10223,11 @@ func codeStaticSpawnsDetailed(language, code string) (argvs [][]string, shellCmd
 				continue
 			}
 			if bare {
-				// A bare member name (`system`, `run`, `execSync`, a bound
-				// fn alias) is a spawn call only when its receiver — the
-				// dotted path left of it — is spawn-bearing. Receivers
-				// that are already spawn keywords (subprocess, os/pty
-				// member chains, require('child_process')) or bound
-				// module names are already audited by their own keyword
-				// pass; any other receiver means this is someone else's
-				// method and the bare keyword is not a spawn site.
 				p := i - 1
 				for p >= 0 && (masked[p] == ' ' || masked[p] == '\t') {
 					p--
 				}
 				if p >= 0 && masked[p] == '.' {
-					// Ident-start tail (`.execSync` vs `[x].execSync`):
-					// only a receiver IDENT can be a spawn module.
 					q := p - 1
 					for q >= 0 && (masked[q] == ' ' || masked[q] == '\t') {
 						q--
@@ -10292,6 +10241,9 @@ func codeStaticSpawnsDetailed(language, code string) (argvs [][]string, shellCmd
 						if !callReceiverIsSpawn(masked[rs:re], binds.names, keywords) {
 							continue
 						}
+					} else if q < 0 || (masked[q] != ')' && masked[q] != ']') {
+						// Skip non-call/non-index receivers like regex `/pat/.exec(s)`.
+						continue
 					}
 				}
 			}
@@ -10301,15 +10253,13 @@ func codeStaticSpawnsDetailed(language, code string) (argvs [][]string, shellCmd
 				unresolved = true
 				continue
 			}
-			argv, shell, ok := staticSpawnArgv(code[lo:hi], masked[lo:hi])
-			switch {
-			case len(argv) > 0:
-				argvs = append(argvs, argv)
-			case shell != "":
-				shellCmds = append(shellCmds, shell)
-			case !ok:
+			cArgvs, cShells, ok := staticSpawnCalls(language, code[lo:hi], masked[lo:hi])
+			if !ok {
 				unresolved = true
+				continue
 			}
+			argvs = append(argvs, cArgvs...)
+			shellCmds = append(shellCmds, cShells...)
 		}
 	}
 	return argvs, shellCmds, len(argvs)+len(shellCmds) > 0 && !unresolved
@@ -10365,6 +10315,9 @@ func staticSpawnArgv(raw, masked string) (argv []string, shell string, ok bool) 
 				if k == "shell" && (v == "True" || v == "true" || v == "1") {
 					shellMode = true
 				}
+				if k != "args" && k != "cmd" && k != "command" {
+					continue
+				}
 			}
 			operands = append(operands, w)
 		}
@@ -10379,14 +10332,11 @@ func staticSpawnArgv(raw, masked string) (argv []string, shell string, ok bool) 
 			firstOp = strings.TrimSpace(firstOp[eq+1:])
 		}
 	}
-	// os.spawnl*(mode, file, arg0, arg1, ...) / os.spawnv*(mode, file, argv):
-	// skip a leading os.P_* mode constant when followed by a literal/list.
 	startIdx := 0
 	if len(operands) >= 2 && (strings.HasPrefix(firstOp, "os.P_") || firstOp == "0" || firstOp == "1") {
 		startIdx = 1
 		firstOp = operands[1]
 	}
-	// Literal argv list/tuple: `['herdsman', 'daemon', 'start']`.
 	if listArgv, ok := staticArgvList(firstOp); ok {
 		if shellMode || (len(listArgv) == 1 && strings.ContainsAny(listArgv[0], " \t'\"\\$`*|;&")) {
 			return nil, strings.Join(listArgv, " "), true
@@ -10399,25 +10349,21 @@ func staticSpawnArgv(raw, masked string) (argv []string, shell string, ok bool) 
 	}
 	if len(operands) > startIdx+1 {
 		secondOp := operands[startIdx+1]
-		if listArgv, ok := staticArgvList(secondOp); ok {
-			// In Python os.execv*(file, argv) / os.spawnv*(mode, file, argv),
-			// listArgv[0] is argv[0] (the program name itself, e.g. 'ssh'),
-			// whereas in JS execFileSync('ssh', ['dmit', 'pig']) listArgv[0]
-			// is the first argument after argv[0]. Deduplicate when listArgv[0]
-			// repeats the executable name and has remaining arguments.
+		if listArgv, ok := staticArgvListAllowEmpty(secondOp); ok {
 			if len(listArgv) >= 1 && filepath.Base(lit) == filepath.Base(listArgv[0]) {
 				return append([]string{lit}, listArgv[1:]...), "", true
 			}
 			return append([]string{lit}, listArgv...), "", true
 		}
-		// Variadic literal string form: os.execl(path, arg0, arg1, ...) /
-		// os.execlp(file, arg0, arg1, ...). Collect when every remaining
-		// positional operand (except a trailing env dict) is a string literal.
 		var varArgs []string
 		allLit := true
 		for idx := startIdx + 1; idx < len(operands); idx++ {
 			op := operands[idx]
 			if strings.Contains(op, "=") && !strings.HasPrefix(op, "'") && !strings.HasPrefix(op, "\"") {
+				break
+			}
+			if strings.HasPrefix(op, "{") && strings.HasSuffix(op, "}") {
+				// Trailing env dict in os.posix_spawn(path, argv, {}) or os.execle(..., {}).
 				break
 			}
 			s, srest, sok := leadingStringLiteral(op)
@@ -10434,7 +10380,7 @@ func staticSpawnArgv(raw, masked string) (argv []string, shell string, ok bool) 
 			return append([]string{lit}, varArgs...), "", true
 		}
 	}
-	if strings.ContainsAny(lit, "'\"\\$`*|;&") {
+	if shellMode || strings.ContainsAny(lit, "'\"\\$`*|;&") {
 		return nil, lit, true
 	}
 	return strings.Fields(lit), "", true
@@ -10860,30 +10806,14 @@ func openParenAfter(s string, afterIdx int) int {
 	return -1
 }
 
-// pythonWriteModeHit checks Python open()/io.open()/os.open() call sites for
-// write modes; plain `open(p)` / `open(p,'r')` / `open(p,'rb')` stay free.
-// A method call `.open(` on io/codecs/builtins/_io is the module function
-// (mode in the SECOND positional arg); any other `.open(` (Path.open, file
-// objects) takes the mode as its FIRST positional arg or the mode= kwarg.
-// urllib.request.urlretrieve downloads to disk and sqlite3.connect opens
-// the database for writing unless mode=ro — both block. An unclosed call
-// (`open(` at EOF) fails closed rather than slicing out of bounds.
-//
-// Matching runs on `masked` — the byte-aligned lexical mask produced by
-// pythonMask (len(masked) == len(code)) — so string/comment bodies cannot
-// trip or hide a call (`print("open('/tmp/x','w')")` stays free, and a
-// filename containing "O_WRONLY" is blanked before the flag scan). Mode
-// literals are recovered from the same byte span in the original code; no
-// normCallSpace is applied to `masked` before slicing (it would shift
-// offsets), so `openParenAfter` covers the `open ('x')` spelling instead.
+// pythonWriteModeHit checks Python open()/io.open()/os.open()/ZipFile()/
+// PyZipFile()/FileIO()/logging.*FileHandler() call sites for write modes;
+// plain read-only `open(p)`, `ZipFile(p)`, `ZipFile(p,'r')`, `FileIO(p,'r')`
+// stay free while write modes ('w','a','x','+'), non-literal modes, rebinds,
+// urlretrieve, non-ro sqlite3.connect, and logging FileHandlers block.
 func pythonWriteModeHit(code string) string {
 	masked := pythonMask(code)
-	// Single pass over `open` occurrences (builtin and io.open/module
-	// spellings): the identifier on the LEFT decides whether this is a
-	// builtin open, a module open (io.open/codecs.open — mode at arg 2),
-	// or a real method call (Path(p).open/p.open — mode at arg 1).
 	ioModuleOpens := map[string]bool{
-		// Mode in the SECOND positional arg (or mode= kwarg), default 'r'.
 		"io": true, "codecs": true, "builtins": true, "_io": true,
 		"gzip": true, "bz2": true, "lzma": true, "tarfile": true,
 		"wave": true, "aifc": true, "sunau": true,
@@ -10900,23 +10830,14 @@ func pythonWriteModeHit(code string) string {
 			idx = pos + len("open")
 			continue
 		}
-		// Resolve the receiver: `.open(` is a method/module call; a bare
-		// `open(` is the builtin. `os.open` is skipped here — its flags are
-		// vetted by the dedicated os.open scan below (treating the path as
-		// the mode operand would misfire on filenames containing w/a/x/+).
 		methodCall := false
 		skip := false
 		if pos > 0 && masked[pos-1] == '.' {
-			// Walk back over the receiver: identifiers AND dots so a
-			// package path (dbm.gnu.open, self.io.open) is captured whole.
 			k := pos - 1
 			for k > 0 && (isIdentByte(masked[k-1]) || masked[k-1] == '.') {
 				k--
 			}
 			recv := masked[k : pos-1]
-			// The module table matches the LAST package segment
-			// (x.io.open -> io); the dedicated scans match a leading or
-			// trailing name (os.open / dbm.gnu.open).
 			lastSeg := recv
 			if dot := strings.LastIndexByte(recv, '.'); dot >= 0 {
 				lastSeg = recv[dot+1:]
@@ -10925,9 +10846,6 @@ func pythonWriteModeHit(code string) string {
 			case lastSeg == "os":
 				skip = true
 			case recv == "dbm" || strings.HasPrefix(recv, "dbm."):
-				// dbm.open(file[, flag]): flag 'r' (default) reads; 'w'/'c'/'n'
-				// write. Handled by a dedicated scan below — a generic mode
-				// check cannot express the flag set.
 				if dbmOpenWrites(masked, code, openParen) {
 					return "dbm.open write flag"
 				}
@@ -10942,7 +10860,6 @@ func pythonWriteModeHit(code string) string {
 		}
 		lo, hi, closed := callInnerBounds(masked, openParen)
 		if !closed {
-			// Unclosed `open(` — cannot vet the call: fail closed.
 			return "python open() unclosed"
 		}
 		if openArgsWriteMode(masked[lo:hi], code[lo:hi], methodCall) {
@@ -10950,9 +10867,6 @@ func pythonWriteModeHit(code string) string {
 		}
 		idx = openParen + 1
 	}
-	// os.open(path, flags) with a write flag. The scan runs on the masked
-	// argument text, so a path literal containing "O_WRONLY" cannot trip it
-	// while `os.open ('/tmp/x', os.O_WRONLY)` still blocks.
 	idx = 0
 	for {
 		j := strings.Index(masked[idx:], "os.open")
@@ -10982,16 +10896,10 @@ func pythonWriteModeHit(code string) string {
 		}
 		idx = openParen + 1
 	}
-	// urllib.request.urlretrieve(url, filename) downloads to disk — a file
-	// write no matter where the call site appears. The token view is built
-	// from the spacing-normalized MASKED text so `urlretrieve (` hits while
-	// a mention inside a string literal (blanked by the mask) stays free.
 	toks := codeTokens(normCallSpace(masked))
 	if toks.hasTokenLike("urlretrieve(") || toks.hasTokenLike("urllib.request.urlretrieve") {
 		return "urlretrieve downloads to disk"
 	}
-	// sqlite3.connect(path) opens the database read-write unless the URI
-	// carries mode=ro; plain connects are writes (journal, wal, schema).
 	idx = 0
 	for {
 		j := strings.Index(masked[idx:], "sqlite3.connect")
@@ -11013,6 +10921,1072 @@ func pythonWriteModeHit(code string) string {
 		}
 		idx = openParen + 1
 	}
+	return pythonStdlibWriteTailHit(code, masked)
+}
+
+var pySensitiveReflectNames = map[string]bool{
+	"open":                     true,
+	"FileIO":                   true,
+	"ZipFile":                  true,
+	"PyZipFile":                true,
+	"BaseRotatingHandler":      true,
+	"FileHandler":              true,
+	"RotatingFileHandler":      true,
+	"TimedRotatingFileHandler": true,
+	"WatchedFileHandler":       true,
+	"basicConfig":              true,
+	"dictConfig":               true,
+	"DictConfigurator":         true,
+	"dictConfigClass":          true,
+	"BaseConfigurator":         true,
+	"fileConfig":               true,
+	"resolve_name":             true,
+	"write_text":               true,
+	"write_bytes":              true,
+	"unlink":                   true,
+	"rmdir":                    true,
+	"rmtree":                   true,
+	"mkdir":                    true,
+	"makedirs":                 true,
+	"symlink":                  true,
+	"symlink_to":               true,
+	"hardlink_to":              true,
+	"chmod":                    true,
+	"lchmod":                   true,
+	"chown":                    true,
+	"ftruncate":                true,
+	"copyfile":                 true,
+	"copy2":                    true,
+	"copytree":                 true,
+	"make_archive":             true,
+	"NamedTemporaryFile":       true,
+	"TemporaryFile":            true,
+	"mkstemp":                  true,
+	"mkdtemp":                  true,
+	"popen":                    true,
+	"Popen":                    true,
+	"posix_spawn":              true,
+	"posix_spawnp":             true,
+}
+
+func pyIsIdentByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+func pyNextIdent(s string, from int, name string) int {
+	if name == "" || from < 0 {
+		return -1
+	}
+	for off := from; off+len(name) <= len(s); {
+		rel := strings.Index(s[off:], name)
+		if rel < 0 {
+			return -1
+		}
+		idx := off + rel
+		prevOK := idx == 0 || !pyIsIdentByte(s[idx-1])
+		nextOK := idx+len(name) == len(s) || !pyIsIdentByte(s[idx+len(name)])
+		if prevOK && nextOK {
+			return idx
+		}
+		off = idx + 1
+	}
+	return -1
+}
+
+func pySkipHorizAndCont(s string, i int, allowBareNL bool) int {
+	for i < len(s) {
+		c := s[i]
+		if c == ' ' || c == '\t' || c == '\r' || (allowBareNL && c == '\n') {
+			i++
+			continue
+		}
+		if c == '\\' && (i == 0 || s[i-1] != '\\') {
+			if i+1 < len(s) && s[i+1] == '\n' {
+				i += 2
+				continue
+			}
+			if i+2 < len(s) && s[i+1] == '\r' && s[i+2] == '\n' {
+				i += 3
+				continue
+			}
+		}
+		break
+	}
+	return i
+}
+
+// pyImportStmtHeaderStart returns the start offset of the enclosing import /
+// from-import statement for an identifier at idx where isPythonImportStmtAt(s, idx) is true.
+func pyImportStmtHeaderStart(s string, idx int) (stmtStart int, inParen bool) {
+	i := idx - 1
+	openParen := -1
+	for i >= 0 {
+		c := s[i]
+		if pyIsIdentByte(c) || c == ',' || c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\\' {
+			i--
+			continue
+		}
+		if c == '(' {
+			openParen = i
+		}
+		break
+	}
+	scanFrom := idx - 1
+	if openParen >= 0 {
+		inParen = true
+		scanFrom = openParen - 1
+	}
+	m := scanFrom
+	for m >= 0 {
+		c := s[m]
+		if pyIsIdentByte(c) || c == '.' || c == ',' || c == ' ' || c == '\t' || c == '\r' {
+			m--
+			continue
+		}
+		if c == '\n' {
+			k := m - 1
+			if k >= 0 && s[k] == '\r' {
+				k--
+			}
+			if k >= 0 && s[k] == '\\' && (k == 0 || s[k-1] != '\\') {
+				m = k - 1
+				continue
+			}
+		}
+		break
+	}
+	return pySkipHorizAndCont(s, m+1, false), inParen
+}
+
+// pyImportAliasAfter extracts `Y` from `<name> as Y` when name at [idx, idx+nameLen)
+// lies inside a valid Python import statement.
+func pyImportAliasAfter(masked string, idx, nameLen int) string {
+	_, inParen := pyImportStmtHeaderStart(masked, idx)
+	j := pySkipHorizAndCont(masked, idx+nameLen, inParen)
+	if j+2 > len(masked) || masked[j:j+2] != "as" {
+		return ""
+	}
+	if j > 0 && pyIsIdentByte(masked[j-1]) {
+		return ""
+	}
+	if j+2 < len(masked) && pyIsIdentByte(masked[j+2]) {
+		return ""
+	}
+	k := pySkipHorizAndCont(masked, j+2, inParen)
+	if k >= len(masked) || !pyIsIdentByte(masked[k]) || (masked[k] >= '0' && masked[k] <= '9') {
+		return ""
+	}
+	end := k
+	for end < len(masked) && pyIsIdentByte(masked[end]) {
+		end++
+	}
+	return masked[k:end]
+}
+
+func pyMatchMatchingDelim(masked string, openIdx int, openCh, closeCh byte) int {
+	if openIdx < 0 || openIdx >= len(masked) || masked[openIdx] != openCh {
+		return -1
+	}
+	var stack [64]byte
+	sp := 0
+	for i := openIdx; i < len(masked); i++ {
+		switch masked[i] {
+		case '(', '[', '{':
+			if sp >= len(stack) {
+				return -1
+			}
+			stack[sp] = masked[i]
+			sp++
+		case ')', ']', '}':
+			if sp == 0 {
+				return -1
+			}
+			top := stack[sp-1]
+			if (top == '(' && masked[i] != ')') ||
+				(top == '[' && masked[i] != ']') ||
+				(top == '{' && masked[i] != '}') {
+				return -1
+			}
+			sp--
+			if sp == 0 {
+				if masked[i] == closeCh {
+					return i
+				}
+				return -1
+			}
+		}
+	}
+	return -1
+}
+
+func pyTrimContinuationSpan(s string) string {
+	start := 0
+	for start < len(s) {
+		c := s[start]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+			start++
+			continue
+		}
+		if c == '\\' && start+1 < len(s) &&
+			(s[start+1] == '\n' || (s[start+1] == '\r' && start+2 < len(s) && s[start+2] == '\n')) {
+			start++
+			continue
+		}
+		break
+	}
+	end := len(s)
+	for end > start {
+		c := s[end-1]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\\' {
+			end--
+			continue
+		}
+		break
+	}
+	return s[start:end]
+}
+
+func pyTrimSpanBounds(s string, a, b int) (int, int) {
+	for a < b {
+		c := s[a]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+			a++
+			continue
+		}
+		if c == '\\' && a+1 < b &&
+			(s[a+1] == '\n' || (s[a+1] == '\r' && a+2 < b && s[a+2] == '\n')) {
+			a++
+			continue
+		}
+		break
+	}
+	for b > a {
+		c := s[b-1]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\\' {
+			b--
+			continue
+		}
+		break
+	}
+	return a, b
+}
+
+func pySplitTopLevelArgs(masked string, openParen, closeParen int) [][2]int {
+	var out [][2]int
+	depth := 0
+	segStart := openParen + 1
+	for i := openParen + 1; i <= closeParen; i++ {
+		if i == closeParen || (depth == 0 && masked[i] == ',') {
+			a, b := pyTrimSpanBounds(masked, segStart, i)
+			if a < b {
+				out = append(out, [2]int{a, b})
+			}
+			segStart = i + 1
+			continue
+		}
+		switch masked[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+	return out
+}
+
+func pyTopLevelKeywordEq(masked string, aStart, aEnd int) (string, int, bool) {
+	depth := 0
+	for i := aStart; i < aEnd; i++ {
+		switch masked[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case '=':
+			if depth != 0 {
+				continue
+			}
+			if i > aStart {
+				prev := masked[i-1]
+				if prev == '=' || prev == '!' || prev == '<' || prev == '>' || prev == ':' {
+					continue
+				}
+			}
+			if i+1 < aEnd && masked[i+1] == '=' {
+				continue
+			}
+			kw := pyTrimContinuationSpan(masked[aStart:i])
+			if kw == "" || (kw[0] >= '0' && kw[0] <= '9') {
+				return "", -1, false
+			}
+			for j := 0; j < len(kw); j++ {
+				if !pyIsIdentByte(kw[j]) {
+					return "", -1, false
+				}
+			}
+			return kw, i, true
+		}
+	}
+	return "", -1, false
+}
+
+func pyHexVal(b byte) (byte, bool) {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0', true
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10, true
+	case b >= 'A' && b <= 'F':
+		return b - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func pyUnquoteStringLiteral(raw string) (string, string, bool) {
+	s := pyTrimContinuationSpan(raw)
+	if len(s) < 2 {
+		return "", "", false
+	}
+	pEnd := 0
+	for pEnd < len(s) && pEnd < 2 &&
+		((s[pEnd] >= 'a' && s[pEnd] <= 'z') || (s[pEnd] >= 'A' && s[pEnd] <= 'Z')) {
+		pEnd++
+	}
+	if pEnd >= len(s) || (s[pEnd] != '\'' && s[pEnd] != '"') {
+		return "", "", false
+	}
+	prefix := s[:pEnd]
+	for i := 0; i < len(prefix); i++ {
+		switch prefix[i] {
+		case 'r', 'R', 'u', 'U', 'b', 'B', 'f', 'F':
+		default:
+			return "", "", false
+		}
+	}
+	isRaw := strings.ContainsAny(prefix, "rR")
+	q := s[pEnd]
+	delimLen := 1
+	if len(s) >= pEnd+6 && s[pEnd+1] == q && s[pEnd+2] == q {
+		delimLen = 3
+	}
+	var buf strings.Builder
+	i := pEnd + delimLen
+	closedAt := -1
+	for i < len(s) {
+		if delimLen == 3 {
+			if i+3 <= len(s) && s[i] == q && s[i+1] == q && s[i+2] == q {
+				closedAt = i + 3
+				break
+			}
+		} else if s[i] == q {
+			closedAt = i + 1
+			break
+		}
+		if s[i] == '\\' {
+			if i+1 >= len(s) {
+				return "", "", false
+			}
+			if isRaw {
+				buf.WriteByte('\\')
+				buf.WriteByte(s[i+1])
+				i += 2
+				continue
+			}
+			next := s[i+1]
+			switch next {
+			case '\n':
+				i += 2
+			case '\r':
+				if i+2 < len(s) && s[i+2] == '\n' {
+					i += 3
+				} else {
+					i += 2
+				}
+			case '\\', '\'', '"':
+				buf.WriteByte(next)
+				i += 2
+			case 'n':
+				buf.WriteByte('\n')
+				i += 2
+			case 'r':
+				buf.WriteByte('\r')
+				i += 2
+			case 't':
+				buf.WriteByte('\t')
+				i += 2
+			case 'x':
+				if i+4 > len(s) {
+					return "", "", false
+				}
+				hi, ok1 := pyHexVal(s[i+2])
+				lo, ok2 := pyHexVal(s[i+3])
+				if !ok1 || !ok2 {
+					return "", "", false
+				}
+				buf.WriteByte((hi << 4) | lo)
+				i += 4
+			case 'u':
+				if i+6 > len(s) {
+					return "", "", false
+				}
+				var cp uint32
+				for k := 0; k < 4; k++ {
+					hv, okH := pyHexVal(s[i+2+k])
+					if !okH {
+						return "", "", false
+					}
+					cp = (cp << 4) | uint32(hv)
+				}
+				buf.WriteRune(rune(cp))
+				i += 6
+			case 'U':
+				if i+10 > len(s) {
+					return "", "", false
+				}
+				var cp uint32
+				for k := 0; k < 8; k++ {
+					hv, okH := pyHexVal(s[i+2+k])
+					if !okH {
+						return "", "", false
+					}
+					cp = (cp << 4) | uint32(hv)
+				}
+				if cp > 0x10FFFF {
+					return "", "", false
+				}
+				buf.WriteRune(rune(cp))
+				i += 10
+			default:
+				if next >= '0' && next <= '7' {
+					oct := uint32(next - '0')
+					step := 2
+					for step < 4 && i+step < len(s) && s[i+step] >= '0' && s[i+step] <= '7' {
+						oct = (oct << 3) | uint32(s[i+step]-'0')
+						step++
+					}
+					buf.WriteByte(byte(oct & 0xff))
+					i += step
+				} else {
+					buf.WriteByte('\\')
+					buf.WriteByte(next)
+					i += 2
+				}
+			}
+			continue
+		}
+		buf.WriteByte(s[i])
+		i++
+	}
+	if closedAt != len(s) {
+		return "", "", false
+	}
+	return buf.String(), prefix, true
+}
+
+func pyIsReadonlyModeLiteral(raw string) bool {
+	val, prefix, ok := pyUnquoteStringLiteral(raw)
+	if !ok || val == "" || strings.ContainsAny(prefix, "fF") {
+		return false
+	}
+	for i := 0; i < len(val); i++ {
+		switch val[i] {
+		case 'r', 'b', 't', 'U':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func pyCtorCallIsWrite(code, masked string, openParen int, canonName string) bool {
+	closeParen := pyMatchMatchingDelim(masked, openParen, '(', ')')
+	if closeParen < 0 {
+		return true
+	}
+	args := pySplitTopLevelArgs(masked, openParen, closeParen)
+	posIdx := 0
+	for _, sp := range args {
+		aStart, aEnd := sp[0], sp[1]
+		if masked[aStart] == '*' {
+			return true
+		}
+		if kw, eqIdx, ok := pyTopLevelKeywordEq(masked, aStart, aEnd); ok {
+			if kw == "mode" && !pyIsReadonlyModeLiteral(code[eqIdx+1:aEnd]) {
+				return true
+			}
+			if canonName == "FileIO" && kw == "opener" &&
+				pyTrimContinuationSpan(masked[eqIdx+1:aEnd]) != "None" {
+				return true
+			}
+			continue
+		}
+		if posIdx == 1 && !pyIsReadonlyModeLiteral(code[aStart:aEnd]) {
+			return true
+		}
+		if canonName == "FileIO" && posIdx == 3 &&
+			pyTrimContinuationSpan(masked[aStart:aEnd]) != "None" {
+			return true
+		}
+		posIdx++
+	}
+	return false
+}
+
+func pyCheckDictSubscriptOrGet(code, masked string, afterExpr int, label string) string {
+	k := pySkipHorizAndCont(masked, afterExpr, true)
+	if k >= len(masked) {
+		return ""
+	}
+	if masked[k] == '[' {
+		closeBr := pyMatchMatchingDelim(masked, k, '[', ']')
+		if closeBr > k+1 {
+			if val, prefix, ok := pyUnquoteStringLiteral(code[k+1 : closeBr]); ok &&
+				!strings.ContainsAny(prefix, "fF") && pySensitiveReflectNames[val] {
+				return "python " + label + " " + val
+			}
+		}
+		return ""
+	}
+	if masked[k] == '.' {
+		m := pySkipHorizAndCont(masked, k+1, true)
+		if m+3 <= len(masked) && masked[m:m+3] == "get" &&
+			(m+3 == len(masked) || !pyIsIdentByte(masked[m+3])) {
+			p := pySkipHorizAndCont(masked, m+3, true)
+			if p < len(masked) && masked[p] == '(' {
+				closeP := pyMatchMatchingDelim(masked, p, '(', ')')
+				if closeP > p+1 {
+					args := pySplitTopLevelArgs(masked, p, closeP)
+					if len(args) >= 1 {
+						if val, prefix, ok := pyUnquoteStringLiteral(code[args[0][0]:args[0][1]]); ok &&
+							!strings.ContainsAny(prefix, "fF") && pySensitiveReflectNames[val] {
+							return "python " + label + ".get " + val
+						}
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+type pySymTarget struct {
+	sym   string
+	canon string
+}
+
+// pyExtractFromImportItems parses all `from <wantModule> import ...` statements
+// in masked, returning imported local bindings paired with their canonical names
+// in wantModule, plus hasStar when `from <wantModule> import *` is present.
+func pyExtractFromImportItems(masked, wantModule string) ([]pySymTarget, bool) {
+	var out []pySymTarget
+	hasStar := false
+
+	prevContNL := func(nlIdx int) (int, bool) {
+		k := nlIdx - 1
+		if k >= 0 && masked[k] == '\r' {
+			k--
+		}
+		if k >= 0 && masked[k] == '\\' && (k == 0 || masked[k-1] != '\\') {
+			return k - 1, true
+		}
+		return 0, false
+	}
+
+	isBoundaryBefore := func(idx int) bool {
+		k := idx - 1
+		for k >= 0 {
+			if masked[k] == ' ' || masked[k] == '\t' || masked[k] == '\r' {
+				k--
+				continue
+			}
+			if masked[k] == '\n' {
+				if prev, ok := prevContNL(k); ok {
+					k = prev
+					continue
+				}
+			}
+			break
+		}
+		if k < 0 || masked[k] == '\n' || masked[k] == ';' {
+			return true
+		}
+		return masked[k] == ':' && (k == 0 || masked[k-1] != ':')
+	}
+
+	parseTargets := func(seg string, allowNL bool) {
+		i := 0
+		for i < len(seg) {
+			i = pySkipHorizAndCont(seg, i, allowNL)
+			if i >= len(seg) {
+				break
+			}
+			if seg[i] == ',' {
+				i++
+				continue
+			}
+			if !pyIsIdentByte(seg[i]) || (seg[i] >= '0' && seg[i] <= '9') {
+				break
+			}
+			nEnd := i
+			for nEnd < len(seg) && pyIsIdentByte(seg[nEnd]) {
+				nEnd++
+			}
+			orig := seg[i:nEnd]
+			bound := orig
+			j := pySkipHorizAndCont(seg, nEnd, allowNL)
+			if j+2 <= len(seg) && seg[j:j+2] == "as" && (j+2 == len(seg) || !pyIsIdentByte(seg[j+2])) {
+				k := pySkipHorizAndCont(seg, j+2, allowNL)
+				if k < len(seg) && pyIsIdentByte(seg[k]) && !(seg[k] >= '0' && seg[k] <= '9') {
+					aEnd := k
+					for aEnd < len(seg) && pyIsIdentByte(seg[aEnd]) {
+						aEnd++
+					}
+					bound = seg[k:aEnd]
+					j = pySkipHorizAndCont(seg, aEnd, allowNL)
+				}
+			}
+			out = append(out, pySymTarget{sym: bound, canon: orig})
+			i = j
+			if i < len(seg) && seg[i] == ',' {
+				i++
+			}
+		}
+	}
+
+	for fromIdx := pyNextIdent(masked, 0, "from"); fromIdx >= 0; fromIdx = pyNextIdent(masked, fromIdx+len("from"), "from") {
+		if !isBoundaryBefore(fromIdx) {
+			continue
+		}
+		q := pySkipHorizAndCont(masked, fromIdx+len("from"), false)
+		var modBuf strings.Builder
+		impIdx := -1
+		for q < len(masked) {
+			if q+len("import") <= len(masked) && masked[q:q+len("import")] == "import" &&
+				(q == 0 || !pyIsIdentByte(masked[q-1])) &&
+				(q+len("import") == len(masked) || !pyIsIdentByte(masked[q+len("import")])) {
+				impIdx = q
+				break
+			}
+			if pyIsIdentByte(masked[q]) {
+				s0 := q
+				for q < len(masked) && pyIsIdentByte(masked[q]) {
+					q++
+				}
+				modBuf.WriteString(masked[s0:q])
+				q = pySkipHorizAndCont(masked, q, false)
+				continue
+			}
+			if masked[q] == '.' {
+				modBuf.WriteByte('.')
+				q = pySkipHorizAndCont(masked, q+1, false)
+				continue
+			}
+			break
+		}
+		if impIdx < 0 || modBuf.String() != wantModule {
+			continue
+		}
+		p := pySkipHorizAndCont(masked, impIdx+len("import"), false)
+		if p >= len(masked) {
+			continue
+		}
+		if masked[p] == '*' {
+			hasStar = true
+			continue
+		}
+		if masked[p] == '(' {
+			closeP := pyMatchMatchingDelim(masked, p, '(', ')')
+			if closeP < 0 {
+				hasStar = true
+				continue
+			}
+			parseTargets(masked[p+1:closeP], true)
+			continue
+		}
+		end := p
+		for end < len(masked) {
+			if masked[end] == '\n' || masked[end] == ';' {
+				break
+			}
+			nextE := pySkipHorizAndCont(masked, end, false)
+			if nextE != end {
+				end = nextE
+				continue
+			}
+			end++
+		}
+		parseTargets(masked[p:end], false)
+	}
+	return out, hasStar
+}
+
+// pyCollectDirectImportModAliases collects local aliases bound by plain
+// `import <topMod> as X` (`topAliases`, seeded with topMod itself) and optional
+// `import <topMod>.<subMod> as Y` (`subAliases`) statements in masked.
+func pyCollectDirectImportModAliases(masked, topMod, subMod string) (topAliases []string, subAliases []string) {
+	topAliases = []string{topMod}
+	addUniq := func(list []string, s string) []string {
+		if s == "" {
+			return list
+		}
+		for _, v := range list {
+			if v == s {
+				return list
+			}
+		}
+		return append(list, s)
+	}
+	for idx := pyNextIdent(masked, 0, topMod); idx >= 0; idx = pyNextIdent(masked, idx+len(topMod), topMod) {
+		if !isPythonImportStmtAt(masked, idx) {
+			continue
+		}
+		stmtStart, _ := pyImportStmtHeaderStart(masked, idx)
+		if !strings.HasPrefix(masked[stmtStart:], "import") || pyNextIdent(masked[stmtStart:idx], 0, "from") >= 0 {
+			continue
+		}
+		prev := idx - 1
+		for prev >= stmtStart && (masked[prev] == ' ' || masked[prev] == '\t' || masked[prev] == '\r') {
+			prev--
+		}
+		if prev >= stmtStart && masked[prev] == '.' {
+			continue
+		}
+		d := pySkipHorizAndCont(masked, idx+len(topMod), false)
+		if d < len(masked) && masked[d] == '.' {
+			if subMod != "" {
+				cIdx := pySkipHorizAndCont(masked, d+1, false)
+				if cIdx+len(subMod) <= len(masked) && masked[cIdx:cIdx+len(subMod)] == subMod &&
+					(cIdx+len(subMod) == len(masked) || !pyIsIdentByte(masked[cIdx+len(subMod)])) {
+					if alias := pyImportAliasAfter(masked, cIdx, len(subMod)); alias != "" {
+						subAliases = addUniq(subAliases, alias)
+					}
+				}
+			}
+			continue
+		}
+		if alias := pyImportAliasAfter(masked, idx, len(topMod)); alias != "" {
+			topAliases = addUniq(topAliases, alias)
+		}
+	}
+	return topAliases, subAliases
+}
+
+// pythonStdlibWriteTailHit checks non-ASCII NFKC identifiers, ZipFile/PyZipFile/FileIO
+// (including `as` aliases and rebinds), logging file handlers (including BaseRotatingHandler),
+// whole-module logging.config usage, logging.basicConfig(filename=/**kw),
+// pkgutil.resolve_name & pydoc.{locate,safeimport}, and literal-string reflection
+// via getattr/__getattribute__/__dict__/vars/globals/locals on strict-readonly Python code.
+func pythonStdlibWriteTailHit(code, masked string) string {
+	// 0. Reject non-ASCII bytes in masked code to defeat PEP 3131 NFKC identifier aliases.
+	if hit := pyMaskedNonASCIIIdentHit(masked); hit != "" {
+		return hit
+	}
+
+	addTarget := func(list []pySymTarget, sym, canon string) []pySymTarget {
+		if sym == "" {
+			return list
+		}
+		for _, it := range list {
+			if it.sym == sym && it.canon == canon {
+				return list
+			}
+		}
+		return append(list, pySymTarget{sym: sym, canon: canon})
+	}
+
+	// 1. ZipFile / PyZipFile / FileIO + `from ... import X as Y` aliases.
+	ctorCanons := []string{"ZipFile", "PyZipFile", "FileIO"}
+	ctors := make([]pySymTarget, 0, 6)
+	for _, c := range ctorCanons {
+		ctors = addTarget(ctors, c, c)
+		for idx := pyNextIdent(masked, 0, c); idx >= 0; idx = pyNextIdent(masked, idx+len(c), c) {
+			if isPythonImportStmtAt(masked, idx) {
+				if alias := pyImportAliasAfter(masked, idx, len(c)); alias != "" {
+					ctors = addTarget(ctors, alias, c)
+				}
+			}
+		}
+	}
+	for _, t := range ctors {
+		for idx := pyNextIdent(masked, 0, t.sym); idx >= 0; idx = pyNextIdent(masked, idx+len(t.sym), t.sym) {
+			if isPythonImportStmtAt(masked, idx) {
+				continue
+			}
+			k := pySkipHorizAndCont(masked, idx+len(t.sym), false)
+			if k >= len(masked) || masked[k] != '(' {
+				return "python " + t.canon + " rebind"
+			}
+			if pyCtorCallIsWrite(code, masked, k, t.canon) {
+				return "python " + t.canon + " write"
+			}
+		}
+	}
+
+	// 2. Logging file handlers (all 5 FileHandler classes) + dictConfig/fileConfig + aliases.
+	handlerCanons := []string{
+		"BaseRotatingHandler",
+		"FileHandler",
+		"RotatingFileHandler",
+		"TimedRotatingFileHandler",
+		"WatchedFileHandler",
+		"dictConfig",
+		"fileConfig",
+	}
+	handlers := make([]pySymTarget, 0, 12)
+	for _, h := range handlerCanons {
+		handlers = addTarget(handlers, h, h)
+		for idx := pyNextIdent(masked, 0, h); idx >= 0; idx = pyNextIdent(masked, idx+len(h), h) {
+			if isPythonImportStmtAt(masked, idx) {
+				if alias := pyImportAliasAfter(masked, idx, len(h)); alias != "" {
+					handlers = addTarget(handlers, alias, h)
+				}
+			}
+		}
+	}
+	for _, t := range handlers {
+		for idx := pyNextIdent(masked, 0, t.sym); idx >= 0; idx = pyNextIdent(masked, idx+len(t.sym), t.sym) {
+			if !isPythonImportStmtAt(masked, idx) {
+				return "python logging." + t.canon
+			}
+		}
+	}
+
+	// 3. Whole-module `logging.config` runtime closure:
+	// - `from logging.config import *`
+	// - any runtime usage of symbols imported via `from logging.config import X [as Y]`
+	// - any runtime `<loggingMod>.config[.<attr>]` (where loggingMod is `logging` or `import logging as L`)
+	// - any runtime `<lc>[.<attr>]` (where lc comes from `import logging.config as lc` or `from logging import config [as lc]`)
+	lcItems, lcStar := pyExtractFromImportItems(masked, "logging.config")
+	if lcStar {
+		return "python logging.config wildcard import"
+	}
+	for _, it := range lcItems {
+		for idx := pyNextIdent(masked, 0, it.sym); idx >= 0; idx = pyNextIdent(masked, idx+len(it.sym), it.sym) {
+			if !isPythonImportStmtAt(masked, idx) {
+				return "python logging.config." + it.canon
+			}
+		}
+	}
+	loggingMods, lcModSyms := pyCollectDirectImportModAliases(masked, "logging", "config")
+	fromLoggingItems, _ := pyExtractFromImportItems(masked, "logging")
+	for _, it := range fromLoggingItems {
+		if it.canon == "config" {
+			lcModSyms = append(lcModSyms, it.sym)
+		}
+	}
+	readTrailingAttr := func(afterObj int) string {
+		d := pySkipHorizAndCont(masked, afterObj, false)
+		if d < len(masked) && masked[d] == '.' {
+			m := pySkipHorizAndCont(masked, d+1, false)
+			if m < len(masked) && pyIsIdentByte(masked[m]) && !(masked[m] >= '0' && masked[m] <= '9') {
+				e := m
+				for e < len(masked) && pyIsIdentByte(masked[e]) {
+					e++
+				}
+				return masked[m:e]
+			}
+		}
+		return ""
+	}
+	for _, lm := range loggingMods {
+		for idx := pyNextIdent(masked, 0, lm); idx >= 0; idx = pyNextIdent(masked, idx+len(lm), lm) {
+			if isPythonImportStmtAt(masked, idx) {
+				continue
+			}
+			d := pySkipHorizAndCont(masked, idx+len(lm), false)
+			if d < len(masked) && masked[d] == '.' {
+				cIdx := pySkipHorizAndCont(masked, d+1, false)
+				if cIdx+len("config") <= len(masked) && masked[cIdx:cIdx+len("config")] == "config" &&
+					(cIdx+len("config") == len(masked) || !pyIsIdentByte(masked[cIdx+len("config")])) {
+					if attr := readTrailingAttr(cIdx + len("config")); attr != "" {
+						return "python logging.config." + attr
+					}
+					return "python logging.config"
+				}
+			}
+		}
+	}
+	for _, lc := range lcModSyms {
+		for idx := pyNextIdent(masked, 0, lc); idx >= 0; idx = pyNextIdent(masked, idx+len(lc), lc) {
+			if isPythonImportStmtAt(masked, idx) {
+				continue
+			}
+			if attr := readTrailingAttr(idx + len(lc)); attr != "" {
+				return "python logging.config." + attr
+			}
+			return "python logging.config"
+		}
+	}
+
+	// 4. `logging.basicConfig(filename=...)` / `basicConfig(**kw)` / rebinds / aliases.
+	bcSyms := []string{"basicConfig"}
+	for idx := pyNextIdent(masked, 0, "basicConfig"); idx >= 0; idx = pyNextIdent(masked, idx+len("basicConfig"), "basicConfig") {
+		if isPythonImportStmtAt(masked, idx) {
+			if alias := pyImportAliasAfter(masked, idx, len("basicConfig")); alias != "" {
+				bcSyms = append(bcSyms, alias)
+			}
+		}
+	}
+	for _, sym := range bcSyms {
+		for idx := pyNextIdent(masked, 0, sym); idx >= 0; idx = pyNextIdent(masked, idx+len(sym), sym) {
+			if isPythonImportStmtAt(masked, idx) {
+				continue
+			}
+			k := pySkipHorizAndCont(masked, idx+len(sym), false)
+			if k >= len(masked) || masked[k] != '(' {
+				return "python logging.basicConfig rebind"
+			}
+			closeP := pyMatchMatchingDelim(masked, k, '(', ')')
+			if closeP < 0 {
+				return "python logging.basicConfig"
+			}
+			for _, sp := range pySplitTopLevelArgs(masked, k, closeP) {
+				if masked[sp[0]] == '*' {
+					return "python logging.basicConfig unpack"
+				}
+				if kw, _, ok := pyTopLevelKeywordEq(masked, sp[0], sp[1]); ok && kw == "filename" {
+					return "python logging.basicConfig filename"
+				}
+			}
+		}
+	}
+
+	// 5. Dynamic string-import resolvers: `pkgutil.resolve_name` & `pydoc.{locate,safeimport}`.
+	rnSyms := []string{"resolve_name"}
+	for idx := pyNextIdent(masked, 0, "resolve_name"); idx >= 0; idx = pyNextIdent(masked, idx+len("resolve_name"), "resolve_name") {
+		if isPythonImportStmtAt(masked, idx) {
+			if alias := pyImportAliasAfter(masked, idx, len("resolve_name")); alias != "" {
+				rnSyms = append(rnSyms, alias)
+			}
+		}
+	}
+	for _, sym := range rnSyms {
+		for idx := pyNextIdent(masked, 0, sym); idx >= 0; idx = pyNextIdent(masked, idx+len(sym), sym) {
+			if !isPythonImportStmtAt(masked, idx) {
+				return "python pkgutil.resolve_name"
+			}
+		}
+	}
+	pydocMods, _ := pyCollectDirectImportModAliases(masked, "pydoc", "")
+	for _, pm := range pydocMods {
+		for idx := pyNextIdent(masked, 0, pm); idx >= 0; idx = pyNextIdent(masked, idx+len(pm), pm) {
+			if isPythonImportStmtAt(masked, idx) {
+				continue
+			}
+			if attr := readTrailingAttr(idx + len(pm)); attr == "locate" || attr == "safeimport" {
+				return "python pydoc." + attr
+			}
+		}
+	}
+	pydocItems, pydocStar := pyExtractFromImportItems(masked, "pydoc")
+	var pydocTargets []pySymTarget
+	if pydocStar {
+		pydocTargets = append(pydocTargets,
+			pySymTarget{sym: "locate", canon: "locate"},
+			pySymTarget{sym: "safeimport", canon: "safeimport"},
+		)
+	}
+	for _, it := range pydocItems {
+		if it.canon == "locate" || it.canon == "safeimport" {
+			pydocTargets = addTarget(pydocTargets, it.sym, it.canon)
+		}
+	}
+	for _, t := range pydocTargets {
+		for idx := pyNextIdent(masked, 0, t.sym); idx >= 0; idx = pyNextIdent(masked, idx+len(t.sym), t.sym) {
+			if !isPythonImportStmtAt(masked, idx) {
+				return "python pydoc." + t.canon
+			}
+		}
+	}
+
+	// 6. Narrow fail-closed reflection on sensitive target string literals:
+	// `getattr`, `__getattribute__`, `.__dict__`, `vars`, `globals`, `locals`.
+	osMods, _ := pyCollectDirectImportModAliases(masked, "os", "")
+	isOSMod := func(expr string) bool {
+		for _, m := range osMods {
+			if expr == m {
+				return true
+			}
+		}
+		return false
+	}
+	getattrSyms := []string{"getattr"}
+	for idx := pyNextIdent(masked, 0, "getattr"); idx >= 0; idx = pyNextIdent(masked, idx+len("getattr"), "getattr") {
+		if isPythonImportStmtAt(masked, idx) {
+			if alias := pyImportAliasAfter(masked, idx, len("getattr")); alias != "" {
+				getattrSyms = append(getattrSyms, alias)
+			}
+		}
+	}
+	for _, sym := range getattrSyms {
+		for idx := pyNextIdent(masked, 0, sym); idx >= 0; idx = pyNextIdent(masked, idx+len(sym), sym) {
+			if isPythonImportStmtAt(masked, idx) {
+				continue
+			}
+			k := pySkipHorizAndCont(masked, idx+len(sym), false)
+			if k < len(masked) && masked[k] == '(' {
+				closeP := pyMatchMatchingDelim(masked, k, '(', ')')
+				if closeP > k+1 {
+					args := pySplitTopLevelArgs(masked, k, closeP)
+					if len(args) >= 2 {
+						if val, prefix, ok := pyUnquoteStringLiteral(code[args[1][0]:args[1][1]]); ok && !strings.ContainsAny(prefix, "fF") {
+							if pySensitiveReflectNames[val] {
+								return "python getattr " + val
+							}
+							if val == "system" && isOSMod(pyTrimContinuationSpan(masked[args[0][0]:args[0][1]])) {
+								return "python getattr system"
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	for idx := pyNextIdent(masked, 0, "__getattribute__"); idx >= 0; idx = pyNextIdent(masked, idx+len("__getattribute__"), "__getattribute__") {
+		k := pySkipHorizAndCont(masked, idx+len("__getattribute__"), false)
+		if k < len(masked) && masked[k] == '(' {
+			closeP := pyMatchMatchingDelim(masked, k, '(', ')')
+			if closeP > k+1 {
+				args := pySplitTopLevelArgs(masked, k, closeP)
+				checkSlots := []int{0}
+				if len(args) >= 2 {
+					checkSlots = []int{0, 1}
+				}
+				for _, sl := range checkSlots {
+					if sl < len(args) {
+						if val, prefix, ok := pyUnquoteStringLiteral(code[args[sl][0]:args[sl][1]]); ok &&
+							!strings.ContainsAny(prefix, "fF") && pySensitiveReflectNames[val] {
+							return "python __getattribute__ " + val
+						}
+					}
+				}
+			}
+		}
+	}
+	for idx := pyNextIdent(masked, 0, "__dict__"); idx >= 0; idx = pyNextIdent(masked, idx+len("__dict__"), "__dict__") {
+		if hit := pyCheckDictSubscriptOrGet(code, masked, idx+len("__dict__"), "__dict__"); hit != "" {
+			return hit
+		}
+	}
+	for _, fn := range []string{"vars", "globals", "locals"} {
+		for idx := pyNextIdent(masked, 0, fn); idx >= 0; idx = pyNextIdent(masked, idx+len(fn), fn) {
+			k := pySkipHorizAndCont(masked, idx+len(fn), false)
+			if k < len(masked) && masked[k] == '(' {
+				closeP := pyMatchMatchingDelim(masked, k, '(', ')')
+				if closeP >= 0 {
+					if hit := pyCheckDictSubscriptOrGet(code, masked, closeP+1, fn); hit != "" {
+						return hit
+					}
+				}
+			}
+		}
+	}
+
 	return ""
 }
 
@@ -12308,324 +13282,11 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 // `PATH=$PATH:<dir>` prefix then expands $PATH like the runtime instead
 // of collapsing to `:<dir>` ([pattern:sbx-wrapper-unwrap-asymmetry]).
 func stdinProgramHeadWithEnv(argv []string, depth int, inherited envAssignments, basePath string) (lang string, isInterp bool, envAs envAssignments) {
-	if len(argv) == 0 || depth >= shellSplitMaxDepth {
+	targets := stdinProgramTargetsWithEnv(argv, depth, inherited, basePath)
+	if len(targets) == 0 {
 		return "", false, inherited
 	}
-	head, _, ea, exhausted := peelWrappers(argv)
-	if exhausted {
-		// An unresolvable wrapper chain (dynamic word in an option/value
-		// slot) could hide a stdin-reading head — fail closed like the
-		// dynamic-placeholder paths below.
-		return "", true, inherited
-	}
-	// R14: the env ops peeled at every recursion level are the environment
-	// the stdin program text actually runs under — `sh -c 'env HOME=-exec
-	// sh'` hands stdin a head whose HOME is overridden. Accumulate them so
-	// the caller screens the payload under the consumed position's env.
-	envAs = inherited.merged(ea)
-	if len(head) == 0 {
-		return "", false, envAs
-	}
-	base := filepath.Base(head[0])
-	// Alias resolution runs against the PATH the peeled env ops install
-	// over the caller's base PATH, not the process PATH alone — the
-	// runtime resolves the head the same way.
-	effPath := envAs.effectivePATHFrom(basePath)
-	// A PATH alias resolving to sbx (foo -> sbx) skipped the sbx option
-	// peel because peelWrappers saw only the typed name — rewrite the
-	// head to `sbx` and recurse once so the inner command (after its
-	// own -- separator) is classified as the stdin program instead of
-	// the unpeeled wrapper ([pattern:sbx-wrapper-unwrap-asymmetry]).
-	if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath)); rb != "" && rb != base && isPeeledWrapperBase(rb) {
-		l, isProg, inner := stdinProgramHeadWithEnv(append([]string{rb}, head[1:]...), depth+1, envAs, basePath)
-		return l, isProg, inner
-	}
-	// An ssh head forwards stdin to the remote command's stdin: resolve the
-	// remote invocation and ask whether any remote head reads its program
-	// from that stream. Malformed invocations keep their argv/shell hits;
-	// here only the bare-host/missing-remote shape returns a parse hit, and
-	// with no remote command stdin is pure data for the login shell anyway.
-	if base == "ssh" || resolveHeadBase(head[0], effPath) == "ssh" {
-		remoteCmd, hit := parseSSHInvocation(head)
-		if hit != "" {
-			return "", false, envAs
-		}
-		for _, seg := range splitShellSegments(remoteCmd) {
-			if seg.depthExceeded || seg.parseErr != "" {
-				return "", true, envAs
-			}
-			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
-				continue
-			}
-			if l, isProg, inner := stdinProgramHeadWithEnv(seg.argv, depth+1, envAssignments{}, os.Getenv("PATH")); isProg {
-				return l, true, envAs.merged(inner)
-			}
-		}
-		return "", false, envAs
-	}
-	// A `shell -c 'code'` argv carries outer program inline, but the INNER
-	// script may still start a stdin-reading head (MF-5: sh -c 'sh').
-	if innerText, has := unwrapShellArgv(head); has {
-		if isDynamicArg(innerText) {
-			return "", true, envAs
-		}
-		var segs []shellSegment
-		switch base {
-		case "bash", "zsh", "ksh", "mksh":
-			segs = splitShellSegmentsBash(innerText)
-		default:
-			segs = splitShellSegments(innerText)
-		}
-		for _, seg := range segs {
-			if seg.depthExceeded || seg.parseErr != "" {
-				return "", true, envAs
-			}
-			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
-				continue
-			}
-			if l, isProg, inner := stdinProgramHeadWithEnv(seg.argv, depth+1, envAs, basePath); isProg {
-				return l, true, inner
-			}
-		}
-		return "", false, envAs
-	}
-	// An interpreter with -c/-e/-r/-m/-p inline code likewise.
-	if _, _, has := unwrapInterpreterInline(head); has {
-		return "", false, envAs
-	}
-	// SH11 MF-1.2: statement-level wrappers whose inner command shares this
-	// stdin. eval joins its operands as shell text; flock/script/watch and
-	// xargs resolve to an inner command argv (or -c text) which may itself
-	// be a stdin program head.
-	switch base {
-	case "eval":
-		if len(head) < 2 {
-			return "", false, envAs
-		}
-		inner := strings.Join(head[1:], " ")
-		if isDynamicArg(inner) {
-			return "", true, envAs
-		}
-		for _, seg := range splitShellSegments(inner) {
-			if seg.depthExceeded || seg.parseErr != "" {
-				return "", true, envAs
-			}
-			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
-				continue
-			}
-			if l, isProg, inner := stdinProgramHeadWithEnv(seg.argv, depth+1, envAs, basePath); isProg {
-				return l, true, inner
-			}
-		}
-		return "", false, envAs
-	case "flock":
-		inner, cmdText := skipFlockArgs(head, 1)
-		if cmdText != "" {
-			if isDynamicArg(cmdText) {
-				return "", true, envAs
-			}
-			for _, seg := range splitShellSegments(cmdText) {
-				if seg.depthExceeded || seg.parseErr != "" {
-					return "", true, envAs
-				}
-				if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
-					continue
-				}
-				if l, isProg, inner := stdinProgramHeadWithEnv(seg.argv, depth+1, envAs, basePath); isProg {
-					return l, true, inner
-				}
-			}
-			return "", false, envAs
-		}
-		if inner < len(head) {
-			// The inner command still inherits this level's peeled env.
-			l, isProg, inner := stdinProgramHeadWithEnv(head[inner:], depth+1, envAs, basePath)
-			return l, isProg, inner
-		}
-		return "", false, envAs
-	case "script":
-		if payload := scriptCommandArg(head); payload != "" {
-			if isDynamicArg(payload) {
-				return "", true, envAs
-			}
-			for _, seg := range splitShellSegments(payload) {
-				if seg.depthExceeded || seg.parseErr != "" {
-					return "", true, envAs
-				}
-				if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
-					continue
-				}
-				if l, isProg, inner := stdinProgramHeadWithEnv(seg.argv, depth+1, envAs, basePath); isProg {
-					return l, true, inner
-				}
-			}
-			return "", false, envAs
-		}
-		// script without -c spawns a login shell on the pty — it reads the
-		// forwarded stdin as commands.
-		return "", true, envAs
-	case "watch":
-		if len(head) < 2 {
-			return "", false, envAs
-		}
-		k, execMode, fc := skipWatchArgs(head, 1)
-		if fc {
-			return "", true, envAs
-		}
-		if k >= len(head) {
-			return "", false, envAs
-		}
-		if execMode {
-			l, isProg, inner := stdinProgramHeadWithEnv(head[k:], depth+1, envAs, basePath)
-			return l, isProg, inner
-		}
-		text := strings.Join(head[k:], " ")
-		if isDynamicArg(text) {
-			return "", true, envAs
-		}
-		for _, seg := range splitShellSegments(text) {
-			if seg.depthExceeded || seg.parseErr != "" {
-				return "", true, envAs
-			}
-			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
-				continue
-			}
-			if l, isProg, inner := stdinProgramHeadWithEnv(seg.argv, depth+1, envAs, basePath); isProg {
-				return l, true, inner
-			}
-		}
-		return "", false, envAs
-	case "xargs":
-		k := xargsTargetIndex(head)
-		if k >= len(head) {
-			return "", false, envAs // xargs with no command runs echo
-		}
-		// xargs feeds the piped words as ARGV, not stdin: an inner bare
-		// `sh` is not a stdin-program (S3). But an inner `sh -c`/`python -c`
-		// whose code operand slot is FILLED from the fed words (code flag
-		// last, or the -I/-i replace-token right after it) IS fed code —
-		// the language follows the fed interpreter head so the payload is
-		// screened under the right code rules.
-		if xargsFeedsCodeFlag(head[k:], head, effPath) {
-			innerHead, innerEnv, _, innerExhausted := peelWrappersAndSbxAliases(head[k:], effPath)
-			envAs = envAs.merged(innerEnv) // fed code runs under the inner wrapper env too
-			if !innerExhausted && len(innerHead) > 0 {
-				if l, ok := heredocInterpLang(filepath.Base(innerHead[0])); ok {
-					return l, true, envAs
-				}
-			}
-			return "", true, envAs
-		}
-		l, isProg, inner := stdinProgramHeadWithEnv(head[k:], depth+1, envAs, basePath)
-		return l, isProg, inner
-	}
-	if shellHeads[base] {
-		// sh/bash/... without -c: commands come from a script file or
-		// stdin. -s forces stdin even with positional args; -o/+o/-O/+O
-		// and short clusters containing o/O consume a value slot.
-		sawDashDash := false
-		forceStdin := false
-		i := 1
-		for i < len(head) {
-			a := head[i]
-			if isDynamicArg(a) {
-				return "", true, envAs // dynamic option/script → treat as stdin-program so heredoc screens
-			}
-			if a == "--" {
-				sawDashDash = true
-				i++
-				continue
-			}
-			if sawDashDash {
-				if isStdinDevicePath(a) {
-					return "", true, envAs // sh -- /dev/stdin reads the program from stdin
-				}
-				if forceStdin {
-					return "", true, envAs
-				}
-				return "", false, envAs
-			}
-			if a == "-" || isStdinDevicePath(a) {
-				return "", true, envAs
-			}
-			if a == "-o" || a == "+o" || a == "-O" || a == "+O" {
-				i += 2
-				continue
-			}
-			if (strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+")) && len(a) > 1 && !strings.HasPrefix(a, "--") {
-				plus := a[0] == '+'
-				for j := 1; j < len(a); j++ {
-					ch := a[j]
-					if ch == 's' && !plus {
-						forceStdin = true
-					}
-					if ch == 'c' && !plus {
-						return "", false, envAs // -c means inline, not stdin
-					}
-					if ch == 'o' || ch == 'O' {
-						if j+1 >= len(a) {
-							i++ // consume option name argv
-						}
-						break
-					}
-				}
-				i++
-				continue
-			}
-			if strings.HasPrefix(a, "--") {
-				i++
-				continue
-			}
-			// non-option operand
-			if forceStdin {
-				return "", true, envAs // -s arg1 still reads stdin
-			}
-			return "", false, envAs // script file
-		}
-		return "", true, envAs // bare shell / only flags
-	}
-	if lang, ok := heredocInterpLang(base); ok {
-		sawDashDash := false
-		valueOpts := map[string]bool{
-			"-W": true, "-X": true, "-r": true, "--require": true,
-			"--loader": true, "--import": true, "--experimental-loader": true,
-			"--conditions": true, "-I": true, "-M": true, "-m": true,
-			"-c": true, "-d": true, "-z": true,
-		}
-		i := 1
-		for i < len(head) {
-			a := head[i]
-			if isDynamicArg(a) {
-				return lang, true, envAs
-			}
-			// A stdin device path reads the PROGRAM from stdin — checked
-			// before the sawDashDash script-file early return so
-			// `python3 -- /dev/stdin` blocks too.
-			if a == "-" || isStdinDevicePath(a) {
-				return lang, true, envAs
-			}
-			if a == "--" {
-				sawDashDash = true
-				i++
-				continue
-			}
-			if sawDashDash || !strings.HasPrefix(a, "-") {
-				return "", false, envAs
-			}
-			if valueOpts[a] {
-				i += 2
-				continue
-			}
-			if strings.HasPrefix(a, "--") && strings.Contains(a, "=") {
-				i++
-				continue
-			}
-			// bundled short opts: -Wignore / -Xutf8 etc. already single argv
-			i++
-		}
-		return lang, true, envAs
-	}
-	return "", false, envAs
+	return targets[0].lang, true, targets[0].envAs
 }
 
 // peelToSSHHead peels both standard wrappers and statement-level stdin
@@ -12704,22 +13365,26 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 	if stdin == "" || (!g.subagent && !g.strictReadonly) {
 		return "", ""
 	}
-	// The env ops peeled at EVERY recursion level (including inside -c
-	// payloads and remote commands) are the env the stdin program text is
-	// parsed against: env HOME=-exec sh +stdin, and `sh -c 'env HOME=-exec
-	// sh'`+stdin alike (R14).
-	lang, isProg, envAs := stdinProgramHeadEnv(argv)
-	if !isProg {
+	targets := stdinProgramTargetsWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"))
+	if len(targets) == 0 {
 		return "", ""
 	}
-	if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(argv, os.Getenv("PATH")) {
-		g.strictReadonly = true
+	gSeg := g
+	if gSeg.readonly && !gSeg.strictReadonly && sshTunnelsStdinProgram(argv, os.Getenv("PATH")) {
+		gSeg.strictReadonly = true
 	}
-	if lang == "" {
-		// Shell head: stdin is shell code, screened under envAs' taint.
-		return g.guardCtxRunShellEnv(stdin, envAs)
+	for _, t := range targets {
+		if t.lang == "" {
+			if r, d := gSeg.guardCtxRunShellEnv(stdin, t.envAs); r != "" {
+				return r, d
+			}
+			continue
+		}
+		if r, d := gSeg.guardCtxRunCode(t.lang, stdin); r != "" {
+			return r, d
+		}
 	}
-	return g.guardCtxRunCode(lang, stdin)
+	return "", ""
 }
 
 // guardCtxRunStdinForCommand is the command-string variant of
@@ -12740,29 +13405,25 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 			}
 			return "", ""
 		}
-		// Skip segments that cannot read the ctx_run stdin: they either
-		// carry no argv, consume the pipe themselves (their stdin is the
-		// upstream bytes, not the stdin payload — those are screened as
-		// piped code separately), or already take their input from a file
-		// redirect / heredoc / here-string (stdin never reaches them).
 		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 			continue
 		}
-		if lang, isProg, envAs := stdinProgramHeadEnv(seg.argv); isProg {
-			// A clean segment result does not end the scan: a LATER
-			// segment may still read stdin (e.g. `python3 -; sh` +stdin).
-			// Only a rule hit blocks; "" falls through to the next segment.
-			gSeg := g
-			if gSeg.readonly && !gSeg.strictReadonly && sshTunnelsStdinProgram(seg.argv, os.Getenv("PATH")) {
-				gSeg.strictReadonly = true
-			}
-			if lang == "" {
-				if r, d := gSeg.guardCtxRunShellEnv(stdin, envAs); r != "" {
+		targets := stdinProgramTargetsWithEnv(seg.argv, 0, envAssignments{}, os.Getenv("PATH"))
+		if len(targets) == 0 {
+			continue
+		}
+		gSeg := g
+		if gSeg.readonly && !gSeg.strictReadonly && sshTunnelsStdinProgram(seg.argv, os.Getenv("PATH")) {
+			gSeg.strictReadonly = true
+		}
+		for _, t := range targets {
+			if t.lang == "" {
+				if r, d := gSeg.guardCtxRunShellEnv(stdin, t.envAs); r != "" {
 					return r, d
 				}
 				continue
 			}
-			if r, d := gSeg.guardCtxRunCode(lang, stdin); r != "" {
+			if r, d := gSeg.guardCtxRunCode(t.lang, stdin); r != "" {
 				return r, d
 			}
 		}
@@ -12821,4 +13482,5058 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func optNumValueOK(s string) bool {
+	if s == "all" {
+		return true
+	}
+	return allDigits(strings.TrimPrefix(s, "+"))
+}
+
+// isTrustedRelToolchainTarget allows a symlink from a relative toolchain PATH
+// segment (node_modules/.bin, .venv/bin) to resolve into an ancestor monorepo's
+// hoisted node_modules/.venv/venv tree (e.g. packages/app -> ../../node_modules/...)
+// or a sibling worktree under trustedHomeDirs(), while rejecting all scratch
+// roots (/tmp, /var/tmp, /dev/shm, /run) and foreign-owned binaries.
+func isTrustedRelToolchainTarget(resolved, realCwd string, euid int) bool {
+	if isTmpOrScratchPath(resolved) {
+		return false
+	}
+	st, err := os.Stat(resolved)
+	if err != nil || st.IsDir() {
+		return false
+	}
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+		if sys.Uid != 0 && int(sys.Uid) != euid {
+			return false
+		}
+	}
+	if realCwd != "" && !isTmpOrScratchPath(realCwd) {
+		for anc := filepath.Dir(realCwd); anc != "/" && anc != "."; {
+			if isTmpOrScratchPath(anc) || anc == "/home" || anc == "/Users" {
+				break
+			}
+			for _, sub := range []string{"/node_modules/", "/.venv/", "/venv/"} {
+				if strings.HasPrefix(resolved, anc+sub) {
+					return true
+				}
+			}
+			next := filepath.Dir(anc)
+			if next == anc {
+				break
+			}
+			anc = next
+		}
+	}
+	resDir := filepath.Clean(filepath.Dir(resolved))
+	if tail, ok := stripTrustedHomePrefix(resDir); ok {
+		for _, sub := range []string{"/node_modules/", "/.venv/", "/venv/"} {
+			if strings.Contains(tail+"/", sub) && isTrustedExecutableOnDisk(resolved, euid) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func pythonHasBareOpenIdent(masked string) bool {
+	for off := 0; ; {
+		pos := indexIdent(masked, "open", off)
+		if pos < 0 {
+			return false
+		}
+		off = pos + len("open")
+		if openParenAfter(masked, off) >= 0 {
+			continue
+		}
+		// Exempt keyword-argument label `fn(..., open=...)`; keep bare `open`
+		// and `.open` (e.g. `f = io.open`) blocked against rebind escapes.
+		prev := pos - 1
+		for prev >= 0 && (masked[prev] == ' ' || masked[prev] == '\t' || masked[prev] == '\n') {
+			prev--
+		}
+		next := off
+		for next < len(masked) && (masked[next] == ' ' || masked[next] == '\t') {
+			next++
+		}
+		if prev >= 0 && (masked[prev] == '(' || masked[prev] == ',') &&
+			next < len(masked) && masked[next] == '=' &&
+			(next+1 >= len(masked) || masked[next+1] != '=') {
+			continue
+		}
+		return true
+	}
+}
+
+type stdinTarget struct {
+	lang  string
+	envAs envAssignments
+}
+
+func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignments, basePath string) []stdinTarget {
+	if len(argv) == 0 || depth >= shellSplitMaxDepth {
+		return nil
+	}
+	head, _, ea, exhausted := peelWrappers(argv)
+	envAs := inherited.merged(ea)
+	if exhausted {
+		return []stdinTarget{{lang: "", envAs: envAs}}
+	}
+	if len(head) == 0 {
+		return nil
+	}
+	base := filepath.Base(head[0])
+	if canon := canonicalResolvedBase(base); canon != base {
+		if isPeeledWrapperBase(canon) {
+			return stdinProgramTargetsWithEnv(append([]string{canon}, head[1:]...), depth+1, envAs, basePath)
+		}
+		head = append([]string{canon}, head[1:]...)
+		base = canon
+	}
+	effPath := envAs.effectivePATHFrom(basePath)
+	if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath)); rb != "" && rb != base {
+		if isPeeledWrapperBase(rb) {
+			return stdinProgramTargetsWithEnv(append([]string{rb}, head[1:]...), depth+1, envAs, basePath)
+		}
+		if !isStructuralGuardHead(base) {
+			head = append([]string{rb}, head[1:]...)
+			base = rb
+		}
+	}
+	collectSegs := func(segs []shellSegment, subEnv envAssignments, subPath string, mergeOuter bool) []stdinTarget {
+		var out []stdinTarget
+		for _, seg := range segs {
+			if seg.depthExceeded || seg.parseErr != "" {
+				out = append(out, stdinTarget{lang: "", envAs: envAs})
+				continue
+			}
+			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
+				continue
+			}
+			for _, t := range stdinProgramTargetsWithEnv(seg.argv, depth+1, subEnv, subPath) {
+				if mergeOuter {
+					t.envAs = envAs.merged(t.envAs)
+				}
+				out = append(out, t)
+			}
+		}
+		return out
+	}
+	if base == "ssh" {
+		remoteCmd, hit := parseSSHInvocation(head)
+		if hit != "" {
+			return nil
+		}
+		return collectSegs(splitShellSegments(remoteCmd), envAssignments{}, os.Getenv("PATH"), true)
+	}
+	if innerText, has := unwrapShellArgv(head); has {
+		if isDynamicArg(innerText) {
+			return []stdinTarget{{lang: "", envAs: envAs}}
+		}
+		var segs []shellSegment
+		switch base {
+		case "bash", "zsh", "ksh", "mksh":
+			segs = splitShellSegmentsBash(innerText)
+		default:
+			segs = splitShellSegments(innerText)
+		}
+		return collectSegs(segs, envAs, basePath, false)
+	}
+	if _, _, has := unwrapInterpreterInline(head); has {
+		return nil
+	}
+	switch base {
+	case "eval":
+		if len(head) < 2 {
+			return nil
+		}
+		inner := strings.Join(head[1:], " ")
+		if isDynamicArg(inner) {
+			return []stdinTarget{{lang: "", envAs: envAs}}
+		}
+		return collectSegs(splitShellSegments(inner), envAs, basePath, false)
+	case "flock":
+		inner, cmdText := skipFlockArgs(head, 1)
+		if cmdText != "" {
+			if isDynamicArg(cmdText) {
+				return []stdinTarget{{lang: "", envAs: envAs}}
+			}
+			return collectSegs(splitShellSegments(cmdText), envAs, basePath, false)
+		}
+		if inner < len(head) {
+			return stdinProgramTargetsWithEnv(head[inner:], depth+1, envAs, basePath)
+		}
+		return nil
+	case "script":
+		if payload := scriptCommandArg(head); payload != "" {
+			if isDynamicArg(payload) {
+				return []stdinTarget{{lang: "", envAs: envAs}}
+			}
+			return collectSegs(splitShellSegments(payload), envAs, basePath, false)
+		}
+		return []stdinTarget{{lang: "", envAs: envAs}}
+	case "watch":
+		if len(head) < 2 {
+			return nil
+		}
+		k, execMode, fc := skipWatchArgs(head, 1)
+		if fc {
+			return []stdinTarget{{lang: "", envAs: envAs}}
+		}
+		if k >= len(head) {
+			return nil
+		}
+		if execMode {
+			return stdinProgramTargetsWithEnv(head[k:], depth+1, envAs, basePath)
+		}
+		text := strings.Join(head[k:], " ")
+		if isDynamicArg(text) {
+			return []stdinTarget{{lang: "", envAs: envAs}}
+		}
+		return collectSegs(splitShellSegments(text), envAs, basePath, false)
+	case "xargs":
+		k := xargsTargetIndex(head)
+		if k >= len(head) {
+			return nil
+		}
+		if xargsFeedsCodeFlag(head[k:], head, effPath) {
+			innerHead, innerEnv, _, innerExhausted := peelWrappersAndSbxAliases(head[k:], effPath)
+			envAs = envAs.merged(innerEnv)
+			if !innerExhausted && len(innerHead) > 0 {
+				if l, ok := heredocInterpLang(canonicalResolvedBase(filepath.Base(innerHead[0]))); ok {
+					return []stdinTarget{{lang: l, envAs: envAs}}
+				}
+			}
+			return []stdinTarget{{lang: "", envAs: envAs}}
+		}
+		return stdinProgramTargetsWithEnv(head[k:], depth+1, envAs, basePath)
+	}
+	if shellHeads[base] {
+		sawDashDash := false
+		forceStdin := false
+		for i := 1; i < len(head); {
+			a := head[i]
+			if isDynamicArg(a) {
+				return []stdinTarget{{lang: "", envAs: envAs}}
+			}
+			if a == "--" {
+				sawDashDash = true
+				i++
+				continue
+			}
+			if sawDashDash {
+				if a == "-" || isStdinDevicePath(a) || forceStdin {
+					return []stdinTarget{{lang: "", envAs: envAs}}
+				}
+				return nil
+			}
+			if a == "-" || isStdinDevicePath(a) {
+				return []stdinTarget{{lang: "", envAs: envAs}}
+			}
+			if a == "-o" || a == "+o" || a == "-O" || a == "+O" {
+				i += 2
+				continue
+			}
+			if (strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+")) && len(a) > 1 && !strings.HasPrefix(a, "--") {
+				plus := a[0] == '+'
+				for j := 1; j < len(a); j++ {
+					ch := a[j]
+					if ch == 's' && !plus {
+						forceStdin = true
+					}
+					if ch == 'c' && !plus {
+						return nil
+					}
+					if ch == 'o' || ch == 'O' {
+						if j+1 >= len(a) {
+							i++
+						}
+						break
+					}
+				}
+				i++
+				continue
+			}
+			if strings.HasPrefix(a, "--") {
+				i++
+				continue
+			}
+			if forceStdin {
+				return []stdinTarget{{lang: "", envAs: envAs}}
+			}
+			return nil
+		}
+		return []stdinTarget{{lang: "", envAs: envAs}}
+	}
+	if lang, ok := heredocInterpLang(base); ok {
+		sawDashDash := false
+		valueOpts := map[string]bool{
+			"-W": true, "-X": true, "-r": true, "--require": true,
+			"--loader": true, "--import": true, "--experimental-loader": true,
+			"--conditions": true, "-C": true, "-I": true, "-M": true, "-m": true,
+			"-c": true, "-d": true, "-z": true, "-F": true, "-K": true,
+			"--input-type": true, "--check-hash-based-pycs": true, "--title": true,
+			"--env-file": true, "--env-file-if-exists": true, "--redirect-warnings": true,
+			"--diagnostic-dir": true, "--watch-path": true,
+		}
+		for i := 1; i < len(head); {
+			a := head[i]
+			if isDynamicArg(a) {
+				return []stdinTarget{{lang: lang, envAs: envAs}}
+			}
+			if a == "-" || isStdinDevicePath(a) {
+				return []stdinTarget{{lang: lang, envAs: envAs}}
+			}
+			if a == "--" {
+				sawDashDash = true
+				i++
+				continue
+			}
+			if sawDashDash || !strings.HasPrefix(a, "-") {
+				return nil
+			}
+			if valueOpts[a] {
+				i += 2
+				continue
+			}
+			i++
+		}
+		return []stdinTarget{{lang: lang, envAs: envAs}}
+	}
+	return nil
+}
+
+func isLongOptAbbrev(name, full string, minPrefixLen int) bool {
+	return name == full || (len(name) >= minPrefixLen && strings.HasPrefix(full, name))
+}
+
+// resolveNodeRunnerPathOpt normalizes a path-valued option operand (--prefix /
+// --userconfig) of npx/bunx/pnpx and reports the resolved path plus whether it
+// is safe: single-word, only `~` or `~/...` for tilde (`~user` fails closed),
+// no '..' traversal on dynamic prefixes, relative paths joined against
+// currentScreenCwd(), and neither lexical nor symlink-resolved path inside
+// /tmp|/var/tmp|/dev/shm|/run.
+func resolveNodeRunnerPathOpt(val string) (string, bool) {
+	if val == "" || !isSingleWordOptionValue(val) {
+		return "", false
+	}
+	var cand string
+	switch {
+	case strings.HasPrefix(val, "~"):
+		raw := strings.Replace(val, cmdSubPlaceholderGlob, "", 1)
+		if isDynamicArg(raw) || strings.ContainsAny(raw, "*?[") {
+			return "", false
+		}
+		if raw != "~" && !strings.HasPrefix(raw, "~/") {
+			return "", false // ~otheruser: untrusted home directory
+		}
+		home := filepath.Clean(safeHomeDir())
+		if home == "" || home == "." || !filepath.IsAbs(home) {
+			return "", false
+		}
+		cand = filepath.Clean(home + raw[1:])
+	case isDynamicArg(val):
+		for _, seg := range strings.Split(filepath.ToSlash(val), "/") {
+			if seg == ".." {
+				return "", false
+			}
+		}
+		cand = filepath.Clean(val)
+	case filepath.IsAbs(val):
+		cand = filepath.Clean(val)
+	default:
+		cwd := currentScreenCwd()
+		if cwd == "" {
+			return "", false
+		}
+		if ec, err := filepath.EvalSymlinks(cwd); err == nil {
+			cwd = ec
+		}
+		cand = filepath.Clean(filepath.Join(cwd, val))
+	}
+	if isTmpOrScratchPath(cand) {
+		return "", false
+	}
+	if resolved, err := filepath.EvalSymlinks(cand); err == nil {
+		if isTmpOrScratchPath(filepath.Clean(resolved)) {
+			return "", false
+		}
+	}
+	return cand, true
+}
+
+func trimByteAligned(raw, mask string) (string, string) {
+	n := minInt(len(raw), len(mask))
+	s, e := 0, n
+	for s < e && (raw[s] == ' ' || raw[s] == '\t' || raw[s] == '\n' || raw[s] == '\r') {
+		s++
+	}
+	for e > s && (raw[e-1] == ' ' || raw[e-1] == '\t' || raw[e-1] == '\n' || raw[e-1] == '\r') {
+		e--
+	}
+	return raw[s:e], mask[s:e]
+}
+
+func staticArgvListAllowEmpty(s string) ([]string, bool) {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && ((s[0] == '[' && strings.TrimSpace(s[1:]) == "]") ||
+		(s[0] == '(' && strings.TrimSpace(s[1:]) == ")")) {
+		return []string{}, true
+	}
+	return staticArgvList(s)
+}
+
+// inspectJSSpawnOptions parses a JS/TS child_process options object literal
+// (`{ cwd: '/tmp', shell: ..., execPath: ... }`) and extracts any shell mode
+// or custom executable path. Dynamic values on shell/execPath, spread `...`,
+// computed keys `[k]: v`, or shorthand `{ shell }`/`{ execPath }` return ok=false.
+func inspectJSSpawnOptions(rawObj, maskObj string) (shellMode bool, execPath string, ok bool) {
+	if len(maskObj) < 2 || maskObj[0] != '{' {
+		return false, "", false
+	}
+	end := matchingBracket(maskObj, '{', '}')
+	if end < 0 || strings.TrimSpace(maskObj[end+1:]) != "" {
+		return false, "", false
+	}
+	innerMask := maskObj[1:end]
+	innerRaw := rawObj[1:minInt(end, len(rawObj))]
+	for _, sp := range splitCallArgsOffsets(innerMask) {
+		lo := minInt(sp[0], len(innerRaw))
+		hi := minInt(sp[1], len(innerRaw))
+		mlo := minInt(sp[0], len(innerMask))
+		mhi := minInt(sp[1], len(innerMask))
+		if hi <= lo || mhi <= mlo {
+			continue
+		}
+		eRaw, eMask := trimByteAligned(innerRaw[lo:hi], innerMask[mlo:mhi])
+		if eRaw == "" {
+			continue
+		}
+		if strings.HasPrefix(eMask, "...") || strings.HasPrefix(eMask, "[") {
+			return false, "", false
+		}
+		colon := strings.IndexByte(eMask, ':')
+		if colon < 0 {
+			if eMask == "shell" || eMask == "execPath" {
+				return false, "", false
+			}
+			continue
+		}
+		kRaw := strings.TrimSpace(eRaw[:colon])
+		kMask := strings.TrimSpace(eMask[:colon])
+		key := kMask
+		if !isIdentName(key) {
+			var rest string
+			var litOK bool
+			key, rest, litOK = leadingStringLiteral(kRaw)
+			if !litOK || strings.TrimSpace(rest) != "" {
+				return false, "", false
+			}
+		}
+		vRaw := strings.TrimSpace(eRaw[colon+1:])
+		switch key {
+		case "execPath":
+			if vRaw == "undefined" || vRaw == "null" {
+				continue
+			}
+			lit, rest, litOK := leadingStringLiteral(vRaw)
+			if !litOK || strings.TrimSpace(rest) != "" {
+				return false, "", false
+			}
+			execPath = lit
+		case "shell":
+			switch vRaw {
+			case "false", "undefined", "null":
+				continue
+			case "true":
+				shellMode = true
+			default:
+				lit, rest, litOK := leadingStringLiteral(vRaw)
+				if !litOK || strings.TrimSpace(rest) != "" {
+					return false, "", false
+				}
+				shellMode = true
+				execPath = lit
+			}
+		}
+	}
+	return shellMode, execPath, true
+}
+
+func staticSpawnCalls(language, raw, masked string) (argvs [][]string, shellCmds []string, ok bool) {
+	isJS := language == "javascript" || language == "typescript"
+	type callArg struct{ raw, mask string }
+	var allArgs []callArg
+	for _, sp := range splitCallArgsOffsets(masked) {
+		lo := minInt(sp[0], len(raw))
+		hi := minInt(sp[1], len(raw))
+		mlo := minInt(sp[0], len(masked))
+		mhi := minInt(sp[1], len(masked))
+		if hi <= lo || mhi <= mlo {
+			continue
+		}
+		rOp, mOp := trimByteAligned(raw[lo:hi], masked[mlo:mhi])
+		if rOp != "" {
+			allArgs = append(allArgs, callArg{raw: rOp, mask: mOp})
+		}
+	}
+	if len(allArgs) == 0 {
+		return nil, nil, false
+	}
+
+	var posArgs []callArg
+	shellMode := false
+	var extraExecs []string
+	for _, op := range allArgs {
+		if strings.HasPrefix(op.mask, "*") || strings.HasPrefix(op.mask, "...") {
+			return nil, nil, false
+		}
+		if language == "python" {
+			if eq := strings.IndexByte(op.mask, '='); eq > 0 &&
+				(eq+1 >= len(op.mask) || op.mask[eq+1] != '=') &&
+				op.mask[eq-1] != '!' && op.mask[eq-1] != '<' && op.mask[eq-1] != '>' &&
+				isIdentName(strings.TrimSpace(op.mask[:eq])) {
+				k := strings.TrimSpace(op.mask[:eq])
+				vRaw := strings.TrimSpace(op.raw[eq+1:])
+				switch k {
+				case "args", "cmd", "command":
+					rSub, mSub := trimByteAligned(op.raw[eq+1:], op.mask[eq+1:])
+					posArgs = append([]callArg{{raw: rSub, mask: mSub}}, posArgs...)
+				case "shell":
+					switch vRaw {
+					case "True", "true", "1":
+						shellMode = true
+					case "False", "false", "0", "None":
+					default:
+						return nil, nil, false
+					}
+				case "executable":
+					if vRaw == "None" {
+						continue
+					}
+					lit, rest, litOK := leadingStringLiteral(vRaw)
+					if !litOK || strings.TrimSpace(rest) != "" {
+						return nil, nil, false
+					}
+					extraExecs = append(extraExecs, lit)
+				}
+				continue
+			}
+		}
+		posArgs = append(posArgs, op)
+	}
+	if len(posArgs) == 0 {
+		return nil, nil, false
+	}
+
+	var jsArgsList []string
+	hasJSArgsList := false
+	if isJS {
+		for idx := 1; idx < len(posArgs); idx++ {
+			op := posArgs[idx]
+			switch {
+			case op.mask == "undefined" || op.mask == "null":
+				continue
+			case strings.HasPrefix(op.mask, "function") || strings.Contains(op.mask, "=>"):
+				continue
+			case idx == 1 && len(op.mask) > 0 && op.mask[0] == '[':
+				l, listOK := staticArgvListAllowEmpty(op.raw)
+				if !listOK {
+					return nil, nil, false
+				}
+				jsArgsList = l
+				hasJSArgsList = true
+			case len(op.mask) > 0 && op.mask[0] == '{':
+				shMode, execLit, optOK := inspectJSSpawnOptions(op.raw, op.mask)
+				if !optOK {
+					return nil, nil, false
+				}
+				if shMode {
+					shellMode = true
+				}
+				if execLit != "" {
+					extraExecs = append(extraExecs, execLit)
+				}
+			default:
+				return nil, nil, false // dynamic args/options variable
+			}
+		}
+	}
+
+	appendExtras := func(mainArgv []string) {
+		for _, ex := range extraExecs {
+			argvs = append(argvs, []string{ex})
+			if !shellMode && len(mainArgv) > 1 {
+				argvs = append(argvs, append([]string{ex}, mainArgv[1:]...))
+			} else if isJS && !shellMode && len(mainArgv) == 1 {
+				// fork('/tmp/pig', [], {execPath: ...}) or fork('/tmp/x.js', [], {execPath: P})
+				argvs = append(argvs, []string{ex, mainArgv[0]})
+			}
+		}
+	}
+
+	if isJS {
+		firstOp := posArgs[0].raw
+		if listArgv, listOK := staticArgvList(firstOp); listOK {
+			if shellMode || (len(listArgv) == 1 && strings.ContainsAny(listArgv[0], " \t'\"\\$`*|;&")) {
+				shellCmds = append(shellCmds, strings.Join(listArgv, " "))
+			} else {
+				argvs = append(argvs, listArgv)
+			}
+			appendExtras(listArgv)
+			return argvs, shellCmds, len(argvs)+len(shellCmds) > 0
+		}
+		lit, rest, litOK := leadingStringLiteral(firstOp)
+		if !litOK || strings.TrimSpace(rest) != "" {
+			return nil, nil, false
+		}
+		if hasJSArgsList {
+			combined := append([]string{lit}, jsArgsList...)
+			if shellMode {
+				shellCmds = append(shellCmds, strings.Join(combined, " "))
+			} else {
+				argvs = append(argvs, combined)
+			}
+			appendExtras(combined)
+			return argvs, shellCmds, len(argvs)+len(shellCmds) > 0
+		}
+		if shellMode || strings.ContainsAny(lit, "'\"\\$`*|;&") {
+			shellCmds = append(shellCmds, lit)
+		} else if f := strings.Fields(lit); len(f) > 0 {
+			argvs = append(argvs, f)
+		}
+		appendExtras([]string{lit})
+		return argvs, shellCmds, len(argvs)+len(shellCmds) > 0
+	}
+
+	// Python positional extraction: delegate base argv/shell parsing to
+	// staticSpawnArgv and additionally vet positional Popen executable (arg 3).
+	if len(posArgs) >= 3 {
+		if _, isList0 := staticArgvListAllowEmpty(posArgs[0].raw); isList0 {
+			pExec := posArgs[2].raw
+			if pExec != "None" {
+				lit, rest, litOK := leadingStringLiteral(pExec)
+				if !litOK || strings.TrimSpace(rest) != "" {
+					return nil, nil, false
+				}
+				extraExecs = append(extraExecs, lit)
+			}
+		}
+	}
+	baseArgv, baseShell, baseOK := staticSpawnArgv(raw, masked)
+	if !baseOK {
+		return nil, nil, false
+	}
+	if len(baseArgv) > 0 {
+		if shellMode {
+			shellCmds = append(shellCmds, strings.Join(baseArgv, " "))
+		} else {
+			argvs = append(argvs, baseArgv)
+			base := canonicalResolvedBase(filepath.Base(baseArgv[0]))
+			if len(baseArgv) >= 3 && (shellHeads[base] || isPeeledWrapperBase(base)) && strings.HasPrefix(baseArgv[2], "-") {
+				// Cover Python execv/posix_spawn(shell, ['fake_argv0', '-c', 'pig']).
+				argvs = append(argvs, append([]string{baseArgv[0]}, baseArgv[2:]...))
+			}
+		}
+	}
+	if baseShell != "" {
+		shellCmds = append(shellCmds, baseShell)
+	}
+	appendExtras(baseArgv)
+	return argvs, shellCmds, len(argvs)+len(shellCmds) > 0
+}
+
+// isPythonImportStmtAt reports whether byte offset pos in pythonMask-processed
+// code s lies inside a syntactically valid Python `import ...` or
+// `from ... import ...` statement (rather than a runtime call, attribute load,
+// or symbol rebind). Bare newlines terminate statements unless enclosed within
+// `from <module> import ( ... )` or escaped by a trailing `\` line continuation.
+func isPythonImportStmtAt(s string, pos int) bool {
+	isIdent := func(b byte) bool {
+		return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+	}
+	if pos < 0 || pos >= len(s) || !isIdent(s[pos]) {
+		return false
+	}
+	if pos > 0 && isIdent(s[pos-1]) {
+		return false
+	}
+	end := pos
+	for end < len(s) && isIdent(s[end]) {
+		end++
+	}
+
+	// prevContinuedNL reports whether s[nlIdx] == '\n' is escaped by a single
+	// line-continuation backslash (`\\\n` or `\\\r\n`), returning the byte index
+	// immediately preceding that backslash.
+	prevContinuedNL := func(nlIdx int) (int, bool) {
+		k := nlIdx - 1
+		if k >= 0 && s[k] == '\r' {
+			k--
+		}
+		if k >= 0 && s[k] == '\\' && (k == 0 || s[k-1] != '\\') {
+			return k - 1, true
+		}
+		return 0, false
+	}
+
+	skipForwardWS := func(i int) int {
+		for i < len(s) {
+			if s[i] == ' ' || s[i] == '\t' || s[i] == '\r' {
+				i++
+				continue
+			}
+			if s[i] == '\\' && (i == 0 || s[i-1] != '\\') {
+				if i+1 < len(s) && s[i+1] == '\n' {
+					i += 2
+					continue
+				}
+				if i+2 < len(s) && s[i+1] == '\r' && s[i+2] == '\n' {
+					i += 3
+					continue
+				}
+			}
+			break
+		}
+		return i
+	}
+
+	skipBackwardWS := func(i int) int {
+		for i >= 0 {
+			if s[i] == ' ' || s[i] == '\t' || s[i] == '\r' {
+				i--
+				continue
+			}
+			if s[i] == '\n' {
+				if prev, ok := prevContinuedNL(i); ok {
+					i = prev
+					continue
+				}
+			}
+			break
+		}
+		return i
+	}
+
+	isStmtBoundaryBefore := func(idx int) bool {
+		k := skipBackwardWS(idx - 1)
+		if k < 0 || s[k] == '\n' || s[k] == ';' {
+			return true
+		}
+		if s[k] == ':' && (k == 0 || s[k-1] != ':') {
+			return true
+		}
+		return false
+	}
+
+	matchWordAt := func(idx int, kw string) bool {
+		if idx < 0 || idx+len(kw) > len(s) || s[idx:idx+len(kw)] != kw {
+			return false
+		}
+		if idx > 0 && isIdent(s[idx-1]) {
+			return false
+		}
+		if idx+len(kw) < len(s) && isIdent(s[idx+len(kw)]) {
+			return false
+		}
+		return true
+	}
+
+	// hasFromImportPrefix validates `from <module> import` starting at kwStart up
+	// to limit (openParen for parenthesized imports, stmtEnd for plain imports).
+	hasFromImportPrefix := func(kwStart, limit int, requireTargetAfterImport bool) bool {
+		if !isStmtBoundaryBefore(kwStart) || !matchWordAt(kwStart, "from") {
+			return false
+		}
+		q := skipForwardWS(kwStart + len("from"))
+		hasMod := false
+		for q < limit {
+			if matchWordAt(q, "import") {
+				if !hasMod {
+					return false
+				}
+				afterImp := skipForwardWS(q + len("import"))
+				if requireTargetAfterImport {
+					return afterImp < limit
+				}
+				return afterImp == limit
+			}
+			if isIdent(s[q]) {
+				hasMod = true
+				for q < limit && isIdent(s[q]) {
+					q++
+				}
+				q = skipForwardWS(q)
+				continue
+			}
+			if s[q] == '.' {
+				hasMod = true
+				q++
+				q = skipForwardWS(q)
+				continue
+			}
+			return false
+		}
+		return false
+	}
+
+	// Case 1: Parenthesized multiline `from <module> import ( ... )`.
+	// Bare newlines are permitted ONLY strictly between `(` and matching `)`.
+	{
+		i := pos - 1
+		openParen := -1
+		for i >= 0 {
+			c := s[i]
+			if isIdent(c) || c == ',' || c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+				i--
+				continue
+			}
+			if c == '\\' && (i == 0 || s[i-1] != '\\') &&
+				((i+1 < len(s) && s[i+1] == '\n') || (i+2 < len(s) && s[i+1] == '\r' && s[i+2] == '\n')) {
+				i--
+				continue
+			}
+			if c == '(' {
+				openParen = i
+			}
+			break
+		}
+		if openParen >= 0 {
+			j := end
+			closeParen := -1
+			for j < len(s) {
+				c := s[j]
+				if isIdent(c) || c == ',' || c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+					j++
+					continue
+				}
+				if c == '\\' && (j == 0 || s[j-1] != '\\') &&
+					((j+1 < len(s) && s[j+1] == '\n') || (j+2 < len(s) && s[j+1] == '\r' && s[j+2] == '\n')) {
+					j++
+					continue
+				}
+				if c == ')' {
+					closeParen = j
+				}
+				break
+			}
+			if closeParen >= 0 {
+				afterClose := skipForwardWS(closeParen + 1)
+				if afterClose == len(s) || s[afterClose] == '\n' || s[afterClose] == ';' {
+					m := openParen - 1
+					for m >= 0 {
+						if isIdent(s[m]) || s[m] == '.' {
+							m--
+							continue
+						}
+						nextM := skipBackwardWS(m)
+						if nextM != m {
+							m = nextM
+							continue
+						}
+						break
+					}
+					kwStart := skipForwardWS(m + 1)
+					if hasFromImportPrefix(kwStart, openParen, false) {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	// Case 2: Unparenthesized `import ...` or `from ... import ...` on a single
+	// logical line (only `\`-escaped newlines may join physical lines).
+	m := pos - 1
+	for m >= 0 {
+		if isIdent(s[m]) || s[m] == '.' || s[m] == ',' {
+			m--
+			continue
+		}
+		nextM := skipBackwardWS(m)
+		if nextM != m {
+			m = nextM
+			continue
+		}
+		break
+	}
+	kwStart := skipForwardWS(m + 1)
+	if kwStart > pos || !isStmtBoundaryBefore(kwStart) {
+		return false
+	}
+
+	stmtEnd := kwStart
+	for stmtEnd < len(s) {
+		if isIdent(s[stmtEnd]) || s[stmtEnd] == '.' || s[stmtEnd] == ',' {
+			stmtEnd++
+			continue
+		}
+		nextE := skipForwardWS(stmtEnd)
+		if nextE != stmtEnd {
+			stmtEnd = nextE
+			continue
+		}
+		break
+	}
+	if end > stmtEnd {
+		return false
+	}
+	if stmtEnd < len(s) && s[stmtEnd] != '\n' && s[stmtEnd] != ';' {
+		return false
+	}
+
+	if matchWordAt(kwStart, "import") {
+		afterImp := skipForwardWS(kwStart + len("import"))
+		return afterImp <= pos && afterImp < stmtEnd
+	}
+	return hasFromImportPrefix(kwStart, stmtEnd, true)
+}
+
+const strictReadonlyBlockLegacyScripting = true
+
+func sroWordSet(raw string) map[string]bool {
+	fields := strings.Fields(raw)
+	m := make(map[string]bool, len(fields))
+	for _, f := range fields {
+		m[f] = true
+	}
+	return m
+}
+
+// Offline-generated CPython dir() member sets (non-readonly public & single-'_' private).
+var sroPyNonROMembers = sroWordSet(`
+	AND ARITH ATOM AWAIT BAND BOOLEAN_STATES BXOR CMP DataError DatabaseError EXPR Emax Emin Error Etiny Etop FACTOR
+	FileHeader IntegrityError InterfaceError InternalError KEYWORD_ONLY MAX_N MAX_SEEK_READ MIN_READ_SIZE NAMED_EXPR
+	NONSPACECRE NOT NotSupportedError OPEN_METH OPTCRE OPTCRE_NV OR OperationalError POSITIONAL_ONLY
+	POSITIONAL_OR_KEYWORD POWER ProgrammingError SECTCRE SHIFT TERM TEST TUPLE VAR_KEYWORD VAR_POSITIONAL VERSION
+	Warning YIELD abs absolute aclose acquire add addFilter addHandler add_argument add_argument_group
+	add_mutually_exclusive_group add_note add_section add_subparsers addfile adjusted ag_await ag_code ag_frame
+	ag_running append appendleft apply_defaults arguments arraysize as_integer_ratio as_posix as_tuple as_uri asend
+	asname astimezone athrow autocommit backup betavariate bind bind_partial binop binop_precedence binop_rassoc
+	bit_count bit_length blobopen block block_size blocksize boolop_precedence boolops braceidpattern buffer
+	buffered bz2open c_contiguous callHandlers canonical capitals case_sensitive cast cell_contents
+	characters_written check chmod choice choices chown clamp clear clear_flags clear_traps clock_seq
+	clock_seq_hi_variant clock_seq_low close closefd cmpops co_argcount co_cellvars co_code co_consts
+	co_exceptiontable co_filename co_firstlineno co_flags co_freevars co_kwonlyargcount co_lines co_linetable
+	co_lnotab co_name co_names co_nlocals co_positions co_posonlyargcount co_qualname co_stacksize co_varnames
+	combine commit compare compare_signal compare_total compare_total_mag compress compress_type conjugate
+	connection contiguous convert_arg_line_to_args converter converters copy copy_abs copy_decimal copy_into
+	copy_negate copy_sign cr_await cr_code cr_frame cr_origin cr_running cr_suspended createLock create_aggregate
+	create_collation create_decimal create_decimal_from_float create_function create_gnu_header create_module
+	create_pax_global_header create_pax_header create_system create_ustar_header create_version
+	create_window_function critical ctime cursor cwd date debug decompress default_factory default_msec_format
+	default_time_format defaults deleter delimit delimit_if delimiter dereference deserialize detach devmajor
+	devminor dialect difference difference_update digest_size dims disable discard divide divide_int divmod
+	do_visit_try doublequote dst emit enable_load_extension entity eof error error_leader errorlevel escapechar
+	exception exec_module execute executemany executescript exit exp expand expanduser expovariate extend extendleft
+	external_attr extra extract extract_version extractall extractfile extraction_filter f_back f_builtins f_code
+	f_contiguous f_globals f_lasti f_lineno f_locals f_trace f_trace_lines f_trace_opcodes fatal fdel feed fetchall
+	fetchmany fetchone fget fieldnames fileno fileobject fill filter findCaller find_longest_match find_module
+	find_spec findall finditer findtext firstweekday flag_bits flush fma formatException formatMessage formatStack
+	formatTime format_help format_map format_spec format_usage formatday formatmonth formatmonthname formatweek
+	formatweekday formatweekheader formatyear fp from_bytes from_callable from_decimal from_file from_float
+	from_iterable from_uri frombuf fromhex fromisocalendar fromisoformat fromkeys fromordinal fromtarfile
+	fromtimestamp fromutc fset full full_match fullmatch gammavariate gauss generic_visit getChild getEffectiveLevel
+	getLogger getMessage get_code get_default get_grouped_opcodes get_identifiers get_info get_matching_blocks
+	get_name get_nowait get_opcodes get_precedence get_raw_docstring get_source get_token get_type_comment
+	getboolean getbuffer getconfig getfirstweekday getfloat getinfo getint getlimit getmember getrandbits getroot
+	getstate gettarinfo getter geturl getvalue gi_code gi_frame gi_running gi_suspended gi_yieldfrom glob guard
+	gzopen handle handleError hardlink_to hasHandlers has_header has_option has_section header_offset home idpattern
+	ignore_zeros in_transaction indices info inode insert interleave internal_attr interrupt intersection
+	intersection_update isEnabledFor is_block_device is_canonical is_char_device is_fifo is_finite is_infinite
+	is_integer is_junction is_mount is_nan is_normal is_package is_qnan is_relative_to is_reserved is_safe is_signed
+	is_snan is_socket is_subnormal is_valid is_zero isatty isblk ischr isdev isdir isdisjoint isfifo isfile islnk
+	isocalendar isolation_level isoweekday isreadable isrecursive isreg issparse issubset issuperset issym
+	items_view itemsize iter_unpack iterdir iterdump iterfind itermonthdates itermonthdays itermonthdays2
+	itermonthdays3 itermonthdays4 itertext iterweekdays joinpath kwarg kwargs lchmod limit_denominator line_num
+	lineterminator link_to linkpath list ln load_extension load_module log log10 logb logical_and logical_invert
+	logical_or logical_xor lognormvariate lstat makeRecord make_file make_table makedev makedir makeelement makefifo
+	makefile makelink maketrans makeunknown manager mapping match max_mag maxlen maybe_newline min_mag minus mkdir
+	module_repr monthdatescalendar monthdays2calendar monthdayscalendar move move_into move_to_end mro multiply
+	myfileobj n_fields n_sequence_fields n_unnamed_fields nbytes ndim needs_input new_child next next_minus
+	next_plus next_toward normalize normalvariate now number_class obj open options optionxform orig_filename owner
+	pack pack_into paretovariate parse parse_args parse_intermixed_args parse_known_args parse_known_intermixed_args
+	parser peek pformat pi plus pop pop_source popitem popleft power pprint prec print_help print_usage printdir
+	prmonth process processor prweek pryear punctuation_chars push_source push_token put put_nowait qsize quantize
+	quick_ratio quotechar quoting radix randbytes randint random randrange ratio raw read read1 read_dict read_file
+	read_string read_token readable readall readfp readinto readinto1 readline readlines readlink readonly
+	real_quick_ratio reconfigure register relative_to remainder remainder_near remove removeFilter removeHandler
+	remove_option remove_section rename replace require_parens reserved resolve rest reverse rewind rglob rmdir
+	rollback rotate rounding row_factory s safe_substitute same_quantum samefile sample scaleb scanner search
+	sections seed seek seekable send sentence_end_re serialize set setFormatter setLevel setLogRecordFactory
+	setLoggerClass setStream set_authorizer set_defaults set_name set_precedence set_progress_handler set_seq1
+	set_seq2 set_seqs set_trace_callback setconfig setdefault setfirstweekday setinputsizes setlimit setoutputsize
+	setpassword setstate setter shape shift shuffle signature skipinitialspace sniff sort sourcehook span sparse
+	sqrt stat stop strftime strides strptime sub subn suboffsets substitute subtract symlink_to symmetric_difference
+	symmetric_difference_update tarfile tarinfo taropen task_done tb_frame tb_lasti tb_lineno tb_next tell
+	terminator testzip text_factory throw time time_hi_version time_low time_mid timestamp timetuple timetz to_bytes
+	to_eng_string to_integral to_integral_exact to_integral_value to_sci_string tobuf tobytes today tolist toordinal
+	toreadonly total_changes total_seconds touch translate traverse triangular truncate type_params tzname
+	unconsumed_tail unicode_whitespace_trans uniform union unlink unop unop_precedence unpack unpack_from
+	unused_data update usesTime utcfromtimestamp utcnow utcoffset utctimetuple utime vararg visit visit_AnnAssign
+	visit_Assert visit_Assign visit_AsyncFor visit_AsyncFunctionDef visit_AsyncWith visit_Attribute visit_AugAssign
+	visit_Await visit_BinOp visit_BoolOp visit_Break visit_Call visit_ClassDef visit_Compare visit_Constant
+	visit_Continue visit_Delete visit_Dict visit_DictComp visit_Ellipsis visit_ExceptHandler visit_Expr visit_For
+	visit_FormattedValue visit_FunctionDef visit_FunctionType visit_GeneratorExp visit_Global visit_If visit_IfExp
+	visit_Import visit_ImportFrom visit_JoinedStr visit_Lambda visit_List visit_ListComp visit_Match visit_MatchAs
+	visit_MatchClass visit_MatchMapping visit_MatchOr visit_MatchSequence visit_MatchSingleton visit_MatchStar
+	visit_MatchValue visit_Module visit_Name visit_NamedExpr visit_Nonlocal visit_Pass visit_Raise visit_Return
+	visit_Set visit_SetComp visit_Slice visit_Starred visit_Subscript visit_Try visit_TryStar visit_Tuple
+	visit_UnaryOp visit_While visit_With visit_Yield visit_YieldFrom visit_alias visit_arg visit_arguments
+	visit_comprehension visit_keyword visit_match_case visit_withitem volume vonmisesvariate walk warn warning
+	weekday weibullvariate with_name with_segments with_stem with_suffix with_traceback wordsep_re wordsep_simple_re
+	wrap writable write write_bytes write_c14n write_text write_through writelines writestr xzopen yeardatescalendar
+	yeardays2calendar yeardayscalendar
+`)
+
+// Offline-generated CPython dir() member sets (non-readonly public & single-'_' private).
+var sroPyAllPrivMembers = sroWordSet(`
+	_ _ActionsContainer _AppendAction _AppendConstAction _ArgumentGroup _AttributeHolder _CD64_CREATE_VERSION
+	_CD64_DIRECTORY_RECSIZE _CD64_DIRECTORY_SIZE _CD64_DISK_NUMBER _CD64_DISK_NUMBER_START _CD64_EXTRACT_VERSION
+	_CD64_NUMBER_ENTRIES_THIS_DISK _CD64_NUMBER_ENTRIES_TOTAL _CD64_OFFSET_START_CENTDIR _CD64_SIGNATURE
+	_CD_COMMENT_LENGTH _CD_COMPRESSED_SIZE _CD_COMPRESS_TYPE _CD_CRC _CD_CREATE_SYSTEM _CD_CREATE_VERSION
+	_CD_DATE _CD_DISK_NUMBER_START _CD_EXTERNAL_FILE_ATTRIBUTES _CD_EXTRACT_SYSTEM _CD_EXTRACT_VERSION
+	_CD_EXTRA_FIELD_LENGTH _CD_FILENAME_LENGTH _CD_FLAG_BITS _CD_INTERNAL_FILE_ATTRIBUTES
+	_CD_LOCAL_HEADER_OFFSET _CD_SIGNATURE _CD_TIME _CD_UNCOMPRESSED_SIZE _CHUNK_SIZE _ChainMap _CountAction
+	_DD_SIGNATURE _DEFAULT_INTERPOLATION _ECD_COMMENT _ECD_COMMENT_SIZE _ECD_DISK_NUMBER _ECD_DISK_START
+	_ECD_ENTRIES_THIS_DISK _ECD_ENTRIES_TOTAL _ECD_LOCATION _ECD_OFFSET _ECD_SIGNATURE _ECD_SIZE
+	_EXTRA_FIELD_STRUCT _Element_Py _EndRecData _EndRecData64 _Environ _ExtendAction _FH_COMPRESSED_SIZE
+	_FH_COMPRESSION_METHOD _FH_CRC _FH_EXTRACT_SYSTEM _FH_EXTRACT_VERSION _FH_EXTRA_FIELD_LENGTH
+	_FH_FILENAME_LENGTH _FH_GENERAL_PURPOSE_FLAG_BITS _FH_LAST_MOD_DATE _FH_LAST_MOD_TIME _FH_SIGNATURE
+	_FH_UNCOMPRESSED_SIZE _FileInFile _Flavour _HelpAction _IGNORED_ERRNOS _IGNORED_WINERRORS _ListDataStream
+	_LowLevelFile _MASK_COMPRESSED_PATCH _MASK_COMPRESS_OPTION_1 _MASK_ENCRYPTED _MASK_STRONG_ENCRYPTION
+	_MASK_USE_DATA_DESCRIPTOR _MASK_UTF_FILENAME _MutableMapping__marker _MutuallyExclusiveGroup _OPT_NV_TMPL
+	_OPT_TMPL _ORIGIN _PathParents _Path__repr _PosixFlavour _PreciseSelector _RealGetContents
+	_RecursiveWildcardSelector _SECT_TMPL _STYLES _Selector _SequenceMatcher__chain_b _SharedFile _StderrHandler
+	_StoreAction _StoreConstAction _StoreFalseAction _StoreTrueAction _Stream _StreamProxy _SubParsersAction
+	_Tellable _TerminatingSelector _UNRECOGNIZED_ARGS_ATTR _UNSET _UserList__cast _VersionAction
+	_WINERROR_CANT_RESOLVE_FILENAME _WINERROR_INVALID_NAME _WINERROR_NOT_READY _WildcardSelector _WindowsFlavour
+	_ZipDecrypter _ZipWriteFile _abc_impl _acquireLock _add _addHandlerRef _add_action _add_container_actions
+	_after_at_fork_child_reinit_locks _ancestry _annotation _apply _apply_pax_info _asdict _at_fork_reinit
+	_at_fork_reinit_lock_weakset _attributes _base_executable _bind _blksize _block _bound_arguments_cls
+	_cached_cparts _check _checkClosed _checkLevel _checkReadable _checkSeekable _checkWritable _check_can_read
+	_check_can_seek _check_can_write _check_compression _check_conflict _check_methods _check_not_closed
+	_check_value _check_zipfile _clear_cache _clear_type_cache _co_code_adaptive _collect_lines _compresslevel
+	_convert_flags _convert_to_boolean _copy_items _cparts _crctable _create_gnu_long_header _create_header
+	_create_pax_generic_header _create_payload _current _current_exceptions _current_frames _dbg _dealloc_warn
+	_debugmallocstats _decodeExtra _decode_pax_field _dedupe _default _defaultFormatter _defaultLastResort
+	_default_dict _default_prefix _denominator _difference _dispatch _div _divmod _drv _dump
+	_encodeFilenameFlags _encoded_counterpart _end_offset _escape_attrib _escape_attrib_c14n _escape_attrib_html
+	_escape_cdata _escape_cdata_c14n _execvpe _exists _exit _extract_member _extract_text_encoding _fancy_helper
+	_fancy_replace _field_defaults _fields _file_template _finalizing _find_link_target _fix_sentence_endings
+	_fixupChildren _fixupParents _flavour _floordiv _for_helper _format _format_dict_items _format_items
+	_format_line _format_namespace_items _format_parsed_parts _fpclose _framework _from_parsed_parts _from_parts
+	_frombuf _fromtarfile _fspath _function_helper _fwalk _gen_crc _get _get_action_name _get_args
+	_get_compressor _get_conv _get_decompressor _get_exports_list _get_formatter _get_handler _get_kwargs
+	_get_nargs_pattern _get_option_tuples _get_optional_actions _get_optional_kwargs _get_positional_actions
+	_get_positional_kwargs _get_sep _get_value _get_values _get_writer _getframe _getmember _getquickenedcount
+	_git _guess_delimiter _guess_quote_and_delimiter _handle_conflict_error _handle_conflict_resolve
+	_handle_error _handle_long_word _handlerList _handlers _hash _hash_basis _header_length_prefix_re _hmac
+	_home _hostinfo _ignore_error _init _init_decrypter _init_hmac _init_old _init_write _inner _invalid _io
+	_is_child _is_internal_frame _is_wildcard_pattern _join_multiline_values _joinrealpath _keep_positive _kind
+	_legend _levelToName _line_wrapper _link_target _load _lock _log _logRecordFactory _loggerClass
+	_looks_like_prefix_name _make _make_child _make_child_relpath _make_prefix _make_selector _match_argument
+	_match_arguments_partial _mod _mul _munge_whitespace _name _nameToLevel _namespace_map _namespaces _next
+	_numerator _open _open_to_write _operator_fallbacks _options _os _outer _parameter_cls _parameters _parents
+	_parse_args _parse_known_args _parse_optional _parse_whole _parts _path_normpath _plain_replace
+	_pop_action_class _posix_flavour _posix_split_name _pparts _pprint_bytearray _pprint_bytes _pprint_chain_map
+	_pprint_counter _pprint_dataclass _pprint_default_dict _pprint_deque _pprint_dict _pprint_list
+	_pprint_mappingproxy _pprint_ordered_dict _pprint_set _pprint_simplenamespace _pprint_str _pprint_tuple
+	_pprint_user_dict _pprint_user_list _pprint_user_string _print_message _proc_builtin _proc_gnulong
+	_proc_gnusparse_00 _proc_gnusparse_01 _proc_gnusparse_10 _proc_member _proc_pax _proc_sparse _put _qformat
+	_qsize _raise_serialization_error _randbelow _randbelow_with_getrandbits _randbelow_without_getrandbits
+	_raw_time _re _read _read1 _read2 _read_args_from_files _read_defaults _register_at_fork_reinit_lock
+	_registry_get _releaseLock _removeHandlerRef _remove_action _replace _repr _return_annotation _richcmp _root
+	_safe_print _safe_repr _sanitize_windows_name _scandir _serialize _serialize_html _serialize_text
+	_serialize_xml _set_factories _setevents _setroot _showwarning _signature _sparse_structs _spawnvef _split
+	_split_chunks _split_line _srcfile _startTime _stdlib_dir _str _str_formatter _str_literal_helper
+	_strip_extra _styles _sub _sys _tab_newline_replace _table_template _unify_values _update_crc _userinfo
+	_valid _validate _validate_value_types _varname_from_oparg _varpattern _varsub _varsubb _walk
+	_warnings_showwarning _windows_flavour _windows_illegal_name_trans_table _wrap_chunks _wrap_close
+	_write_constant _write_docstring _write_docstring_and_traverse_body _write_end_record _write_fstring_inner
+	_write_gzip_header _write_section _write_str_avoiding_backslashes _writecheck _xoptions
+`)
+
+var sroPyUncalledMeths = sroWordSet(`
+	capitalize casefold center count decode encode endswith expandtabs find hex
+	index isalnum isalpha isascii isdecimal isdigit isidentifier islower isnumeric
+	isprintable isspace istitle isupper join ljust lower lstrip partition
+	removeprefix removesuffix rfind rindex rjust rpartition rsplit rstrip split
+	splitlines startswith strip swapcase title upper zfill
+	get keys values items most_common elements total
+	exists is_dir is_file is_symlink is_absolute namelist getnames getmembers
+	infolist read_text read_bytes hexdigest digest isoformat group groups groupdict
+	format_help format_usage
+`)
+
+var sroPyDirectMeths = func() map[string]bool {
+	m := sroWordSet(`
+		format format_map maketrans translate
+		add append clear difference difference_update discard extend extendleft
+		intersection intersection_update isdisjoint issubset issuperset move_to_end
+		pop popitem popleft remove reverse rotate setdefault sort subtract
+		symmetric_difference symmetric_difference_update union update
+		as_integer_ratio bit_count bit_length conjugate from_bytes to_bytes
+		close expanduser extractfile fetchall fetchmany fetchone fileno findall
+		finditer findtext fullmatch get_default getboolean getfloat getinfo getint
+		getmember getroot getvalue glob has_option has_section inode
+		is_block_device is_char_device is_fifo is_mount is_relative_to is_reserved
+		is_socket isatty isocalendar isdir isfile islnk isreg issym iter iterdir
+		iterdump iterfind itertext joinpath lstat match options parse_args
+		parse_known_args peek pformat pprint read read_dict read_file read_string
+		readable readlink readline readlines relative_to resolve rglob samefile
+		search sections seek seekable span start end stat strftime sub subn tell
+		testzip timetuple timestamp toordinal utctimetuple weekday isoweekday
+		with_name with_stem with_suffix as_posix as_uri
+		now today utcnow fromisoformat fromtimestamp utcfromtimestamp strptime
+		combine fromordinal
+		add_argument add_argument_group add_mutually_exclusive_group
+		addHandler setFormatter setLevel debug info warning warn error critical
+		exception cursor owner
+	`)
+	for k := range sroPyUncalledMeths {
+		m[k] = true
+	}
+	return m
+}()
+
+var sroPyDataAttrs = sroWordSet(`
+	name stem suffix suffixes parent parents parts anchor drive root
+	st_mode st_ino st_dev st_nlink st_uid st_gid st_size
+	st_atime st_mtime st_ctime st_atime_ns st_mtime_ns st_ctime_ns
+	st_blocks st_blksize st_rdev path
+	year month day hour minute second microsecond tzinfo fold
+	days seconds microseconds min max resolution utc
+	tm_year tm_mon tm_mday tm_hour tm_min tm_sec tm_wday tm_yday tm_isdst tm_zone tm_gmtoff
+	pattern flags groupindex pos endpos lastindex lastgroup re string regs
+	lineno col_offset end_lineno end_col_offset id attr arg value target targets
+	body orelse finalbody handlers func args keywords decorator_list bases
+	names module level elts ops comparators left right op operand test
+	iter ifs generators annotation returns type_comment ctx slice step
+	msg exc cause context_expr optional_vars is_async n
+	filename file_size compress_size date_time CRC comment
+	size mtime mode type linkname uid gid uname gname chksum offset offset_data pax_headers
+	tag text tail attrib data
+	scheme netloc params query fragment username password hostname port
+	system node release version machine
+	errno strerror filename2 returncode code
+	description rowcount lastrowid
+	real imag numerator denominator
+	closed encoding errors newlines line_buffering
+	int bytes bytes_le fields urn variant
+	format start end line lines columns exact_type
+	parameters return_annotation default kind empty fp
+`)
+
+var sroPyAllPubMembers = func() map[string]bool {
+	m := make(map[string]bool, len(sroPyNonROMembers)+len(sroPyDirectMeths)+len(sroPyDataAttrs))
+	for k := range sroPyNonROMembers {
+		m[k] = true
+	}
+	for k := range sroPyDirectMeths {
+		m[k] = true
+	}
+	for k := range sroPyDataAttrs {
+		m[k] = true
+	}
+	return m
+}()
+
+type sroPyExportKind uint8
+
+const (
+	sroPyExpConst sroPyExportKind = iota
+	sroPyExpCall
+	sroPyExpValueCls
+	sroPyExpSubmod
+)
+
+func sroPyExports(calls, valCls, consts, submods string) map[string]sroPyExportKind {
+	m := make(map[string]sroPyExportKind)
+	for _, w := range strings.Fields(calls) {
+		m[w] = sroPyExpCall
+	}
+	for _, w := range strings.Fields(valCls) {
+		m[w] = sroPyExpValueCls
+	}
+	for _, w := range strings.Fields(consts) {
+		m[w] = sroPyExpConst
+	}
+	for _, w := range strings.Fields(submods) {
+		m[w] = sroPyExpSubmod
+	}
+	return m
+}
+
+var sroPyModExports = map[string]map[string]sroPyExportKind{
+	"argparse":              sroPyExports("ArgumentParser Namespace", "", "SUPPRESS OPTIONAL ZERO_OR_MORE ONE_OR_MORE REMAINDER", ""),
+	"ast":                   sroPyExports("parse literal_eval walk iter_fields iter_child_nodes get_docstring get_source_segment unparse dump AST Module FunctionDef AsyncFunctionDef ClassDef Import ImportFrom Call Name Attribute Constant Assign AnnAssign AugAssign Return Expr", "NodeVisitor", "", ""),
+	"base64":                sroPyExports("b64encode b64decode standard_b64encode standard_b64decode urlsafe_b64encode urlsafe_b64decode b32encode b32decode b16encode b16decode", "", "", ""),
+	"binascii":              sroPyExports("hexlify unhexlify b2a_hex a2b_hex b2a_base64 a2b_base64 crc32", "", "", ""),
+	"bisect":                sroPyExports("bisect bisect_left bisect_right", "", "", ""),
+	"bz2":                   sroPyExports("open BZ2File compress decompress", "", "", ""),
+	"calendar":              sroPyExports("isleap leapdays weekday monthrange month timegm", "", "day_name month_name", ""),
+	"collections":           sroPyExports("namedtuple", "Counter defaultdict OrderedDict deque ChainMap", "", "abc"),
+	"collections.abc":       sroPyExports("Iterable Iterator Mapping Sequence Set Callable", "", "", ""),
+	"configparser":          sroPyExports("ConfigParser RawConfigParser", "", "", ""),
+	"copy":                  sroPyExports("copy deepcopy", "", "", ""),
+	"csv":                   sroPyExports("reader DictReader Sniffer field_size_limit", "", "QUOTE_ALL QUOTE_MINIMAL QUOTE_NONNUMERIC QUOTE_NONE", ""),
+	"dataclasses":           sroPyExports("dataclass field fields asdict astuple is_dataclass replace", "", "KW_ONLY MISSING", ""),
+	"datetime":              sroPyExports("", "date time datetime timedelta timezone", "MINYEAR MAXYEAR UTC", ""),
+	"decimal":               sroPyExports("getcontext localcontext", "Decimal", "", ""),
+	"difflib":               sroPyExports("unified_diff context_diff ndiff get_close_matches SequenceMatcher", "", "", ""),
+	"enum":                  sroPyExports("Enum IntEnum StrEnum Flag IntFlag auto unique", "", "", ""),
+	"errno":                 sroPyExports("", "", "ENOENT EACCES EEXIST EINTR EINVAL EIO EISDIR ENOTDIR EPERM errorcode", ""),
+	"fnmatch":               sroPyExports("fnmatch fnmatchcase filter translate", "", "", ""),
+	"fractions":             sroPyExports("", "Fraction", "", ""),
+	"functools":             sroPyExports("reduce lru_cache cache cmp_to_key partial", "", "", ""),
+	"glob":                  sroPyExports("glob iglob escape", "", "", ""),
+	"gzip":                  sroPyExports("open GzipFile compress decompress", "", "", ""),
+	"hashlib":               sroPyExports("md5 sha1 sha224 sha256 sha384 sha512 blake2b blake2s sha3_256 sha3_512 new file_digest pbkdf2_hmac", "", "algorithms_guaranteed", ""),
+	"heapq":                 sroPyExports("heappush heappop heapify nlargest nsmallest merge", "", "", ""),
+	"hmac":                  sroPyExports("new digest compare_digest", "", "", ""),
+	"html":                  sroPyExports("escape unescape", "", "", ""),
+	"io":                    sroPyExports("StringIO BytesIO FileIO open TextIOWrapper BufferedReader", "", "DEFAULT_BUFFER_SIZE", ""),
+	"itertools":             sroPyExports("combinations combinations_with_replacement compress count cycle dropwhile filterfalse groupby islice pairwise permutations product repeat starmap takewhile tee zip_longest accumulate batched", "chain", "", ""),
+	"json":                  sroPyExports("loads load dumps dump JSONDecodeError", "", "", ""),
+	"keyword":               sroPyExports("iskeyword issoftkeyword", "", "kwlist softkwlist", ""),
+	"linecache":             sroPyExports("getline getlines", "", "", ""),
+	"logging":               sroPyExports("getLogger basicConfig StreamHandler NullHandler Formatter Filter LoggerAdapter debug info warning warn error critical exception log disable getLevelName", "", "DEBUG INFO WARNING WARN ERROR CRITICAL NOTSET", ""),
+	"lzma":                  sroPyExports("open LZMAFile compress decompress", "", "", ""),
+	"math":                  sroPyExports("ceil floor trunc fabs factorial fmod fsum gcd lcm isclose isfinite isinf isnan isqrt prod exp log log2 log10 pow sqrt sin cos tan asin acos atan atan2 degrees radians hypot", "", "pi e tau inf nan", ""),
+	"numbers":               sroPyExports("Number Complex Real Rational Integral", "", "", ""),
+	"operator":              sroPyExports("add sub mul truediv floordiv mod neg pos abs eq ne lt le gt ge not_ truth is_ is_not and_ or_ xor index contains countOf indexOf", "", "", ""),
+	"os":                    sroPyExports("getcwd listdir scandir walk stat lstat readlink access getenv cpu_count getpid getppid fspath strerror", "", "environ sep altsep extsep pathsep linesep curdir pardir devnull name F_OK R_OK W_OK X_OK", "path"),
+	"os.path":               sroPyExports("abspath basename commonpath commonprefix dirname exists expanduser expandvars getatime getctime getmtime getsize isabs isdir isfile islink ismount join lexists normcase normpath realpath relpath samefile split splitdrive splitext", "", "sep pathsep extsep curdir pardir devnull", ""),
+	"pathlib":               sroPyExports("Path PurePath PosixPath PurePosixPath WindowsPath PureWindowsPath", "", "", ""),
+	"platform":              sroPyExports("system node release version machine uname python_version python_version_tuple python_implementation python_compiler platform", "", "", ""),
+	"pprint":                sroPyExports("pprint pformat pp isreadable isrecursive saferepr PrettyPrinter", "", "", ""),
+	"random":                sroPyExports("Random seed random uniform randint randrange choice choices sample shuffle", "", "", ""),
+	"re":                    sroPyExports("compile search match fullmatch split findall finditer sub subn escape Pattern Match error", "", "ASCII A IGNORECASE I MULTILINE M DOTALL S VERBOSE X", ""),
+	"shlex":                 sroPyExports("split quote join", "", "", ""),
+	"sqlite3":               sroPyExports("connect Error DatabaseError OperationalError IntegrityError ProgrammingError", "", "Row sqlite_version sqlite_version_info", ""),
+	"stat":                  sroPyExports("S_ISDIR S_ISCHR S_ISBLK S_ISREG S_ISFIFO S_ISLNK S_ISSOCK S_IMODE S_IFMT filemode", "", "ST_MODE ST_SIZE ST_MTIME", ""),
+	"statistics":            sroPyExports("mean fmean median median_low median_high mode multimode pstdev pvariance stdev variance quantiles", "", "", ""),
+	"string":                sroPyExports("Template capwords", "", "ascii_letters ascii_lowercase ascii_uppercase digits hexdigits octdigits punctuation printable whitespace", ""),
+	"struct":                sroPyExports("pack unpack unpack_from iter_unpack calcsize Struct error", "", "", ""),
+	"sys":                   sroPyExports("exit getsizeof getrecursionlimit", "", "stdin stdout stderr argv path version version_info platform maxsize byteorder executable prefix", ""),
+	"tarfile":               sroPyExports("open TarFile is_tarfile TarError ReadError", "", "", ""),
+	"textwrap":              sroPyExports("wrap fill shorten dedent indent TextWrapper", "", "", ""),
+	"time":                  sroPyExports("time time_ns monotonic monotonic_ns perf_counter perf_counter_ns gmtime localtime mktime strftime strptime asctime ctime sleep", "", "", ""),
+	"tomllib":               sroPyExports("load loads TOMLDecodeError", "", "", ""),
+	"types":                 sroPyExports("SimpleNamespace", "", "", ""),
+	"typing":                sroPyExports("TypeVar cast", "", "Any Union Optional List Dict Set Tuple Sequence Mapping Iterable Iterator Callable Literal Final ClassVar NamedTuple TypedDict", ""),
+	"unicodedata":           sroPyExports("normalize name lookup category", "", "", ""),
+	"urllib":                sroPyExports("", "", "", "parse"),
+	"urllib.parse":          sroPyExports("urlparse urlsplit urlunparse urlunsplit urljoin urldefrag parse_qs parse_qsl quote quote_plus unquote unquote_plus urlencode", "", "", ""),
+	"uuid":                  sroPyExports("uuid3 uuid4 uuid5", "UUID", "NAMESPACE_DNS NAMESPACE_URL NAMESPACE_OID NAMESPACE_X500", ""),
+	"warnings":              sroPyExports("warn filterwarnings simplefilter catch_warnings", "", "", ""),
+	"xml":                   sroPyExports("", "", "", "etree"),
+	"xml.etree":             sroPyExports("", "", "", "ElementTree"),
+	"xml.etree.ElementTree": sroPyExports("parse fromstring tostring ElementTree Element", "", "", ""),
+	"zipfile":               sroPyExports("ZipFile PyZipFile Path is_zipfile BadZipFile", "", "ZIP_STORED ZIP_DEFLATED", ""),
+	"zlib":                  sroPyExports("compress decompress crc32 adler32", "", "", ""),
+}
+
+func strictReadonlyNodeExecFlags(language string, strictReadonly, viaLocalCtxRun, nodePermSupported bool) ([]string, bool) {
+	if strictReadonly && viaLocalCtxRun && nodePermSupported && language == "javascript" {
+		return []string{"--permission", "--allow-fs-read=*"}, true
+	}
+	return nil, false
+}
+
+func strictReadonlyCodeAllowlistHit(language, code string) string {
+	return strictReadonlyCodeAllowlistHitWithNodePerm(language, code, false)
+}
+
+func strictReadonlyCodeAllowlistHitWithNodePerm(language, code string, jsNodePerm bool) string {
+	switch language {
+	case "python":
+		return sroPyAllowlistHit(code)
+	case "javascript", "typescript":
+		if language == "typescript" {
+			jsNodePerm = false
+		}
+		return sroJSAllowlistHit(code, jsNodePerm)
+	case "perl", "ruby", "php", "r", "elixir":
+		if strictReadonlyBlockLegacyScripting {
+			return "allowlist: [lang-legacy] scripting language " + language + " not allowed in strict readonly"
+		}
+		return ""
+	default:
+		return ""
+	}
+}
+
+type sroPyTokKind uint8
+
+const (
+	sroPyId sroPyTokKind = iota
+	sroPyNum
+	sroPyStr
+	sroPyTokOp
+	sroPyNL
+)
+
+type sroPyTok struct {
+	kind      sroPyTokKind
+	val       string
+	isDynamic bool
+	indentCol int
+}
+
+func (t sroPyTok) isOp(op string) bool {
+	return t.kind == sroPyTokOp && t.val == op
+}
+
+func (t sroPyTok) isId(v string) bool {
+	return t.kind == sroPyId && t.val == v
+}
+
+func sroNormNL(code string) string {
+	if strings.HasPrefix(code, "\xef\xbb\xbf") {
+		code = code[3:]
+	}
+	if strings.IndexByte(code, '\r') < 0 {
+		return code
+	}
+	var b strings.Builder
+	b.Grow(len(code))
+	for i := 0; i < len(code); i++ {
+		if code[i] == '\r' {
+			b.WriteByte('\n')
+			if i+1 < len(code) && code[i+1] == '\n' {
+				i++
+			}
+		} else {
+			b.WriteByte(code[i])
+		}
+	}
+	return b.String()
+}
+
+func sroPyBadCoding(norm string) bool {
+	rest := norm
+	for lineNum := 1; lineNum <= 2 && len(rest) > 0; lineNum++ {
+		nl := strings.IndexByte(rest, '\n')
+		var line string
+		if nl >= 0 {
+			line = rest[:nl]
+			rest = rest[nl+1:]
+		} else {
+			line = rest
+			rest = ""
+		}
+		j := 0
+		for j < len(line) && (line[j] == ' ' || line[j] == '\t' || line[j] == '\f') {
+			j++
+		}
+		if j >= len(line) {
+			continue
+		}
+		if line[j] != '#' {
+			break
+		}
+		comment := strings.ToLower(line[j+1:])
+		if enc := sroExtractCodingName(comment); enc != "" {
+			clean := strings.ReplaceAll(strings.ReplaceAll(enc, "_", "-"), ".", "-")
+			if clean != "utf-8" && clean != "utf8" && clean != "ascii" && clean != "us-ascii" {
+				return true
+			}
+			return false
+		}
+	}
+	return false
+}
+
+func sroExtractCodingName(lowerComment string) string {
+	idx := strings.Index(lowerComment, "coding")
+	for idx >= 0 {
+		after := idx + len("coding")
+		if after < len(lowerComment) && (lowerComment[after] == ':' || lowerComment[after] == '=') {
+			k := after + 1
+			for k < len(lowerComment) && (lowerComment[k] == ' ' || lowerComment[k] == '\t') {
+				k++
+			}
+			start := k
+			for k < len(lowerComment) {
+				c := lowerComment[k]
+				if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' {
+					k++
+				} else {
+					break
+				}
+			}
+			if k > start {
+				return lowerComment[start:k]
+			}
+		}
+		next := strings.Index(lowerComment[after:], "coding")
+		if next < 0 {
+			break
+		}
+		idx = after + next
+	}
+	return ""
+}
+
+func sroIsASCIIAlpha(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+func sroIsASCIIDigit(b byte) bool {
+	return b >= '0' && b <= '9'
+}
+
+func sroIsPyIdentStart(b byte) bool {
+	return sroIsASCIIAlpha(b) || b == '_'
+}
+
+func sroIsPyIdentCont(b byte) bool {
+	return sroIsASCIIAlpha(b) || sroIsASCIIDigit(b) || b == '_'
+}
+
+func sroPyValidPrefix(p string) (isRaw, isBytes, isF, ok bool) {
+	switch strings.ToLower(p) {
+	case "":
+		return false, false, false, true
+	case "r":
+		return true, false, false, true
+	case "u":
+		return false, false, false, true
+	case "b":
+		return false, true, false, true
+	case "f":
+		return false, false, true, true
+	case "rb", "br":
+		return true, true, false, true
+	case "rf", "fr":
+		return true, false, true, true
+	default:
+		return false, false, false, false
+	}
+}
+
+func sroPyDecodeSimpleStr(raw string, isRaw bool) (string, bool) {
+	if isRaw {
+		return raw, true
+	}
+	if strings.IndexByte(raw, '\\') < 0 {
+		return raw, true
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			b.WriteByte(raw[i])
+			continue
+		}
+		if i+1 >= len(raw) {
+			return "", false
+		}
+		i++
+		switch raw[i] {
+		case '\\', '\'', '"':
+			b.WriteByte(raw[i])
+		case 'n':
+			b.WriteByte('\n')
+		case 'r':
+			b.WriteByte('\r')
+		case 't':
+			b.WriteByte('\t')
+		case '\n':
+		default:
+			return "", false
+		}
+	}
+	return b.String(), true
+}
+
+func sroPyMatchingOpen(closeCh byte) byte {
+	switch closeCh {
+	case ')':
+		return '('
+	case ']':
+		return '['
+	case '}':
+		return '{'
+	default:
+		return 0
+	}
+}
+
+func sroPyLex(norm string) ([]sroPyTok, string) {
+	var toks []sroPyTok
+	var deferredExprs [][]sroPyTok
+	n := len(norm)
+	i := 0
+	delimStack := make([]byte, 0, 16)
+	delimBad := false
+	atLineStart := true
+	curIndent := 0
+
+	emitTok := func(t sroPyTok) {
+		if atLineStart && t.kind != sroPyNL {
+			t.indentCol = curIndent
+			atLineStart = false
+		}
+		if t.kind == sroPyStr && len(toks) > 0 && toks[len(toks)-1].kind == sroPyStr {
+			toks[len(toks)-1].isDynamic = true
+			t.isDynamic = true
+		}
+		toks = append(toks, t)
+	}
+
+	for i < n {
+		b := norm[i]
+		if b == ' ' || b == '\t' {
+			if atLineStart && len(delimStack) == 0 {
+				if b == '\t' {
+					curIndent = (curIndent/8 + 1) * 8
+				} else {
+					curIndent++
+				}
+			}
+			i++
+			continue
+		}
+		if b == '\n' {
+			i++
+			if len(delimStack) == 0 {
+				if len(toks) > 0 && toks[len(toks)-1].kind != sroPyNL {
+					toks = append(toks, sroPyTok{kind: sroPyNL, val: "\n"})
+				}
+				atLineStart = true
+				curIndent = 0
+			}
+			continue
+		}
+		if b < 0x20 || b == 0x7f {
+			return nil, "allowlist: [py-ctrl-char] blocked"
+		}
+		if b >= 0x80 {
+			return nil, "allowlist: [py-non-ascii] blocked"
+		}
+		if b == '#' {
+			for i < n && norm[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if b == '\\' {
+			if i+1 < n && norm[i+1] == '\n' {
+				i += 2
+				continue
+			}
+			return nil, "allowlist: [py-stray-backslash] blocked"
+		}
+
+		if b == '\'' || b == '"' || (sroIsASCIIAlpha(b) && i+1 < n) {
+			pEnd := i
+			if b != '\'' && b != '"' {
+				for pEnd < n && pEnd-i < 2 && sroIsASCIIAlpha(norm[pEnd]) {
+					pEnd++
+				}
+			}
+			if pEnd < n && (norm[pEnd] == '\'' || norm[pEnd] == '"') {
+				isRaw, isBytes, isF, okPref := sroPyValidPrefix(norm[i:pEnd])
+				if okPref {
+					tok, extraExprs, nextPos, unclosed, badFStr, innerHit := sroPyScanString(norm, pEnd, isRaw, isBytes, isF)
+					if innerHit != "" {
+						return nil, innerHit
+					}
+					if unclosed {
+						return nil, "allowlist: [py-unclosed-string] blocked"
+					}
+					if badFStr {
+						return nil, "allowlist: [py-fstring-syntax] blocked"
+					}
+					emitTok(tok)
+					if len(extraExprs) > 0 {
+						deferredExprs = append(deferredExprs, extraExprs...)
+					}
+					i = nextPos
+					continue
+				}
+			}
+		}
+
+		if sroIsPyIdentStart(b) {
+			start := i
+			i++
+			for i < n && sroIsPyIdentCont(norm[i]) {
+				i++
+			}
+			emitTok(sroPyTok{kind: sroPyId, val: norm[start:i]})
+			continue
+		}
+
+		if sroIsASCIIDigit(b) || (b == '.' && i+1 < n && sroIsASCIIDigit(norm[i+1])) {
+			start := i
+			if b == '.' {
+				i += 2
+			} else {
+				i++
+			}
+			for i < n {
+				c := norm[i]
+				if sroIsASCIIDigit(c) || sroIsASCIIAlpha(c) || c == '_' || c == '.' {
+					if (c == 'e' || c == 'E') && i+1 < n && (norm[i+1] == '+' || norm[i+1] == '-') {
+						i += 2
+						continue
+					}
+					i++
+				} else {
+					break
+				}
+			}
+			emitTok(sroPyTok{kind: sroPyNum, val: norm[start:i]})
+			continue
+		}
+
+		if b == '(' || b == '[' || b == '{' {
+			delimStack = append(delimStack, b)
+			emitTok(sroPyTok{kind: sroPyTokOp, val: string(b)})
+			i++
+			continue
+		}
+		if b == ')' || b == ']' || b == '}' {
+			if len(delimStack) == 0 || delimStack[len(delimStack)-1] != sroPyMatchingOpen(b) {
+				delimBad = true
+				break
+			}
+			delimStack = delimStack[:len(delimStack)-1]
+			emitTok(sroPyTok{kind: sroPyTokOp, val: string(b)})
+			i++
+			continue
+		}
+
+		op, step := sroPyScanOp(norm, i)
+		if step == 0 {
+			return nil, "allowlist: [py-unknown-char] blocked"
+		}
+		emitTok(sroPyTok{kind: sroPyTokOp, val: op})
+		i += step
+	}
+
+	if delimBad || len(delimStack) > 0 {
+		return nil, "allowlist: [py-delim-mismatch] blocked"
+	}
+	if len(toks) > 0 && toks[len(toks)-1].kind == sroPyNL {
+		toks = toks[:len(toks)-1]
+	}
+	for _, exprToks := range deferredExprs {
+		if len(toks) > 0 && toks[len(toks)-1].kind != sroPyNL {
+			toks = append(toks, sroPyTok{kind: sroPyNL, val: "\n"})
+		}
+		toks = append(toks, sroPyTok{kind: sroPyTokOp, val: "(", indentCol: 0})
+		for _, et := range exprToks {
+			if et.kind != sroPyNL {
+				et.indentCol = 0
+				toks = append(toks, et)
+			}
+		}
+		toks = append(toks, sroPyTok{kind: sroPyTokOp, val: ")"})
+	}
+	return toks, ""
+}
+
+var (
+	sroPyOps3 = sroWordSet("... **= //= <<= >>=")
+	sroPyOps2 = sroWordSet("** // << >> <= >= == != := -> += -= *= /= %= @= &= |= ^=")
+)
+
+func sroPyScanOp(s string, i int) (string, int) {
+	if i+3 <= len(s) && sroPyOps3[s[i:i+3]] {
+		return s[i : i+3], 3
+	}
+	if i+2 <= len(s) && sroPyOps2[s[i:i+2]] {
+		return s[i : i+2], 2
+	}
+	if strings.IndexByte("+-*/%@&|^~<>=.,:;", s[i]) >= 0 {
+		return s[i : i+1], 1
+	}
+	return "", 0
+}
+
+func sroPyScanString(s string, qPos int, isRaw, isBytes, isF bool) (sroPyTok, [][]sroPyTok, int, bool, bool, string) {
+	q := s[qPos]
+	triple := qPos+2 < len(s) && s[qPos+1] == q && s[qPos+2] == q
+	qLen := 1
+	if triple {
+		qLen = 3
+	}
+	i := qPos + qLen
+	n := len(s)
+	if !isF {
+		contentStart := i
+		for i < n {
+			c := s[i]
+			if c == '\\' {
+				if i+1 >= n {
+					return sroPyTok{}, nil, 0, true, false, ""
+				}
+				i += 2
+				continue
+			}
+			if !triple && c == '\n' {
+				return sroPyTok{}, nil, 0, true, false, ""
+			}
+			if c == q && (!triple || (i+2 < n && s[i+1] == q && s[i+2] == q)) {
+				raw := s[contentStart:i]
+				if isBytes {
+					return sroPyTok{kind: sroPyStr, val: raw, isDynamic: true}, nil, i + qLen, false, false, ""
+				}
+				decoded, ok := sroPyDecodeSimpleStr(raw, isRaw)
+				return sroPyTok{kind: sroPyStr, val: decoded, isDynamic: !ok}, nil, i + qLen, false, false, ""
+			}
+			i++
+		}
+		return sroPyTok{}, nil, 0, true, false, ""
+	}
+
+	var extra [][]sroPyTok
+	for i < n {
+		c := s[i]
+		if !triple && c == '\n' {
+			return sroPyTok{}, nil, 0, true, false, ""
+		}
+		if c == q && (!triple || (i+2 < n && s[i+1] == q && s[i+2] == q)) {
+			return sroPyTok{kind: sroPyStr, val: "", isDynamic: true}, extra, i + qLen, false, false, ""
+		}
+		if c == '\\' {
+			if i+1 >= n {
+				return sroPyTok{}, nil, 0, true, false, ""
+			}
+			if !isRaw && s[i+1] == 'N' && i+2 < n && s[i+2] == '{' {
+				k := i + 3
+				for k < n && s[k] != '}' && s[k] != '\n' {
+					ch := s[k]
+					if !sroIsASCIIAlpha(ch) && !sroIsASCIIDigit(ch) && ch != ' ' && ch != '-' {
+						return sroPyTok{}, nil, 0, false, true, ""
+					}
+					k++
+				}
+				if k >= n || s[k] != '}' || k == i+3 {
+					return sroPyTok{}, nil, 0, false, true, ""
+				}
+				i = k + 1
+				continue
+			}
+			if s[i+1] == '\\' || s[i+1] == q || s[i+1] == '\n' {
+				i += 2
+				continue
+			}
+			i++
+			continue
+		}
+		if c == '}' {
+			if i+1 < n && s[i+1] == '}' {
+				i += 2
+				continue
+			}
+			return sroPyTok{}, nil, 0, false, true, ""
+		}
+		if c == '{' {
+			if i+1 < n && s[i+1] == '{' {
+				i += 2
+				continue
+			}
+			exprs, afterClose, okF, innerHit := sroPyScanFStringField(s, i+1)
+			if innerHit != "" {
+				return sroPyTok{}, nil, 0, false, false, innerHit
+			}
+			if !okF {
+				return sroPyTok{}, nil, 0, false, true, ""
+			}
+			extra = append(extra, exprs...)
+			i = afterClose
+			continue
+		}
+		i++
+	}
+	return sroPyTok{}, nil, 0, true, false, ""
+}
+
+func sroPyScanFStringField(s string, start int) ([][]sroPyTok, int, bool, string) {
+	n := len(s)
+	i := start
+	depth := 0
+	exprEnd := -1
+	specStart := -1
+
+	for i < n {
+		b := s[i]
+		if b == '#' {
+			for i < n && s[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if b == '\'' || b == '"' || (sroIsASCIIAlpha(b) && i+1 < n) {
+			pEnd := i
+			if b != '\'' && b != '"' {
+				for pEnd < n && pEnd-i < 2 && sroIsASCIIAlpha(s[pEnd]) {
+					pEnd++
+				}
+			}
+			if pEnd < n && (s[pEnd] == '\'' || s[pEnd] == '"') {
+				isRaw, isBytes, isF, okPref := sroPyValidPrefix(s[i:pEnd])
+				if okPref {
+					_, _, nextPos, unclosed, badF, innerHit := sroPyScanString(s, pEnd, isRaw, isBytes, isF)
+					if innerHit != "" {
+						return nil, 0, false, innerHit
+					}
+					if unclosed || badF {
+						return nil, 0, false, ""
+					}
+					i = nextPos
+					continue
+				}
+			}
+		}
+		if b == '(' || b == '[' || b == '{' {
+			depth++
+			i++
+			continue
+		}
+		if b == ')' || b == ']' {
+			if depth == 0 {
+				return nil, 0, false, ""
+			}
+			depth--
+			i++
+			continue
+		}
+		if b == '}' {
+			if depth == 0 {
+				if exprEnd < 0 {
+					exprEnd = i
+				}
+				break
+			}
+			depth--
+			i++
+			continue
+		}
+		if depth == 0 {
+			if b == '!' && i+2 < n && (s[i+1] == 'r' || s[i+1] == 's' || s[i+1] == 'a') && (s[i+2] == ':' || s[i+2] == '}') {
+				if exprEnd < 0 {
+					exprEnd = i
+				}
+				i += 2
+				continue
+			}
+			if b == ':' && (i+1 >= n || s[i+1] != '=') {
+				if exprEnd < 0 {
+					exprEnd = i
+				}
+				specStart = i + 1
+				i++
+				break
+			}
+		}
+		i++
+	}
+	if exprEnd < 0 {
+		return nil, 0, false, ""
+	}
+	rawExpr := strings.TrimSpace(s[start:exprEnd])
+	if strings.HasSuffix(rawExpr, "=") && !strings.HasSuffix(rawExpr, "==") &&
+		!strings.HasSuffix(rawExpr, "!=") && !strings.HasSuffix(rawExpr, "<=") &&
+		!strings.HasSuffix(rawExpr, ">=") && !strings.HasSuffix(rawExpr, ":=") {
+		rawExpr = strings.TrimSpace(rawExpr[:len(rawExpr)-1])
+	}
+	if rawExpr == "" {
+		return nil, 0, false, ""
+	}
+	mainToks, innerHit := sroPyLex(rawExpr)
+	if innerHit != "" {
+		return nil, 0, false, innerHit
+	}
+	if len(mainToks) == 0 {
+		return nil, 0, false, ""
+	}
+	out := [][]sroPyTok{mainToks}
+	if specStart < 0 {
+		if i >= n || s[i] != '}' {
+			return nil, 0, false, ""
+		}
+		return out, i + 1, true, ""
+	}
+	k := specStart
+	for k < n {
+		if s[k] == '}' {
+			return out, k + 1, true, ""
+		}
+		if s[k] == '{' {
+			subExprs, nextK, subOK, subHit := sroPyScanFStringField(s, k+1)
+			if subHit != "" {
+				return nil, 0, false, subHit
+			}
+			if !subOK {
+				return nil, 0, false, ""
+			}
+			out = append(out, subExprs...)
+			k = nextK
+			continue
+		}
+		k++
+	}
+	return nil, 0, false, ""
+}
+
+var sroPyBadIdents = sroWordSet("eval exec compile __import__ breakpoint input setattr delattr globals locals dir help quit copyright credits license global nonlocal")
+
+var sroPyProtBuiltins = sroWordSet("open type isinstance issubclass getattr vars print eval exec compile __import__ setattr delattr globals locals dir breakpoint input")
+
+var sroPyDunderDefs = sroWordSet("__init__ __post_init__ __repr__ __str__ __len__ __iter__ __next__ __contains__ __bool__ __hash__")
+
+var sroPyBaseBuiltins = sroWordSet("object BaseException Exception ValueError TypeError RuntimeError KeyError IndexError OSError AttributeError LookupError")
+
+var sroPyTypeCmpBuiltins = sroWordSet("int str float bool bytes bytearray list dict set frozenset tuple complex")
+
+var sroPyReplaceKw = sroWordSet("year month day hour minute second microsecond tzinfo fold name mtime mode uid gid uname gname")
+
+var sroPyBasicCfgKw = sroWordSet("level format datefmt style force stream")
+
+var sroPyBadSQLKw = sroWordSet("VACUUM ATTACH DETACH INSERT UPDATE DELETE REPLACE CREATE DROP ALTER REINDEX ANALYZE BEGIN COMMIT END ROLLBACK SAVEPOINT RELEASE")
+
+func sroPyIsStmtAssignOp(t sroPyTok) bool {
+	if t.kind != sroPyTokOp {
+		return false
+	}
+	switch t.val {
+	case "=", "+=", "-=", "*=", "/=", "//=", "%=", "**=", "@=", "&=", "|=", "^=", "<<=", ">>=":
+		return true
+	default:
+		return false
+	}
+}
+
+func sroPyIsAnyAssignOp(t sroPyTok) bool {
+	return sroPyIsStmtAssignOp(t) || t.isOp(":=")
+}
+
+func sroPyIsDunderOrMangled(name string) bool {
+	if strings.HasPrefix(name, "__") || strings.HasSuffix(name, "__") {
+		return true
+	}
+	if strings.HasPrefix(name, "_") && strings.Contains(name[1:], "__") {
+		return true
+	}
+	return false
+}
+
+func sroPyMatchDelim(toks []sroPyTok, openIdx int, openOp, closeOp string) int {
+	if openIdx < 0 || openIdx >= len(toks) || !toks[openIdx].isOp(openOp) {
+		return -1
+	}
+	depth := 0
+	for i := openIdx; i < len(toks); i++ {
+		if toks[i].isOp(openOp) {
+			depth++
+		} else if toks[i].isOp(closeOp) {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func sroPySplitTopArgs(toks []sroPyTok, openIdx, closeIdx int) [][]sroPyTok {
+	if closeIdx <= openIdx+1 {
+		return nil
+	}
+	var args [][]sroPyTok
+	depth := 0
+	start := openIdx + 1
+	for i := openIdx + 1; i < closeIdx; i++ {
+		if toks[i].isOp("(") || toks[i].isOp("[") || toks[i].isOp("{") {
+			depth++
+		} else if toks[i].isOp(")") || toks[i].isOp("]") || toks[i].isOp("}") {
+			depth--
+		} else if depth == 0 && toks[i].isOp(",") {
+			args = append(args, toks[start:i])
+			start = i + 1
+		}
+	}
+	if start < closeIdx {
+		args = append(args, toks[start:closeIdx])
+	}
+	return args
+}
+
+type sroPyCallArg struct {
+	kw       string
+	val      []sroPyTok
+	valStart int
+	isStar   bool
+	isKwStar bool
+}
+
+func sroPyParseCallArgs(toks []sroPyTok, openIdx, closeIdx int) []sroPyCallArg {
+	if closeIdx <= openIdx+1 {
+		return nil
+	}
+	var out []sroPyCallArg
+	depth := 0
+	start := openIdx + 1
+	flush := func(a, b int) {
+		if a >= b {
+			return
+		}
+		seg := toks[a:b]
+		if seg[0].isOp("**") {
+			out = append(out, sroPyCallArg{val: seg[1:], valStart: a + 1, isKwStar: true})
+			return
+		}
+		if seg[0].isOp("*") {
+			out = append(out, sroPyCallArg{val: seg[1:], valStart: a + 1, isStar: true})
+			return
+		}
+		if len(seg) >= 2 && seg[0].kind == sroPyId && seg[1].isOp("=") {
+			out = append(out, sroPyCallArg{kw: seg[0].val, val: seg[2:], valStart: a + 2})
+			return
+		}
+		out = append(out, sroPyCallArg{val: seg, valStart: a})
+	}
+	for i := openIdx + 1; i < closeIdx; i++ {
+		if toks[i].isOp("(") || toks[i].isOp("[") || toks[i].isOp("{") {
+			depth++
+		} else if toks[i].isOp(")") || toks[i].isOp("]") || toks[i].isOp("}") {
+			depth--
+		} else if depth == 0 && toks[i].isOp(",") {
+			flush(start, i)
+			start = i + 1
+		}
+	}
+	if start < closeIdx {
+		flush(start, closeIdx)
+	}
+	return out
+}
+
+func sroPyStaticStr(seg []sroPyTok) (string, bool) {
+	if len(seg) == 1 && seg[0].kind == sroPyStr && !seg[0].isDynamic {
+		return seg[0].val, true
+	}
+	return "", false
+}
+
+func sroPyStaticBool(seg []sroPyTok) (bool, bool) {
+	if len(seg) == 1 && seg[0].kind == sroPyId {
+		if seg[0].val == "True" {
+			return true, true
+		}
+		if seg[0].val == "False" {
+			return false, true
+		}
+	}
+	return false, false
+}
+
+func sroPyIsStdioOrNone(seg []sroPyTok, valStart int, confinedMods map[string]string, validStdioTok map[int]bool) bool {
+	if len(seg) == 1 && seg[0].isId("None") {
+		return true
+	}
+	if len(seg) == 3 && seg[0].kind == sroPyId && confinedMods[seg[0].val] == "sys" &&
+		seg[1].isOp(".") && seg[2].kind == sroPyId &&
+		(seg[2].val == "stdout" || seg[2].val == "stderr") {
+		validStdioTok[valStart+2] = true
+		return true
+	}
+	return false
+}
+
+func sroPyIsReadonlyOpenModeStr(mode string, allowTarStream bool) bool {
+	if allowTarStream {
+		switch mode {
+		case "r", "r:*", "r:", "r:gz", "r:bz2", "r:xz":
+			return true
+		default:
+			return false
+		}
+	}
+	if mode == "" {
+		return false
+	}
+	hasR := false
+	for i := 0; i < len(mode); i++ {
+		switch mode[i] {
+		case 'r':
+			hasR = true
+		case 'b', 't', 'U':
+		default:
+			return false
+		}
+	}
+	return hasR
+}
+
+var sroPyLegacyModuleOpens = sroWordSet("codecs builtins _io wave aifc sunau")
+
+func sroPyLooksLikeWriteModeStr(s string) bool {
+	if s == "" {
+		return false
+	}
+	hasWrite := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case 'w', 'a', 'x', '+':
+			hasWrite = true
+		case 'r', 'b', 't', 'U':
+		default:
+			return false
+		}
+	}
+	return hasWrite
+}
+
+func sroPyCheckDbmOpenArgs(args []sroPyCallArg) (string, bool) {
+	posCount := 0
+	hasFileKw := false
+	hasFlag := false
+	var flagSeg []sroPyTok
+	for _, a := range args {
+		if a.isStar || a.isKwStar {
+			return "mode", false
+		}
+		if a.kw != "" {
+			switch a.kw {
+			case "file", "filename":
+				hasFileKw = true
+			case "flag":
+				if hasFlag {
+					return "mode", false
+				}
+				flagSeg = a.val
+				hasFlag = true
+			case "mode":
+				if len(a.val) != 1 || a.val[0].kind != sroPyNum {
+					return "mode", false
+				}
+			default:
+				return "mode", false
+			}
+			continue
+		}
+		posCount++
+		switch posCount {
+		case 1:
+		case 2:
+			if hasFlag {
+				return "mode", false
+			}
+			flagSeg = a.val
+			hasFlag = true
+		case 3:
+			if len(a.val) != 1 || a.val[0].kind != sroPyNum {
+				return "mode", false
+			}
+		default:
+			return "mode", false
+		}
+	}
+	if posCount == 0 && !hasFileKw {
+		return "mode", false
+	}
+	if hasFlag {
+		fStr, ok := sroPyStaticStr(flagSeg)
+		if !ok || fStr != "r" {
+			return "mode", false
+		}
+	}
+	return "", true
+}
+
+func sroPyCheckOpenArgs(args []sroPyCallArg, isBuiltinOrFileIO, allowTarStream bool) (string, bool) {
+	return sroPyCheckOpenArgsExt(args, isBuiltinOrFileIO, allowTarStream, false, false, false)
+}
+
+func sroPyCheckOpenArgsExt(args []sroPyCallArg, isBuiltinOrFileIO, allowTarStream, isMethod, isDbm, isLegacyModOpen bool) (string, bool) {
+	if isDbm {
+		return sroPyCheckDbmOpenArgs(args)
+	}
+	posCount := 0
+	var firstPosSeg, modeSeg []sroPyTok
+	hasMode := false
+	for _, a := range args {
+		if a.isStar || a.isKwStar {
+			return "mode", false
+		}
+		if a.kw != "" {
+			switch a.kw {
+			case "opener":
+				return "opener", false
+			case "mode":
+				modeSeg = a.val
+				hasMode = true
+			case "file", "name", "buffering", "encoding", "errors", "newline", "closefd",
+				"compresslevel", "format", "filter", "preset", "allowZip64", "metadata_encoding":
+			default:
+				return "mode", false
+			}
+			continue
+		}
+		posCount++
+		if posCount == 1 {
+			firstPosSeg = a.val
+		} else if posCount == 2 {
+			modeSeg = a.val
+			hasMode = true
+		}
+		if isBuiltinOrFileIO && posCount >= 8 {
+			return "opener", false
+		}
+		if isBuiltinOrFileIO && posCount == 4 && len(args) == 4 {
+			if !(len(a.val) == 1 && a.val[0].isId("None")) {
+				return "opener", false
+			}
+		}
+	}
+	if posCount == 0 && !isMethod {
+		hasPathKw := false
+		for _, a := range args {
+			if a.kw == "file" || a.kw == "name" {
+				hasPathKw = true
+			}
+		}
+		if !hasPathKw {
+			return "mode", false
+		}
+	}
+	if isMethod && !isLegacyModOpen && posCount == 1 && !hasMode {
+		s1, ok := sroPyStaticStr(firstPosSeg)
+		if !ok || sroPyLooksLikeWriteModeStr(s1) {
+			return "mode", false
+		}
+	}
+	if !hasMode {
+		return "", true
+	}
+	mStr, ok := sroPyStaticStr(modeSeg)
+	if !ok || !sroPyIsReadonlyOpenModeStr(mStr, allowTarStream) {
+		return "mode", false
+	}
+	return "", true
+}
+
+func sroPySqliteRO(args []sroPyCallArg) bool {
+	var dbSeg []sroPyTok
+	hasDB := false
+	uriTrue := false
+	posCount := 0
+	for _, a := range args {
+		if a.isStar || a.isKwStar {
+			return false
+		}
+		if a.kw != "" {
+			switch a.kw {
+			case "database":
+				dbSeg = a.val
+				hasDB = true
+			case "uri":
+				b, ok := sroPyStaticBool(a.val)
+				if !ok || !b {
+					return false
+				}
+				uriTrue = true
+			case "timeout", "detect_types", "isolation_level", "check_same_thread":
+			default:
+				return false
+			}
+			continue
+		}
+		posCount++
+		if posCount == 1 {
+			dbSeg = a.val
+			hasDB = true
+		} else {
+			return false
+		}
+	}
+	if !hasDB || !uriTrue {
+		return false
+	}
+	u, ok := sroPyStaticStr(dbSeg)
+	if !ok || !strings.HasPrefix(u, "file:") {
+		return false
+	}
+	if hash := strings.IndexByte(u, '#'); hash >= 0 {
+		u = u[:hash]
+	}
+	qIdx := strings.IndexByte(u, '?')
+	if qIdx < 0 {
+		return false
+	}
+	query := u[qIdx+1:]
+	hasModeRO := false
+	for _, part := range strings.Split(query, "&") {
+		if part == "mode=ro" {
+			hasModeRO = true
+		} else if strings.HasPrefix(part, "mode=") {
+			return false
+		}
+	}
+	return hasModeRO
+}
+
+func sroPyReadonlySQL(args []sroPyCallArg) bool {
+	if len(args) < 1 || len(args) > 2 {
+		return false
+	}
+	for _, a := range args {
+		if a.isStar || a.isKwStar || a.kw != "" {
+			return false
+		}
+	}
+	sqlStr, ok := sroPyStaticStr(args[0].val)
+	if !ok {
+		return false
+	}
+	if strings.Contains(sqlStr, ";") || strings.Contains(sqlStr, "--") || strings.Contains(sqlStr, "/*") {
+		return false
+	}
+	var words []string
+	i := 0
+	for i < len(sqlStr) {
+		c := sqlStr[i]
+		if c == '\'' {
+			i++
+			for i < len(sqlStr) {
+				if sqlStr[i] == '\'' {
+					if i+1 < len(sqlStr) && sqlStr[i+1] == '\'' {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if c == '"' {
+			i++
+			for i < len(sqlStr) && sqlStr[i] != '"' {
+				i++
+			}
+			if i < len(sqlStr) {
+				i++
+			}
+			continue
+		}
+		if sroIsASCIIAlpha(c) || c == '_' {
+			start := i
+			i++
+			for i < len(sqlStr) && (sroIsASCIIAlpha(sqlStr[i]) || sroIsASCIIDigit(sqlStr[i]) || sqlStr[i] == '_') {
+				i++
+			}
+			words = append(words, strings.ToUpper(sqlStr[start:i]))
+			continue
+		}
+		if c == '=' && len(words) > 0 && words[0] == "PRAGMA" {
+			return false
+		}
+		i++
+	}
+	if len(words) == 0 {
+		return false
+	}
+	switch words[0] {
+	case "SELECT", "WITH", "EXPLAIN", "PRAGMA":
+	default:
+		return false
+	}
+	for _, w := range words {
+		if sroPyBadSQLKw[w] {
+			return false
+		}
+	}
+	return true
+}
+
+func sroPyClassInfoOK(toks []sroPyTok, start, end int, mark map[int]bool) bool {
+	if start >= end {
+		return false
+	}
+	depth := 0
+	for i := start; i < end; i++ {
+		if toks[i].isOp("(") {
+			depth++
+		} else if toks[i].isOp(")") {
+			depth--
+		} else if depth == 0 && toks[i].isOp("|") {
+			return sroPyClassInfoOK(toks, start, i, mark) &&
+				sroPyClassInfoOK(toks, i+1, end, mark)
+		}
+	}
+	if toks[start].isOp("(") && sroPyMatchDelim(toks, start, "(", ")") == end-1 {
+		elems := sroPySplitTopArgs(toks, start, end-1)
+		if len(elems) == 0 {
+			return true
+		}
+		d := 0
+		segStart := start + 1
+		for i := start + 1; i < end-1; i++ {
+			if toks[i].isOp("(") || toks[i].isOp("[") || toks[i].isOp("{") {
+				d++
+			} else if toks[i].isOp(")") || toks[i].isOp("]") || toks[i].isOp("}") {
+				d--
+			} else if d == 0 && toks[i].isOp(",") {
+				if i > segStart && !sroPyClassInfoOK(toks, segStart, i, mark) {
+					return false
+				}
+				segStart = i + 1
+			}
+		}
+		if segStart < end-1 {
+			return sroPyClassInfoOK(toks, segStart, end-1, mark)
+		}
+		return true
+	}
+	for i := start; i < end; i++ {
+		if (i-start)%2 == 0 {
+			if toks[i].kind != sroPyId {
+				return false
+			}
+		} else {
+			if !toks[i].isOp(".") {
+				return false
+			}
+		}
+	}
+	if (end-start)%2 != 1 {
+		return false
+	}
+	mark[end-1] = true
+	return true
+}
+
+func sroPyExtractNamedtupleFields(args []sroPyCallArg, out map[string]bool) {
+	if len(args) < 2 {
+		return
+	}
+	seg := args[1].val
+	if s, ok := sroPyStaticStr(seg); ok {
+		cleaned := strings.ReplaceAll(s, ",", " ")
+		for _, f := range strings.Fields(cleaned) {
+			if len(f) > 0 && sroIsPyIdentStart(f[0]) && !strings.HasPrefix(f, "_") && !sroPyNonROMembers[f] {
+				out[f] = true
+			}
+		}
+		return
+	}
+	if len(seg) >= 2 && (seg[0].isOp("[") || seg[0].isOp("(")) {
+		for _, t := range seg[1 : len(seg)-1] {
+			if t.kind == sroPyStr && !t.isDynamic && len(t.val) > 0 &&
+				sroIsPyIdentStart(t.val[0]) && !strings.HasPrefix(t.val, "_") && !sroPyNonROMembers[t.val] {
+				out[t.val] = true
+			}
+		}
+	}
+}
+
+func sroPyExtractAddArgDest(args []sroPyCallArg, out map[string]bool) {
+	var longOpt, shortOpt string
+	for _, a := range args {
+		if a.kw == "dest" {
+			if s, ok := sroPyStaticStr(a.val); ok && len(s) > 0 && !strings.HasPrefix(s, "_") && !sroPyNonROMembers[s] {
+				out[s] = true
+			}
+			return
+		}
+		if a.kw == "" {
+			if s, ok := sroPyStaticStr(a.val); ok {
+				if strings.HasPrefix(s, "--") && len(s) > 2 {
+					longOpt = strings.ReplaceAll(strings.TrimLeft(s, "-"), "-", "_")
+				} else if strings.HasPrefix(s, "-") && len(s) > 1 && longOpt == "" {
+					shortOpt = strings.ReplaceAll(strings.TrimLeft(s, "-"), "-", "_")
+				}
+			}
+		}
+	}
+	cand := longOpt
+	if cand == "" {
+		cand = shortOpt
+	}
+	if cand != "" && !strings.HasPrefix(cand, "_") && !sroPyNonROMembers[cand] {
+		out[cand] = true
+	}
+}
+
+func sroPyOpenHit(args []sroPyCallArg, isBuiltinOrFileIO, allowTarStream, isArchive bool) string {
+	return sroPyOpenHitExt(args, isBuiltinOrFileIO, allowTarStream, isArchive, false, false, false)
+}
+
+func sroPyOpenHitExt(args []sroPyCallArg, isBuiltinOrFileIO, allowTarStream, isArchive, isMethod, isDbm, isLegacyModOpen bool) string {
+	kind, ok := sroPyCheckOpenArgsExt(args, isBuiltinOrFileIO, allowTarStream, isMethod, isDbm, isLegacyModOpen)
+	if ok {
+		return ""
+	}
+	if kind == "opener" {
+		return "allowlist: [py-open-opener] blocked"
+	}
+	if isArchive {
+		return "allowlist: [py-archive-mode] blocked"
+	}
+	return "allowlist: [py-open-mode] blocked"
+}
+
+func sroPyValidStreamHandlerArgs(args []sroPyCallArg, confinedMods map[string]string, validStdioTok map[int]bool) bool {
+	if len(args) == 0 {
+		return true
+	}
+	if len(args) > 1 {
+		return false
+	}
+	a := args[0]
+	return !a.isStar && !a.isKwStar && (a.kw == "" || a.kw == "stream") &&
+		sroPyIsStdioOrNone(a.val, a.valStart, confinedMods, validStdioTok)
+}
+
+func sroPyValidBasicConfigArgs(args []sroPyCallArg, confinedMods map[string]string, validStdioTok map[int]bool) bool {
+	for _, a := range args {
+		if a.isStar || a.isKwStar || a.kw == "" || !sroPyBasicCfgKw[a.kw] {
+			return false
+		}
+		if a.kw == "stream" && !sroPyIsStdioOrNone(a.val, a.valStart, confinedMods, validStdioTok) {
+			return false
+		}
+	}
+	return true
+}
+
+func sroPyValidPprintArgs(canon string, args []sroPyCallArg, confinedMods map[string]string, validStdioTok map[int]bool) bool {
+	for idx, a := range args {
+		if a.isKwStar || a.isStar {
+			return false
+		}
+		if a.kw == "stream" || (canon == "pprint.PrettyPrinter" && a.kw == "" && idx == 3) {
+			if !sroPyIsStdioOrNone(a.val, a.valStart, confinedMods, validStdioTok) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sroPyValidJsonDumpArgs(args []sroPyCallArg, confinedMods map[string]string, validStdioTok map[int]bool) bool {
+	posCount := 0
+	var fpArg *sroPyCallArg
+	for idx := range args {
+		a := &args[idx]
+		if a.isStar || a.isKwStar {
+			return false
+		}
+		if a.kw == "fp" {
+			fpArg = a
+		} else if a.kw == "" {
+			posCount++
+			if posCount == 2 {
+				fpArg = a
+			}
+		}
+	}
+	return fpArg != nil &&
+		sroPyIsStdioOrNone(fpArg.val, fpArg.valStart, confinedMods, validStdioTok) &&
+		!(len(fpArg.val) == 1 && fpArg.val[0].val == "None")
+}
+
+func sroPyCheckSpecialCallable(
+	canon string,
+	args []sroPyCallArg,
+	confinedMods map[string]string,
+	validStdioTok map[int]bool,
+	userAttrs map[string]bool,
+) string {
+	switch canon {
+	case "io.open", "gzip.open", "bz2.open", "lzma.open":
+		return sroPyOpenHit(args, canon == "io.open", false, false)
+	case "tarfile.open", "zipfile.ZipFile", "zipfile.PyZipFile", "tarfile.TarFile",
+		"io.FileIO", "gzip.GzipFile", "bz2.BZ2File", "lzma.LZMAFile":
+		return sroPyOpenHit(args, canon == "io.FileIO", canon == "tarfile.open" || canon == "tarfile.TarFile", true)
+	case "sqlite3.connect":
+		if !sroPySqliteRO(args) {
+			return "allowlist: [py-sqlite-ro] blocked"
+		}
+	case "logging.StreamHandler":
+		if !sroPyValidStreamHandlerArgs(args, confinedMods, validStdioTok) {
+			return "allowlist: [py-streamhandler-arg] blocked"
+		}
+	case "logging.basicConfig":
+		if !sroPyValidBasicConfigArgs(args, confinedMods, validStdioTok) {
+			return "allowlist: [py-basicconfig-arg] blocked"
+		}
+	case "pprint.pprint", "pprint.pp", "pprint.PrettyPrinter":
+		if !sroPyValidPprintArgs(canon, args, confinedMods, validStdioTok) {
+			return "allowlist: [py-pprint-stream] blocked"
+		}
+	case "json.dump":
+		if !sroPyValidJsonDumpArgs(args, confinedMods, validStdioTok) {
+			return "allowlist: [py-jsondump-fp] blocked"
+		}
+	case "collections.namedtuple":
+		sroPyExtractNamedtupleFields(args, userAttrs)
+	case "argparse.Namespace", "types.SimpleNamespace":
+		for _, a := range args {
+			if !a.isStar && !a.isKwStar && a.kw != "" && !strings.HasPrefix(a.kw, "_") && !sroPyNonROMembers[a.kw] {
+				userAttrs[a.kw] = true
+			}
+		}
+	}
+	return ""
+}
+
+func sroPyParseImport(
+	toks []sroPyTok,
+	i, end int,
+	confinedMods, confCalls, confValCls map[string]string,
+	environVars, enumBaseVars, importedNames map[string]bool,
+) (string, string) {
+	if toks[i].val == "import" {
+		k := i + 1
+		if k >= end {
+			return "syntax", ""
+		}
+		for k < end {
+			if toks[k].kind != sroPyId {
+				return "syntax", ""
+			}
+			modParts := []string{toks[k].val}
+			k++
+			for k < end && toks[k].isOp(".") {
+				if k+1 >= end || toks[k+1].kind != sroPyId {
+					return "syntax", ""
+				}
+				modParts = append(modParts, toks[k+1].val)
+				k += 2
+			}
+			fullMod := strings.Join(modParts, ".")
+			if _, ok := sroPyModExports[fullMod]; !ok {
+				return "imp-mod", fullMod
+			}
+			localAlias := modParts[0]
+			hasAs := false
+			if k < end && toks[k].isId("as") {
+				if k+1 >= end || toks[k+1].kind != sroPyId {
+					return "syntax", ""
+				}
+				localAlias = toks[k+1].val
+				hasAs = true
+				k += 2
+			}
+			importedNames[localAlias] = true
+			if hasAs {
+				confinedMods[localAlias] = fullMod
+			} else {
+				confinedMods[modParts[0]] = modParts[0]
+			}
+			if k < end {
+				if !toks[k].isOp(",") {
+					return "syntax", ""
+				}
+				k++
+			}
+		}
+		return "", ""
+	}
+
+	k := i + 1
+	if k < end && (toks[k].isOp(".") || toks[k].isOp("...")) {
+		return "rel", ""
+	}
+	if k >= end || toks[k].kind != sroPyId {
+		return "syntax", ""
+	}
+	modParts := []string{toks[k].val}
+	k++
+	for k < end && toks[k].isOp(".") {
+		if k+1 >= end || toks[k+1].kind != sroPyId {
+			return "syntax", ""
+		}
+		modParts = append(modParts, toks[k+1].val)
+		k += 2
+	}
+	if k >= end || toks[k].kind != sroPyId || toks[k].val != "import" {
+		return "syntax", ""
+	}
+	fullMod := strings.Join(modParts, ".")
+	exports, ok := sroPyModExports[fullMod]
+	if !ok {
+		return "from-mod", fullMod
+	}
+	k++
+	if k < end && toks[k].isOp("*") {
+		return "wild", ""
+	}
+	inParen := false
+	if k < end && toks[k].isOp("(") {
+		inParen = true
+		k++
+	}
+	parsedAny := false
+	for k < end {
+		if inParen && toks[k].isOp(")") {
+			k++
+			inParen = false
+			break
+		}
+		if toks[k].kind != sroPyId {
+			return "syntax", ""
+		}
+		orig := toks[k].val
+		expKind, okExp := exports[orig]
+		if !okExp {
+			return "from-mem", fullMod + "." + orig
+		}
+		local := orig
+		k++
+		if k < end && toks[k].isId("as") {
+			if k+1 >= end || toks[k+1].kind != sroPyId {
+				return "syntax", ""
+			}
+			local = toks[k+1].val
+			k += 2
+		}
+		importedNames[local] = true
+		parsedAny = true
+		canon := fullMod + "." + orig
+		switch expKind {
+		case sroPyExpSubmod:
+			confinedMods[local] = canon
+		case sroPyExpCall:
+			confCalls[local] = canon
+			if fullMod == "enum" && (orig == "Enum" || orig == "IntEnum" || orig == "StrEnum" || orig == "Flag" || orig == "IntFlag") {
+				enumBaseVars[local] = true
+			}
+		case sroPyExpValueCls:
+			confValCls[local] = canon
+		case sroPyExpConst:
+			if canon == "os.environ" {
+				environVars[local] = true
+			}
+		}
+		if k < end && toks[k].isOp(",") {
+			k++
+		}
+	}
+	if inParen || !parsedAny || k != end {
+		return "syntax", ""
+	}
+	return "", ""
+}
+
+func sroPyValidClassHeader(
+	toks []sroPyTok,
+	start, end int,
+	confinedMods map[string]string,
+	clsBaseTok map[int]bool,
+	enumBaseNames map[string]bool,
+) bool {
+	if start+2 >= end || toks[start+1].kind != sroPyId {
+		return false
+	}
+	k := start + 2
+	if !toks[k].isOp("(") {
+		return toks[k].isOp(":")
+	}
+	cp := sroPyMatchDelim(toks, k, "(", ")")
+	if cp < 0 || cp+1 >= end || !toks[cp+1].isOp(":") {
+		return false
+	}
+	for _, ba := range sroPyParseCallArgs(toks, k, cp) {
+		if ba.isStar || ba.isKwStar || ba.kw != "" {
+			return false
+		}
+		if len(ba.val) == 1 && ba.val[0].kind == sroPyId {
+			bn := ba.val[0].val
+			if sroPyBaseBuiltins[bn] || enumBaseNames[bn] {
+				clsBaseTok[ba.valStart] = true
+				continue
+			}
+		}
+		if len(ba.val) == 3 && ba.val[0].kind == sroPyId && confinedMods[ba.val[0].val] == "enum" &&
+			ba.val[1].isOp(".") && ba.val[2].kind == sroPyId &&
+			(ba.val[2].val == "Enum" || ba.val[2].val == "IntEnum" || ba.val[2].val == "StrEnum" || ba.val[2].val == "Flag" || ba.val[2].val == "IntFlag") {
+			clsBaseTok[ba.valStart+2] = true
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func sroPyValidIsInstanceCall(toks []sroPyTok, idx int, isInstTok map[int]bool) bool {
+	if idx+1 >= len(toks) || !toks[idx+1].isOp("(") {
+		return false
+	}
+	cp := sroPyMatchDelim(toks, idx+1, "(", ")")
+	if cp < 0 {
+		return false
+	}
+	cArgs := sroPyParseCallArgs(toks, idx+1, cp)
+	if len(cArgs) != 2 || cArgs[0].isStar || cArgs[0].isKwStar || cArgs[0].kw != "" ||
+		cArgs[1].isStar || cArgs[1].isKwStar || cArgs[1].kw != "" {
+		return false
+	}
+	for _, tk := range cArgs[1].val {
+		if tk.isOp(":=") {
+			return false
+		}
+	}
+	return sroPyClassInfoOK(toks, cArgs[1].valStart, cArgs[1].valStart+len(cArgs[1].val), isInstTok)
+}
+
+func sroPyValidGetattrArgs(toks []sroPyTok, idx int) ([]sroPyCallArg, string, bool) {
+	if idx+1 >= len(toks) || !toks[idx+1].isOp("(") {
+		return nil, "", false
+	}
+	cp := sroPyMatchDelim(toks, idx+1, "(", ")")
+	if cp < 0 {
+		return nil, "", false
+	}
+	cArgs := sroPyParseCallArgs(toks, idx+1, cp)
+	if len(cArgs) < 2 || len(cArgs) > 3 {
+		return nil, "", false
+	}
+	for _, ca := range cArgs {
+		if ca.isStar || ca.isKwStar || ca.kw != "" {
+			return nil, "", false
+		}
+	}
+	attrStr, okAttr := sroPyStaticStr(cArgs[1].val)
+	if !okAttr || attrStr == "" || strings.HasPrefix(attrStr, "_") {
+		return nil, "", false
+	}
+	return cArgs, attrStr, true
+}
+
+func sroPyValidVarsCall(toks []sroPyTok, idx int, confinedMods map[string]string, reflModTok map[int]bool) bool {
+	if idx+1 >= len(toks) || !toks[idx+1].isOp("(") {
+		return false
+	}
+	cp := sroPyMatchDelim(toks, idx+1, "(", ")")
+	if cp < 0 {
+		return false
+	}
+	cArgs := sroPyParseCallArgs(toks, idx+1, cp)
+	if len(cArgs) != 1 || cArgs[0].isStar || cArgs[0].isKwStar || cArgs[0].kw != "" ||
+		len(cArgs[0].val) != 1 || cArgs[0].val[0].kind != sroPyId || confinedMods[cArgs[0].val[0].val] == "" {
+		return false
+	}
+	canonMod := confinedMods[cArgs[0].val[0].val]
+	if cp+3 >= len(toks) || !toks[cp+1].isOp(".") || toks[cp+2].kind != sroPyId || toks[cp+2].val != "get" || !toks[cp+3].isOp("(") {
+		return false
+	}
+	gcp := sroPyMatchDelim(toks, cp+3, "(", ")")
+	gArgs := sroPyParseCallArgs(toks, cp+3, gcp)
+	if len(gArgs) < 1 || len(gArgs) > 2 || gArgs[0].isStar || gArgs[0].isKwStar || gArgs[0].kw != "" {
+		return false
+	}
+	keyStr, okKey := sroPyStaticStr(gArgs[0].val)
+	exports := sroPyModExports[canonMod]
+	kind, okExp := exports[keyStr]
+	if !okKey || !okExp || kind != sroPyExpConst || keyStr == "environ" || keyStr == "stdout" || keyStr == "stderr" || keyStr == "stdin" {
+		return false
+	}
+	reflModTok[cArgs[0].valStart] = true
+	return true
+}
+
+func sroPyValidPrintArgs(args []sroPyCallArg, confinedMods map[string]string, validStdioTok map[int]bool) bool {
+	for _, a := range args {
+		if a.isKwStar {
+			return false
+		}
+		if a.kw == "file" && !sroPyIsStdioOrNone(a.val, a.valStart, confinedMods, validStdioTok) {
+			return false
+		}
+	}
+	return true
+}
+
+func sroPyValidPrintdirArgs(args []sroPyCallArg, confinedMods map[string]string, validStdioTok map[int]bool) bool {
+	if len(args) == 0 {
+		return true
+	}
+	if len(args) > 1 {
+		return false
+	}
+	pa := args[0]
+	return !pa.isStar && !pa.isKwStar && (pa.kw == "" || pa.kw == "file") &&
+		sroPyIsStdioOrNone(pa.val, pa.valStart, confinedMods, validStdioTok)
+}
+
+func sroPyIsShadowBinding(toks []sroPyTok, i int, defParamToks map[int]bool) bool {
+	if defParamToks[i] && (i == 0 || toks[i-1].isOp("(") || toks[i-1].isOp(",") || toks[i-1].isOp("*")) {
+		return true
+	}
+	if i+1 < len(toks) && sroPyIsAnyAssignOp(toks[i+1]) {
+		return true
+	}
+	if i > 0 && toks[i-1].kind == sroPyId &&
+		(toks[i-1].val == "for" || toks[i-1].val == "as" || toks[i-1].val == "def" || toks[i-1].val == "class") {
+		return true
+	}
+	return false
+}
+
+func sroPyIsValidDotAt(toks []sroPyTok, i int) bool {
+	if i <= 0 || i+1 >= len(toks) || toks[i+1].kind != sroPyId {
+		return false
+	}
+	prev := toks[i-1]
+	return prev.kind == sroPyId || prev.kind == sroPyStr || prev.kind == sroPyNum ||
+		prev.isOp(")") || prev.isOp("]") || prev.isOp("}")
+}
+
+func sroPyAllowlistHit(code string) string {
+	norm := sroNormNL(code)
+	if sroPyBadCoding(norm) {
+		return "allowlist: [py-coding-cookie] blocked"
+	}
+	toks, lexHit := sroPyLex(norm)
+	if lexHit != "" {
+		return lexHit
+	}
+	if len(toks) == 0 {
+		return ""
+	}
+
+	type lineSpan struct {
+		start, end int
+		indent     int
+		inClass    bool
+	}
+	var lines []lineSpan
+	for i := 0; i < len(toks); {
+		if toks[i].kind == sroPyNL {
+			i++
+			continue
+		}
+		j := i
+		for j < len(toks) && toks[j].kind != sroPyNL {
+			j++
+		}
+		lines = append(lines, lineSpan{start: i, end: j, indent: toks[i].indentCol})
+		i = j + 1
+	}
+
+	var classIndents []int
+	inClassTok := make(map[int]bool)
+	defParamToks := make(map[int]bool)
+	clsBaseTok := make(map[int]bool)
+
+	for li := 0; li < len(lines); li++ {
+		ln := &lines[li]
+		for len(classIndents) > 0 && ln.indent <= classIndents[len(classIndents)-1] {
+			classIndents = classIndents[:len(classIndents)-1]
+		}
+		if len(classIndents) > 0 {
+			ln.inClass = true
+			for k := ln.start; k < ln.end; k++ {
+				inClassTok[k] = true
+			}
+		}
+		if toks[ln.start].isId("class") {
+			classIndents = append(classIndents, ln.indent)
+		}
+		for k := ln.start; k < ln.end; k++ {
+			if toks[k].isId("def") && k+2 < ln.end && toks[k+1].kind == sroPyId && toks[k+2].isOp("(") {
+				cp := sroPyMatchDelim(toks, k+2, "(", ")")
+				if cp > k+2 {
+					for p := k + 3; p < cp; p++ {
+						defParamToks[p] = true
+					}
+				}
+			}
+		}
+	}
+
+	confinedMods := make(map[string]string)
+	confCalls := make(map[string]string)
+	confValCls := make(map[string]string)
+	environVars := make(map[string]bool)
+	enumBaseVars := make(map[string]bool)
+	importedNames := make(map[string]bool)
+	importSpanToks := make(map[int]bool)
+
+	for i := 0; i < len(toks); i++ {
+		atStmtStart := i == 0 || toks[i-1].kind == sroPyNL || toks[i-1].isOp(";") || toks[i-1].isOp(":")
+		if !atStmtStart || toks[i].kind != sroPyId || (toks[i].val != "import" && toks[i].val != "from") {
+			continue
+		}
+		end := i
+		depth := 0
+		for end < len(toks) {
+			if toks[end].isOp("(") || toks[end].isOp("[") || toks[end].isOp("{") {
+				depth++
+			} else if toks[end].isOp(")") || toks[end].isOp("]") || toks[end].isOp("}") {
+				depth--
+			} else if depth == 0 && (toks[end].kind == sroPyNL || toks[end].isOp(";")) {
+				break
+			}
+			end++
+		}
+		for k := i; k < end; k++ {
+			importSpanToks[k] = true
+		}
+		errKind, arg := sroPyParseImport(toks, i, end, confinedMods, confCalls, confValCls, environVars, enumBaseVars, importedNames)
+		switch errKind {
+		case "rel":
+			return "allowlist: [py-relative-import] blocked"
+		case "wild":
+			return "allowlist: [py-wildcard-import] blocked"
+		case "imp-mod":
+			return "allowlist: [py-import-mod] import module " + arg + " not allowed"
+		case "from-mod":
+			return "allowlist: [py-from-mod] from-import module " + arg + " not allowed"
+		case "from-mem":
+			return "allowlist: [py-from-member] from-import member " + arg + " not allowed"
+		case "syntax":
+			return "allowlist: [py-import-syntax] blocked"
+		}
+		i = end - 1
+	}
+
+	for i := 0; i < len(toks); i++ {
+		if !importSpanToks[i] && toks[i].isOp(".") && !sroPyIsValidDotAt(toks, i) {
+			return "allowlist: [py-dot-syntax] blocked"
+		}
+	}
+
+	for i := 0; i < len(toks); i++ {
+		t := toks[i]
+		if t.kind != sroPyId {
+			continue
+		}
+		if sroPyIsDunderOrMangled(t.val) {
+			if i > 0 && toks[i-1].isOp(".") {
+				notCalledOrAssigned := i+1 >= len(toks) || (!toks[i+1].isOp("(") && !sroPyIsAnyAssignOp(toks[i+1]))
+				if (t.val == "__name__" || t.val == "__qualname__" || t.val == "__doc__") && notCalledOrAssigned {
+					continue
+				}
+				if t.val == "__class__" && i+2 < len(toks) && toks[i+1].isOp(".") &&
+					toks[i+2].kind == sroPyId && (toks[i+2].val == "__name__" || toks[i+2].val == "__qualname__") {
+					continue
+				}
+				return "allowlist: [py-dunder-attr] dunder or mangled attribute ." + t.val + " not allowed"
+			}
+			if (t.val == "__name__" || t.val == "__file__") && (i+1 >= len(toks) || !sroPyIsAnyAssignOp(toks[i+1])) {
+				continue
+			}
+			if i > 0 && toks[i-1].isId("def") && inClassTok[i] && sroPyDunderDefs[t.val] {
+				continue
+			}
+			return "allowlist: [py-dunder-ident] dunder or mangled identifier " + t.val + " not allowed"
+		}
+
+		if t.val == "self" && !defParamToks[i] && (i == 0 || !toks[i-1].isOp(".")) && sroPyIsShadowBinding(toks, i, defParamToks) {
+			return "allowlist: [py-self-rebind] blocked"
+		}
+
+		if sroPyProtBuiltins[t.val] && (i == 0 || !toks[i-1].isOp(".")) {
+			isCallKw := !defParamToks[i] && i > 0 && (toks[i-1].isOp("(") || toks[i-1].isOp(",")) && i+1 < len(toks) && toks[i+1].isOp("=")
+			if !isCallKw && sroPyIsShadowBinding(toks, i, defParamToks) {
+				return "allowlist: [py-builtin-shadow] shadowing builtin " + t.val + " not allowed"
+			}
+		}
+	}
+
+	locallyBound := make(map[string]bool)
+	for i := 0; i < len(toks); i++ {
+		if importSpanToks[i] || toks[i].kind != sroPyId || (i > 0 && toks[i-1].isOp(".")) {
+			continue
+		}
+		name := toks[i].val
+		isKwArg := !defParamToks[i] && i > 0 && (toks[i-1].isOp("(") || toks[i-1].isOp(",")) && i+1 < len(toks) && toks[i+1].isOp("=")
+		if isKwArg {
+			continue
+		}
+		isRebind := (i+1 < len(toks) && sroPyIsAnyAssignOp(toks[i+1])) ||
+			(i > 0 && toks[i-1].kind == sroPyId && (toks[i-1].val == "def" || toks[i-1].val == "class" || toks[i-1].val == "for" || toks[i-1].val == "as"))
+		if isRebind {
+			if importedNames[name] && confinedMods[name] != "" {
+				return "allowlist: [py-mod-rebind] reassigning imported module " + name + " not allowed"
+			}
+			locallyBound[name] = true
+		}
+	}
+
+	for modName := range sroPyModExports {
+		if strings.IndexByte(modName, '.') < 0 && !importedNames[modName] && !locallyBound[modName] {
+			confinedMods[modName] = modName
+		}
+	}
+
+	userAttrs := make(map[string]bool)
+	selfPrivAttrs := make(map[string]bool)
+	userMeths := make(map[string]bool)
+	userPrivMeths := make(map[string]bool)
+
+	for _, ln := range lines {
+		first := toks[ln.start]
+		if first.isId("class") {
+			if !sroPyValidClassHeader(toks, ln.start, ln.end, confinedMods, clsBaseTok, enumBaseVars) {
+				return "allowlist: [py-class-base] blocked"
+			}
+			continue
+		}
+		if ln.inClass {
+			if first.isId("def") && ln.start+1 < ln.end && toks[ln.start+1].kind == sroPyId {
+				mName := toks[ln.start+1].val
+				if strings.HasPrefix(mName, "_") && !strings.HasPrefix(mName, "__") && !sroPyAllPrivMembers[mName] {
+					userPrivMeths[mName] = true
+				} else if !strings.HasPrefix(mName, "_") && !sroPyAllPubMembers[mName] {
+					userMeths[mName] = true
+				}
+			} else if first.kind == sroPyId && ln.start+1 < ln.end &&
+				(toks[ln.start+1].isOp("=") || toks[ln.start+1].isOp(":")) {
+				fName := first.val
+				if !strings.HasPrefix(fName, "_") && !sroPyNonROMembers[fName] {
+					userAttrs[fName] = true
+				}
+			}
+		}
+	}
+
+	lhsAttrValidTok := make(map[int]bool)
+	for i := 0; i < len(toks); i++ {
+		if importSpanToks[i] {
+			continue
+		}
+		if toks[i].isId("del") {
+			for k := i + 1; k < len(toks) && toks[k].kind != sroPyNL && !toks[k].isOp(";"); k++ {
+				if toks[k].isOp(".") || (toks[k].kind == sroPyId && (environVars[toks[k].val] || confinedMods[toks[k].val] != "")) {
+					return "allowlist: [py-del-attr] blocked"
+				}
+			}
+		}
+		if toks[i].isOp(".") && i > 0 && i+1 < len(toks) && toks[i+1].kind == sroPyId {
+			attr := toks[i+1].val
+			afterIdx := i + 2
+			isAssign := false
+			if afterIdx < len(toks) && sroPyIsStmtAssignOp(toks[afterIdx]) {
+				isAssign = true
+			} else if afterIdx < len(toks) && toks[afterIdx].isOp(":") {
+				for k := afterIdx + 1; k < len(toks) && toks[k].kind != sroPyNL && !toks[k].isOp(";"); k++ {
+					if toks[k].isOp("=") {
+						isAssign = true
+						break
+					}
+				}
+			}
+			if !isAssign {
+				continue
+			}
+			recv := toks[i-1]
+			isConfinedRecv := (recv.kind == sroPyId && (confinedMods[recv.val] != "" || confCalls[recv.val] != "" ||
+				confValCls[recv.val] != "" || environVars[recv.val])) ||
+				(i >= 3 && toks[i-2].isOp(".") && toks[i-3].kind == sroPyId && confinedMods[toks[i-3].val] != "")
+			if isConfinedRecv {
+				return "allowlist: [py-confined-attr-assign] blocked"
+			}
+			if strings.HasPrefix(attr, "_") {
+				if recv.isId("self") && (i < 2 || !toks[i-2].isOp(".")) &&
+					!strings.HasPrefix(attr, "__") && !sroPyAllPrivMembers[attr] {
+					selfPrivAttrs[attr] = true
+					lhsAttrValidTok[i+1] = true
+					continue
+				}
+				return "allowlist: [py-priv-attr-assign] private attribute assignment ." + attr + " not allowed"
+			}
+			if sroPyNonROMembers[attr] {
+				return "allowlist: [py-stdlib-attr-assign] attribute assignment to stdlib member ." + attr + " not allowed"
+			}
+			userAttrs[attr] = true
+			lhsAttrValidTok[i+1] = true
+		}
+	}
+
+	for i := 0; i < len(toks); i++ {
+		if i == 0 || toks[i-1].kind == sroPyNL {
+			t := toks[i]
+			if t.kind == sroPyId && (t.val == "match" || t.val == "case") {
+				allowedAssign := i+1 < len(toks) && sroPyIsStmtAssignOp(toks[i+1])
+				allowedDot := i+2 < len(toks) && toks[i+1].isOp(".") && toks[i+2].kind == sroPyId
+				if !allowedAssign && !allowedDot {
+					return "allowlist: [py-match-stmt] blocked"
+				}
+			}
+		}
+	}
+
+	isInstTok := make(map[int]bool)
+	for i := 0; i < len(toks); i++ {
+		if importSpanToks[i] || toks[i].kind != sroPyId || (toks[i].val != "isinstance" && toks[i].val != "issubclass") {
+			continue
+		}
+		if i > 0 && toks[i-1].isOp(".") {
+			continue
+		}
+		if !defParamToks[i] && i > 0 && (toks[i-1].isOp("(") || toks[i-1].isOp(",")) && i+1 < len(toks) && toks[i+1].isOp("=") {
+			continue
+		}
+		if !sroPyValidIsInstanceCall(toks, i, isInstTok) {
+			return "allowlist: [py-isinstance-call] blocked"
+		}
+	}
+
+	for i := 0; i < len(toks); i++ {
+		if toks[i].isOp(".") && i+2 < len(toks) && toks[i+1].isId("add_argument") && toks[i+2].isOp("(") {
+			cp := sroPyMatchDelim(toks, i+2, "(", ")")
+			if cp > i+2 {
+				sroPyExtractAddArgDest(sroPyParseCallArgs(toks, i+2, cp), userAttrs)
+			}
+		}
+		if toks[i].kind == sroPyId && !importSpanToks[i] && i+1 < len(toks) && toks[i+1].isOp("(") {
+			cp := sroPyMatchDelim(toks, i+1, "(", ")")
+			if cp > i+1 {
+				canon := confCalls[toks[i].val]
+				if i >= 2 && toks[i-1].isOp(".") && toks[i-2].kind == sroPyId && confinedMods[toks[i-2].val] != "" {
+					canon = confinedMods[toks[i-2].val] + "." + toks[i].val
+				}
+				if canon == "collections.namedtuple" {
+					sroPyExtractNamedtupleFields(sroPyParseCallArgs(toks, i+1, cp), userAttrs)
+				} else if canon == "argparse.Namespace" || canon == "types.SimpleNamespace" {
+					for _, a := range sroPyParseCallArgs(toks, i+1, cp) {
+						if !a.isStar && !a.isKwStar && a.kw != "" && !strings.HasPrefix(a.kw, "_") && !sroPyNonROMembers[a.kw] {
+							userAttrs[a.kw] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	reflModTok := make(map[int]bool)
+	validStdioTok := make(map[int]bool)
+	for i := 0; i < len(toks); i++ {
+		if importSpanToks[i] || toks[i].kind != sroPyId || (i > 0 && toks[i-1].isOp(".")) {
+			continue
+		}
+		if !defParamToks[i] && i > 0 && (toks[i-1].isOp("(") || toks[i-1].isOp(",")) && i+1 < len(toks) && toks[i+1].isOp("=") {
+			continue
+		}
+		if toks[i].val == "getattr" {
+			cArgs, attrStr, okG := sroPyValidGetattrArgs(toks, i)
+			if !okG {
+				return "allowlist: [py-getattr-syntax] blocked"
+			}
+			if len(cArgs) == 0 {
+				continue
+			}
+			objSeg := cArgs[0].val
+			if len(objSeg) == 3 && objSeg[0].kind == sroPyId && objSeg[1].isOp(".") && objSeg[2].kind == sroPyId && confinedMods[objSeg[0].val] != "" {
+				return "allowlist: [py-getattr-confined-dot] getattr on confined symbol " + objSeg[0].val + "." + objSeg[2].val + " not allowed"
+			}
+			if len(objSeg) == 1 && objSeg[0].kind == sroPyId {
+				oName := objSeg[0].val
+				if confCalls[oName] != "" || confValCls[oName] != "" {
+					return "allowlist: [py-getattr-confined-sym] getattr on confined symbol " + oName + " not allowed"
+				}
+				if canonMod := confinedMods[oName]; canonMod != "" {
+					exports := sroPyModExports[canonMod]
+					kind, okExp := exports[attrStr]
+					if !okExp || kind != sroPyExpConst || attrStr == "environ" || attrStr == "stdout" || attrStr == "stderr" || attrStr == "stdin" {
+						return "allowlist: [py-getattr-mod] getattr module member " + canonMod + "." + attrStr + " not allowed"
+					}
+					reflModTok[cArgs[0].valStart] = true
+					continue
+				}
+			}
+			if !sroPyUncalledMeths[attrStr] && !sroPyDataAttrs[attrStr] && !userAttrs[attrStr] {
+				return "allowlist: [py-getattr-attr] getattr attribute ." + attrStr + " not allowed"
+			}
+		} else if toks[i].val == "vars" {
+			if !sroPyValidVarsCall(toks, i, confinedMods, reflModTok) {
+				return "allowlist: [py-vars-call] blocked"
+			}
+		}
+	}
+
+	for i := 0; i < len(toks); i++ {
+		if importSpanToks[i] {
+			continue
+		}
+		if toks[i].isId("print") && (i == 0 || !toks[i-1].isOp(".")) && i+1 < len(toks) && toks[i+1].isOp("(") {
+			cp := sroPyMatchDelim(toks, i+1, "(", ")")
+			for _, a := range sroPyParseCallArgs(toks, i+1, cp) {
+				if a.kw == "file" {
+					sroPyIsStdioOrNone(a.val, a.valStart, confinedMods, validStdioTok)
+				}
+			}
+		}
+		if toks[i].isOp(".") && i+2 < len(toks) && toks[i+1].isId("printdir") && toks[i+2].isOp("(") {
+			cp := sroPyMatchDelim(toks, i+2, "(", ")")
+			pArgs := sroPyParseCallArgs(toks, i+2, cp)
+			if len(pArgs) == 1 {
+				sroPyIsStdioOrNone(pArgs[0].val, pArgs[0].valStart, confinedMods, validStdioTok)
+			}
+		}
+	}
+
+	skipUntil := -1
+	for i := 0; i < len(toks); i++ {
+		if i <= skipUntil || importSpanToks[i] {
+			continue
+		}
+		t := toks[i]
+		if t.kind != sroPyId {
+			continue
+		}
+
+		isAfterDot := i > 0 && toks[i-1].isOp(".")
+		isCallKwName := !isAfterDot && !defParamToks[i] && i > 0 && (toks[i-1].isOp("(") || toks[i-1].isOp(",")) && i+1 < len(toks) && toks[i+1].isOp("=")
+		if isCallKwName {
+			continue
+		}
+
+		if !isAfterDot && sroPyBadIdents[t.val] {
+			return "allowlist: [py-forbidden-ident] identifier " + t.val + " not allowed"
+		}
+
+		if !isAfterDot && (confinedMods[t.val] != "" || environVars[t.val]) {
+			if environVars[t.val] {
+				if !sroPyCheckEnvironUse(toks, i) {
+					return "allowlist: [py-environ-alias-use] blocked"
+				}
+				continue
+			}
+			if reflModTok[i] {
+				continue
+			}
+			if i+1 >= len(toks) || !toks[i+1].isOp(".") {
+				return "allowlist: [py-mod-bare] module " + t.val + " must be accessed via .member"
+			}
+			curMod := confinedMods[t.val]
+			curIdx := i
+			for {
+				member := toks[curIdx+2].val
+				expMap := sroPyModExports[curMod]
+				expKind, okExp := expMap[member]
+				if !okExp {
+					return "allowlist: [py-mod-member] module member " + curMod + "." + member + " not allowed"
+				}
+				memberIdx := curIdx + 2
+				if expKind == sroPyExpSubmod {
+					if memberIdx+1 >= len(toks) || !toks[memberIdx+1].isOp(".") {
+						return "allowlist: [py-submod-bare] submodule " + curMod + "." + member + " must be accessed via .member"
+					}
+					curMod = curMod + "." + member
+					curIdx = memberIdx
+					continue
+				}
+
+				canon := curMod + "." + member
+				if canon == "os.environ" {
+					if !sroPyCheckEnvironUse(toks, memberIdx) {
+						return "allowlist: [py-environ-use] blocked"
+					}
+					skipUntil = memberIdx
+					break
+				}
+				if canon == "sys.stdout" || canon == "sys.stderr" || canon == "sys.stdin" {
+					if validStdioTok[memberIdx] {
+						skipUntil = memberIdx
+						break
+					}
+					if !sroPyCheckStdioDirectUse(toks, memberIdx, member, &skipUntil) {
+						return "allowlist: [py-stdio-use] unconfined sys." + member + " alias not allowed"
+					}
+					break
+				}
+				if canon == "sys.path" {
+					if !sroPyCheckSysPathUse(toks, memberIdx) {
+						return "allowlist: [py-sys-path-mutate] blocked"
+					}
+					skipUntil = memberIdx
+					break
+				}
+
+				if expKind == sroPyExpCall {
+					isDecorator := i > 0 && toks[i-1].isOp("@") && canon == "dataclasses.dataclass"
+					if strings.HasPrefix(canon, "pathlib.") && memberIdx+3 < len(toks) &&
+						toks[memberIdx+1].isOp(".") && toks[memberIdx+2].kind == sroPyId &&
+						(toks[memberIdx+2].val == "cwd" || toks[memberIdx+2].val == "home") && toks[memberIdx+3].isOp("(") {
+						skipUntil = memberIdx + 2
+						break
+					}
+					if isInstTok[memberIdx] || clsBaseTok[memberIdx] || (isDecorator && (memberIdx+1 >= len(toks) || !toks[memberIdx+1].isOp("("))) {
+						skipUntil = memberIdx
+						break
+					}
+					if memberIdx+1 >= len(toks) || !toks[memberIdx+1].isOp("(") {
+						return "allowlist: [py-mod-callable] " + canon + " must be called directly"
+					}
+					cp := sroPyMatchDelim(toks, memberIdx+1, "(", ")")
+					if hit := sroPyCheckSpecialCallable(canon, sroPyParseCallArgs(toks, memberIdx+1, cp), confinedMods, validStdioTok, userAttrs); hit != "" {
+						return hit
+					}
+				} else if expKind == sroPyExpValueCls {
+					if !isInstTok[memberIdx] {
+						hasCall := memberIdx+1 < len(toks) && toks[memberIdx+1].isOp("(")
+						hasDot := memberIdx+1 < len(toks) && toks[memberIdx+1].isOp(".")
+						if !hasCall && !hasDot {
+							return "allowlist: [py-mod-valcls] " + canon + " must be called or accessed via .member"
+						}
+					}
+				}
+				skipUntil = memberIdx
+				break
+			}
+			continue
+		}
+
+		if !isAfterDot && confCalls[t.val] != "" {
+			canon := confCalls[t.val]
+			isDecorator := i > 0 && toks[i-1].isOp("@") && canon == "dataclasses.dataclass"
+			if strings.HasPrefix(canon, "pathlib.") && i+3 < len(toks) &&
+				toks[i+1].isOp(".") && toks[i+2].kind == sroPyId &&
+				(toks[i+2].val == "cwd" || toks[i+2].val == "home") && toks[i+3].isOp("(") {
+				skipUntil = i + 2
+				continue
+			}
+			if isInstTok[i] || clsBaseTok[i] || (isDecorator && (i+1 >= len(toks) || !toks[i+1].isOp("("))) {
+				continue
+			}
+			if i+1 >= len(toks) || !toks[i+1].isOp("(") {
+				return "allowlist: [py-imp-callable] imported callable " + t.val + " must be called directly"
+			}
+			cp := sroPyMatchDelim(toks, i+1, "(", ")")
+			if hit := sroPyCheckSpecialCallable(canon, sroPyParseCallArgs(toks, i+1, cp), confinedMods, validStdioTok, userAttrs); hit != "" {
+				return hit
+			}
+			continue
+		}
+		if !isAfterDot && confValCls[t.val] != "" {
+			if !isInstTok[i] {
+				hasCall := i+1 < len(toks) && toks[i+1].isOp("(")
+				hasDot := i+1 < len(toks) && toks[i+1].isOp(".")
+				if !hasCall && !hasDot {
+					return "allowlist: [py-imp-valcls] imported class " + t.val + " must be called or accessed via .member"
+				}
+			}
+			continue
+		}
+
+		if !isAfterDot && t.val == "open" {
+			if i+1 >= len(toks) || !toks[i+1].isOp("(") {
+				return "allowlist: [py-bare-open] blocked"
+			}
+			cp := sroPyMatchDelim(toks, i+1, "(", ")")
+			if hit := sroPyOpenHit(sroPyParseCallArgs(toks, i+1, cp), true, false, false); hit != "" {
+				return hit
+			}
+			continue
+		}
+
+		if !isAfterDot && t.val == "print" {
+			if i+1 >= len(toks) || !toks[i+1].isOp("(") {
+				return "allowlist: [py-print-bare] blocked"
+			}
+			cp := sroPyMatchDelim(toks, i+1, "(", ")")
+			if !sroPyValidPrintArgs(sroPyParseCallArgs(toks, i+1, cp), confinedMods, validStdioTok) {
+				return "allowlist: [py-print-file] blocked"
+			}
+			continue
+		}
+
+		if !isAfterDot && t.val == "type" {
+			if !isInstTok[i] && !sroPyCheckTypeCallContext(toks, i) {
+				return "allowlist: [py-type-call] blocked"
+			}
+			continue
+		}
+
+		if isAfterDot {
+			attr := t.val
+			if sroPyIsDunderOrMangled(attr) {
+				continue
+			}
+			isCall := i+1 < len(toks) && toks[i+1].isOp("(")
+			recvTok := toks[i-2]
+			isBareSelf := recvTok.isId("self") && (i < 3 || !toks[i-3].isOp("."))
+
+			if isCall {
+				cp := sroPyMatchDelim(toks, i+1, "(", ")")
+				if strings.HasPrefix(attr, "_") {
+					if isBareSelf && userPrivMeths[attr] {
+						continue
+					}
+					return "allowlist: [py-priv-method] private method call ." + attr + "() not allowed"
+				}
+				switch attr {
+				case "open":
+					isDbmOpen := !importedNames["dbm"] && !locallyBound["dbm"] &&
+						((recvTok.isId("dbm") && (i < 3 || !toks[i-3].isOp("."))) ||
+							(i >= 4 && recvTok.kind == sroPyId &&
+								(recvTok.val == "gnu" || recvTok.val == "ndbm" || recvTok.val == "dumb") &&
+								toks[i-3].isOp(".") && toks[i-4].isId("dbm") && (i < 5 || !toks[i-5].isOp("."))))
+					isLegacyModOpen := recvTok.kind == sroPyId && sroPyLegacyModuleOpens[recvTok.val] &&
+						!importedNames[recvTok.val] && !locallyBound[recvTok.val] && (i < 3 || !toks[i-3].isOp("."))
+					if hit := sroPyOpenHitExt(sroPyParseCallArgs(toks, i+1, cp), false, false, false, !isLegacyModOpen, isDbmOpen, isLegacyModOpen); hit != "" {
+						return hit
+					}
+				case "replace":
+					if !sroPyCheckDotReplaceCall(sroPyParseCallArgs(toks, i+1, cp)) {
+						return "allowlist: [py-replace-call] blocked"
+					}
+				case "copy":
+					if len(sroPyParseCallArgs(toks, i+1, cp)) != 0 {
+						return "allowlist: [py-copy-call] blocked"
+					}
+				case "printdir":
+					if !sroPyValidPrintdirArgs(sroPyParseCallArgs(toks, i+1, cp), confinedMods, validStdioTok) {
+						return "allowlist: [py-printdir-file] blocked"
+					}
+				case "execute":
+					if !sroPyReadonlySQL(sroPyParseCallArgs(toks, i+1, cp)) {
+						return "allowlist: [py-sqlite-sql] blocked"
+					}
+				default:
+					if !sroPyDirectMeths[attr] && !userMeths[attr] {
+						return "allowlist: [py-method-call] method call ." + attr + "() not allowed"
+					}
+				}
+				continue
+			}
+
+			if lhsAttrValidTok[i] {
+				continue
+			}
+			if recvTok.isId("dbm") && !importedNames["dbm"] && !locallyBound["dbm"] &&
+				(attr == "gnu" || attr == "ndbm" || attr == "dumb") &&
+				i+3 < len(toks) && toks[i+1].isOp(".") && toks[i+2].isId("open") && toks[i+3].isOp("(") {
+				continue
+			}
+			if strings.HasPrefix(attr, "_") {
+				if isBareSelf && selfPrivAttrs[attr] {
+					continue
+				}
+				return "allowlist: [py-priv-attr] private attribute ." + attr + " not allowed"
+			}
+			if !sroPyUncalledMeths[attr] && !sroPyDataAttrs[attr] && !userAttrs[attr] {
+				return "allowlist: [py-uncalled-attr] attribute ." + attr + " not allowed"
+			}
+		}
+	}
+
+	return ""
+}
+
+func sroPyCheckEnvironUse(toks []sroPyTok, idx int) bool {
+	if idx > 0 && toks[idx-1].isId("in") &&
+		(idx+1 >= len(toks) || (!toks[idx+1].isOp(".") && !toks[idx+1].isOp("[") && !sroPyIsAnyAssignOp(toks[idx+1]))) {
+		if idx < 2 || toks[idx-2].kind != sroPyId || toks[idx-2].val != "for" {
+			return true
+		}
+	}
+	if idx >= 2 && toks[idx-1].isOp("(") && idx+1 < len(toks) && toks[idx+1].isOp(")") &&
+		toks[idx-2].kind == sroPyId && (toks[idx-2].val == "dict" || toks[idx-2].val == "len" || toks[idx-2].val == "list") {
+		return true
+	}
+	if idx+1 >= len(toks) {
+		return false
+	}
+	if toks[idx+1].isOp("[") {
+		cb := sroPyMatchDelim(toks, idx+1, "[", "]")
+		return cb >= 0 && (cb+1 >= len(toks) || !sroPyIsAnyAssignOp(toks[cb+1]))
+	}
+	if toks[idx+1].isOp(".") && idx+3 < len(toks) && toks[idx+2].kind == sroPyId && toks[idx+3].isOp("(") {
+		switch toks[idx+2].val {
+		case "get", "keys", "values", "items", "copy":
+			return true
+		}
+	}
+	return false
+}
+
+func sroPyCheckStdioDirectUse(toks []sroPyTok, memberIdx int, member string, skipUntil *int) bool {
+	if member == "stdin" {
+		if memberIdx+3 < len(toks) && toks[memberIdx+1].isOp(".") && toks[memberIdx+2].kind == sroPyId &&
+			(toks[memberIdx+2].val == "read" || toks[memberIdx+2].val == "readline" || toks[memberIdx+2].val == "readlines") &&
+			toks[memberIdx+3].isOp("(") {
+			*skipUntil = memberIdx + 2
+			return true
+		}
+		if memberIdx >= 3 && (toks[memberIdx-3].isOp("(") || toks[memberIdx-3].isOp(",") ||
+			(toks[memberIdx-3].isId("in"))) {
+			*skipUntil = memberIdx
+			return true
+		}
+		return false
+	}
+	if memberIdx+3 < len(toks) && toks[memberIdx+1].isOp(".") && toks[memberIdx+2].kind == sroPyId &&
+		(toks[memberIdx+2].val == "write" || toks[memberIdx+2].val == "flush") && toks[memberIdx+3].isOp("(") {
+		*skipUntil = memberIdx + 2
+		return true
+	}
+	return false
+}
+
+func sroPyCheckSysPathUse(toks []sroPyTok, memberIdx int) bool {
+	if memberIdx+1 < len(toks) {
+		if sroPyIsAnyAssignOp(toks[memberIdx+1]) || toks[memberIdx+1].isOp(".") {
+			return false
+		}
+		if toks[memberIdx+1].isOp("[") {
+			cb := sroPyMatchDelim(toks, memberIdx+1, "[", "]")
+			if cb < 0 || (cb+1 < len(toks) && sroPyIsAnyAssignOp(toks[cb+1])) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sroPyCheckTypeCallContext(toks []sroPyTok, typeIdx int) bool {
+	if typeIdx > 0 {
+		prev := toks[typeIdx-1]
+		if prev.isOp("==") || prev.isOp("!=") || prev.isOp("<") || prev.isOp("<=") || prev.isOp(">") || prev.isOp(">=") ||
+			(prev.kind == sroPyId && (prev.val == "is" || prev.val == "in" || prev.val == "not")) {
+			return false
+		}
+	}
+	if typeIdx+1 >= len(toks) || !toks[typeIdx+1].isOp("(") {
+		return false
+	}
+	cp := sroPyMatchDelim(toks, typeIdx+1, "(", ")")
+	if cp < 0 {
+		return false
+	}
+	cArgs := sroPyParseCallArgs(toks, typeIdx+1, cp)
+	if len(cArgs) != 1 || cArgs[0].isStar || cArgs[0].isKwStar || cArgs[0].kw != "" {
+		return false
+	}
+	if cp+2 < len(toks) && toks[cp+1].isOp(".") && toks[cp+2].kind == sroPyId &&
+		(toks[cp+2].val == "__name__" || toks[cp+2].val == "__qualname__") {
+		return true
+	}
+	if cp+2 < len(toks) {
+		opIdx := cp + 1
+		targetIdx := cp + 2
+		if toks[opIdx].isId("is") {
+			if targetIdx < len(toks) && toks[targetIdx].isId("not") {
+				targetIdx++
+			}
+		} else if !toks[opIdx].isOp("==") && !toks[opIdx].isOp("!=") {
+			return false
+		}
+		if targetIdx < len(toks) && toks[targetIdx].kind == sroPyId && sroPyTypeCmpBuiltins[toks[targetIdx].val] {
+			if targetIdx+1 >= len(toks) {
+				return true
+			}
+			after := toks[targetIdx+1]
+			if !after.isOp("(") && !after.isOp("[") && !after.isOp(".") &&
+				!after.isOp("==") && !after.isOp("!=") && !after.isOp("<") && !after.isOp("<=") && !after.isOp(">") && !after.isOp(">=") &&
+				!(after.kind == sroPyId && (after.val == "is" || after.val == "in")) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sroPyCheckDotReplaceCall(args []sroPyCallArg) bool {
+	posCount := 0
+	kwCount := 0
+	onlyCountKw := true
+	allDatetimeKw := true
+	for _, a := range args {
+		if a.isStar || a.isKwStar {
+			return false
+		}
+		if a.kw != "" {
+			kwCount++
+			if a.kw != "count" {
+				onlyCountKw = false
+			}
+			if !sroPyReplaceKw[a.kw] {
+				allDatetimeKw = false
+			}
+		} else {
+			posCount++
+		}
+	}
+	if posCount >= 2 && posCount <= 3 && onlyCountKw && posCount+kwCount <= 3 {
+		return true
+	}
+	if posCount == 0 && kwCount >= 1 && allDatetimeKw {
+		return true
+	}
+	return false
+}
+
+type sroJSTokKind uint8
+
+const (
+	sroJSId sroJSTokKind = iota
+	sroJSNum
+	sroJSStr
+	sroJSRe
+	sroJSTokOp
+)
+
+type sroJSTok struct {
+	kind          sroJSTokKind
+	val           string
+	hasEscape     bool
+	isTemplate    bool
+	isSynthTmplFn bool
+}
+
+func (t sroJSTok) isOp(op string) bool {
+	return t.kind == sroJSTokOp && t.val == op
+}
+
+func (t sroJSTok) isId(v string) bool {
+	return t.kind == sroJSId && t.val == v
+}
+
+func sroIsJSIdentStart(b byte) bool {
+	return sroIsASCIIAlpha(b) || b == '_' || b == '$'
+}
+
+func sroIsJSIdentCont(b byte) bool {
+	return sroIsASCIIAlpha(b) || sroIsASCIIDigit(b) || b == '_' || b == '$'
+}
+
+func sroIsValidJSIdentStr(s string) bool {
+	if len(s) == 0 || !sroIsJSIdentStart(s[0]) {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		if !sroIsJSIdentCont(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func sroIsDigitsOnly(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !sroIsASCIIDigit(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+var sroJSRegexKw = sroWordSet("return throw case delete void typeof await yield in of instanceof new else do")
+
+var sroJSNonExprKw = sroWordSet("return throw case delete void typeof await yield in of instanceof new const let var else do try finally function class if while for switch catch")
+
+var sroJSBadIdents = sroWordSet(`
+	eval Function AsyncFunction GeneratorFunction AsyncGeneratorFunction
+	Proxy Reflect globalThis global self window module exports arguments
+	WebAssembly SharedArrayBuffer Atomics FinalizationRegistry WeakRef Worker
+	fetch XMLHttpRequest WebSocket importScripts
+	setImmediate setInterval setTimeout
+`)
+
+var sroJSBadProps = sroWordSet(`
+	constructor __proto__ prototype mainModule
+	__defineGetter__ __defineSetter__ __lookupGetter__ __lookupSetter__
+	getBuiltinModule binding dlopen _load _compile
+	umask chdir kill initgroups setuid setgid seteuid setegid setgroups openStdin
+`)
+
+var sroJSBuiltinNS = sroWordSet(`
+	Object Array String Number Boolean Math JSON Date RegExp Promise
+	Map Set WeakMap WeakSet Symbol BigInt Buffer URL URLSearchParams
+	Error TypeError RangeError SyntaxError ReferenceError URIError EvalError
+	Int8Array Uint8Array Uint8ClampedArray Int16Array Uint16Array
+	Int32Array Uint32Array Float32Array Float64Array BigInt64Array BigUint64Array
+	ArrayBuffer DataView Intl TextEncoder TextDecoder console require
+`)
+
+type sroJSExportKind uint8
+
+const (
+	sroJSExpConst sroJSExportKind = iota
+	sroJSExpCall
+	sroJSExpSubns
+)
+
+func sroJSExports(calls, consts, subns string) map[string]sroJSExportKind {
+	m := make(map[string]sroJSExportKind)
+	for _, w := range strings.Fields(calls) {
+		m[w] = sroJSExpCall
+	}
+	for _, w := range strings.Fields(consts) {
+		m[w] = sroJSExpConst
+	}
+	for _, w := range strings.Fields(subns) {
+		m[w] = sroJSExpSubns
+	}
+	return m
+}
+
+var sroJSModExports = map[string]map[string]sroJSExportKind{
+	"assert":      sroJSExports("ok strictEqual deepStrictEqual notStrictEqual", "", ""),
+	"buffer":      sroJSExports("", "Buffer", ""),
+	"crypto":      sroJSExports("createHash createHmac randomBytes randomUUID randomInt timingSafeEqual", "", ""),
+	"fs":          sroJSExports("readFileSync readdirSync statSync lstatSync existsSync realpathSync accessSync readFile readdir stat lstat realpath access", "constants", "promises"),
+	"fs/promises": sroJSExports("readFile readdir stat lstat realpath access", "", ""),
+	"os":          sroJSExports("arch cpus endianness freemem homedir hostname loadavg machine networkInterfaces platform release tmpdir totalmem type uptime userInfo version", "EOL", ""),
+	"path":        sroJSExports("basename dirname extname format isAbsolute join normalize parse relative resolve", "sep delimiter", "posix win32"),
+	"querystring": sroJSExports("parse stringify escape unescape", "", ""),
+	"url":         sroJSExports("URL URLSearchParams parse format fileURLToPath pathToFileURL", "", ""),
+	"util":        sroJSExports("format inspect", "types", ""),
+}
+
+var sroJSProcMembers = sroJSExports("cwd exit hrtime memoryUsage uptime nextTick", "env argv platform arch version versions pid ppid stdout stderr", "")
+
+var sroJSMeths = sroWordSet(`
+	charAt charCodeAt codePointAt concat endsWith includes indexOf lastIndexOf
+	localeCompare match matchAll normalize padEnd padStart repeat replace
+	replaceAll search slice split startsWith substring toLocaleLowerCase
+	toLocaleUpperCase toLowerCase toUpperCase trim trimEnd trimStart
+	at every fill filter find findIndex findLast findLastIndex flat flatMap
+	forEach join keys map pop push reduce reduceRight reverse shift some sort
+	splice unshift values entries with toReversed toSorted toSpliced
+	has get set add delete clear
+	exec test
+	toFixed toExponential toPrecision toString valueOf
+	getTime getFullYear getUTCFullYear getMonth getUTCMonth getDate getUTCDate
+	getDay getUTCDay getHours getUTCHours getMinutes getUTCMinutes
+	getSeconds getUTCSeconds getMilliseconds getUTCMilliseconds
+	getTimezoneOffset toISOString toJSON toDateString toTimeString toUTCString
+	then catch finally resolve reject all allSettled any race
+	isArray from of
+	isFinite isInteger isNaN isSafeInteger parseFloat parseInt
+	abs acos acosh asin asinh atan atan2 atanh cbrt ceil clz32 cos cosh exp
+	expm1 floor fround hypot imul log log1p log10 log2 max min pow random
+	round sign sin sinh sqrt tan tanh trunc
+	parse stringify
+	fromEntries hasOwn is
+	alloc allocUnsafe byteLength compare isBuffer subarray readUInt8 readUInt16LE
+	readUInt16BE readUInt32LE readUInt32BE readInt32LE readInt32BE
+	update digest
+	log info warn error debug dir table time timeEnd
+	encode decode
+	append getAll sort toString
+`)
+
+var sroJSDynSubMeths = sroWordSet("trim trimStart trimEnd toLowerCase toUpperCase startsWith endsWith includes indexOf lastIndexOf charCodeAt codePointAt")
+
+func sroJSCanStartRegex(toks []sroJSTok) bool {
+	if len(toks) == 0 {
+		return true
+	}
+	prev := toks[len(toks)-1]
+	if prev.kind == sroJSId {
+		return sroJSRegexKw[prev.val]
+	}
+	if prev.kind == sroJSTokOp {
+		switch prev.val {
+		case ")", "]", "++", "--":
+			return false
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+func sroJSLex(code string) ([]sroJSTok, string) {
+	if strings.Contains(code, "\xe2\x80\xa8") || strings.Contains(code, "\xe2\x80\xa9") {
+		code = "\x01"
+	}
+	norm := sroNormNL(code)
+	var toks []sroJSTok
+	var deferredTmplExprs [][]sroJSTok
+	n := len(norm)
+	i := 0
+	delimStack := make([]byte, 0, 16)
+	delimBad := false
+
+	for i < n {
+		b := norm[i]
+		if b == ' ' || b == '\t' || b == '\n' {
+			i++
+			continue
+		}
+		if b < 0x20 || b == 0x7f {
+			return nil, "allowlist: [js-ctrl-char] blocked"
+		}
+		if b >= 0x80 {
+			return nil, "allowlist: [js-non-ascii] blocked"
+		}
+
+		if b == '/' && i+1 < n && norm[i+1] == '/' {
+			i += 2
+			for i < n && norm[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if b == '/' && i+1 < n && norm[i+1] == '*' {
+			end := strings.Index(norm[i+2:], "*/")
+			if end < 0 {
+				return nil, "allowlist: [js-unclosed-comment] blocked"
+			}
+			i += 2 + end + 2
+			continue
+		}
+
+		if b == '\\' {
+			if i+1 < n && (norm[i+1] == 'u' || norm[i+1] == 'x') {
+				return nil, "allowlist: [js-unicode-esc] blocked"
+			}
+			return nil, "allowlist: [js-stray-bs] blocked"
+		}
+
+		if b == '\'' || b == '"' {
+			q := b
+			i++
+			start := i
+			hasEsc := false
+			closed := false
+			for i < n {
+				c := norm[i]
+				if c == '\\' {
+					hasEsc = true
+					if i+1 >= n {
+						break
+					}
+					i += 2
+					continue
+				}
+				if c == '\n' {
+					break
+				}
+				if c == q {
+					closed = true
+					break
+				}
+				i++
+			}
+			if !closed {
+				return nil, "allowlist: [js-unclosed-string] blocked"
+			}
+			toks = append(toks, sroJSTok{kind: sroJSStr, val: norm[start:i], hasEscape: hasEsc})
+			i++
+			continue
+		}
+
+		if b == '`' {
+			if len(toks) > 0 {
+				prev := toks[len(toks)-1]
+				if (prev.kind == sroJSId && !sroJSNonExprKw[prev.val]) ||
+					prev.isOp(")") || prev.isOp("]") || prev.isTemplate {
+					return nil, "allowlist: [js-tagged-template] blocked"
+				}
+			}
+			subExprs, nextIdx, okTmpl, innerHit := sroJSScanTemplate(norm, i+1)
+			if innerHit != "" {
+				return nil, innerHit
+			}
+			if !okTmpl {
+				return nil, "allowlist: [js-unclosed-template] blocked"
+			}
+			toks = append(toks, sroJSTok{kind: sroJSStr, val: "", hasEscape: true, isTemplate: true})
+			deferredTmplExprs = append(deferredTmplExprs, subExprs...)
+			i = nextIdx
+			continue
+		}
+
+		if b == '/' && sroJSCanStartRegex(toks) {
+			k := i + 1
+			inCharClass := false
+			closed := false
+			for k < n {
+				c := norm[k]
+				if c == '\n' {
+					break
+				}
+				if c == '\\' {
+					if k+1 >= n || norm[k+1] == '\n' {
+						break
+					}
+					k += 2
+					continue
+				}
+				if c == '[' {
+					inCharClass = true
+				} else if c == ']' {
+					inCharClass = false
+				} else if c == '/' && !inCharClass {
+					closed = true
+					break
+				}
+				k++
+			}
+			if !closed {
+				return nil, "allowlist: [js-unclosed-regex] blocked"
+			}
+			k++
+			for k < n && sroIsASCIIAlpha(norm[k]) {
+				k++
+			}
+			toks = append(toks, sroJSTok{kind: sroJSRe, val: norm[i:k]})
+			i = k
+			continue
+		}
+
+		if sroIsJSIdentStart(b) {
+			start := i
+			i++
+			for i < n && sroIsJSIdentCont(norm[i]) {
+				i++
+			}
+			toks = append(toks, sroJSTok{kind: sroJSId, val: norm[start:i]})
+			continue
+		}
+
+		if sroIsASCIIDigit(b) || (b == '.' && i+1 < n && sroIsASCIIDigit(norm[i+1])) {
+			start := i
+			if b == '.' {
+				i += 2
+			} else {
+				i++
+			}
+			for i < n {
+				c := norm[i]
+				if sroIsASCIIDigit(c) || sroIsASCIIAlpha(c) || c == '_' || c == '.' {
+					if (c == 'e' || c == 'E') && i+1 < n && (norm[i+1] == '+' || norm[i+1] == '-') {
+						i += 2
+						continue
+					}
+					i++
+				} else {
+					break
+				}
+			}
+			toks = append(toks, sroJSTok{kind: sroJSNum, val: norm[start:i]})
+			continue
+		}
+
+		if b == '(' || b == '[' || b == '{' {
+			delimStack = append(delimStack, b)
+			toks = append(toks, sroJSTok{kind: sroJSTokOp, val: string(b)})
+			i++
+			continue
+		}
+		if b == ')' || b == ']' || b == '}' {
+			if len(delimStack) == 0 || delimStack[len(delimStack)-1] != sroPyMatchingOpen(b) {
+				delimBad = true
+				break
+			}
+			delimStack = delimStack[:len(delimStack)-1]
+			toks = append(toks, sroJSTok{kind: sroJSTokOp, val: string(b)})
+			i++
+			continue
+		}
+
+		op, step := sroJSScanOp(norm, i)
+		if step == 0 {
+			return nil, "allowlist: [js-unknown-char] blocked"
+		}
+		toks = append(toks, sroJSTok{kind: sroJSTokOp, val: op})
+		i += step
+	}
+
+	if delimBad || len(delimStack) > 0 {
+		return nil, "allowlist: [js-delim-mismatch] blocked"
+	}
+
+	for _, sub := range deferredTmplExprs {
+		toks = append(toks,
+			sroJSTok{kind: sroJSTokOp, val: ";"},
+			sroJSTok{kind: sroJSId, val: "String", isSynthTmplFn: true},
+			sroJSTok{kind: sroJSTokOp, val: "("},
+		)
+		toks = append(toks, sub...)
+		toks = append(toks,
+			sroJSTok{kind: sroJSTokOp, val: ")"},
+			sroJSTok{kind: sroJSTokOp, val: ";"},
+		)
+	}
+	return toks, ""
+}
+
+func sroJSScanTemplate(s string, start int) ([][]sroJSTok, int, bool, string) {
+	n := len(s)
+	i := start
+	var exprs [][]sroJSTok
+	for i < n {
+		c := s[i]
+		if c == '\\' {
+			if i+1 >= n {
+				return nil, 0, false, ""
+			}
+			i += 2
+			continue
+		}
+		if c == '`' {
+			return exprs, i + 1, true, ""
+		}
+		if c == '$' && i+1 < n && s[i+1] == '{' {
+			k := i + 2
+			depth := 1
+			for k < n && depth > 0 {
+				ch := s[k]
+				if ch == '/' && k+1 < n && s[k+1] == '/' {
+					for k < n && s[k] != '\n' {
+						k++
+					}
+					continue
+				}
+				if ch == '/' && k+1 < n && s[k+1] == '*' {
+					end := strings.Index(s[k+2:], "*/")
+					if end < 0 {
+						return nil, 0, false, ""
+					}
+					k += 2 + end + 2
+					continue
+				}
+				if ch == '\'' || ch == '"' {
+					q := ch
+					k++
+					for k < n {
+						if s[k] == '\\' {
+							k += 2
+							continue
+						}
+						if s[k] == q || s[k] == '\n' {
+							break
+						}
+						k++
+					}
+					if k >= n || s[k] != q {
+						return nil, 0, false, ""
+					}
+					k++
+					continue
+				}
+				if ch == '`' {
+					nested, nextK, okN, hitN := sroJSScanTemplate(s, k+1)
+					if hitN != "" {
+						return nil, 0, false, hitN
+					}
+					if !okN {
+						return nil, 0, false, ""
+					}
+					exprs = append(exprs, nested...)
+					k = nextK
+					continue
+				}
+				if ch == '{' {
+					depth++
+				} else if ch == '}' {
+					depth--
+					if depth == 0 {
+						break
+					}
+				}
+				k++
+			}
+			if depth != 0 {
+				return nil, 0, false, ""
+			}
+			rawInner := strings.TrimSpace(s[i+2 : k])
+			if rawInner == "" {
+				return nil, 0, false, ""
+			}
+			subToks, hitSub := sroJSLex(rawInner)
+			if hitSub != "" {
+				return nil, 0, false, hitSub
+			}
+			if len(subToks) == 0 {
+				return nil, 0, false, ""
+			}
+			exprs = append(exprs, subToks)
+			i = k + 1
+			continue
+		}
+		i++
+	}
+	return nil, 0, false, ""
+}
+
+var (
+	sroJSOps3 = sroWordSet("=== !== >>> <<= >>= **= &&= ||= ??= ...")
+	sroJSOps2 = sroWordSet("== != <= >= && || ?? ++ -- => ?. += -= *= /= %= &= |= ^= << >> **")
+)
+
+func sroJSScanOp(s string, i int) (string, int) {
+	if i+4 <= len(s) && s[i:i+4] == ">>>=" {
+		return ">>>=", 4
+	}
+	if i+3 <= len(s) && sroJSOps3[s[i:i+3]] {
+		return s[i : i+3], 3
+	}
+	if i+2 <= len(s) && sroJSOps2[s[i:i+2]] {
+		return s[i : i+2], 2
+	}
+	if strings.IndexByte("+-*/%&|^~!<>?=?:.,;", s[i]) >= 0 {
+		return s[i : i+1], 1
+	}
+	return "", 0
+}
+
+func sroJSMatchDelim(toks []sroJSTok, openIdx int, openOp, closeOp string) int {
+	if openIdx < 0 || openIdx >= len(toks) || !toks[openIdx].isOp(openOp) {
+		return -1
+	}
+	depth := 0
+	for i := openIdx; i < len(toks); i++ {
+		if toks[i].isOp(openOp) {
+			depth++
+		} else if toks[i].isOp(closeOp) {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func sroJSIsAssign(t sroJSTok) bool {
+	if t.kind != sroJSTokOp {
+		return false
+	}
+	switch t.val {
+	case "=", "+=", "-=", "*=", "/=", "%=", "**=", "<<=", ">>=", ">>>=", "&=", "|=", "^=", "&&=", "||=", "??=", "++", "--":
+		return true
+	default:
+		return false
+	}
+}
+
+func sroJSIsPrimBinOp(t sroJSTok) bool {
+	if t.kind == sroJSId {
+		return t.val == "in" || t.val == "instanceof"
+	}
+	if t.kind != sroJSTokOp {
+		return false
+	}
+	switch t.val {
+	case "+", "-", "*", "/", "%", "**", "<<", ">>", ">>>", "&", "^", "|",
+		"===", "!==", "==", "!=", "<", "<=", ">", ">=":
+		return true
+	default:
+		return false
+	}
+}
+
+func sroJSIsSafePostPrimBoundary(toks []sroJSTok, idx int) bool {
+	if idx >= len(toks) {
+		return true
+	}
+	t := toks[idx]
+	if t.kind != sroJSTokOp {
+		return false
+	}
+	switch t.val {
+	case ";", ",", ")", ":", "?", "&&", "||":
+		return true
+	default:
+		return sroJSIsPrimBinOp(t)
+	}
+}
+
+func sroJSSafeSinkArg(toks []sroJSTok, openParenIdx, argStart, argEnd int, confinedMods map[string]string) bool {
+	if openParenIdx <= 0 || !toks[openParenIdx].isOp("(") {
+		return false
+	}
+	if argStart <= openParenIdx || (argStart != openParenIdx+1 && !toks[argStart-1].isOp(",")) {
+		return false
+	}
+	cp := sroJSMatchDelim(toks, openParenIdx, "(", ")")
+	if cp < 0 || argEnd > cp || (argEnd != cp && !toks[argEnd].isOp(",")) {
+		return false
+	}
+
+	fnTok := toks[openParenIdx-1]
+	if fnTok.kind == sroJSId && fnTok.isSynthTmplFn {
+		return argStart == openParenIdx+1 && argEnd == cp
+	}
+
+	if fnTok.kind == sroJSId && (openParenIdx < 2 || (!toks[openParenIdx-2].isOp(".") && !toks[openParenIdx-2].isOp("?."))) {
+		if confinedMods[fnTok.val] != "" {
+			return false
+		}
+		if openParenIdx >= 2 && toks[openParenIdx-2].isId("new") {
+			return false
+		}
+		switch fnTok.val {
+		case "String", "Number", "Boolean", "parseFloat", "isNaN", "isFinite":
+			return argStart == openParenIdx+1 && argEnd == cp
+		case "parseInt":
+			return argStart == openParenIdx+1
+		}
+		return false
+	}
+
+	if openParenIdx >= 3 && toks[openParenIdx-2].isOp(".") && toks[openParenIdx-3].kind == sroJSId && fnTok.kind == sroJSId {
+		if openParenIdx >= 4 && (toks[openParenIdx-4].isOp(".") || (toks[openParenIdx-4].isId("new"))) {
+			return false
+		}
+		obj := toks[openParenIdx-3].val
+		meth := fnTok.val
+		if confinedMods[obj] != "" {
+			return false
+		}
+		switch obj {
+		case "console":
+			return meth == "log" || meth == "info" || meth == "warn" || meth == "error"
+		case "Math":
+			return sroJSMeths[meth]
+		case "Array":
+			return meth == "isArray" && argStart == openParenIdx+1 && argEnd == cp
+		case "Number":
+			switch meth {
+			case "isFinite", "isInteger", "isNaN", "isSafeInteger", "parseFloat":
+				return argStart == openParenIdx+1 && argEnd == cp
+			case "parseInt":
+				return argStart == openParenIdx+1
+			}
+		case "JSON":
+			return meth == "stringify" && argStart == openParenIdx+1 && argEnd == cp
+		}
+	}
+	return false
+}
+
+func sroJSDynSubReadSink(toks []sroJSTok, baseIdx, endIdx int, confinedMods map[string]string) bool {
+	if endIdx+2 < len(toks) && toks[endIdx+1].isOp(".") && toks[endIdx+2].kind == sroJSId {
+		prop := toks[endIdx+2].val
+		if prop == "length" {
+			afterProp := endIdx + 3
+			if afterProp < len(toks) && (toks[afterProp].isOp("(") || toks[afterProp].isOp("[") || toks[afterProp].isOp("?.") || sroJSIsAssign(toks[afterProp])) {
+				return false
+			}
+			return true
+		}
+		if sroJSDynSubMeths[prop] && endIdx+3 < len(toks) && toks[endIdx+3].isOp("(") {
+			return true
+		}
+		return false
+	}
+
+	if baseIdx >= 2 && toks[baseIdx-1].isOp("(") && endIdx+1 < len(toks) && toks[endIdx+1].isOp(")") &&
+		toks[baseIdx-2].kind == sroJSId && (toks[baseIdx-2].val == "if" || toks[baseIdx-2].val == "while") {
+		return true
+	}
+
+	if baseIdx > 0 && (toks[baseIdx-1].isOp("(") || toks[baseIdx-1].isOp(",")) {
+		d := 0
+		for k := baseIdx - 1; k >= 0; k-- {
+			if toks[k].isOp(")") || toks[k].isOp("]") || toks[k].isOp("}") {
+				d++
+			} else if toks[k].isOp("(") || toks[k].isOp("[") || toks[k].isOp("{") {
+				if d == 0 {
+					if toks[k].isOp("(") && sroJSSafeSinkArg(toks, k, baseIdx, endIdx+1, confinedMods) {
+						return true
+					}
+					break
+				}
+				d--
+			}
+		}
+	}
+
+	if baseIdx > 0 && toks[baseIdx-1].isOp("(") && endIdx+4 < len(toks) &&
+		(toks[endIdx+1].isOp("||") || toks[endIdx+1].isOp("??")) &&
+		(toks[endIdx+2].kind == sroJSNum || (toks[endIdx+2].kind == sroJSStr && !toks[endIdx+2].isTemplate)) &&
+		toks[endIdx+3].isOp(")") && sroJSIsPrimBinOp(toks[endIdx+4]) {
+		return true
+	}
+
+	if baseIdx > 0 {
+		prev := toks[baseIdx-1]
+		isUnaryPrim := prev.isOp("!") || prev.isOp("~") || prev.isId("typeof")
+		isAugRHS := prev.isOp("+=") || prev.isOp("-=") || prev.isOp("*=") || prev.isOp("/=") || prev.isOp("%=")
+		if (isUnaryPrim || isAugRHS || sroJSIsPrimBinOp(prev)) && sroJSIsSafePostPrimBoundary(toks, endIdx+1) {
+			return true
+		}
+	}
+
+	if endIdx+1 < len(toks) && sroJSIsPrimBinOp(toks[endIdx+1]) {
+		if baseIdx == 0 {
+			return true
+		}
+		prev := toks[baseIdx-1]
+		if prev.isOp("(") || prev.isOp(",") || prev.isOp(";") || prev.isOp("{") || prev.isOp("?") || prev.isOp(":") ||
+			prev.isOp("&&") || prev.isOp("||") || prev.isOp("=") || prev.isOp("+=") || prev.isOp("-=") ||
+			sroJSIsPrimBinOp(prev) || prev.isId("return") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func sroJSDynSubSafe(toks []sroJSTok, baseIdx, closeBracketIdx int, ctrlCloses map[int]bool, confinedMods map[string]string) bool {
+	endIdx := closeBracketIdx
+	for endIdx+1 < len(toks) && toks[endIdx+1].isOp("[") {
+		nb := sroJSMatchDelim(toks, endIdx+1, "[", "]")
+		if nb < 0 {
+			return false
+		}
+		endIdx = nb
+	}
+
+	if endIdx+1 < len(toks) && sroJSIsAssign(toks[endIdx+1]) {
+		atStmtBoundary := baseIdx == 0 || toks[baseIdx-1].isOp(";") || toks[baseIdx-1].isOp("{") ||
+			toks[baseIdx-1].isOp("}") || ctrlCloses[baseIdx-1] ||
+			toks[baseIdx-1].isId("else")
+		return atStmtBoundary
+	}
+
+	return sroJSDynSubReadSink(toks, baseIdx, endIdx, confinedMods)
+}
+
+func sroJSDynSubConstOK(
+	toks []sroJSTok,
+	rootBaseIdx, closeBracketIdx int,
+	ctrlCloses map[int]bool,
+	confinedMods map[string]string,
+	fnVars map[string]bool,
+) (string, bool) {
+	endIdx := closeBracketIdx
+	for endIdx+1 < len(toks) && toks[endIdx+1].isOp("[") {
+		nb := sroJSMatchDelim(toks, endIdx+1, "[", "]")
+		if nb < 0 {
+			return "", false
+		}
+		endIdx = nb
+	}
+	if rootBaseIdx < 3 {
+		return "", false
+	}
+	endOK := endIdx+1 == len(toks) || toks[endIdx+1].isOp(";") || toks[endIdx+1].isOp("}") ||
+		(toks[endIdx+1].kind == sroJSId && toks[endIdx+1].val != "in" && toks[endIdx+1].val != "instanceof")
+	if !endOK {
+		return "", false
+	}
+	constIdx := rootBaseIdx - 3
+	declIdx := rootBaseIdx - 2
+	if !toks[constIdx].isId("const") || toks[declIdx].kind != sroJSId || !toks[rootBaseIdx-1].isOp("=") {
+		return "", false
+	}
+	if constIdx > 0 && toks[constIdx-1].isOp("(") {
+		return "", false
+	}
+	vName := toks[declIdx].val
+	if vName == "this" || vName == "process" || sroJSBadIdents[vName] || sroJSBuiltinNS[vName] ||
+		confinedMods[vName] != "" || fnVars[vName] {
+		return "", false
+	}
+	for u := 0; u < len(toks); u++ {
+		if toks[u].kind != sroJSId || toks[u].val != vName || u == declIdx {
+			continue
+		}
+		if u > 0 && (toks[u-1].isOp(".") || toks[u-1].isOp("?.")) {
+			continue
+		}
+		if u > 0 && (toks[u-1].isOp("{") || toks[u-1].isOp(",")) && u+1 < len(toks) && toks[u+1].isOp(":") {
+			continue
+		}
+		if u > 0 && toks[u-1].kind == sroJSId &&
+			(toks[u-1].val == "const" || toks[u-1].val == "let" || toks[u-1].val == "var" ||
+				toks[u-1].val == "function" || toks[u-1].val == "class" || toks[u-1].val == "catch") {
+			return "", false
+		}
+		if u+1 < len(toks) && (toks[u+1].isOp("=>") || sroJSIsAssign(toks[u+1])) {
+			return "", false
+		}
+		spanEnd := u
+		for spanEnd+2 < len(toks) && toks[spanEnd+1].isOp(".") && toks[spanEnd+2].kind == sroJSId {
+			prop := toks[spanEnd+2].val
+			if sroJSBadProps[prop] || prop == "toString" || prop == "valueOf" {
+				return "", false
+			}
+			afterProp := spanEnd + 3
+			if prop == "length" && (afterProp >= len(toks) || !toks[afterProp].isOp(".")) {
+				break
+			}
+			if afterProp < len(toks) && toks[afterProp].isOp("(") {
+				break
+			}
+			spanEnd += 2
+		}
+		if spanEnd+1 < len(toks) && (toks[spanEnd+1].isOp("(") || toks[spanEnd+1].isOp("[") ||
+			toks[spanEnd+1].isOp("?.") || sroJSIsAssign(toks[spanEnd+1])) {
+			return "", false
+		}
+		if !sroJSDynSubReadSink(toks, u, spanEnd, confinedMods) {
+			return "", false
+		}
+	}
+	return vName, true
+}
+
+func sroJSAllowlistHit(code string, jsNodePerm bool) string {
+	toks, lexHit := sroJSLex(code)
+	if lexHit != "" {
+		return lexHit
+	}
+	if len(toks) == 0 {
+		return ""
+	}
+
+	inClassBody := make(map[int]bool)
+	ctrlCloses := make(map[int]bool)
+	fnVars := make(map[string]bool)
+	localVars := make(map[string]bool)
+	userClassMethods := make(map[string]bool)
+
+	for i := 0; i < len(toks); i++ {
+		t := toks[i]
+		if t.kind == sroJSId {
+			switch t.val {
+			case "if", "while", "for", "switch", "catch":
+				if i+1 < len(toks) && toks[i+1].isOp("(") {
+					cp := sroJSMatchDelim(toks, i+1, "(", ")")
+					if cp > i+1 {
+						ctrlCloses[cp] = true
+					}
+				}
+			case "class":
+				k := i + 1
+				if k < len(toks) && toks[k].kind == sroJSId {
+					fnVars[toks[k].val] = true
+					localVars[toks[k].val] = true
+					k++
+				}
+				if k < len(toks) && toks[k].isId("extends") {
+					k += 2
+				}
+				if k < len(toks) && toks[k].isOp("{") {
+					cb := sroJSMatchDelim(toks, k, "{", "}")
+					if cb > k {
+						for p := k + 1; p < cb; p++ {
+							inClassBody[p] = true
+						}
+						d := 0
+						for p := k + 1; p < cb; p++ {
+							if toks[p].isOp("{") || toks[p].isOp("(") || toks[p].isOp("[") {
+								d++
+							} else if toks[p].isOp("}") || toks[p].isOp(")") || toks[p].isOp("]") {
+								d--
+							} else if d == 0 && toks[p].kind == sroJSId && p+1 < cb && toks[p+1].isOp("(") {
+								mn := toks[p].val
+								if mn != "constructor" && !sroJSBadProps[mn] && !sroJSWriteMeths[mn] {
+									userClassMethods[mn] = true
+								}
+							}
+						}
+					}
+				}
+			case "function":
+				if i+1 < len(toks) && toks[i+1].kind == sroJSId {
+					fnVars[toks[i+1].val] = true
+					localVars[toks[i+1].val] = true
+				}
+			case "const", "let", "var":
+				if i+1 < len(toks) && toks[i+1].kind == sroJSId {
+					vName := toks[i+1].val
+					localVars[vName] = true
+					if i+3 < len(toks) && toks[i+2].isOp("=") {
+						rhs := toks[i+3]
+						if (rhs.kind == sroJSId && (rhs.val == "function" || rhs.val == "async")) ||
+							(i+4 < len(toks) && rhs.kind == sroJSId && toks[i+4].isOp("=>")) {
+							fnVars[vName] = true
+						} else if rhs.isOp("(") {
+							cp := sroJSMatchDelim(toks, i+3, "(", ")")
+							if cp > 0 && cp+1 < len(toks) && toks[cp+1].isOp("=>") {
+								fnVars[vName] = true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	confinedMods := make(map[string]string)
+	confinedModFns := make(map[string]string)
+	validRequireTok := make(map[int]bool)
+	modDeclBindTok := make(map[int]bool)
+	destrBindTok := make(map[int]bool)
+
+	for i := 0; i < len(toks); i++ {
+		t := toks[i]
+		if t.kind != sroJSId || t.val != "require" {
+			continue
+		}
+		if i > 0 && (toks[i-1].isOp(".") || toks[i-1].isOp("?.")) {
+			continue
+		}
+		if i+3 >= len(toks) || !toks[i+1].isOp("(") || toks[i+2].kind != sroJSStr ||
+			toks[i+2].hasEscape || toks[i+2].isTemplate || !toks[i+3].isOp(")") {
+			return "allowlist: [js-require-syntax] blocked"
+		}
+		rawMod := strings.TrimPrefix(toks[i+2].val, "node:")
+		exports, okMod := sroJSModExports[rawMod]
+		if !okMod {
+			return "allowlist: [js-require-mod] module " + rawMod + " not allowed"
+		}
+		closeReq := i + 3
+
+		if closeReq+1 < len(toks) && toks[closeReq+1].isOp(".") {
+			validRequireTok[i] = true
+			continue
+		}
+
+		if i >= 3 && toks[i-1].isOp("=") && toks[i-2].kind == sroJSId &&
+			toks[i-3].kind == sroJSId && (toks[i-3].val == "const" || toks[i-3].val == "let" || toks[i-3].val == "var") {
+			alias := toks[i-2].val
+			confinedMods[alias] = rawMod
+			modDeclBindTok[i-2] = true
+			validRequireTok[i] = true
+			continue
+		}
+
+		if i >= 4 && toks[i-1].isOp("=") && toks[i-2].isOp("}") {
+			openBrace := -1
+			d := 0
+			for k := i - 2; k >= 0; k-- {
+				if toks[k].isOp("}") {
+					d++
+				} else if toks[k].isOp("{") {
+					d--
+					if d == 0 {
+						openBrace = k
+						break
+					}
+				}
+			}
+			if openBrace >= 1 && toks[openBrace-1].kind == sroJSId &&
+				(toks[openBrace-1].val == "const" || toks[openBrace-1].val == "let" || toks[openBrace-1].val == "var") {
+				propHit, badShape := sroJSDestructReq(toks, openBrace, i-2, rawMod, exports, confinedModFns, destrBindTok)
+				if badShape {
+					return "allowlist: [js-destruct-require-unconfined] blocked"
+				}
+				if propHit != "" {
+					return propHit
+				}
+				validRequireTok[i] = true
+				continue
+			}
+		}
+
+		return "allowlist: [js-require-unconfined] blocked"
+	}
+
+	for modName := range sroJSModExports {
+		if strings.IndexByte(modName, '/') >= 0 {
+			continue
+		}
+		if confinedMods[modName] == "" && !localVars[modName] {
+			confinedMods[modName] = modName
+		}
+	}
+
+	dynSubTaintedVars := make(map[string]bool)
+	dynSubConstVars := make(map[string]bool)
+	if jsNodePerm {
+		for i := 0; i+4 < len(toks); i++ {
+			if toks[i].kind == sroJSId && toks[i+1].isOp("=") {
+				for k := i + 2; k < len(toks) && !toks[k].isOp(";"); k++ {
+					if toks[k].isOp("[") && k > i+2 && toks[k-1].kind == sroJSId {
+						dynSubTaintedVars[toks[i].val] = true
+						break
+					}
+				}
+			}
+		}
+	}
+
+	skipUntil := -1
+	for i := 0; i < len(toks); i++ {
+		if i <= skipUntil {
+			continue
+		}
+		t := toks[i]
+
+		if t.isOp("?.") {
+			if i+1 < len(toks) && (toks[i+1].isOp("[") || toks[i+1].isOp("(")) {
+				return "allowlist: [js-optchain-sub-call] blocked"
+			}
+		}
+		if (t.isOp(".") || t.isOp("?.")) && (i == 0 || i+1 >= len(toks) || toks[i+1].kind != sroJSId) {
+			return "allowlist: [js-dot-syntax] blocked"
+		}
+		if t.isOp(".") || t.isOp("?.") {
+			continue
+		}
+
+		isAfterDot := i > 0 && (toks[i-1].isOp(".") || toks[i-1].isOp("?."))
+
+		if t.kind == sroJSId && !isAfterDot {
+			switch t.val {
+			case "import":
+				if i+1 < len(toks) && toks[i+1].isOp("(") {
+					return "allowlist: [js-dynamic-import] blocked"
+				}
+				return "allowlist: [js-esm-import] blocked"
+			case "with":
+				return "allowlist: [js-with-stmt] blocked"
+			case "this":
+				if !inClassBody[i] {
+					return "allowlist: [js-this-outside-class] blocked"
+				}
+				if i+2 >= len(toks) || !toks[i+1].isOp(".") || toks[i+2].kind != sroJSId {
+					return "allowlist: [js-this-non-dot] blocked"
+				}
+				continue
+			}
+
+			if sroJSBadIdents[t.val] {
+				return "allowlist: [js-forbidden-ident] identifier " + t.val + " not allowed"
+			}
+
+			if i > 0 && (toks[i-1].isOp("{") || toks[i-1].isOp(",")) &&
+				i+1 < len(toks) && (toks[i+1].isOp(":") || toks[i+1].isOp("}") || toks[i+1].isOp(",") || toks[i+1].isOp("=")) {
+				if sroJSBadProps[t.val] || t.val == "toString" || t.val == "valueOf" {
+					return "allowlist: [js-destruct-forbidden-prop] destructuring or defining ." + t.val + " not allowed"
+				}
+			}
+
+			if t.val == "require" && validRequireTok[i] {
+				if i+4 < len(toks) && toks[i+4].isOp(".") {
+					rawMod := strings.TrimPrefix(toks[i+2].val, "node:")
+					if hit, nextIdx := sroJSModChain(toks, i+3, rawMod); hit != "" {
+						return hit
+					} else {
+						skipUntil = nextIdx
+					}
+				}
+				continue
+			}
+
+			if canonMod := confinedMods[t.val]; canonMod != "" {
+				if modDeclBindTok[i] {
+					continue
+				}
+				if i+1 < len(toks) && sroJSIsAssign(toks[i+1]) {
+					return "allowlist: [js-mod-rebind] reassigning confined module " + t.val + " not allowed"
+				}
+				if i+1 >= len(toks) || !toks[i+1].isOp(".") {
+					return "allowlist: [js-mod-bare] confined module " + t.val + " must be accessed via .member"
+				}
+				if hit, nextIdx := sroJSModChain(toks, i, canonMod); hit != "" {
+					return hit
+				} else {
+					skipUntil = nextIdx
+				}
+				continue
+			}
+
+			if canonFn := confinedModFns[t.val]; canonFn != "" {
+				if destrBindTok[i] {
+					continue
+				}
+				parts := strings.SplitN(canonFn, ".", 2)
+				expKind := sroJSModExports[parts[0]][parts[1]]
+				if expKind == sroJSExpCall && (i+1 >= len(toks) || !toks[i+1].isOp("(")) {
+					return "allowlist: [js-destruct-callable] destructured module function " + t.val + " must be called directly"
+				}
+				continue
+			}
+
+			if t.val == "process" {
+				if hit, nextIdx := sroJSCheckProcessUse(toks, i); hit != "" {
+					return hit
+				} else {
+					skipUntil = nextIdx
+				}
+				continue
+			}
+
+			if jsNodePerm && dynSubTaintedVars[t.val] && i+1 < len(toks) && toks[i+1].isOp("(") {
+				return "allowlist: [js-dynsub-taint-call] blocked"
+			}
+		}
+
+		if t.kind == sroJSId && isAfterDot {
+			prop := t.val
+			isCall := i+1 < len(toks) && toks[i+1].isOp("(")
+			if sroJSBadProps[prop] || (!isCall && (prop == "toString" || prop == "valueOf")) {
+				return "allowlist: [js-forbidden-prop] property ." + prop + " not allowed"
+			}
+			if isCall && !sroJSMeths[prop] && !userClassMethods[prop] {
+				return "allowlist: [js-method-call] method ." + prop + "() not allowed"
+			}
+			continue
+		}
+
+		if t.isOp("[") && sroJSIsBracketSubscript(toks, i, ctrlCloses) {
+			cb := sroJSMatchDelim(toks, i, "[", "]")
+			if cb <= i+1 {
+				return "allowlist: [js-sub-empty] blocked"
+			}
+			idxSlice := toks[i+1 : cb]
+
+			if len(idxSlice) == 1 && idxSlice[0].kind == sroJSNum && sroIsDigitsOnly(idxSlice[0].val) {
+				continue
+			}
+
+			if len(idxSlice) == 1 && idxSlice[0].kind == sroJSStr && !idxSlice[0].isTemplate {
+				if idxSlice[0].hasEscape {
+					return "allowlist: [js-sub-escaped-key] blocked"
+				}
+				key := idxSlice[0].val
+				isCall := cb+1 < len(toks) && toks[cb+1].isOp("(")
+				if !sroIsValidJSIdentStr(key) || sroJSBadProps[key] || (!isCall && (key == "toString" || key == "valueOf")) {
+					return "allowlist: [js-sub-static-prop] subscript ['" + key + "'] not allowed"
+				}
+				if isCall && !sroJSMeths[key] && !userClassMethods[key] {
+					return "allowlist: [js-sub-static-call] subscript method ['" + key + "']() not allowed"
+				}
+				continue
+			}
+
+			if cb+1 < len(toks) && (toks[cb+1].isOp("(") || toks[cb+1].isOp("?.")) {
+				return "allowlist: [js-dynsub-call] blocked"
+			}
+			if i >= 3 && (toks[i-2].isOp(".") || toks[i-2].isOp("?.")) && toks[i-1].kind == sroJSId {
+				propBefore := toks[i-1].val
+				if sroJSMeths[propBefore] {
+					return "allowlist: [js-dynsub-method-prop] dynamic subscript on method property ." + propBefore + " not allowed"
+				}
+			}
+			rootBaseIdx := i - 1
+			for rootBaseIdx >= 2 && toks[rootBaseIdx].isOp("]") {
+				d := 0
+				for k := rootBaseIdx; k >= 0; k-- {
+					if toks[k].isOp("]") {
+						d++
+					} else if toks[k].isOp("[") {
+						d--
+						if d == 0 {
+							rootBaseIdx = k - 1
+							break
+						}
+					}
+				}
+			}
+			badBase := rootBaseIdx < 0 || toks[rootBaseIdx].kind != sroJSId ||
+				(rootBaseIdx > 0 && (toks[rootBaseIdx-1].isOp(".") || toks[rootBaseIdx-1].isOp("?.")))
+			if !badBase {
+				baseName := toks[rootBaseIdx].val
+				badBase = baseName == "this" || baseName == "process" || confinedMods[baseName] != "" ||
+					sroJSBuiltinNS[baseName] || fnVars[baseName] || dynSubConstVars[baseName]
+			}
+			if badBase {
+				return "allowlist: [js-dynsub-base] blocked"
+			}
+
+			if !jsNodePerm && !sroJSDynSubSafe(toks, rootBaseIdx, cb, ctrlCloses, confinedMods) {
+				vName, okHold := sroJSDynSubConstOK(toks, rootBaseIdx, cb, ctrlCloses, confinedMods, fnVars)
+				if !okHold {
+					return "allowlist: [js-dynsub-escape] blocked"
+				}
+				dynSubConstVars[vName] = true
+			}
+		}
+	}
+
+	return ""
+}
+
+var sroJSWriteMeths = sroWordSet("write writeFile writeFileSync appendFile appendFileSync mkdir mkdirSync mkdtemp mkdtempSync rmdir rmdirSync rm rmSync unlink unlinkSync rename renameSync copyFile copyFileSync cp cpSync chmod chmodSync lchmod fchmod chown chownSync lchown fchown utimes utimesSync lutimes lutimesSync futimes symlink symlinkSync link linkSync truncate truncateSync ftruncate open openSync createWriteStream")
+
+func sroJSIsBracketSubscript(toks []sroJSTok, openBracketIdx int, ctrlCloses map[int]bool) bool {
+	if openBracketIdx <= 0 {
+		return false
+	}
+	prev := toks[openBracketIdx-1]
+	if prev.kind == sroJSId {
+		return !sroJSNonExprKw[prev.val]
+	}
+	if prev.kind == sroJSStr || prev.kind == sroJSNum || prev.kind == sroJSRe {
+		return true
+	}
+	if prev.isOp(")") {
+		return !ctrlCloses[openBracketIdx-1]
+	}
+	if prev.isOp("]") {
+		return true
+	}
+	return false
+}
+
+func sroJSDestructReq(
+	toks []sroJSTok,
+	openBrace, closeBrace int,
+	rawMod string,
+	exports map[string]sroJSExportKind,
+	confinedModFns map[string]string,
+	destrBindTok map[int]bool,
+) (string, bool) {
+	if closeBrace <= openBrace+1 {
+		return "", true
+	}
+	k := openBrace + 1
+	for k < closeBrace {
+		if toks[k].isOp("...") || toks[k].isOp("[") || toks[k].isOp("{") || toks[k].kind != sroJSId {
+			return "", true
+		}
+		prop := toks[k].val
+		local := prop
+		localIdx := k
+		k++
+		if k < closeBrace && toks[k].isOp(":") {
+			if k+1 >= closeBrace || toks[k+1].kind != sroJSId {
+				return "", true
+			}
+			local = toks[k+1].val
+			localIdx = k + 1
+			k += 2
+		}
+		if k < closeBrace && !toks[k].isOp(",") {
+			return "", true
+		}
+		if k < closeBrace && toks[k].isOp(",") {
+			k++
+		}
+		if _, ok := exports[prop]; !ok {
+			return "allowlist: [js-destruct-require-prop] destructured require member " + rawMod + "." + prop + " not allowed", false
+		}
+		confinedModFns[local] = rawMod + "." + prop
+		destrBindTok[localIdx] = true
+	}
+	return "", false
+}
+
+func sroJSModChain(toks []sroJSTok, baseEndIdx int, canonMod string) (string, int) {
+	if baseEndIdx+2 >= len(toks) || toks[baseEndIdx+2].kind != sroJSId {
+		return "", baseEndIdx
+	}
+	member := toks[baseEndIdx+2].val
+	memberIdx := baseEndIdx + 2
+	exports := sroJSModExports[canonMod]
+	expKind, okExp := exports[member]
+	if !okExp {
+		return "allowlist: [js-mod-member] module member " + canonMod + "." + member + " not allowed", memberIdx
+	}
+	if expKind == sroJSExpSubns {
+		if canonMod == "fs" && member == "promises" {
+			okFSP := memberIdx+3 < len(toks) && toks[memberIdx+1].isOp(".") && toks[memberIdx+2].kind == sroJSId && toks[memberIdx+3].isOp("(")
+			if okFSP {
+				_, okFSP = sroJSModExports["fs/promises"][toks[memberIdx+2].val]
+			}
+			if !okFSP {
+				return "allowlist: [js-fs-promises-member] blocked", memberIdx
+			}
+			return "", memberIdx + 2
+		}
+		return sroJSModChain(toks, memberIdx, "path")
+	}
+	if expKind == sroJSExpCall {
+		if memberIdx+1 >= len(toks) || !toks[memberIdx+1].isOp("(") {
+			return "allowlist: [js-mod-callable] " + canonMod + "." + member + " must be called directly", memberIdx
+		}
+	}
+	return "", memberIdx
+}
+
+func sroJSValidProcessEnvRead(toks []sroJSTok, idx, memIdx int) (bool, int) {
+	if idx > 0 && toks[idx-1].isId("delete") {
+		return false, memIdx
+	}
+	if memIdx+2 < len(toks) && toks[memIdx+1].isOp(".") && toks[memIdx+2].kind == sroJSId {
+		keyIdx := memIdx + 2
+		if keyIdx+1 < len(toks) && sroJSIsAssign(toks[keyIdx+1]) {
+			return false, keyIdx
+		}
+		return true, keyIdx
+	}
+	if memIdx+1 < len(toks) && toks[memIdx+1].isOp("[") {
+		cb := sroJSMatchDelim(toks, memIdx+1, "[", "]")
+		if cb != memIdx+3 || toks[memIdx+2].kind != sroJSStr || toks[memIdx+2].hasEscape ||
+			toks[memIdx+2].isTemplate || !sroIsValidJSIdentStr(toks[memIdx+2].val) {
+			return false, memIdx
+		}
+		if cb+1 < len(toks) && sroJSIsAssign(toks[cb+1]) {
+			return false, cb
+		}
+		return true, cb
+	}
+	return false, -1
+}
+
+func sroJSCheckProcessUse(toks []sroJSTok, idx int) (string, int) {
+	hasDotMem := idx+2 < len(toks) && toks[idx+1].isOp(".") && toks[idx+2].kind == sroJSId
+	var expKind sroJSExportKind
+	okMem := false
+	mem := ""
+	memIdx := idx
+	if hasDotMem {
+		mem = toks[idx+2].val
+		memIdx = idx + 2
+		expKind, okMem = sroJSProcMembers[mem]
+		if okMem && memIdx+1 < len(toks) && sroJSIsAssign(toks[memIdx+1]) {
+			okMem = false
+		}
+	}
+	if !hasDotMem || !okMem {
+		return "allowlist: [js-process-member] blocked", memIdx
+	}
+	if mem == "stdout" || mem == "stderr" {
+		if memIdx+3 >= len(toks) || !toks[memIdx+1].isOp(".") || toks[memIdx+2].kind != sroJSId ||
+			toks[memIdx+2].val != "write" || !toks[memIdx+3].isOp("(") {
+			return "allowlist: [js-process-stdio] process." + mem + " only allows .write(...)", memIdx
+		}
+		return "", memIdx + 2
+	}
+	if mem == "env" {
+		okRead, endIdx := sroJSValidProcessEnvRead(toks, idx, memIdx)
+		if okRead {
+			return "", endIdx
+		}
+		if endIdx >= 0 {
+			return "allowlist: [js-process-env-mutate] blocked", endIdx
+		}
+		if idx >= 4 && toks[idx-1].isOp("(") && memIdx+1 < len(toks) && toks[memIdx+1].isOp(")") &&
+			toks[idx-3].isOp(".") && toks[idx-4].kind == sroJSId && toks[idx-2].kind == sroJSId {
+			oName := toks[idx-4].val
+			mName := toks[idx-2].val
+			if (oName == "Object" && (mName == "keys" || mName == "values" || mName == "entries")) ||
+				(oName == "JSON" && mName == "stringify") ||
+				(oName == "console" && mName == "log") {
+				return "", memIdx
+			}
+		}
+		return "allowlist: [js-process-env-alias] blocked", memIdx
+	}
+	if expKind == sroJSExpCall {
+		if memIdx+1 >= len(toks) || !toks[memIdx+1].isOp("(") {
+			return "allowlist: [js-process-callable] process." + mem + " must be called directly", memIdx
+		}
+	}
+	return "", memIdx
+}
+
+// Legacy helper entrypoints retained for guardCtxRunCode, pythonStdlibWriteTailHit, and unit tests.
+func jsUnicodeIdentEscapeHit(code string) string {
+	if !strings.Contains(code, `\u`) {
+		return ""
+	}
+	if _, why := sroJSLex(code); strings.HasPrefix(why, "allowlist: [js-unicode-esc]") {
+		return "js unicode identifier escape"
+	}
+	return ""
+}
+
+func pyMaskedNonASCIIIdentHit(codeOrMasked string) string {
+	if _, why := sroPyLex(sroNormNL(codeOrMasked)); strings.HasPrefix(why, "allowlist: [py-non-ascii]") {
+		return "python non-ASCII identifier"
+	}
+	return ""
 }
