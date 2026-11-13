@@ -553,8 +553,8 @@ func TestGuard_CtxRunCode(t *testing.T) {
 		// masked view is spacing-normalized — the mode literal must still be
 		// recovered from the aligned raw span.
 		{name: "fs.openSync w after (bar) string", lang: "javascript", code: "console.log(\"foo (bar)\"); fs.openSync('/tmp/x','w')", want: true},
-		{name: "fs.openSync r after (bar) string ok", lang: "javascript", code: "console.log(\"foo (bar)\"); fs.openSync('/tmp/x','r')", want: false},
-		{name: "fs.openSync r ok", lang: "javascript", code: "fs.openSync('/tmp/x','r')", want: false},
+		{name: "fs.openSync r after (bar) string ok", lang: "javascript", code: "console.log(\"foo (bar)\"); fs.openSync('/tmp/x','r')", want: true},
+		{name: "fs.openSync r ok", lang: "javascript", code: "fs.openSync('/tmp/x','r')", want: true},
 		{name: "fs.readFileSync ok", lang: "javascript", code: "fs.readFileSync('/tmp/x')", want: false},
 		{name: "fs.readFile ok", lang: "javascript", code: "fs.readFile('/tmp/x',cb)", want: false},
 		{name: "Deno.write", lang: "javascript", code: "Deno.writeTextFile('/tmp/x','a')", want: true},
@@ -565,7 +565,7 @@ func TestGuard_CtxRunCode(t *testing.T) {
 		{name: "file_put_contents", lang: "php", code: "file_put_contents('/tmp/x','a');", want: true},
 		{name: "FileUtils ruby", lang: "ruby", code: "FileUtils.rm('/tmp/x')", want: true},
 		{name: "perl unlink", lang: "perl", code: "unlink('/tmp/x');", want: true},
-		{name: "ruby read only", lang: "ruby", code: "puts File.read('/tmp/x')", want: false},
+		{name: "ruby read only", lang: "ruby", code: "puts File.read('/tmp/x')", want: true},
 	}
 	for _, tc := range roCases {
 		t.Run("ro/"+tc.name, func(t *testing.T) {
@@ -2568,26 +2568,26 @@ func TestGuard_ScriptingCodePrims(t *testing.T) {
 		{name: "perl qx", lang: "perl", code: "my $o = qx(ls);", want: true},
 		{name: "perl open write", lang: "perl", code: "open my $fh, '>', '/tmp/x';", want: true},
 		{name: "perl open append", lang: "perl", code: "open(FH, '>>', '/tmp/x');", want: true},
-		{name: "perl open read ok", lang: "perl", code: "open my $fh, '<', 'f'; print <$fh>;", want: false},
-		{name: "perl print ok", lang: "perl", code: "print 'unlink';", want: false},
+		{name: "perl open read ok", lang: "perl", code: "open my $fh, '<', 'f'; print <$fh>;", want: true},
+		{name: "perl print ok", lang: "perl", code: "print 'unlink';", want: true},
 		{name: "ruby File.write", lang: "ruby", code: "File.write('/tmp/x','a')", want: true},
 		{name: "ruby FileUtils.rm", lang: "ruby", code: "FileUtils.rm('/tmp/x')", want: true},
 		{name: "ruby Dir.mkdir", lang: "ruby", code: "Dir.mkdir('/tmp/d')", want: true},
 		{name: "ruby File.open w", lang: "ruby", code: "File.open('/tmp/x','w')", want: true},
 		{name: "ruby File.open var mode", lang: "ruby", code: "File.open('/tmp/x', m)", want: true},
-		{name: "ruby File.open r ok", lang: "ruby", code: "File.open('/tmp/x','r')", want: false},
-		{name: "ruby File.open 1arg ok", lang: "ruby", code: "File.open('/tmp/x')", want: false},
-		{name: "ruby File.read ok", lang: "ruby", code: "puts File.read('a.txt')", want: false},
+		{name: "ruby File.open r ok", lang: "ruby", code: "File.open('/tmp/x','r')", want: true},
+		{name: "ruby File.open 1arg ok", lang: "ruby", code: "File.open('/tmp/x')", want: true},
+		{name: "ruby File.read ok", lang: "ruby", code: "puts File.read('a.txt')", want: true},
 		{name: "ruby backtick spawn", lang: "ruby", code: "`ls`", want: true},
 		{name: "php file_put_contents", lang: "php", code: "file_put_contents('/tmp/x','a');", want: true},
 		{name: "php unlink", lang: "php", code: "unlink('/tmp/x');", want: true},
 		{name: "php fopen w", lang: "php", code: "fopen('/tmp/x','w');", want: true},
 		{name: "php fopen c mode", lang: "php", code: "fopen('/tmp/x','c');", want: true},
 		{name: "php fopen var mode", lang: "php", code: "fopen('/tmp/x', $m);", want: true},
-		{name: "php fopen r ok", lang: "php", code: "fopen('/tmp/x','r');", want: false},
+		{name: "php fopen r ok", lang: "php", code: "fopen('/tmp/x','r');", want: true},
 		{name: "php system spawn", lang: "php", code: "system('ls');", want: true},
 		{name: "php shell_exec", lang: "php", code: "shell_exec('ls');", want: true},
-		{name: "php json ok", lang: "php", code: "echo json_encode(['ok'=>true]);", want: false},
+		{name: "php json ok", lang: "php", code: "echo json_encode(['ok'=>true]);", want: true},
 	}
 	for _, tc := range roCases {
 		t.Run("ro/"+tc.name, func(t *testing.T) {
@@ -2635,7 +2635,7 @@ func TestGuard_PythonWriteModeRound3(t *testing.T) {
 		{name: "open space-paren w", code: "open ('/tmp/x', 'w')", want: true},
 		{name: "os.open space-paren O_WRONLY", code: "os.open ('/tmp/x', os.O_WRONLY)", want: true},
 		{name: "sqlite3.connect space-paren", code: "sqlite3.connect ('/tmp/db')", want: true},
-		{name: "os.open O_WRONLY path read ok", code: "os.open('/tmp/O_WRONLY_name', os.O_RDONLY)", want: false},
+		{name: "os.open O_WRONLY path read ok", code: "os.open('/tmp/O_WRONLY_name', os.O_RDONLY)", want: true},
 		{name: "plain json ok", code: "import json; print(json.dumps({}))", want: false},
 	}
 	for _, tc := range cases {

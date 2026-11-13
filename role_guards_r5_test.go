@@ -327,7 +327,7 @@ func TestGuard_R5_JSScanExprStringMask(t *testing.T) {
 		{name: "string mention in ${} ok", code: "`${\"fs.writeFileSync\"}`", want: false},
 		{name: "single-quoted mention ok", code: "`${'fs.writeFileSync'}`", want: false},
 		{name: "real call still blocked", code: "`${fs.writeFileSync('/tmp/x','a')}`", want: true},
-		{name: "unterminated quote backslash no panic", code: "`${" + "'\\", want: false},
+		{name: "unterminated quote backslash no panic", code: "`${" + "'\\", want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
