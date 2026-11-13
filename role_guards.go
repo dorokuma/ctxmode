@@ -45,6 +45,8 @@ import (
 	"strings"
 	"syscall"
 	"unicode/utf8"
+
+	"mvdan.cc/sh/v3/syntax"
 )
 
 // Guard rule names, shared by the guards, the router, and the audit record.
@@ -106,8 +108,9 @@ type heredocBody struct {
 // consumed. A segment with no words is dropped.
 type shellSegment struct {
 	argv         []string
-	redirectFile string        // "" when every redirection was safe (or none existed)
-	heredocText  []heredocBody // bodies queued by <<DELIM on this command line
+	argWords     []*syntax.Word // parallel to argv; nil for assigns / enum-expanded heads
+	redirectFile string         // "" when every redirection was safe (or none existed)
+	heredocText  []heredocBody  // bodies queued by <<DELIM on this command line
 	// pipedStdin marks a segment whose stdin comes from a pipeline upstream
 	// (it follows a bare `|`). A shell/interpreter head with pipedStdin reads
 	// its PROGRAM from the pipe — the upstream bytes are code, not data.
@@ -3813,6 +3816,17 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			if repl := xargsReplToken(head); repl != "" && replTokenInExecSlot(head[k:], repl, caller.pathEnv) {
 				return "dynamic code payload"
 			}
+			// Nested hc/herdr-core via xargs can receive injected argv at runtime
+			// ( -I replacement / trailing stdin words ). Block unconditionally —
+			// including help/query — because no -I `xargs hc --help` still appends
+			// stdin words and breaks the two-word pure-query shape.
+			target := head[k:]
+			th, _, _, _ := peelWrappersAndSbxAliases(target, caller.pathEnv)
+			for _, b := range headBaseAliasHits(th, caller.pathEnv) {
+				if b == "hc" || b == "herdr-core" {
+					return "xargs " + b
+				}
+			}
 			innerSeg := xargsDerivedSeg(head[:k], head[k:], seg, caller.pathEnv)
 			return peelResolvedSegDepth(head[k:], innerSeg, kind, depth+1, caller)
 		}
@@ -5433,6 +5447,14 @@ func screenFindArgsSeg(args []string, outerSeg shellSegment, kind byte, depth in
 				inner := args[i+1 : j]
 				if replTokenInExecSlot(inner, "{}", caller.pathEnv) {
 					return "find " + a + " dynamic code payload"
+				}
+				// Nested hc/herdr-core via find -exec* / -ok* receives path args
+				// at runtime ({} replacement / + batching). Block unconditionally.
+				th, _, _, _ := peelWrappersAndSbxAliases(inner, caller.pathEnv)
+				for _, b := range headBaseAliasHits(th, caller.pathEnv) {
+					if b == "hc" || b == "herdr-core" {
+						return "find " + a + " " + b
+					}
 				}
 				innerSeg := shellSegment{}
 				if a == "-ok" || a == "-okdir" {
@@ -8899,10 +8921,24 @@ func guardShellReadonly(code string) string {
 	return guardShellReadonlyDepth(code, 0, currentCallerIdentity())
 }
 func guardShellReadonlyDepth(code string, depth int, caller callerIdentity) string {
+	return guardShellReadonlyDepthMode(code, depth, caller, false)
+}
+
+func guardShellReadonlyDepthPrepare(code string, depth int, caller callerIdentity) string {
+	return guardShellReadonlyDepthMode(code, depth, caller, true)
+}
+
+func guardShellReadonlyDepthMode(code string, depth int, caller callerIdentity, prepare bool) string {
 	if depth >= peelChainMaxDepth {
 		return depthExceededHit
 	}
-	roSegs, hit := parseReadonlyShellSegments(code)
+	var roSegs []roSegment
+	var hit string
+	if prepare {
+		roSegs, hit = parseReadonlyShellSegmentsPrepare(code)
+	} else {
+		roSegs, hit = parseReadonlyShellSegments(code)
+	}
 	if hit != "" {
 		return readonlyBlockWithHint(allowlistDetail(hit))
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -363,6 +364,14 @@ func parseReadonlyShellAST(code string) (argvs [][]string, rejectReason string) 
 }
 
 func parseReadonlyShellSegments(code string) (segs []roSegment, rejectReason string) {
+	return parseReadonlyShellSegmentsMode(code, false)
+}
+
+func parseReadonlyShellSegmentsPrepare(code string) (segs []roSegment, rejectReason string) {
+	return parseReadonlyShellSegmentsMode(code, true)
+}
+
+func parseReadonlyShellSegmentsMode(code string, prepare bool) (segs []roSegment, rejectReason string) {
 	if hit := checkShellBytes(code, true); hit != "" {
 		return nil, hit
 	}
@@ -375,22 +384,26 @@ func parseReadonlyShellSegments(code string) (segs []roSegment, rejectReason str
 		return nil, hit
 	}
 	var out []roSegment
-	if hit := roWalkFile(code, file, &out, false); hit != "" {
+	if hit := roWalkFileMode(code, file, &out, false, prepare); hit != "" {
 		return nil, hit
 	}
 	return out, ""
 }
 
 func roWalkFile(code string, f *syntax.File, out *[]roSegment, pipeIn bool) string {
+	return roWalkFileMode(code, f, out, pipeIn, false)
+}
+
+func roWalkFileMode(code string, f *syntax.File, out *[]roSegment, pipeIn bool, prepare bool) string {
 	for i, st := range f.Stmts {
-		if hit := roWalkStmt(code, st, out, pipeIn && i == 0); hit != "" {
+		if hit := roWalkStmtMode(code, st, out, pipeIn && i == 0, prepare); hit != "" {
 			return hit
 		}
 	}
 	return ""
 }
 
-func roWalkStmt(code string, st *syntax.Stmt, out *[]roSegment, pipeIn bool) string {
+func roWalkStmtMode(code string, st *syntax.Stmt, out *[]roSegment, pipeIn bool, prepare bool) string {
 	if st.Negated {
 		return "control flow '!' forbidden"
 	}
@@ -405,19 +418,19 @@ func roWalkStmt(code string, st *syntax.Stmt, out *[]roSegment, pipeIn bool) str
 	}
 	switch cmd := st.Cmd.(type) {
 	case *syntax.CallExpr:
-		return roWalkCall(code, st, cmd, out, pipeIn)
+		return roWalkCallMode(code, st, cmd, out, pipeIn, prepare)
 	case *syntax.BinaryCmd:
 		switch cmd.Op {
 		case syntax.Pipe, syntax.PipeAll:
-			if hit := roWalkStmt(code, cmd.X, out, pipeIn); hit != "" {
+			if hit := roWalkStmtMode(code, cmd.X, out, pipeIn, prepare); hit != "" {
 				return hit
 			}
-			return roWalkStmt(code, cmd.Y, out, true)
+			return roWalkStmtMode(code, cmd.Y, out, true, prepare)
 		case syntax.AndStmt, syntax.OrStmt:
-			if hit := roWalkStmt(code, cmd.X, out, pipeIn); hit != "" {
+			if hit := roWalkStmtMode(code, cmd.X, out, pipeIn, prepare); hit != "" {
 				return hit
 			}
-			return roWalkStmt(code, cmd.Y, out, false)
+			return roWalkStmtMode(code, cmd.Y, out, false, prepare)
 		default:
 			return fmt.Sprintf("unsupported syntax node %T op=%v", cmd, cmd.Op)
 		}
@@ -437,12 +450,19 @@ func roWalkStmt(code string, st *syntax.Stmt, out *[]roSegment, pipeIn bool) str
 	}
 }
 
-func roWalkCall(code string, st *syntax.Stmt, call *syntax.CallExpr, out *[]roSegment, pipeIn bool) string {
+func roWalkCallMode(code string, st *syntax.Stmt, call *syntax.CallExpr, out *[]roSegment, pipeIn bool, prepare bool) string {
 	if len(call.Assigns) > 0 {
 		return "env assign forbidden Hint: 禁止 VAR=val 前缀；需要环境变量时只用 LANG/LC_ALL/TZ 经 ctx_run env"
 	}
 	if len(call.Args) < 1 {
 		return "empty command"
+	}
+	// Prepare-mode: allow hc send / selfExe --hc-gate send with a single-arg
+	// double-quoted text word; recurse into CmdSubst for readonly screening.
+	if prepare {
+		if hit := roWalkPreparedHcSend(code, st, call, out, pipeIn); hit != "not-hc" {
+			return hit
+		}
 	}
 	argv := make([]string, 0, len(call.Args))
 	for i, w := range call.Args {
@@ -466,6 +486,100 @@ func roWalkCall(code string, st *syntax.Stmt, call *syntax.CallExpr, out *[]roSe
 		}
 	}
 	*out = append(*out, seg)
+	return ""
+}
+
+// roWalkPreparedHcSend handles prepare-mode hc send / --hc-gate send forms.
+// Returns "not-hc" when the call is not an eligible send shape.
+func roWalkPreparedHcSend(code string, st *syntax.Stmt, call *syntax.CallExpr, out *[]roSegment, pipeIn bool) string {
+	args := call.Args
+	var addrWord, textWord *syntax.Word
+	var argvHead []string
+
+	switch {
+	case len(args) == 4:
+		h0, ok0 := wordToArg(args[0])
+		h1, ok1 := wordToArg(args[1])
+		h2, ok2 := wordToArg(args[2])
+		if !ok0 || !ok1 || !ok2 {
+			return "not-hc"
+		}
+		if filepath.Base(h0) != "hc" || h1 != "send" || !hcSendAddrOK(h2) || strings.HasPrefix(h2, "-") {
+			return "not-hc"
+		}
+		addrWord, textWord = args[2], args[3]
+		argvHead = []string{"hc", "send", h2}
+	case len(args) == 5:
+		head, ok0 := wordToArg(args[0])
+		flag, ok1 := wordToArg(args[1])
+		send, ok2 := wordToArg(args[2])
+		addr, ok3 := wordToArg(args[3])
+		if !ok0 || !ok1 || !ok2 || !ok3 {
+			return "not-hc"
+		}
+		// Accept any absolute selfExe (test binaries are not named "ctxmode").
+		if !(strings.Contains(head, "/") && flag == "--hc-gate" &&
+			send == "send" && hcSendAddrOK(addr) && !strings.HasPrefix(addr, "-")) {
+			return "not-hc"
+		}
+		addrWord, textWord = args[3], args[4]
+		argvHead = []string{"hc", "send", addr}
+	default:
+		return "not-hc"
+	}
+	_ = addrWord
+	if !isGuaranteedSingleArgWord(textWord, false) {
+		return "not-hc"
+	}
+	if hit := roWalkHcTextCmdSubsts(code, textWord, out); hit != "" {
+		return hit
+	}
+	argv := append(argvHead, "ok") // static stand-in; --hc-gate validates real text
+	seg := roSegment{argv: argv, pipedStdin: pipeIn}
+	for _, r := range st.Redirs {
+		hb, redirFile, hit := roCheckRedirect(code, call, r)
+		if hit != "" {
+			return hit
+		}
+		if hb != nil {
+			seg.heredocText = append(seg.heredocText, *hb)
+		}
+		if redirFile != "" {
+			seg.redirectFile = redirFile
+		}
+	}
+	*out = append(*out, seg)
+	return ""
+}
+
+func roWalkHcTextCmdSubsts(code string, textWord *syntax.Word, out *[]roSegment) string {
+	if textWord == nil {
+		return "empty command"
+	}
+	for _, part := range textWord.Parts {
+		switch p := part.(type) {
+		case *syntax.Lit, *syntax.SglQuoted:
+			continue
+		case *syntax.DblQuoted:
+			if p.Dollar {
+				return `$"..." quoting forbidden`
+			}
+			for _, ip := range p.Parts {
+				switch ipp := ip.(type) {
+				case *syntax.Lit:
+					continue
+				case *syntax.CmdSubst:
+					if hit := roWalkFile(code, &syntax.File{Stmts: ipp.Stmts}, out, false); hit != "" {
+						return hit
+					}
+				default:
+					return "shell expansion inside double quotes forbidden"
+				}
+			}
+		default:
+			return "not-hc"
+		}
+	}
 	return ""
 }
 
@@ -1807,11 +1921,13 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 	}
 
 	argv := make([]string, 0, len(call.Assigns)+len(call.Args))
+	argWords := make([]*syntax.Word, 0, len(call.Assigns)+len(call.Args))
 	// SH11 F9: a backgrounded statement runs in a subshell — its assigns
 	// never bind in the parent shell (walkStmt already closed allowBind on
 	// the whole subtree).
 	for _, a := range call.Assigns {
 		argv = append(argv, c.assignToPrefix(a))
+		argWords = append(argWords, nil) // prefix assigns have no command Word
 		if a.Name != nil && !a.Naked {
 			if len(call.Args) == 0 {
 				// Pure assignment statement — eligible for staticVars.
@@ -1831,6 +1947,9 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 				if name, single := singleSimpleParamExp(w); single {
 					if words, ok := c.enumCmdWords[name]; ok && len(words) > 0 {
 						argv = append(argv, words...)
+						for range words {
+							argWords = append(argWords, nil) // expanded; no 1:1 Word
+						}
 						continue
 					}
 				}
@@ -1841,6 +1960,7 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 				s, ok := c.wordToArg(w)
 				if ok && isSafeAbsPathVal(s) {
 					argv = append(argv, s)
+					argWords = append(argWords, w)
 					continue
 				}
 				saved := c.enumVars
@@ -1848,17 +1968,20 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 				s, _ = c.wordToArg(w)
 				c.enumVars = saved
 				argv = append(argv, s)
+				argWords = append(argWords, w)
 				continue
 			}
 		}
 		s, _ := c.wordToArg(w)
 		argv = append(argv, s)
+		argWords = append(argWords, w)
 	}
 	// POSIX parses `export NAME=VAL` as CallExpr (bash uses DeclClause).
 	c.noteDeclCallBinds(argv)
 
 	seg := shellSegment{
 		argv:         argv,
+		argWords:     argWords,
 		pipedStdin:   feed.piped,
 		backgrounded: st.Background,
 		processSubst: callHasProcSubst(call),

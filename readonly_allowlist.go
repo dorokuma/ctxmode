@@ -1230,6 +1230,9 @@ func checkKillReadonly(argv []string) string {
 }
 
 func checkCtxmodeReadonly(argv []string) string {
+	if isPreparedHcGateArgv(argv) {
+		return screenPreparedHcGateReadonly(argv)
+	}
 	args := argv[1:]
 	i := 0
 	sawHelp := false
@@ -1244,6 +1247,9 @@ func checkCtxmodeReadonly(argv []string) string {
 				sawHelp = true
 				i++
 				continue
+			}
+			if a == "--hc-gate" {
+				return screenPreparedHcGateReadonly(argv)
 			}
 			if a == "-config" || a == "--config" || strings.HasPrefix(a, "-config=") || strings.HasPrefix(a, "--config=") {
 				return "ctxmode config"
@@ -1273,6 +1279,28 @@ func checkCtxmodeReadonly(argv []string) string {
 
 // screenReadonlyAllowlist is the primary default-deny gate for a resolved
 // command argv. Returns "" when the argv is within policy.
+// screenPreparedHcGateReadonly admits prepare*-rewritten ctxmode --hc-gate
+// invocations. The runtime gate re-validates addr/text; here we only require
+// the static shape send|query.
+func screenPreparedHcGateReadonly(argv []string) string {
+	if len(argv) < 2 || argv[1] != "--hc-gate" {
+		return "ctxmode --hc-gate"
+	}
+	args := argv[2:]
+	if isPureQueryInvocation(append([]string{"hc"}, args...)) {
+		return ""
+	}
+	if len(args) == 2 && !strings.HasPrefix(args[0], "-") && (args[1] == "--help" || args[1] == "-h") {
+		return ""
+	}
+	if len(args) == 3 && args[0] == "send" && hcSendAddrOK(args[1]) && !strings.HasPrefix(args[1], "-") &&
+		!strings.HasPrefix(args[2], "-") {
+		// Dynamic placeholders are expected in the text slot before runtime expansion.
+		return ""
+	}
+	return "ctxmode --hc-gate"
+}
+
 func screenReadonlyAllowlist(argv []string) string {
 	if len(argv) == 0 {
 		return ""
@@ -1288,7 +1316,11 @@ func screenReadonlyAllowlist(argv []string) string {
 	// "t42"] delivers a report identically to the bare-name spelling. Every
 	// other path-form head — and a non-trusted report path like
 	// /tmp/dispatch-report — keeps the "path command" verdict.
+	// Exception: prepare*-emitted absolute selfExe --hc-gate … (runtime gate validates).
 	if strings.Contains(argv[0], "/") {
+		if isPreparedHcGateArgv(argv) {
+			return screenPreparedHcGateReadonly(argv)
+		}
 		if filepath.IsAbs(argv[0]) && (filepath.Base(argv[0]) == "dispatch-report" || filepath.Base(argv[0]) == "hc") {
 			if canon := admittedReadonlyCanonicalHead(argv[0], os.Geteuid()); canon != "" {
 				argv = append([]string{canon}, argv[1:]...)

@@ -139,15 +139,16 @@ func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args r
 	if serr != nil {
 		return nil, nil, serr
 	}
-	if grule, detail := guard.guardCtxRunArgv(argv); grule != "" {
-		audit.setScreen(shellBlock, grule)
-		return nil, nil, guardBlockedError(grule, detail)
+	prep := guard.prepareCtxRunArgv(argv, "")
+	if prep.rule != "" {
+		audit.setScreen(shellBlock, prep.rule)
+		return nil, nil, guardBlockedError(prep.rule, prep.detail)
 	}
 
 	// custom (and any path-like argv[0]) go through validateArgv, which now only
 	// normalizes argv[0] — it no longer fences it to a workspace (see main.go).
 	// Fixed kinds use simple exe names (go/npm/cargo/make) which pass as-is.
-	argv, err = s.validateArgv(argv, cwd)
+	argv, err = s.validateArgv(prep.execArgv, cwd)
 	if err != nil {
 		return nil, nil, err
 	}
