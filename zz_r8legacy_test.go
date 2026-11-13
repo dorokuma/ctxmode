@@ -13,7 +13,9 @@ import (
 func TestR8Legacy(t *testing.T) {
 	f, err := os.Open("/root/r8in/adv/cases8legacy.jsonl")
 	if err != nil {
-		t.Fatal(err)
+		// Local audit fixture lives under /root on the dev host only;
+		// skip (do not fail) when it is not available, e.g. on CI.
+		t.Skip(err)
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)

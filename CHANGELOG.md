@@ -5,6 +5,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Fixed
+- **CI: skip local-only audit probe tests when their fixtures are absent (`zz_r7adv_test.go`, `zz_r7reg_test.go`, `zz_r8adv_test.go`, `zz_r8legacy_test.go`, `zz_r9adv_test.go`, `zz_r10adv_test.go`).** The R7/R8/R9/R10 adversarial probes read fixture files under `/root/r7in`, `/root/r8in`, `/root/r9in`, `/root/r10in`, which exist only on the dev host; on the GitHub runner `/root` is unreadable, so `TestR7Adv`, `TestR7Reg`, `TestR8Adv`, `TestR8Legacy`, `TestR9Adv` and `TestR10Adv` failed with `permission denied` (run 43388728182). A missing fixture now skips the test (`t.Skip`, the same pattern `zz_rtaudit_test.go` already uses) instead of failing it; when the fixtures are present the probes run unchanged.
+
 ## [5.4.0] - 2026-11-13
 
 ### Changed

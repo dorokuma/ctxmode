@@ -14,7 +14,9 @@ func TestR9Adv(t *testing.T) {
 	for _, fn := range []string{"/root/r9in/adv/cases9.jsonl", "/root/r8in/adv/cases8.jsonl", "/root/r8in/adv/cases8legacy.jsonl"} {
 		f, err := os.Open(fn)
 		if err != nil {
-			t.Fatal(err)
+			// Local audit fixtures live under /root on the dev host only;
+			// skip (do not fail) when they are not available, e.g. on CI.
+			t.Skip(err)
 		}
 		sc := bufio.NewScanner(f)
 		sc.Buffer(make([]byte, 1<<20), 1<<20)
