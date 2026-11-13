@@ -227,3 +227,45 @@ already write `~/.local/bin` can also run the planted binary directly, so
 tightening this edge buys nothing inside the non-sandbox threat model —
 same class as the archived `[pattern:path-trust-user-writable]` / C10
 boundary (`.agents/notes/2026-11-01-role-guards-non-sandbox-boundaries.md`).
+
+## 8. 第13轮合入复核（round-13 merge recheck）
+
+Worktree: `/root/ctxmode-merge-r13`, branch `merge/rt1111-r13-20261113`.
+
+Official baseline remains clean `main` / `origin/main` at `8f3cb64e1ddbdbbce640f4e83b12b71a8af12330`. This packaging REPORT (sections 1–7) is the official rt1111 packaging/closure evidence and is **kept in full**; round-13 does not replace it with the older R13 REPORT.
+
+### Commits on this integration branch (before this docs commit)
+
+1. `e58dd93c0d8f1ee9a2cd9292f7d1c941a95bde99` — `fix(fetch): recheck cache inside singleflight and preserve force refetch`
+2. `082a722131bb8039eb45bd02f4adbd86e533b501` — `feat(role-guards): integrate round13 strict-readonly checks without npm regressions`
+
+This document commit is **step 3** (CHANGELOG + REPORT only). Untracked local copies `FETCH-REPORT.md`, `GUARDS-REPORT.md`, `RETEST-REPORT.md`, `RETEST2-REPORT.md` are **not** part of this commit.
+
+### Scope and trade-offs
+
+- Official main (`8f3cb64`) is the base.
+- Official finite npm accept model and later official fixes (`--call` / option zone / child spec / `--` passthrough / empty value) are retained; R13 did not replace that model.
+- Under **strict-readonly roles only**, via the allowlist path, `strictReadonlyBlockLegacyScripting` blocks **perl / ruby / php / R / Elixir** wholesale. This is not a global ban for non-readonly or worker execution.
+- Fetch: recheck TTL cache inside `singleflight`, and preserve force refetch via a distinct `|force` key.
+- Lazy Node-permission helpers and Landlock-related code remain present but are **not** wired onto the production executor path.
+
+### SSH heredoc take (test expectation alignment)
+
+- `M-scout-ssh-heredoc-sh` uses `wantAllow=true` to match the adopted R13 `screenSSHHead` production behavior (official `false` was incompatible with that take).
+- Official-only `M-scout-ssh-uptime` and ukh intercept cases remain with `wantAllow=false`. Uptime was **not** opened up.
+
+### Verification already on record (no new runs in this docs step)
+
+On integrated tree `082a722` (GUARDS-REPORT):
+
+- Full suite skipping `TestAlFix7_FuzzArgvDiff`: `ok … 232.395s` (pass).
+- Fuzz alone with `TMPDIR=/root/gotmp-merge`, `-run '^TestAlFix7_FuzzArgvDiff$'`: `ok … 160.937s` (pass).
+- `go test -count=5 -run '^TestStressSingleflight$'`: pass.
+- Full `-race` suite: **not run** (do not treat as pass).
+
+Separate pre-guards fetch retest (RETEST2), after `e58dd93` and before guards landed — **not** the final integrated-tree acceptance:
+
+- Full suite skipping fuzz: `ok … 225.199s` (pass).
+- Fuzz disk: `ok … 138.495s` (pass).
+
+Older R13 audit numbers and earlier packaging logs are reference only; they are **not** re-asserted as a new main acceptance. This step does **not** push, merge to main, tag, or release.
