@@ -269,3 +269,13 @@ Separate pre-guards fetch retest (RETEST2), after `e58dd93` and before guards la
 - Fuzz disk: `ok … 138.495s` (pass).
 
 Older R13 audit numbers and earlier packaging logs are reference only; they are **not** re-asserted as a new main acceptance. This step does **not** push, merge to main, tag, or release.
+
+### Later race verification (after docs commit `3976763`)
+
+The full `-race` suite recorded as **not run** in the subsection above was still accurate at docs-commit time. It was subsequently run on the same integration tree (`3976763745ad800b94344cf3f8e8ea4523bc1c7b`, parent `082a722`; no implementation changes). Official `/root/workspace/ctxmode` remained clean `main` / `origin/main` `8f3cb64e1ddbdbbce640f4e83b12b71a8af12330`. Logs: `/root/ctxmode-merge-jobs/race-full.log`, `race-fuzz.log`, `race-summary.txt` (2026-11-13 15:17:44–15:29:19 +0800).
+
+- Default TMPDIR: `go test -race -count=1 -timeout 30m -skip TestAlFix7_FuzzArgvDiff .` → `ok … 660.988s`, rc=0.
+- `TMPDIR=/root/gotmp-merge go test -race -count=1 -timeout 20m -run '^TestAlFix7_FuzzArgvDiff$' .` → `ok … 14.125s`, rc=0.
+- Merge HEAD after both runs remained `3976763745ad800b94344cf3f8e8ea4523bc1c7b` (`HEAD_UNCHANGED=yes`).
+
+This release-prep commit only updates version metadata and the records above. It does not re-run the full or race suites, and does not push, merge, tag, or deploy.
