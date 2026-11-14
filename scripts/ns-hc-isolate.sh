@@ -52,7 +52,11 @@ note() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool missing: $1"; }
 
 # Trusted bin dirs + the caller's PATH: every hc/herdr-core/sbx entry under
-# them (and its readlink -f resolution) must end up masked. Passed to the
+# them must end up masked. Each entry is emitted ONLY as its readlink -f
+# canonical path (deduplicated): mount --bind follows symlinks, so feeding
+# the unresolved symlink path AND the resolved path would stack two bind
+# mounts on the same dentry — masking the real inode once already makes
+# every symlink that points at it resolve to the stand-in. Passed to the
 # inner phase as a newline-separated list via NS_TARGETS.
 enumerate_targets() {
   local dirs d name p resolved
@@ -71,9 +75,11 @@ enumerate_targets() {
     for d in "${!seen[@]}"; do
       p=$d/$name
       if [[ -e $p && ! -d $p ]]; then
-        printf '%s\n' "$p"
         resolved=$(readlink -f "$p" 2>/dev/null || true)
-        [[ -n $resolved && $resolved != "$p" ]] && printf '%s\n' "$resolved"
+        if [[ -z $resolved || ! -f $resolved ]]; then
+          die "cannot resolve enumerated target to a regular file: $p"
+        fi
+        printf '%s\n' "$resolved"
       fi
     done
   done | sort -u

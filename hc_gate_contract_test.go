@@ -286,7 +286,7 @@ func TestT_AST1_SingleArgWordPredicates(t *testing.T) {
 		`hc send t42 "dev@a.com"`,
 		`hc send t42 "$*"`,
 		`hc send t42 "$((1+1))"`,
-		`hc send t11j "$(cat /tmp/r.txt)"`,
+		`hc send t42 "$(cat /tmp/r.txt)"`,
 	}
 	for _, cmd := range allow {
 		prep := prepRule("worker", "", cmd)
@@ -319,8 +319,8 @@ func TestT_AST1_SingleArgWordPredicates(t *testing.T) {
 
 func TestT_INNER1_InnerFirst(t *testing.T) {
 	for _, cmd := range []string{
-		`hc send t11j "$(hc kill t2)"`,
-		`hc send t11j "$(pig)"`,
+		`hc send t42 "$(hc kill t2)"`,
+		`hc send t42 "$(pig)"`,
 	} {
 		prep := prepRule("worker", "", cmd)
 		if prep.rule == "" {
@@ -334,7 +334,7 @@ func TestT_INNER1_InnerFirst(t *testing.T) {
 }
 
 func TestT_EX1_PrepareRewriteWorker(t *testing.T) {
-	cmd := `hc send t11j "$(cat /tmp/r.md)"`
+	cmd := `hc send t42 "$(cat /tmp/r.md)"`
 	prep := prepRule("worker", "", cmd)
 	if prep.rule != "" {
 		t.Fatalf("prepare blocked: %s (%s)", prep.rule, prep.detail)
@@ -349,7 +349,7 @@ func TestT_EX1_PrepareRewriteWorker(t *testing.T) {
 		t.Fatal("rawCode must stay original")
 	}
 	// wrapper + assign
-	cmd2 := `FOO=1 timeout 5 env A=1 hc send t11j "$msg"`
+	cmd2 := `FOO=1 timeout 5 env A=1 hc send t42 "$msg"`
 	prep2 := prepRule("worker", "", cmd2)
 	if prep2.rule != "" {
 		t.Fatalf("wrapper prepare blocked: %s (%s)", prep2.rule, prep2.detail)
@@ -374,19 +374,19 @@ func TestT_RO1_ScoutPrepareReadonly(t *testing.T) {
 }
 
 func TestT_GATE1_ValidateHcGateArgs(t *testing.T) {
-	if got := validateHcGateArgs([]string{"send", "t11j", "ok"}); got != "" {
+	if got := validateHcGateArgs([]string{"send", "t42", "ok"}); got != "" {
 		t.Fatalf("benign blocked: %s", got)
 	}
-	if got := validateHcGateArgs([]string{"send", "t11j", "--force"}); got == "" {
+	if got := validateHcGateArgs([]string{"send", "t42", "--force"}); got == "" {
 		t.Fatal("leading dash text must block")
 	}
-	if got := validateHcGateArgs([]string{"send", "t11j", "a\rb"}); got == "" || !strings.Contains(got, "CR") {
+	if got := validateHcGateArgs([]string{"send", "t42", "a\rb"}); got == "" || !strings.Contains(got, "CR") {
 		t.Fatalf("CR must block with CR tip, got %q", got)
 	}
-	if got := validateHcGateArgs([]string{"send", "t11j", "x\x03y"}); got == "" {
+	if got := validateHcGateArgs([]string{"send", "t42", "x\x03y"}); got == "" {
 		t.Fatal("C0 must block")
 	}
-	if got := validateHcGateArgs([]string{"send", "t11j", "BEGIN RSA PRIVATE KEY"}); !strings.Contains(got, "sensitive") {
+	if got := validateHcGateArgs([]string{"send", "t42", "BEGIN RSA PRIVATE KEY"}); !strings.Contains(got, "sensitive") {
 		t.Fatalf("sensitive must redact, got %q", got)
 	} else if strings.Contains(got, "BEGIN RSA") {
 		t.Fatal("must not echo sensitive body")
@@ -407,7 +407,7 @@ func TestT_GATE1_ExtraFilesFdExec(t *testing.T) {
 	restore := withIsolatedHcPath(t, stub, logPath)
 	defer restore()
 
-	code := runHcGate([]string{"send", "t11j", "hello-from-gate"})
+	code := runHcGate([]string{"send", "t42", "hello-from-gate"})
 	if code != 0 {
 		t.Fatalf("runHcGate rc=%d", code)
 	}
@@ -415,7 +415,7 @@ func TestT_GATE1_ExtraFilesFdExec(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("stub calls=%d want 1; log=%v", len(got), got)
 	}
-	if got[0][0] != "hc" || got[0][1] != "send" || got[0][2] != "t11j" || got[0][3] != "hello-from-gate" {
+	if got[0][0] != "hc" || got[0][1] != "send" || got[0][2] != "t42" || got[0][3] != "hello-from-gate" {
 		t.Fatalf("argv=%v", got[0])
 	}
 }
@@ -426,7 +426,7 @@ func TestT_EX2_ArgvLiteralVsShell(t *testing.T) {
 	g := currentGuardCall()
 
 	// Literal argv: $(...) is data, not shell.
-	prep := g.prepareCtxRunArgv([]string{"hc", "send", "t11j", "$(cat /tmp/r.txt)"}, "")
+	prep := g.prepareCtxRunArgv([]string{"hc", "send", "t42", "$(cat /tmp/r.txt)"}, "")
 	if prep.rule != "" {
 		t.Fatalf("literal argv blocked: %s", prep.detail)
 	}
@@ -437,7 +437,7 @@ func TestT_EX2_ArgvLiteralVsShell(t *testing.T) {
 		t.Fatal("literal argv must not rewrite to --hc-gate")
 	}
 
-	prep2 := g.prepareCtxRunArgv([]string{"bash", "-c", `hc send t11j "$(cat /tmp/r.txt)"`}, "")
+	prep2 := g.prepareCtxRunArgv([]string{"bash", "-c", `hc send t42 "$(cat /tmp/r.txt)"`}, "")
 	if prep2.rule != "" {
 		t.Fatalf("bash -c prepare blocked: %s (%s)", prep2.rule, prep2.detail)
 	}
@@ -460,7 +460,7 @@ func TestT_EF1_ExecuteFilePrepareThenInject(t *testing.T) {
 	defer os.Unsetenv("CTXMODE_ROLE")
 
 	g := currentGuardCall()
-	prep := g.prepareCtxRunShellWithTaint(`hc send t11j "$FILE_CONTENT"`, map[string]bool{"FILE_CONTENT": true})
+	prep := g.prepareCtxRunShellWithTaint(`hc send t42 "$FILE_CONTENT"`, map[string]bool{"FILE_CONTENT": true})
 	if prep.rule != "" {
 		t.Fatalf("prepare with FILE_CONTENT taint blocked: %s (%s)", prep.rule, prep.detail)
 	}
@@ -535,7 +535,7 @@ func prepArgvRule(t *testing.T, role, ro string, argv []string, stdin string) pr
 // the rewritten bytes must never re-enter a pure-check stdin guard
 // (hcProv == nil would self-block every legal send).
 func TestT_STDIN1_RewrittenStdinNoSelfLock(t *testing.T) {
-	dynSend := `hc send t11j "x: $(cat /tmp/r.txt)"`
+	dynSend := `hc send t42 "x: $(cat /tmp/r.txt)"`
 
 	// argv form: ["sh"] + dynamic hc send on stdin.
 	p := prepArgvRule(t, "worker", "", []string{"sh"}, dynSend)
@@ -564,7 +564,7 @@ func TestT_STDIN1_RewrittenStdinNoSelfLock(t *testing.T) {
 // foreign-language target, local shell target, ssh remote target and the
 // mixed data+shell line.
 func TestT_STDIN2_CScripStdinMatrix(t *testing.T) {
-	dynSend := `hc send t11j "x: $(cat /tmp/r.txt)"`
+	dynSend := `hc send t42 "x: $(cat /tmp/r.txt)"`
 
 	// bash -c 'python3 -' + anything: python reads ITS program from stdin,
 	// so a shell-looking hc send must block, never be rewritten.
@@ -639,6 +639,31 @@ func TestT_STDIN2_CScripStdinMatrix(t *testing.T) {
 	if sp.execStdin != `{"k":1}` {
 		t.Fatalf("Command data stdin must stay verbatim, got %q", sp.execStdin)
 	}
+
+	// Multi-target different-PATH regression (1114F §3.1 item 2): two local
+	// shell stdin targets whose PATH= prefixes differ must EACH be screened
+	// under its own env — a merged replay ends with the LAST PATH= and the
+	// first target's alias view would escape audit. Plant a blocked-agent
+	// alias (myrunner -> claude) under the trusted <home>/.local/bin: the
+	// first segment resolves `myrunner` in $binDir (blocked name), the
+	// second resolves it in /usr/bin (harmless script). Only the per-target
+	// guardPreparedShellEnv pass sees the $binDir view.
+	home := withTestTrustedHome(t)
+	binDir := filepath.Join(home, ".local", "bin")
+	writeTestExecutable(t, filepath.Join(binDir, "claude"), 0o755)
+	if err := os.Symlink(filepath.Join(binDir, "claude"), filepath.Join(binDir, "myrunner")); err != nil {
+		t.Fatal(err)
+	}
+	multiPath := fmt.Sprintf("PATH=%s:/usr/bin:/bin sh ; PATH=/usr/bin:/bin sh", binDir)
+	p = prepArgvRule(t, "worker", "", []string{"bash", "-c", multiPath}, "myrunner")
+	if p.rule == "" {
+		t.Fatalf("multi-target PATH=%s:/usr/bin:/bin + stdin 'myrunner' must block (per-target PATH audit), got ALLOW stdin=%q", binDir, p.execStdin)
+	}
+	// Same shape through the Command-string entry.
+	sp = currentGuardCall().prepareCtxRunShellAndStdin(multiPath, "myrunner")
+	if sp.rule == "" {
+		t.Fatalf("Command multi-target PATH= + stdin 'myrunner' must block (per-target PATH audit), got ALLOW stdin=%q", sp.execStdin)
+	}
 }
 
 // TestT_GLUED1_GluedShellC covers the glued -c matrix rows: spellings with
@@ -681,12 +706,24 @@ func TestT_GLUED1_GluedShellC(t *testing.T) {
 	// Glued -c + stdin: the stdin is screened but NEVER rewritten — a
 	// `sh -ce 'sh'` line whose body would read a program must keep stdin
 	// verbatim.
-	p := prepArgvRule(t, "worker", "", []string{"sh", "-ce", "echo ok"}, "ls")
+	p := prepArgvRule(t, "worker", "", []string{"sh", "-ce", "sh"}, "ls")
 	if p.rule != "" {
 		t.Fatalf("glued -c + benign stdin must pass, got %s (%s)", p.rule, p.detail)
 	}
 	if p.execStdin != "ls" {
 		t.Fatalf("glued -c stdin must never be rewritten, got %q", p.execStdin)
+	}
+
+	// `sh -ce 'sh'` unwraps to "e\nsh" whose `sh` IS a stdin-program
+	// target — the pre-1114F code rewrote the stdin bytes into a
+	// `<selfExe> --hc-gate` call anyway. With a dynamic hc send on stdin
+	// the verdict must be a block AND the bytes must never be rewritten.
+	p = prepArgvRule(t, "worker", "", []string{"sh", "-ce", "sh"}, `hc send t42 "$(cat /tmp/r.txt)"`)
+	if p.rule == "" {
+		t.Fatal("glued -c 'sh' + dynamic hc send stdin must block")
+	}
+	if strings.Contains(p.execStdin, "--hc-gate") {
+		t.Fatalf("glued -c 'sh' stdin must NEVER be rewritten to --hc-gate: %q", p.execStdin)
 	}
 }
 

@@ -204,33 +204,33 @@ func TestT_EX1_ExecuteShellDelivery(t *testing.T) {
 	cases := []sendCase{
 		{
 			"heredoc-then-send",
-			fmt.Sprintf("cat <<'EOF' > %[1]s\nmulti 中文 line1\n```code fence```\n\nline3\nEOF\nhc send t11j \"report: $(cat %[1]s)\"", filepath.Join(e.workdir, "hd.txt")),
-			[3]string{"send", "t11j", "report: multi 中文 line1\n```code fence```\n\nline3"},
+			fmt.Sprintf("cat <<'EOF' > %[1]s\nmulti 中文 line1\n```code fence```\n\nline3\nEOF\nhc send t42 \"report: $(cat %[1]s)\"", filepath.Join(e.workdir, "hd.txt")),
+			[3]string{"send", "t42", "report: multi 中文 line1\n```code fence```\n\nline3"},
 		},
 		{
 			"wrapper-env-timeout",
-			fmt.Sprintf("msg=$(cat %s); FOO=1 timeout 5 env A=1 hc send t11j \"$msg\"", mkReport("r1.txt", "wrap-body")),
-			[3]string{"send", "t11j", "wrap-body"},
+			fmt.Sprintf("msg=$(cat %s); FOO=1 timeout 5 env A=1 hc send t42 \"$msg\"", mkReport("r1.txt", "wrap-body")),
+			[3]string{"send", "t42", "wrap-body"},
 		},
 		{
 			"abs-hc-path",
-			fmt.Sprintf("%s send t11j \"report: $(cat %s)\"", filepath.Join(e.binDir, "hc"), mkReport("r2.txt", "abs-body")),
-			[3]string{"send", "t11j", "report: abs-body"},
+			fmt.Sprintf("%s send t42 \"report: $(cat %s)\"", filepath.Join(e.binDir, "hc"), mkReport("r2.txt", "abs-body")),
+			[3]string{"send", "t42", "report: abs-body"},
 		},
 		{
 			"bash-l-c",
-			fmt.Sprintf("bash -l -c 'hc send t11j \"report: $(cat %s)\"'", mkReport("r3.txt", "bashl-body")),
-			[3]string{"send", "t11j", "report: bashl-body"},
+			fmt.Sprintf("bash -l -c 'hc send t42 \"report: $(cat %s)\"'", mkReport("r3.txt", "bashl-body")),
+			[3]string{"send", "t42", "report: bashl-body"},
 		},
 		{
 			"path-prefix-send",
-			fmt.Sprintf("PATH=%s:/usr/bin:/bin hc send t11j \"report: $(cat %s)\"", e.binDir, mkReport("r4.txt", "pathp-body")),
-			[3]string{"send", "t11j", "report: pathp-body"},
+			fmt.Sprintf("PATH=%s:/usr/bin:/bin hc send t42 \"report: $(cat %s)\"", e.binDir, mkReport("r4.txt", "pathp-body")),
+			[3]string{"send", "t42", "report: pathp-body"},
 		},
 		{
 			"48kib-body",
-			fmt.Sprintf("hc send t11j \"big:$(cat %s)\"", bigPath),
-			[3]string{"send", "t11j", "big:" + bigBody},
+			fmt.Sprintf("hc send t42 \"big:$(cat %s)\"", bigPath),
+			[3]string{"send", "t42", "big:" + bigBody},
 		},
 	}
 	for _, c := range cases {
@@ -262,7 +262,7 @@ func TestT_EX1_BackgroundWait(t *testing.T) {
 	e.s = testServerWithWorkdir(t, e.workdir)
 
 	res, _, err := e.s.toolExecute(context.Background(), nil, executeArgs{
-		Command:    fmt.Sprintf("hc send t11j \"bg: $(cat %s)\"", e.report),
+		Command:    fmt.Sprintf("hc send t42 \"bg: $(cat %s)\"", e.report),
 		Background: true,
 	})
 	e.execOK(t, res, nil, err)
@@ -273,7 +273,7 @@ func TestT_EX1_BackgroundWait(t *testing.T) {
 		t.Fatalf("no background id in %q", text)
 	}
 	waitBackgroundDone(t, m[1])
-	e.wantSends(t, [][3]string{{"send", "t11j", "bg: e2e-report-body-中文"}})
+	e.wantSends(t, [][3]string{{"send", "t42", "bg: e2e-report-body-中文"}})
 }
 
 // ---------------- T-EX2: argv + stdin delivery --------------------------
@@ -287,24 +287,24 @@ func TestT_EX2_ArgvStdinDelivery(t *testing.T) {
 
 	// ① bash -c dynamic send expands and reaches the stub.
 	res, _, err := e.executeArgv(t,
-		[]string{"bash", "-c", fmt.Sprintf(`hc send t11j "task: $(cat %s)"`, e.report)}, "")
+		[]string{"bash", "-c", fmt.Sprintf(`hc send t42 "task: $(cat %s)"`, e.report)}, "")
 	e.execOK(t, res, nil, err)
 
 	// ② ["sh"] + stdin script expands and reaches the stub.
 	res2, _, err2 := e.executeArgv(t,
-		[]string{"sh"}, fmt.Sprintf(`hc send t11j "stdin: $(cat %s)"`, e.report))
+		[]string{"sh"}, fmt.Sprintf(`hc send t42 "stdin: $(cat %s)"`, e.report))
 	e.execOK(t, res2, nil, err2)
 
 	// ③ literal argv must NOT expand: the stub receives the literal
 	// "$(cat /tmp/r.txt)" word as data (no shell ever sees it).
 	res3, _, err3 := e.executeArgv(t,
-		[]string{"hc", "send", "t11j", "$(cat /tmp/r.txt)"}, "")
+		[]string{"hc", "send", "t42", "$(cat /tmp/r.txt)"}, "")
 	e.execOK(t, res3, nil, err3)
 
 	e.wantSends(t, [][3]string{
-		{"send", "t11j", "task: e2e-report-body-中文"},
-		{"send", "t11j", "stdin: e2e-report-body-中文"},
-		{"send", "t11j", "$(cat /tmp/r.txt)"},
+		{"send", "t42", "task: e2e-report-body-中文"},
+		{"send", "t42", "stdin: e2e-report-body-中文"},
+		{"send", "t42", "$(cat /tmp/r.txt)"},
 	})
 }
 
@@ -332,13 +332,13 @@ func TestT_EF1_HostileFileContent(t *testing.T) {
 	res, _, err := e.s.toolExecuteFile(context.Background(), nil, executeFileArgs{
 		Path:     report,
 		Language: "shell",
-		Code:     `hc send t11j "$FILE_CONTENT"`,
+		Code:     `hc send t42 "$FILE_CONTENT"`,
 	})
 	e.execOK(t, res, nil, err)
 
 	// The body (with the injectFileContent single-quote round-trip) must be
 	// received byte-identical.
-	e.wantSends(t, [][3]string{{"send", "t11j", body}})
+	e.wantSends(t, [][3]string{{"send", "t42", body}})
 
 	// Embedded command fragments must never have executed: the canary the
 	// $(touch …) fragment would create must not exist, and the stub must
@@ -364,9 +364,9 @@ func TestT_BA1_BatchMixed(t *testing.T) {
 			e.setRole(t, "worker", "")
 			e.s = testServerWithWorkdir(t, e.workdir)
 
-			legalSend := fmt.Sprintf(`hc send t11j "batch: $(cat %s)"`, e.report)
+			legalSend := fmt.Sprintf(`hc send t42 "batch: $(cat %s)"`, e.report)
 			legalNormal := `echo batch-normal-ok`
-			violating := `hc send t11j "$(pig)"`
+			violating := `hc send t42 "$(pig)"`
 
 			res, _, err := e.s.toolBatchExecute(context.Background(), nil, batchArgs{
 				Commands: []batchCommand{
@@ -404,7 +404,7 @@ func TestT_BA1_BatchMixed(t *testing.T) {
 				t.Fatalf("violating item must be ExitCode=-1: %+v", by["violate"])
 			}
 			// Exactly one downstream call (the legal send); violating zero.
-			e.wantSends(t, [][3]string{{"send", "t11j", "batch: e2e-report-body-中文"}})
+			e.wantSends(t, [][3]string{{"send", "t42", "batch: e2e-report-body-中文"}})
 
 			// Audit raw_cmd must also be original text, and the violating
 			// command's per-command entry records its guard block.
@@ -450,7 +450,7 @@ func TestT_RT1_RunTaskCustom(t *testing.T) {
 
 	res, _, err := e.s.toolRunTask(context.Background(), nil, runTaskArgs{
 		Kind: "custom",
-		Args: []string{"bash", "-c", fmt.Sprintf(`hc send t11j "task: $(cat %s)"`, e.report)},
+		Args: []string{"bash", "-c", fmt.Sprintf(`hc send t42 "task: $(cat %s)"`, e.report)},
 	})
 	e.execOK(t, res, nil, err)
 
@@ -460,7 +460,7 @@ func TestT_RT1_RunTaskCustom(t *testing.T) {
 	})
 	e.execBlocked(t, err2)
 
-	e.wantSends(t, [][3]string{{"send", "t11j", "task: e2e-report-body-中文"}})
+	e.wantSends(t, [][3]string{{"send", "t42", "task: e2e-report-body-中文"}})
 }
 
 // ---------------- T-RO1: readonly roles via real entry ------------------

@@ -79,8 +79,11 @@ const hcIsolationStandinTag = "CTXMODE-NS-HC-STANDIN"
 // hcIsolationShadowTargets enumerates the host paths a stage-B namespace
 // must have masked with the read-only stand-in: every hc / herdr-core / sbx
 // entry in the conventional trusted bin dirs and in the dirs of the
-// inherited PATH. Entries that do not exist on the host are skipped; every
-// existing one must be a ro mount serving the stand-in, or the gate refuses.
+// inherited PATH. Entries are kept as the ORIGINAL path — a symlink like
+// /root/.local/bin/hc -> herdr-core is listed once (the gate resolves it
+// through EvalSymlinks when checking mountinfo, since mount --bind follows
+// the link and mounts the real target). Missing entries and dangling
+// symlinks are skipped; a symlink counts only when its target exists.
 func hcIsolationShadowTargets() []string {
 	dirs := map[string]bool{}
 	for _, d := range []string{
@@ -100,16 +103,39 @@ func hcIsolationShadowTargets() []string {
 	for _, name := range []string{"hc", "herdr-core", "sbx"} {
 		for d := range dirs {
 			p := filepath.Join(d, name)
-			if fi, err := os.Lstat(p); err == nil && !fi.IsDir() {
-				out = append(out, p)
+			fi, err := os.Lstat(p)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				hcIsolationRefuse("cannot lstat %s: %v", p, err)
 			}
+			if fi.IsDir() {
+				continue
+			}
+			// A symlink only counts when its target exists (a dangling
+			// link can never be masked: mount --bind would fail on it
+			// anyway and nothing real sits behind it).
+			fi, err = os.Stat(p)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				hcIsolationRefuse("cannot stat %s: %v", p, err)
+			}
+			if fi.IsDir() {
+				continue
+			}
+			out = append(out, p)
 		}
 	}
 	return out
 }
 
 // hcIsolationMountinfo parses /proc/self/mountinfo into (mountpoint,
-// optional-fields, super-options) triples.
+// optional-fields, mount-options) triples. The third element is pre[5] —
+// the per-mountpoint option list where `remount,bind,ro` sets `ro` —
+// never the superblock options post[2] (which stay rw for a ro bind).
 func hcIsolationMountinfo() (rootShared bool, mounts map[string][2]string) {
 	data, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
@@ -135,9 +161,11 @@ func hcIsolationMountinfo() (rootShared bool, mounts map[string][2]string) {
 		if len(pre) > 6 {
 			optional = strings.Join(pre[6:], " ")
 		}
-		mounts[mp] = [2]string{optional, post[2]}
-		if mp == "/" && strings.Contains(optional, "shared:") {
-			rootShared = true
+		mounts[mp] = [2]string{optional, pre[5]}
+		if mp == "/" {
+			// Overwrite-assignment (not a sticky OR): only the real /
+			// line's own propagation flag counts.
+			rootShared = strings.Contains(optional, "shared:")
 		}
 	}
 	return rootShared, mounts
@@ -212,12 +240,20 @@ func mustVerifyOuterTestIsolation() {
 		hcIsolationRefuse("no hc/herdr-core/sbx shadow targets enumerated: nothing proves the namespace")
 	}
 	for _, p := range targets {
-		mnt, ok := mounts[p]
+		// mount --bind follows symlinks: the mount sits on the REAL path
+		// (e.g. /root/.local/bin/herdr-core for the hc symlink), so
+		// mountinfo must be checked on EvalSymlinks(p), never on p
+		// itself — mountinfo never lists a symlink as a mountpoint.
+		realP, err := filepath.EvalSymlinks(p)
+		if err != nil || realP == "" {
+			hcIsolationRefuse("cannot resolve %s: %v", p, err)
+		}
+		mnt, ok := mounts[realP]
 		if !ok {
-			hcIsolationRefuse("%s is not its own mount point (host binary reachable)", p)
+			hcIsolationRefuse("%s (resolves to %s) is not its own mount point (host binary reachable)", p, realP)
 		}
 		if !strings.Contains(","+mnt[1]+",", ",ro,") {
-			hcIsolationRefuse("%s mount is not read-only (opts %q)", p, mnt[1])
+			hcIsolationRefuse("%s (resolves to %s) mount is not read-only (opts %q)", p, realP, mnt[1])
 		}
 		fd, oerr := syscall.Open(p, syscall.O_WRONLY, 0)
 		if oerr == nil {
