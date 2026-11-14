@@ -20,6 +20,37 @@ var (
 	selfExeErr  error
 )
 
+// inTestBinary is set true ONLY by TestMain in *_test.go builds: it arms the
+// compile-time hc-gate pin so a test binary can never fall through to the
+// host herdr-core on PATH. Production source never reads CTXMODE_TEST_*
+// here — the pin itself is activated from test code.
+var inTestBinary bool
+
+// hcGateTestPin binds the test-binary hc-gate to ONE pre-verified stub
+// herdr-core inside a single trusted home. The pin is installed by
+// mustActivateChildHcGatePin (audit_test.go) in the --hc-gate child and by
+// the test helpers for in-process runHcGate calls.
+type hcGateTestPin struct {
+	trustedHome string      // canonical trusted-home root (under os.TempDir())
+	stubBin     string      // canonical stub path inside trustedHome, basename "herdr-core"
+	stubInfo    os.FileInfo // os.Stat(stubBin) captured at pin time
+}
+
+// testHcGatePin is the process-wide pin; nil means "no pin" (fail-closed
+// under inTestBinary, unused in production).
+var testHcGatePin *hcGateTestPin
+
+// hcTestEnvTrustedHome / hcTestEnvStub / hcTestEnvStubLog are the env names
+// the pin contract passes from a test parent to a --hc-gate child of the
+// test binary. They are declared here only so the contract documentation
+// travels with the implementation — PRODUCTION code must never read them
+// (mustActivateChildHcGatePin in *_test.go is the sole reader).
+const (
+	hcTestEnvTrustedHome = "CTXMODE_TEST_TRUSTED_HOME"
+	hcTestEnvStub        = "CTXMODE_TEST_HC_STUB"
+	hcTestEnvStubLog     = "HC_STUB_LOG"
+)
+
 // resolvedSelfExe returns the symlink-resolved path of the running
 // executable and its Stat info. The result is computed once per process.
 func resolvedSelfExe() (string, os.FileInfo, error) {
@@ -136,6 +167,13 @@ func runHcGate(args []string) int {
 		fmt.Fprintln(os.Stderr, "hc-gate: target is not an ELF binary")
 		return 126
 	}
+	// Test binaries: the opened target must be the PINNED stub itself — the
+	// selection-stage pin already guarantees this, but the fd-exec stage
+	// re-verifies so a pin bypass (or a swapped file) can never reach exec.
+	if inTestBinary && (testHcGatePin == nil || !os.SameFile(st, testHcGatePin.stubInfo)) {
+		fmt.Fprintln(os.Stderr, "hc-gate: test binary refuses non-pinned hc target")
+		return 126
+	}
 
 	devNull, err := os.Open(os.DevNull)
 	if err != nil {
@@ -206,6 +244,13 @@ func validateHcGateArgs(args []string) string {
 func findTrustedHcExecutable() (string, error) {
 	euid := os.Geteuid()
 	pathEnv := os.Getenv("PATH")
+	if inTestBinary && testHcGatePin == nil {
+		return "", fmt.Errorf("test binary without hc pin refuses to search PATH")
+	}
+	pinHome := ""
+	if testHcGatePin != nil {
+		pinHome = filepath.Clean(testHcGatePin.trustedHome) + "/"
+	}
 	for _, dir := range strings.Split(pathEnv, ":") {
 		switch {
 		case dir == "":
@@ -214,10 +259,45 @@ func findTrustedHcExecutable() (string, error) {
 			continue
 		}
 		dir = filepath.Clean(dir)
+		cand := filepath.Join(dir, "hc")
+		if testHcGatePin != nil {
+			// Pinned mode: a PATH directory with NO hc entry is skipped
+			// normally (mise/pnpm shim dirs stay compatible), but once a
+			// directory DOES carry an "hc" entry it must be the pinned
+			// stub — anything else is an immediate failure, never a
+			// fall-through to the next PATH dir (e.g. /root/.local/bin).
+			if _, err := os.Lstat(cand); err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return "", fmt.Errorf("test hc pin: lstat %s: %v", cand, err)
+			}
+			if !strings.HasPrefix(dir+"/", pinHome) {
+				return "", fmt.Errorf("test hc pin: %s outside pinned trusted home", cand)
+			}
+			if !isSafePathDirEntry(dir) {
+				return "", fmt.Errorf("test hc pin: %s dir not a safe PATH entry", dir)
+			}
+			st, err := os.Stat(cand)
+			if err != nil || st.IsDir() || st.Mode()&0111 == 0 {
+				return "", fmt.Errorf("test hc pin: %s not an executable regular file", cand)
+			}
+			if !isTrustedExecutableOnDisk(cand, euid) {
+				return "", fmt.Errorf("test hc pin: %s untrusted on disk", cand)
+			}
+			resolved, err := filepath.EvalSymlinks(cand)
+			if err != nil {
+				return "", fmt.Errorf("test hc pin: %s resolve: %v", cand, err)
+			}
+			pst, err := os.Stat(resolved)
+			if err != nil || !os.SameFile(pst, testHcGatePin.stubInfo) {
+				return "", fmt.Errorf("test hc pin: %s is not the pinned stub", cand)
+			}
+			return resolved, nil
+		}
 		if !isSafePathDirEntry(dir) {
 			continue
 		}
-		cand := filepath.Join(dir, "hc")
 		st, err := os.Stat(cand)
 		if err != nil || st.IsDir() || st.Mode()&0111 == 0 {
 			continue

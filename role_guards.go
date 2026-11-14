@@ -143,6 +143,20 @@ type shellSegment struct {
 	// overflow (e.g. bash-only syntax under /bin/sh). Prefer this over stuffing
 	// every parse failure into depthExceeded.
 	parseErr string
+	// srcCode is the exact buffer this segment's words were parsed from. It is
+	// the buffer identity half of the structured provenance match — a span index
+	// means nothing without it.
+	srcCode string
+	// gateProvenanced marks a segment whose `<selfExe> --hc-gate …` shape was
+	// minted by prepare* and matched against its span-bound hcGateProvenance.
+	// It is a copy of a VERIFIED result, never evidence on its own: every read
+	// site also requires isPreparedHcGateArgv + the provenance spans.
+	gateProvenanced bool
+	// secondaryDialect marks a segment that ONLY the non-primary dialect tree
+	// produced (posix primary + bash secondary, or the reverse under `bash -c`).
+	// Rewrite decisions are taken from the primary tree only; a dynamic hc send
+	// visible solely here fails closed instead of being silently dropped.
+	secondaryDialect bool
 }
 
 // shellSplitMaxDepth bounds recursion into $(...)/`...`/subshell text so a
@@ -1965,6 +1979,109 @@ func hasHcControlChars(s string) bool {
 	return false
 }
 
+// headIsCtxmodeOrSelfExe reports whether head0 denotes THIS ctxmode binary:
+// its canonical basename is "ctxmode", or the typed/resolved head is the
+// running executable (path or SameFile). This is an IDENTITY test only — the
+// authorization decision always needs the span-bound provenance, never
+// SameFile alone.
+func headIsCtxmodeOrSelfExe(head0, effPath string) bool {
+	if head0 == "" || isDynamicArg(head0) {
+		return false
+	}
+	if canonicalResolvedBase(filepath.Base(head0)) == "ctxmode" {
+		return true
+	}
+	if canonicalResolvedBase(resolveHeadBase(head0, effPath)) == "ctxmode" {
+		return true
+	}
+	self, selfInfo, err := resolvedSelfExe()
+	if err != nil || self == "" || selfInfo == nil {
+		return false
+	}
+	cand := head0
+	if !filepath.IsAbs(cand) {
+		cand = filepath.Join(currentScreenCwd(), cand)
+	}
+	if filepath.Clean(cand) == self {
+		return true
+	}
+	if resolved, err := filepath.EvalSymlinks(cand); err == nil && filepath.Clean(resolved) == self {
+		return true
+	}
+	if st, err := os.Stat(cand); err == nil && os.SameFile(st, selfInfo) {
+		return true
+	}
+	return false
+}
+
+// screenCtxmodeGateHead blocks a ctxmode/selfExe head that is not backed by
+// the exact prepare*-minted provenance of THIS segment. It returns "" for a
+// bare binary or a plain subcommand spelling (ctxmode search …) and for a
+// fully verified `<selfExe> --hc-gate send addr text` leaf; everything else
+// in the --hc-gate / dynamic-option zone fails closed.
+func screenCtxmodeGateHead(typedHead []string, seg shellSegment, prov *hcGateProvenance) string {
+	if len(typedHead) < 2 {
+		return ""
+	}
+	if typedHead[1] == "--hc-gate" {
+		// The rewrite must be the one this prepare* pass minted: same buffer,
+		// exact head word span, exact --hc-gate word span, safe wrappers, no
+		// env -i, and the prepared argv shape.
+		_, headIdx, wrappers, envAs, exhausted := peelWrappersWithIndex(seg.argv)
+		if exhausted || headIdx < 0 || len(seg.argWords) != len(seg.argv) {
+			return "ctxmode --hc-gate"
+		}
+		for _, op := range envAs.ops {
+			if op.kind == 'c' {
+				return "ctxmode --hc-gate"
+			}
+		}
+		for _, w := range wrappers {
+			if !hcGateSafeWrappers[w] {
+				return "ctxmode --hc-gate"
+			}
+		}
+		if prov == nil || headIdx+1 >= len(seg.argWords) {
+			return "ctxmode --hc-gate"
+		}
+		if !prov.hasGateCall(seg.srcCode, seg.argWords[headIdx], seg.argWords[headIdx+1]) {
+			return "ctxmode --hc-gate"
+		}
+		if !isPreparedHcGateArgv(typedHead) || len(typedHead) != 5 || typedHead[2] != "send" ||
+			isDynamicArg(typedHead[3]) || !hcSendAddrOK(typedHead[3]) ||
+			strings.HasPrefix(typedHead[3], "-") {
+			return "ctxmode --hc-gate"
+		}
+		// Leading-dash on the TEXT slot: the flattened placeholder never starts
+		// with "-", so the check on typedHead[4] is not a runtime guarantee.
+		// The static side judges the AST word (staticWordPrefix) and the real
+		// runtime check stays validateHcGateArgs on the expanded argv.
+		if strings.HasPrefix(typedHead[4], "-") {
+			return "ctxmode --hc-gate"
+		}
+		if headIdx+4 < len(seg.argWords) && seg.argWords[headIdx+4] != nil {
+			if strings.HasPrefix(staticWordPrefix(seg.argWords[headIdx+4]), "-") {
+				return "ctxmode --hc-gate"
+			}
+		}
+		return ""
+	}
+	// Option zone before the subcommand: a --hc-gate or any dynamic word could
+	// expand into it at runtime (`a=--hc-gate; ctxmode "$a" send … `).
+	for _, a := range typedHead[1:] {
+		if !strings.HasPrefix(a, "-") {
+			break
+		}
+		if a == "--hc-gate" {
+			return "ctxmode --hc-gate"
+		}
+		if isDynamicArg(a) {
+			return "ctxmode dynamic option"
+		}
+	}
+	return ""
+}
+
 func screenHcSubagent(headArgv []string) string {
 	args := headArgv[1:]
 	if isPureQueryInvocation(headArgv) {
@@ -3282,6 +3399,11 @@ type callerIdentity struct {
 	// means "use the process PATH" — the same fallback lookPathIn
 	// already applies to an empty pathEnv argument (R7).
 	pathEnv string
+	// hcProv is the prepare*-minted provenance of the buffer being screened.
+	// It is non-nil ONLY on the guardPreparedShell entry and while crossing one
+	// verified `sh -c` script word; every other cross-buffer recursion clears
+	// it by construction.
+	hcProv *hcGateProvenance
 }
 
 // currentCallerIdentity reads the caller's role identity from the process
@@ -3558,11 +3680,18 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		}
 		return ""
 	}
+	// The provenance of THIS buffer is consumed locally. Exactly one
+	// cross-buffer jump (the rewritten `sh -c` script word) may carry it into
+	// the child; every other recursion below starts with nil because the
+	// caller copy is cleared here.
+	entryProv := caller.hcProv
+	caller.hcProv = nil
+	gateLeaf := kind == 'r' && seg.gateProvenanced && isPreparedHcGateArgv(argv)
 	if kind == 'r' {
 		if hit := wrapperWriteOpHit(argv); hit != "" {
 			return hit
 		}
-		if hit := readonlyPrePeelHit(argv); hit != "" {
+		if hit := readonlyPrePeelHitExempt(argv, gateLeaf); hit != "" {
 			return allowlistDetail(hit)
 		}
 	}
@@ -3608,6 +3737,16 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		base = canon
 	}
 	effPath := envAs.effectivePATHFrom(caller.pathEnv)
+	// A ctxmode/selfExe head is a direct --hc-gate attempt unless the exact
+	// prepare*-minted provenance of this buffer backs it (P-3 / 裁决 5): a
+	// worker's `echo --hc-gate` is untouched, while a raw
+	// `./postinstall --hc-gate …`, `ctxmode --hc-gate …` or a dynamic option
+	// word in the ctxmode option zone fails closed.
+	if headIsCtxmodeOrSelfExe(typedHead[0], effPath) {
+		if hit := screenCtxmodeGateHead(typedHead, seg, entryProv); hit != "" {
+			return hit
+		}
+	}
 	// C10: verify that the winning PATH binary is not an untrusted file or a
 	// planted binary in a user-writable toolchain dir shadowing a system command.
 	if hit := screenPathHeadTrust(typedHead[0], effPath); hit != "" {
@@ -3682,11 +3821,13 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	// Strict readonly: allowlist before shell/interpreter unwrap, plus
 	// C10 alias target allowlist verification.
 	if kind == 'r' {
-		if hit := screenReadonlyAllowlist(typedHead); hit != "" {
+		if hit := screenReadonlyAllowlistSeg(typedHead, seg.gateProvenanced); hit != "" {
 			return allowlistDetail(hit)
 		}
-		if hit := screenReadonlyAliasTarget(typedHead, effPath); hit != "" {
-			return allowlistDetail(hit)
+		if !gateLeaf {
+			if hit := screenReadonlyAliasTarget(typedHead, effPath); hit != "" {
+				return allowlistDetail(hit)
+			}
 		}
 	}
 	if hasDynamicInterpOption(head, base) {
@@ -3738,6 +3879,12 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		}
 		if kind == 's' {
 			inner := caller.seededWith(envAs)
+			// Provenance crosses a `sh -c` boundary ONLY when the script word is
+			// the exact rewritten Type-B slot of this buffer (same buffer, exact
+			// span, exact decoded text). Any other -c payload keeps nil.
+			if entryProv != nil {
+				inner.hcProv = entryProv.innerProvMatching(seg.srcCode, seg.argWords, text)
+			}
 			// The -c payload parses under the RESOLVED shell dialect: a
 			// same-family alias (sh -> bash) keeps its typed base, but the
 			// running interpreter is bash, so bash-only syntax must be
@@ -3821,11 +3968,21 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			// including help/query — because no -I `xargs hc --help` still appends
 			// stdin words and breaks the two-word pure-query shape.
 			target := head[k:]
-			th, _, _, _ := peelWrappersAndSbxAliases(target, caller.pathEnv)
-			for _, b := range headBaseAliasHits(th, caller.pathEnv) {
+			th, _, teffP, tex := peelWrappersAndSbxAliases(target, caller.pathEnv)
+			if tex {
+				return "xargs " + depthExceededHit
+			}
+			for _, b := range headBaseAliasHits(th, teffP) {
 				if b == "hc" || b == "herdr-core" {
 					return "xargs " + b
 				}
+			}
+			// `printf '--hc-gate\nsend\nt42\nhi\n' | xargs ctxmode` never spells
+			// --hc-gate on the xargs line, yet the runtime argv becomes
+			// os.Args[1] == "--hc-gate": an unprovenanced ctxmode/selfExe target
+			// through xargs is blocked unconditionally.
+			if len(th) > 0 && headIsCtxmodeOrSelfExe(th[0], teffP) {
+				return "xargs ctxmode --hc-gate"
 			}
 			innerSeg := xargsDerivedSeg(head[:k], head[k:], seg, caller.pathEnv)
 			return peelResolvedSegDepth(head[k:], innerSeg, kind, depth+1, caller)
@@ -3918,7 +4075,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	if kind == 's' {
 		return screenNestedDispatch(typedHead, effPath, depth, caller)
 	}
-	if hit := screenReadonlyAllowlist(typedHead); hit != "" {
+	if hit := screenReadonlyAllowlistSeg(typedHead, seg.gateProvenanced); hit != "" {
 		return allowlistDetail(hit)
 	}
 	return screenReadonlyWritePath(typedHead, effPath)
@@ -5450,11 +5607,17 @@ func screenFindArgsSeg(args []string, outerSeg shellSegment, kind byte, depth in
 				}
 				// Nested hc/herdr-core via find -exec* / -ok* receives path args
 				// at runtime ({} replacement / + batching). Block unconditionally.
-				th, _, _, _ := peelWrappersAndSbxAliases(inner, caller.pathEnv)
-				for _, b := range headBaseAliasHits(th, caller.pathEnv) {
+				th, _, teffP, tex := peelWrappersAndSbxAliases(inner, caller.pathEnv)
+				if tex {
+					return "find " + a + " " + depthExceededHit
+				}
+				for _, b := range headBaseAliasHits(th, teffP) {
 					if b == "hc" || b == "herdr-core" {
 						return "find " + a + " " + b
 					}
+				}
+				if len(th) > 0 && headIsCtxmodeOrSelfExe(th[0], teffP) {
+					return "find " + a + " ctxmode --hc-gate"
 				}
 				innerSeg := shellSegment{}
 				if a == "-ok" || a == "-okdir" {
@@ -8935,7 +9098,7 @@ func guardShellReadonlyDepthMode(code string, depth int, caller callerIdentity, 
 	var roSegs []roSegment
 	var hit string
 	if prepare {
-		roSegs, hit = parseReadonlyShellSegmentsPrepare(code)
+		roSegs, hit = parseReadonlyShellSegmentsPrepare(code, caller.hcProv)
 	} else {
 		roSegs, hit = parseReadonlyShellSegments(code)
 	}
@@ -8944,10 +9107,13 @@ func guardShellReadonlyDepthMode(code string, depth int, caller callerIdentity, 
 	}
 	for _, ro := range roSegs {
 		seg := shellSegment{
-			argv:         ro.argv,
-			pipedStdin:   ro.pipedStdin,
-			heredocText:  ro.heredocText,
-			redirectFile: ro.redirectFile,
+			argv:            ro.argv,
+			argWords:        ro.argWords,
+			pipedStdin:      ro.pipedStdin,
+			heredocText:     ro.heredocText,
+			redirectFile:    ro.redirectFile,
+			srcCode:         ro.srcCode,
+			gateProvenanced: ro.gateProvenanced,
 		}
 		if h := screenOneSegmentDepth(seg, 'r', depth, caller); h != "" {
 			return h

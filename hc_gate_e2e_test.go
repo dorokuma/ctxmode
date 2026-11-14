@@ -81,13 +81,17 @@ func newHcE2E(t *testing.T) *hcE2EEnv {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.Unsetenv("CTXMODE_TEST_TRUSTED_HOME") })
-	// bash -l (login shell) re-reads /etc/profile and resets PATH, which
-	// would drop the stub dir and let the inner --hc-gate fall through to
-	// the REAL hc. Prepend the stub dir via the fake home's .bash_profile
-	// so the login shell keeps the stub first on PATH.
-	if err := os.WriteFile(filepath.Join(e.home, ".bash_profile"),
-		[]byte("export PATH="+shellSingleQuote(e.binDir)+":$PATH\n"), 0o644); err != nil {
-		t.Fatal(err)
+	// bash -l / sh -l (login shells) re-read /etc/profile and reset PATH,
+	// which would drop the stub dir and let the inner --hc-gate fall through to
+	// the REAL hc. Prepend the stub dir via the fake home's .bash_profile AND
+	// .profile so both login spellings keep the stub first on PATH. This is
+	// fixture hygiene, NOT an isolation control: the real boundaries are the
+	// compile-time pin (above) and the stage-B outer OS isolation.
+	profileLine := []byte("export PATH=" + shellSingleQuote(e.binDir) + ":$PATH\n")
+	for _, name := range []string{".bash_profile", ".profile"} {
+		if err := os.WriteFile(filepath.Join(e.home, name), profileLine, 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	e.workdir = t.TempDir()
 	e.report = filepath.Join(e.workdir, "r.txt")

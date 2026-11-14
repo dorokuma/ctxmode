@@ -527,10 +527,23 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 			continue
 		}
 
-		execCode := cmd.Command
-		if i < len(preps) && preps[i].execCode != "" {
-			execCode = preps[i].execCode
+		// No raw-code fallback: a missing prepared artifact means the command
+		// must not spawn at all (zero-fallback invariant). An empty execCode is a
+		// legitimate prepared result (comment-only / empty script) and executes
+		// as such.
+		if i >= len(preps) {
+			errMsg := guardBlockedError(ruleSubagentNestedAgent, "batch command missing prepared artifact").Error()
+			results[i] = batchResult{
+				Label:      cmd.Label,
+				Command:    cmd.Command, // raw
+				Success:    false,
+				ExitCode:   -1,
+				Error:      errMsg,
+				ErrorClass: classifyError(errMsg),
+			}
+			continue
 		}
+		execCode := preps[i].execCode
 		out, exitCode, execErr, truncated := s.executeCommand(cmdCtx, execCode, cwd)
 
 		r := batchResult{
@@ -574,6 +587,20 @@ func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCom
 				}
 				return
 			}
+			// No raw-code fallback (see executeBatchSerial): a missing prepared
+			// artifact fails closed instead of re-running the raw command.
+			if idx >= len(preps) {
+				errMsg := guardBlockedError(ruleSubagentNestedAgent, "batch command missing prepared artifact").Error()
+				results[idx] = batchResult{
+					Label:      c.Label,
+					Command:    c.Command, // raw
+					Success:    false,
+					ExitCode:   -1,
+					Error:      errMsg,
+					ErrorClass: classifyError(errMsg),
+				}
+				return
+			}
 			sem <- struct{}{}        // acquire
 			defer func() { <-sem }() // release
 
@@ -587,10 +614,7 @@ func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCom
 			}
 			defer cmdCancel()
 
-			execCode := c.Command
-			if idx < len(preps) && preps[idx].execCode != "" {
-				execCode = preps[idx].execCode
-			}
+			execCode := preps[idx].execCode
 			out, exitCode, execErr, truncated := s.executeCommand(cmdCtx, execCode, cwd)
 
 			r := batchResult{

@@ -585,7 +585,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 				audit.setScreen(shellBlock, prep.rule)
 				return nil, nil, blockedReportError(guardBlockedError(prep.rule, prep.detail), nil, args.Command)
 			}
-			execStdin := prepareStdinExec(prep, args.Stdin)
+			execStdin := prep.execStdin
 			if opts == nil && execStdin != "" {
 				opts = &runOptions{Stdin: execStdin}
 			} else if opts != nil {

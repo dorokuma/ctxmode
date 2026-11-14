@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"mvdan.cc/sh/v3/syntax"
@@ -79,7 +81,13 @@ func withIsolatedHcPath(t *testing.T, stubBin, logPath string) (restore func()) 
 	os.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath)
 	os.Setenv("HC_STUB_LOG", logPath)
 	_ = os.Remove(logPath)
+	// Pin BOTH layers in one helper: the in-process testHcGatePin plus the
+	// three child-process env names a --hc-gate child of this binary reads in
+	// mustActivateChildHcGatePin. A test that adds the stub to PATH without the
+	// pin is exactly the accident this contract closes.
+	restorePin := activateHcTestPin(t, stubBin, logPath)
 	return func() {
+		restorePin()
 		os.Setenv("PATH", oldPath)
 		if oldLog == "" {
 			os.Unsetenv("HC_STUB_LOG")
@@ -87,6 +95,146 @@ func withIsolatedHcPath(t *testing.T, stubBin, logPath string) (restore func()) 
 			os.Setenv("HC_STUB_LOG", oldLog)
 		}
 	}
+}
+
+// hcPinHomeForStub returns the trusted-home root containing stubBin: the fake
+// home when the stub sits in <home>/.local/bin, else the stub's own directory.
+func hcPinHomeForStub(stubBin string) string {
+	dir := filepath.Dir(stubBin)
+	if filepath.Base(dir) == "bin" && filepath.Base(filepath.Dir(dir)) == ".local" {
+		return filepath.Dir(filepath.Dir(dir))
+	}
+	return dir
+}
+
+// restoreHcTestEnv restores one environment variable (unsetting when it was
+// previously empty).
+func restoreHcTestEnv(key, val string) {
+	if val == "" {
+		_ = os.Unsetenv(key)
+		return
+	}
+	_ = os.Setenv(key, val)
+}
+
+// activateHcTestPin installs the in-process pin plus the child-process pin
+// environment for one test and returns its restore func.
+func activateHcTestPin(t *testing.T, stubBin, logPath string) func() {
+	t.Helper()
+	home := hcPinHomeForStub(stubBin)
+	info, err := os.Stat(stubBin)
+	if err != nil {
+		t.Fatalf("hc test pin: stat %s: %v", stubBin, err)
+	}
+	prevPin := testHcGatePin
+	prevHome := os.Getenv(hcTestEnvTrustedHome)
+	prevStub := os.Getenv(hcTestEnvStub)
+	prevLog := os.Getenv(hcTestEnvStubLog)
+	testHcGatePin = &hcGateTestPin{trustedHome: home, stubBin: stubBin, stubInfo: info}
+	_ = os.Setenv(hcTestEnvTrustedHome, home)
+	_ = os.Setenv(hcTestEnvStub, stubBin)
+	_ = os.Setenv(hcTestEnvStubLog, logPath)
+	return func() {
+		testHcGatePin = prevPin
+		restoreHcTestEnv(hcTestEnvTrustedHome, prevHome)
+		restoreHcTestEnv(hcTestEnvStub, prevStub)
+		restoreHcTestEnv(hcTestEnvStubLog, prevLog)
+	}
+}
+
+// pinFail reports a pin rejection and exits 125 BEFORE runHcGate: a test
+// child must never reach fd-exec without a fully verified pin.
+func pinFail(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "hc-gate test pin: "+format+"\n", args...)
+	os.Exit(125)
+}
+
+// pinOwnerPermOK requires euid/root ownership and no group/other write bits.
+func pinOwnerPermOK(fi os.FileInfo) bool {
+	if fi == nil {
+		return false
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		if int(st.Uid) != os.Geteuid() && st.Uid != 0 {
+			return false
+		}
+	}
+	return fi.Mode().Perm()&0022 == 0
+}
+
+// mustActivateChildHcGatePin is the SOLE reader of CTXMODE_TEST_* / HC_STUB_LOG
+// in this package. It runs at the top of a --hc-gate child of the test binary
+// and hard-fails (os.Exit(125)) on any missing, malformed or unsafe input:
+// trusted home outside the temp root, wrong owner or group/other-writable
+// dirs, a stub that is not an ELF regular executable strictly inside that
+// home, a stub that IS the test binary (SameFile self), or a stub log outside
+// the home. Only then are testTrustedHomeRoot and testHcGatePin installed.
+func mustActivateChildHcGatePin() {
+	home := os.Getenv(hcTestEnvTrustedHome)
+	stub := os.Getenv(hcTestEnvStub)
+	logPath := os.Getenv(hcTestEnvStubLog)
+	if home == "" || stub == "" || logPath == "" {
+		pinFail("missing pin environment (need %s, %s, %s)", hcTestEnvTrustedHome, hcTestEnvStub, hcTestEnvStubLog)
+	}
+	realHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		pinFail("trusted home %q: %v", home, err)
+	}
+	realHome = filepath.Clean(realHome)
+	tmpRoot := filepath.Clean(os.TempDir())
+	if r, rerr := filepath.EvalSymlinks(tmpRoot); rerr == nil {
+		tmpRoot = filepath.Clean(r)
+	}
+	if !strings.HasPrefix(realHome, tmpRoot+"/") && !strings.HasPrefix(realHome, "/tmp/") {
+		pinFail("trusted home %q is not under the temp root %q", realHome, tmpRoot)
+	}
+	hst, err := os.Stat(realHome)
+	if err != nil || !hst.IsDir() {
+		pinFail("trusted home %q is not a directory: %v", realHome, err)
+	}
+	if !pinOwnerPermOK(hst) {
+		pinFail("trusted home %q has a foreign owner or group/other write bits", realHome)
+	}
+	realStub, err := filepath.EvalSymlinks(stub)
+	if err != nil {
+		pinFail("stub %q: %v", stub, err)
+	}
+	realStub = filepath.Clean(realStub)
+	if !strings.HasPrefix(realStub, realHome+"/") {
+		pinFail("stub %q escapes the pinned home %q", realStub, realHome)
+	}
+	if filepath.Base(realStub) != "herdr-core" {
+		pinFail("stub %q is not named herdr-core", realStub)
+	}
+	sst, err := os.Stat(realStub)
+	if err != nil || !sst.Mode().IsRegular() || sst.Mode()&0111 == 0 {
+		pinFail("stub %q is not an executable regular file: %v", realStub, err)
+	}
+	if !pinOwnerPermOK(sst) {
+		pinFail("stub %q has a foreign owner or group/other write bits", realStub)
+	}
+	if _, selfInfo, serr := resolvedSelfExe(); serr == nil && selfInfo != nil && os.SameFile(sst, selfInfo) {
+		pinFail("stub %q IS the test binary (SameFile self)", realStub)
+	}
+	f, err := os.Open(realStub)
+	if err != nil {
+		pinFail("stub %q open: %v", realStub, err)
+	}
+	var hdr [4]byte
+	_, rerr := f.ReadAt(hdr[:], 0)
+	_ = f.Close()
+	if rerr != nil || string(hdr[:]) != "\x7fELF" {
+		pinFail("stub %q is not an ELF binary", realStub)
+	}
+	logDir := filepath.Clean(filepath.Dir(logPath))
+	if r, lerr := filepath.EvalSymlinks(logDir); lerr == nil {
+		logDir = filepath.Clean(r)
+	}
+	if logDir != realHome && !strings.HasPrefix(logDir, realHome+"/") {
+		pinFail("stub log %q is outside the pinned home %q", logPath, realHome)
+	}
+	testTrustedHomeRoot = realHome
+	testHcGatePin = &hcGateTestPin{trustedHome: realHome, stubBin: realStub, stubInfo: sst}
 }
 
 func prepRule(role, ro, cmd string) preparedShell {

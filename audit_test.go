@@ -21,6 +21,11 @@ import (
 // It uses os.Setenv rather than t.Setenv on purpose: TestMain has no *testing.T,
 // and t.Setenv only works inside a test (it registers a cleanup with that test).
 func TestMain(m *testing.M) {
+	// FIRST STATEMENT: a test binary is a test binary. Nothing below may run
+	// before the compile-time hc-gate pin is armed, and a --hc-gate child
+	// must fail closed (exit 125) instead of EVER falling through to the host
+	// herdr-core on PATH. Production source never reads these names.
+	inTestBinary = true
 	// Restore the test-only trusted-home pin BEFORE the --hc-gate short-
 	// circuit: a --hc-gate child of this binary is a fresh process whose
 	// package-level testTrustedHomeRoot is empty, so the fake test home
@@ -35,7 +40,11 @@ func TestMain(m *testing.M) {
 	// exec'ing it must reach runHcGate exactly like the real ctxmode main
 	// does. Without this branch the spawned copy would try to run the go
 	// test flag parser on the gate argv and the delivery chain would break.
+	// mustActivateChildHcGatePin validates the pin environment and exits 125
+	// on any missing/malformed/unsafe input — the gate is never entered
+	// without a verified pin.
 	if len(os.Args) >= 2 && os.Args[1] == "--hc-gate" {
+		mustActivateChildHcGatePin()
 		os.Exit(runHcGate(os.Args[2:]))
 	}
 	dir, err := os.MkdirTemp("", "ctxmode-audit-test")

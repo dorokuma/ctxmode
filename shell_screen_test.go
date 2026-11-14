@@ -152,7 +152,16 @@ func TestExecuteBatchSerial_BlockDoesNotCascade(t *testing.T) {
 	}
 	results := make([]batchResult, len(commands))
 	ctx := context.Background()
-	s.executeBatchSerial(ctx, commands, "/tmp", 30*time.Second, "testrun", results, nil)
+	// Explicit prepared artifacts, one per command: the first carries the role
+	// guard's block (no spawn), the siblings carry their exact execCode. A nil
+	// preps slice now means "missing artifact → fail closed", so this test also
+	// pins the zero-fallback contract at the sibling level.
+	preps := []preparedShell{
+		{rawCode: commands[0].Command, rule: ruleSubagentNestedAgent, detail: "dynamic code payload"},
+		{rawCode: commands[1].Command, execCode: commands[1].Command},
+		{rawCode: commands[2].Command, execCode: commands[2].Command},
+	}
+	s.executeBatchSerial(ctx, commands, "/tmp", 30*time.Second, "testrun", results, preps)
 
 	if results[0].Success || results[0].Error == "" {
 		t.Fatalf("expected blocked command to fail with error, got success=%v err=%q", results[0].Success, results[0].Error)
