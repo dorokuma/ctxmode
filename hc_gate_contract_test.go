@@ -513,3 +513,287 @@ func syntaxNewWord(t *testing.T, word string) *syntax.Word {
 	call := file.Stmts[0].Cmd.(*syntax.CallExpr)
 	return call.Args[3]
 }
+
+// ================= 1114E §3.3 contract matrix =================
+// Static-compile-only additions for the 1114E consensus spec. These tests
+// pin the NEW stage-A behavior; none of them run in stage A.
+
+// prepArgvRule runs prepareCtxRunArgv under a role and returns the prepared
+// artifact (never executes it).
+func prepArgvRule(t *testing.T, role, ro string, argv []string, stdin string) preparedArgv {
+	t.Helper()
+	os.Setenv("CTXMODE_ROLE", role)
+	os.Setenv("CTXMODE_READONLY", ro)
+	defer os.Unsetenv("CTXMODE_ROLE")
+	defer os.Unsetenv("CTXMODE_READONLY")
+	return currentGuardCall().prepareCtxRunArgv(argv, stdin)
+}
+
+// TestT_STDIN1_RewrittenStdinNoSelfLock pins 1114E §3.1 finding ①: a
+// `hc send` payload arriving on stdin must be REWRITTEN to `<selfExe>
+// --hc-gate` and pass the prov-aware guard inside prepareCtxRunShellEnv —
+// the rewritten bytes must never re-enter a pure-check stdin guard
+// (hcProv == nil would self-block every legal send).
+func TestT_STDIN1_RewrittenStdinNoSelfLock(t *testing.T) {
+	dynSend := `hc send t11j "x: $(cat /tmp/r.txt)"`
+
+	// argv form: ["sh"] + dynamic hc send on stdin.
+	p := prepArgvRule(t, "worker", "", []string{"sh"}, dynSend)
+	if p.rule != "" {
+		t.Fatalf("[sh]+stdin prepare blocked (self-lock?): %s (%s)", p.rule, p.detail)
+	}
+	if !strings.Contains(p.execStdin, "--hc-gate") {
+		t.Fatalf("[sh]+stdin: execStdin missing --hc-gate rewrite: %q", p.execStdin)
+	}
+
+	// command form: Command "sh" + the same stdin.
+	os.Setenv("CTXMODE_ROLE", "worker")
+	os.Setenv("CTXMODE_READONLY", "")
+	defer os.Unsetenv("CTXMODE_ROLE")
+	defer os.Unsetenv("CTXMODE_READONLY")
+	sp := currentGuardCall().prepareCtxRunShellAndStdin("sh", dynSend)
+	if sp.rule != "" {
+		t.Fatalf("Command sh + stdin blocked (self-lock?): %s (%s)", sp.rule, sp.detail)
+	}
+	if !strings.Contains(sp.execStdin, "--hc-gate") {
+		t.Fatalf("Command sh + stdin: execStdin missing --hc-gate: %q", sp.execStdin)
+	}
+}
+
+// TestT_STDIN2_CScripStdinMatrix covers the -c + stdin contract rows:
+// foreign-language target, local shell target, ssh remote target and the
+// mixed data+shell line.
+func TestT_STDIN2_CScripStdinMatrix(t *testing.T) {
+	dynSend := `hc send t11j "x: $(cat /tmp/r.txt)"`
+
+	// bash -c 'python3 -' + anything: python reads ITS program from stdin,
+	// so a shell-looking hc send must block, never be rewritten.
+	p := prepArgvRule(t, "worker", "", []string{"bash", "-c", "python3 -"}, dynSend)
+	if p.rule == "" {
+		t.Fatalf("bash -c 'python3 -' + shell stdin must block (foreign lang), got ALLOW stdin=%q", p.execStdin)
+	}
+
+	// bash -c 'sh' + dynamic hc send: the script body reads a PROGRAM from
+	// stdin — it is a local shell, so the rewrite applies and the payload
+	// ships inside --hc-gate.
+	p = prepArgvRule(t, "worker", "", []string{"bash", "-c", "sh"}, dynSend)
+	if p.rule != "" {
+		t.Fatalf("bash -c 'sh' + dyn send must allow the rewrite, got %s (%s)", p.rule, p.detail)
+	}
+	if !strings.Contains(p.execStdin, "--hc-gate") {
+		t.Fatalf("bash -c 'sh' + dyn send: execStdin missing --hc-gate: %q", p.execStdin)
+	}
+
+	// bash -c 'ssh dmit sh' + dynamic hc send: stdin forwards to a REMOTE
+	// shell. The bytes must never be rewritten into a local --hc-gate
+	// call AND the remote-program screen must block the dynamic send.
+	p = prepArgvRule(t, "worker", "", []string{"bash", "-c", "ssh dmit sh"}, dynSend)
+	if p.rule == "" {
+		t.Fatalf("bash -c 'ssh dmit sh' + dyn send must block (remote program)")
+	}
+	if strings.Contains(p.execStdin, "--hc-gate") {
+		t.Fatalf("remote stdin must NOT be rewritten to --hc-gate: %q", p.execStdin)
+	}
+
+	// Same ssh target + benign stdin: a worker may send benign bytes; the
+	// stream must pass through UNCHANGED (still data, no rewrite).
+	p = prepArgvRule(t, "worker", "", []string{"bash", "-c", "ssh dmit sh"}, "ls")
+	if p.rule != "" {
+		t.Fatalf("worker benign stdin to ssh must pass, got %s (%s)", p.rule, p.detail)
+	}
+	if p.execStdin != "ls" {
+		t.Fatalf("benign remote stdin must stay verbatim, got %q", p.execStdin)
+	}
+
+	// Verifier (read-only, non-strict): the same benign write-ish program
+	// escalates to strictReadonly for remote targets — `rm -rf /` on a
+	// remote shell must block.
+	p = prepArgvRule(t, "verifier", "", []string{"bash", "-c", "ssh dmit sh"}, "rm -rf /")
+	if p.rule == "" {
+		t.Fatalf("verifier remote stdin write must escalate + block")
+	}
+
+	// Mixed command line: `jq . ; sh` — jq consumes the stream as DATA, so
+	// the stdin must pass through verbatim; rewriting it into --hc-gate
+	// would destroy the JSON.
+	p = prepArgvRule(t, "worker", "", []string{"bash", "-c", "jq . ; sh"}, `{"k":1}`)
+	if p.rule != "" {
+		t.Fatalf("jq . ; sh must pass, got %s (%s)", p.rule, p.detail)
+	}
+	if p.execStdin != `{"k":1}` {
+		t.Fatalf("data stdin must stay verbatim through a mixed line, got %q", p.execStdin)
+	}
+	if strings.Contains(p.execStdin, "--hc-gate") {
+		t.Fatalf("data stdin must NEVER be rewritten: %q", p.execStdin)
+	}
+
+	// Same mixed line as a plain Command string.
+	os.Setenv("CTXMODE_ROLE", "worker")
+	os.Setenv("CTXMODE_READONLY", "")
+	defer os.Unsetenv("CTXMODE_ROLE")
+	defer os.Unsetenv("CTXMODE_READONLY")
+	sp := currentGuardCall().prepareCtxRunShellAndStdin("jq . ; sh", `{"k":1}`)
+	if sp.rule != "" {
+		t.Fatalf("Command 'jq . ; sh' must pass, got %s (%s)", sp.rule, sp.detail)
+	}
+	if sp.execStdin != `{"k":1}` {
+		t.Fatalf("Command data stdin must stay verbatim, got %q", sp.execStdin)
+	}
+}
+
+// TestT_GLUED1_GluedShellC covers the glued -c matrix rows: spellings with
+// no clean script word must keep the argv untouched (never nil-execArgv,
+// never a rewritten stdin) and still face the full guard.
+func TestT_GLUED1_GluedShellC(t *testing.T) {
+	// Benign glued spellings: allowed, execArgv is the verbatim argv.
+	for _, argv := range [][]string{
+		{"sh", "-cecho ok"},
+		{"sh", "-ce", "echo ok"},
+		{"sh", "-co", "errexit", "echo ok"},
+	} {
+		p := prepArgvRule(t, "worker", "", argv, "")
+		if p.rule != "" {
+			t.Fatalf("benign glued %v must pass, got %s (%s)", argv, p.rule, p.detail)
+		}
+		if len(p.execArgv) != len(argv) {
+			t.Fatalf("benign glued %v: execArgv=%v must be the full verbatim argv", argv, p.execArgv)
+		}
+		for i := range argv {
+			if p.execArgv[i] != argv[i] {
+				t.Fatalf("benign glued %v: execArgv[%d]=%q want %q (no rewrite)", argv, i, p.execArgv[i], argv[i])
+			}
+		}
+	}
+
+	// Hostile glued spellings: the decoded text hides a dynamic hc send —
+	// the guard must block (the rewrite path must never see them).
+	for _, argv := range [][]string{
+		{"sh", "-ce", `hc send "$t" ok`},
+		{"sh", "-co", "errexit", `hc send t42 "$(cat r)"`},
+		{"sh", "-cecho hi; hc send t42 \"$(cat r)\""},
+	} {
+		p := prepArgvRule(t, "worker", "", argv, "")
+		if p.rule == "" {
+			t.Fatalf("hostile glued %v must block (dynamic hc send), got ALLOW argv=%v", argv, p.execArgv)
+		}
+	}
+
+	// Glued -c + stdin: the stdin is screened but NEVER rewritten — a
+	// `sh -ce 'sh'` line whose body would read a program must keep stdin
+	// verbatim.
+	p := prepArgvRule(t, "worker", "", []string{"sh", "-ce", "echo ok"}, "ls")
+	if p.rule != "" {
+		t.Fatalf("glued -c + benign stdin must pass, got %s (%s)", p.rule, p.detail)
+	}
+	if p.execStdin != "ls" {
+		t.Fatalf("glued -c stdin must never be rewritten, got %q", p.execStdin)
+	}
+}
+
+// TestT_GATEHEAD1_CtxmodeOptionZone covers the screenCtxmodeGateHead
+// contract: a dynamic word anywhere in the option zone fails closed,
+// --hc-gate spellings fail closed, while known global options with
+// single-word values and the subcommand's own operands stay free.
+func TestT_GATEHEAD1_CtxmodeOptionZone(t *testing.T) {
+	// Blocks (worker): dynamic option-zone words and raw --hc-gate.
+	for _, cmd := range []string{
+		`a=--hc-gate; ctxmode "$a" send t42 hi`,
+		`ctxmode "$@"`,
+		`ctxmode -"$x" search`,
+		`ctxmode --workdir "$@" search`,
+		`ctxmode --workdir="$@" search`,
+		`ctxmode --hc-gate send t42 hi`,
+		`ctxmode --hc-gate=x send t42 hi`,
+	} {
+		if rule, detail := rtCmdRule("worker", "", cmd, ""); rule == "" {
+			t.Errorf("worker %q: got ALLOW, want block", cmd)
+			_ = detail
+		}
+	}
+	// Allows (worker): subcommand operands are free, and single-word
+	// dynamic option values (quoted $PWD) are fine.
+	for _, cmd := range []string{
+		`ctxmode search --hc-gate`,
+		`ctxmode search "$q"`,
+		`ctxmode --workdir="$PWD" search`,
+		`ctxmode --workdir "$PWD" search`,
+		`ctxmode --workdir="$PWD/sub" index`,
+	} {
+		if rule, detail := rtCmdRule("worker", "", cmd, ""); rule != "" {
+			t.Errorf("worker %q: got BLOCK %s: %s, want ALLOW", cmd, rule, detail)
+		}
+	}
+}
+
+// TestT_VERIFIER1_VerifierGateRows covers the verifier-facing rows: a
+// verifier is a read-only-but-not-strict caller — it may still deliver a
+// dynamic hc send through the gate, a raw --hc-gate stays blocked, and
+// env -S / ${x:-$@} spellings keep their verdicts.
+func TestT_VERIFIER1_VerifierGateRows(t *testing.T) {
+	// Positive: verifier dynamic send through prepare → --hc-gate.
+	p := prepRule("verifier", "", `hc send t42 "v: $(cat /tmp/r.txt)"`)
+	if p.rule != "" {
+		t.Fatalf("verifier dynamic send must be allowed via rewrite, got %s (%s)", p.rule, p.detail)
+	}
+	if !strings.Contains(p.execCode, "--hc-gate") {
+		t.Fatalf("verifier dynamic send missing --hc-gate: %q", p.execCode)
+	}
+
+	// Raw literal --hc-gate: never authorized.
+	if rule, _ := rtCmdRule("verifier", "", `ctxmode --hc-gate send t42 hi`, ""); rule == "" {
+		t.Error("verifier raw --hc-gate must block")
+	}
+
+	// env -S payload: provenance surrendered — a dynamic hc send behind it
+	// must block.
+	if rule, _ := rtCmdRule("verifier", "", `env -S 'hc send t42 "$(cat r)"'`, ""); rule == "" {
+		t.Error("verifier env -S dynamic send must block")
+	}
+
+	// ${x:-@} data default stays free; a real $@ split inside the default
+	// fails closed.
+	prep := prepRule("verifier", "", `hc send t42 "${x:-@}"`)
+	if prep.rule != "" {
+		t.Fatalf("verifier ${x:-@} must allow (literal @), got %s (%s)", prep.rule, prep.detail)
+	}
+	prep = prepRule("verifier", "", `hc send t42 "${x:-${y:-$@}}"`)
+	if prep.rule == "" {
+		t.Error("verifier nested ${x:-${y:-$@}} must block")
+	}
+}
+
+// TestT_PIN1_ShimAndFakeHcPins covers the selection-stage pin behaviour:
+// a PATH dir with NO hc entry is skipped normally (mise/pnpm compat), but
+// a dir WITH an hc entry outside the pinned home fails immediately.
+func TestT_PIN1_ShimAndFakeHcPins(t *testing.T) {
+	home := withTestTrustedHome(t)
+	binDir := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stub := buildHcStub(t, binDir)
+	logPath := filepath.Join(home, "captured.jsonl")
+	restore := withIsolatedHcPath(t, stub, logPath)
+	defer restore()
+
+	// An empty shim dir BEFORE the pinned dir is skipped (no hc entry).
+	shimDir := t.TempDir()
+	oldPath := os.Getenv("PATH")
+	os.Setenv("PATH", shimDir+string(os.PathListSeparator)+oldPath)
+	defer os.Setenv("PATH", oldPath)
+	got, err := findTrustedHcExecutable()
+	if err != nil || got == "" {
+		t.Fatalf("empty shim dir must be skipped, got %q err %v", got, err)
+	}
+
+	// A fake hc in a dir OUTSIDE the pinned home is an immediate failure.
+	fakeDir := t.TempDir()
+	fakeHc := filepath.Join(fakeDir, "hc")
+	if err := os.WriteFile(fakeHc, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.Setenv("PATH", fakeDir+string(os.PathListSeparator)+oldPath)
+	if _, err := findTrustedHcExecutable(); err == nil {
+		t.Fatal("fake hc outside pinned home must fail the selection stage")
+	}
+}

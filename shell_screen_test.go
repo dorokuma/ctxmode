@@ -176,3 +176,90 @@ func TestExecuteBatchSerial_BlockDoesNotCascade(t *testing.T) {
 		t.Fatalf("sibling 2 should not be blocked by sibling 1, got %+v", results[2])
 	}
 }
+
+// TestExecuteBatch_ZeroFallback pins the three zero-fallback invariants on
+// BOTH the serial and the concurrent runner:
+//
+//  1. preps == nil → every command reports ExitCode -1 and never spawns;
+//  2. len(preps) < len(commands) → every index without an artifact reports
+//     -1 (a present artifact for an earlier index must not rescue it);
+//  3. a prepared artifact whose execCode is "" is a LEGAL prepared result
+//     (comment-only / empty script): the runner executes exactly that
+//     prepared text — it must NOT fall back to the raw cmd.Command, so
+//     ExitCode == 0, Success == true and the raw string's marker never
+//     reaches the output.
+func TestExecuteBatch_ZeroFallback(t *testing.T) {
+	sentinel := "echo SHOULD_NOT_RUN"
+
+	type runner struct {
+		name string
+		run  func(s *server, ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, runID string, results []batchResult, preps []preparedShell)
+	}
+	runners := []runner{
+		{"serial", func(s *server, ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, runID string, results []batchResult, preps []preparedShell) {
+			s.executeBatchSerial(ctx, commands, cwd, timeout, runID, results, preps)
+		}},
+		{"concurrent", func(s *server, ctx context.Context, commands []batchCommand, cwd string, timeout time.Duration, runID string, results []batchResult, preps []preparedShell) {
+			s.executeBatchConcurrent(ctx, commands, cwd, timeout, 2, runID, results, preps)
+		}},
+	}
+
+	for _, r := range runners {
+		t.Run(r.name+"/nil-preps", func(t *testing.T) {
+			s := &server{}
+			commands := []batchCommand{
+				{Label: "a", Command: sentinel},
+				{Label: "b", Command: sentinel},
+			}
+			results := make([]batchResult, len(commands))
+			r.run(s, context.Background(), commands, "/tmp", 10*time.Second, "zf-nil", results, nil)
+			for i, res := range results {
+				if res.ExitCode != -1 || res.Success {
+					t.Fatalf("command %d: ExitCode=%d Success=%v, want -1/false (no artifact must never run)", i, res.ExitCode, res.Success)
+				}
+				if strings.Contains(res.Error, "SHOULD_NOT_RUN") {
+					t.Fatalf("command %d ran the raw command: %+v", i, res)
+				}
+			}
+		})
+
+		t.Run(r.name+"/short-preps", func(t *testing.T) {
+			s := &server{}
+			commands := []batchCommand{
+				{Label: "a", Command: sentinel},
+				{Label: "b", Command: sentinel},
+				{Label: "c", Command: sentinel},
+			}
+			// Only index 0 gets an artifact: the two uncovered indices must
+			// fail closed — a present artifact must not slide sideways.
+			preps := []preparedShell{
+				{rawCode: "echo covered", execCode: "echo covered"},
+			}
+			results := make([]batchResult, len(commands))
+			r.run(s, context.Background(), commands, "/tmp", 10*time.Second, "zf-short", results, preps)
+			if results[0].ExitCode != 0 || !results[0].Success {
+				t.Fatalf("covered command: %+v, want success", results[0])
+			}
+			for i := 1; i < len(results); i++ {
+				if results[i].ExitCode != -1 || results[i].Success {
+					t.Fatalf("uncovered command %d: %+v, want -1/false", i, results[i])
+				}
+			}
+		})
+
+		t.Run(r.name+"/empty-execCode", func(t *testing.T) {
+			s := &server{}
+			commands := []batchCommand{{Label: "a", Command: sentinel}}
+			preps := []preparedShell{{rawCode: commands[0].Command, execCode: ""}}
+			results := make([]batchResult, len(commands))
+			r.run(s, context.Background(), commands, "/tmp", 10*time.Second, "zf-empty", results, preps)
+			res := results[0]
+			if res.ExitCode != 0 || !res.Success {
+				t.Fatalf("empty execCode must run as an empty script (exit 0), got %+v", res)
+			}
+			if strings.Contains(res.Error, "SHOULD_NOT_RUN") || res.Size > 0 {
+				t.Fatalf("raw command text must never execute: %+v", res)
+			}
+		})
+	}
+}

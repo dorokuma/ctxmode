@@ -112,26 +112,6 @@ func (p *hcGateProvenance) innerProvAt(code string, scriptWord *syntax.Word, dec
 	return nil
 }
 
-// innerProvMatching returns the child provenance for the ONE Type-B script
-// word of this buffer whose span AND decoded text match the recorded rewrite.
-// Words are located by scanning the parallel argWords slice, but a match
-// requires the recorded [lo,hi) span plus the exact decoded text, so a second
-// word carrying the same text can never inherit provenance.
-func (p *hcGateProvenance) innerProvMatching(code string, argWords []*syntax.Word, decodedText string) *hcGateProvenance {
-	if p == nil || p.code != code || decodedText == "" {
-		return nil
-	}
-	for _, w := range argWords {
-		if w == nil {
-			continue
-		}
-		if prov := p.innerProvAt(code, w, decodedText); prov != nil {
-			return prov
-		}
-	}
-	return nil
-}
-
 // shellSingleQuote wraps s in POSIX single quotes suitable for /bin/sh.
 func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
@@ -894,32 +874,21 @@ func collectInnerShellScriptEdit(seg shellSegment, selfExe string, envTaint map[
 	}
 	// Locate the script Word with the SAME option walk unwrapShellArgv uses
 	// (--rcfile/--init-file/-o/+o/-O/+O), so review and synthesis never pick
-	// different -c slots.
+	// different -c slots. A glued slot (-cCODE / -ce / -co errexit) or a
+	// non-literal script word is never rewritten as a substring: the argv
+	// stays untouched and the ordinary guard (guardCtxRunArgv via
+	// unwrapShellArgv / guardPreparedShell) judges the decoded text under
+	// the full rules — no partial pre-scan can stand in for that screen.
 	scriptRel, _, glued, slotOK := locateShellCSlot(head)
-	if glued {
-		// -cCODE / -ce / -co errexit: the script is not a standalone argv word.
-		// Fail closed only when the decoded text carries a dynamic hc send;
-		// otherwise leave the argv alone (no false kill of `sh -cecho ok`).
-		if shellTextHasDynamicHc(text) {
-			return nil, ruleSubagentNestedAgent, "hc send"
-		}
-		return nil, "", ""
-	}
-	if !slotOK || scriptRel < 0 {
+	if glued || !slotOK || scriptRel < 0 {
 		return nil, "", ""
 	}
 	absIdx := headIdx + scriptRel
 	if absIdx < 0 || absIdx >= len(seg.argWords) || seg.argWords[absIdx] == nil {
-		if shellTextHasDynamicHc(text) {
-			return nil, ruleSubagentNestedAgent, "hc send"
-		}
 		return nil, "", ""
 	}
 	scriptWord := seg.argWords[absIdx]
 	if !wordIsStaticLiteral(scriptWord) {
-		if shellTextHasDynamicHc(text) {
-			return nil, ruleSubagentNestedAgent, "hc send"
-		}
 		return nil, "", ""
 	}
 	bashANSI := hcShellDialectBash(head[0], envAs.effectivePATHFrom(os.Getenv("PATH")))
@@ -947,22 +916,6 @@ func collectInnerShellScriptEdit(seg shellSegment, selfExe string, envTaint map[
 		innerText: innerRewritten,
 		innerProv: innerProv,
 	}, "", ""
-}
-
-func shellTextHasDynamicHc(code string) bool {
-	segs, ok := parseSubagentShellASTEnv(code, 0, false, false, nil)
-	if !ok {
-		segs, _ = parseSubagentShellASTEnv(code, 0, false, true, nil)
-	}
-	for _, seg := range segs {
-		head, _, _, _ := peelWrappers(seg.argv)
-		for _, b := range headBaseAliasHits(head, os.Getenv("PATH")) {
-			if (b == "hc" || b == "herdr-core") && len(head) >= 4 && head[1] == "send" && isDynamicArg(head[len(head)-1]) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // hcRewritableHcHead reports whether a NON-strict (worker/verifier) caller's
@@ -1147,27 +1100,131 @@ func (g guardCall) prepareCtxRunShellWithTaint(code string, envTaint map[string]
 
 // prepareCtxRunShellEnv is prepareCtxRunShell under the env overrides peeled
 // from the calling argv (HOME=/x sh): the payload's env taint must match the
-// environment the child really gets.
+// environment the child really gets. The same envAs is carried into the
+// final guardPreparedShellEnv pass so caller.pathEnv / envTaint reflect the
+// exact env the rewritten payload will run under (a peeled PATH= must drive
+// alias resolution inside the payload too).
 func (g guardCall) prepareCtxRunShellEnv(code string, envAs envAssignments) preparedShell {
-	return g.prepareCtxRunShellWithTaint(code, envAs.taintedSentinelNames())
+	out := preparedShell{rawCode: code, execStdin: ""}
+	if !g.subagent && !g.strictReadonly {
+		out.execCode = code
+		return out
+	}
+	selfExe, _, selfErr := resolvedSelfExe()
+	envTaint := envAs.taintedSentinelNames()
+	edits, rule, detail := collectHcGateEdits(code, selfExe, envTaint, false, g.strictReadonly)
+	if rule != "" {
+		out.rule, out.detail = rule, detail
+		return out
+	}
+	if len(edits) > 0 && (selfErr != nil || selfExe == "") {
+		out.rule = ruleSubagentNestedAgent
+		out.detail = "hc send (self exe unresolved)"
+		return out
+	}
+	execCode := code
+	var prov *hcGateProvenance
+	if len(edits) > 0 {
+		var err error
+		execCode, prov, err = applyHcGateEdits(code, edits)
+		if err != nil {
+			out.rule = ruleSubagentNestedAgent
+			out.detail = "hc rewrite"
+			return out
+		}
+	}
+	// Screen the prepared text once, under the seeded env AND the minted
+	// provenance. Screening the rewritten buffer a second time through a
+	// pure-check entry (guardCtxRunStdin*) would re-enter
+	// screenCtxmodeGateHead with hcProv == nil and self-block every legal
+	// prepared `<selfExe> --hc-gate` call (the stdin rewrite self-lock).
+	if rule, detail := g.guardPreparedShellEnv(execCode, envAs, nil, prov); rule != "" {
+		out.rule, out.detail = rule, detail
+		return out
+	}
+	out.execCode = execCode
+	return out
 }
 
 // stdinSingleShellTarget reports whether every stdin-reading target of the
-// command is a LOCAL shell (lang == "") and the command is not an SSH tunnel.
-// Only then may the stdin payload be prepared as shell text: jq/cat/git apply
-// read DATA, python3 -/node - read their own language, and ssh forwards the
-// stream to a REMOTE program — rewriting any of those into a local
-// `<selfExe> --hc-gate` call would turn data into a host-local send.
+// command is a LOCAL shell (lang == "", remote == false) and the command is
+// not an SSH tunnel. Only then may the stdin payload be prepared as shell
+// text: jq/cat/git apply read DATA, python3 -/node - read their own
+// language, and ssh forwards the stream to a REMOTE program — rewriting any
+// of those into a local `<selfExe> --hc-gate` call would turn data into a
+// host-local send. A remote target arriving through a `bash -c 'ssh host sh'`
+// unwrap carries remote: true and must likewise stay data.
 func stdinSingleShellTarget(targets []stdinTarget, sshTunnel bool) (envAssignments, bool) {
 	if sshTunnel || len(targets) == 0 {
 		return envAssignments{}, false
 	}
 	out := envAssignments{}
 	for _, t := range targets {
-		if t.lang != "" {
+		if t.lang != "" || t.remote {
 			return envAssignments{}, false
 		}
 		out = out.merged(t.envAs)
+	}
+	return out, true
+}
+
+// scriptAllowsLocalShellStdinPrepare reports whether a shell command string
+// permits stdin to be prepared as shell text, returning the merged env
+// overrides of every stdin-reading target. Every segment that could touch
+// the shared stdin stream must resolve to local shell heads; a data consumer
+// (jq ., cat), a foreign-language interpreter, an ssh tunnel (including one
+// nested inside `bash -c 'ssh host sh'`), a glued -c script or an unparsed
+// segment all refuse the rewrite — the stream then stays data and the
+// caller screens it with guardCtxRunStdin / guardCtxRunStdinForCommand.
+// Segments that never see the stream (pipe-fed, redirect-fed, heredoc /
+// here-string fed, empty or pure-assignment commands) are skipped.
+func scriptAllowsLocalShellStdinPrepare(code string, bash bool, outerEnv envAssignments, basePath string) (envAssignments, bool) {
+	var segs []shellSegment
+	if bash {
+		segs = splitShellSegmentsBash(code)
+	} else {
+		segs = splitShellSegments(code)
+	}
+	sawTarget := false
+	out := envAssignments{}
+	for _, seg := range segs {
+		if seg.depthExceeded || seg.parseErr != "" {
+			return envAssignments{}, false
+		}
+		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
+			continue
+		}
+		// Pure-assignment / no-op segments consume no stdin; a segment whose
+		// head does not survive the wrapper peel is left to the caller's
+		// guard pass (which fails closed on the same condition).
+		if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv); len(peeledHead) == 0 {
+			continue
+		}
+		// A nested shell -c whose slot walk cannot pin a clean script word
+		// (glued -cCODE / -ce / -co, or an unlocatable slot) has an ambiguous
+		// script/option boundary: refuse the rewrite and let the caller's
+		// guard pass judge the argv verbatim.
+		if _, hasC := unwrapShellArgv(seg.argv); hasC {
+			if _, _, glued, slotOK := locateShellCSlot(seg.argv); glued || !slotOK {
+				return envAssignments{}, false
+			}
+		}
+		targets := stdinProgramTargetsWithEnv(seg.argv, 0, outerEnv, basePath)
+		if len(targets) == 0 {
+			// A plain data consumer (jq ., cat, git apply) reads the stream as
+			// DATA: rewriting it into `<selfExe> --hc-gate` would turn payload
+			// bytes into a host-local send.
+			return envAssignments{}, false
+		}
+		sawTarget = true
+		ea, ok := stdinSingleShellTarget(targets, sshTunnelsStdinProgram(seg.argv, out.effectivePATHFrom(basePath)))
+		if !ok {
+			return envAssignments{}, false
+		}
+		out = out.merged(ea)
+	}
+	if !sawTarget {
+		return envAssignments{}, false
 	}
 	return out, true
 }
@@ -1181,47 +1238,24 @@ func (g guardCall) prepareCtxRunShellAndStdin(command, stdin string) preparedShe
 	if prep.rule != "" || stdin == "" {
 		return prep
 	}
-	// stdin is only prepared when EVERY stdin target of the prepared command
-	// is a local shell reading its PROGRAM from this stream. Otherwise the
-	// payload stays data and is screened by the real language / remote rules.
-	sawTarget := false
-	allShellPrograms := true
-	var envAs envAssignments
-	for _, seg := range splitShellSegments(prep.execCode) {
-		if seg.depthExceeded || seg.parseErr != "" {
-			allShellPrograms = false
-			break
-		}
-		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
-			continue
-		}
-		targets := stdinProgramTargetsWithEnv(seg.argv, 0, envAssignments{}, os.Getenv("PATH"))
-		if len(targets) == 0 {
-			continue
-		}
-		sawTarget = true
-		ea, ok := stdinSingleShellTarget(targets, sshTunnelsStdinProgram(seg.argv, os.Getenv("PATH")))
-		if !ok {
-			allShellPrograms = false
-			break
-		}
-		envAs = envAs.merged(ea)
-	}
-	if !sawTarget || !allShellPrograms {
+	// stdin is only prepared when EVERY stdin-touching segment of the
+	// prepared command resolves to a local shell reading its PROGRAM from
+	// this stream. Otherwise the payload stays data and is screened by the
+	// real language / remote rules.
+	envAs, ok := scriptAllowsLocalShellStdinPrepare(prep.execCode, false, envAssignments{}, os.Getenv("PATH"))
+	if !ok {
 		if rule, detail := g.guardCtxRunStdinForCommand(prep.execCode, stdin); rule != "" {
 			prep.rule, prep.detail = rule, detail
 			prep.execCode = ""
 		}
 		return prep
 	}
+	// The rewrite and its single prov-aware guard pass happen inside
+	// prepareCtxRunShellEnv; re-screening the rewritten bytes through a
+	// pure-check stdin guard would self-lock on hcProv == nil.
 	sp := g.prepareCtxRunShellEnv(stdin, envAs)
 	if sp.rule != "" {
 		prep.rule, prep.detail = sp.rule, sp.detail
-		prep.execCode = ""
-		return prep
-	}
-	if rule, detail := g.guardCtxRunStdinForCommand(prep.execCode, sp.execCode); rule != "" {
-		prep.rule, prep.detail = rule, detail
 		prep.execCode = ""
 		return prep
 	}
@@ -1240,97 +1274,94 @@ func (g guardCall) prepareCtxRunArgv(argv []string, stdin string) preparedArgv {
 		out.execArgv = append([]string(nil), argv...)
 		return out
 	}
-	// Shell head with a -c script word: rewrite ONLY that word, and only after
-	// the OUTER argv passed the ordinary guard with the script slot replaced by
-	// a static ":" (so no script text is screened twice and no diagnostic
-	// string can ever stand in for authorization).
+	// Shell head with a CLEAN -c script word (never glued): rewrite ONLY
+	// that word, and only after the OUTER argv passed the ordinary guard
+	// with the script slot replaced by a static ":" (so no script text is
+	// screened twice and no diagnostic string can ever stand in for
+	// authorization). A glued -c (-cCODE / -ce / -co errexit) or a missing
+	// slot is NOT a clean rewritable word: it falls through to the plain
+	// branch, which screens argv + stdin and never rewrites stdin.
 	if _, has := unwrapShellArgv(argv); has {
 		scriptIdx, rawScript, glued, slotOK := locateShellCSlot(argv)
-		if glued {
-			// -cCODE / -ce / -co errexit: not a clean script word. Fail closed
-			// only when the decoded text hides a dynamic hc send; otherwise
-			// leave the argv untouched for the ordinary guard (no false kill
-			// of `sh -cecho ok`).
-			if shellTextHasDynamicHc(rawScript) {
-				out.rule, out.detail = ruleSubagentNestedAgent, "hc send"
-			}
-			return out
-		}
-		if !slotOK || scriptIdx < 0 || scriptIdx >= len(argv) {
-			if rule, detail := g.guardCtxRunArgv(argv); rule != "" {
+		if !glued && slotOK && scriptIdx >= 0 && scriptIdx < len(argv) {
+			outerCheck := append([]string(nil), argv...)
+			outerCheck[scriptIdx] = ":"
+			if rule, detail := g.guardCtxRunArgv(outerCheck); rule != "" {
 				out.rule, out.detail = rule, detail
 				return out
 			}
-			out.execArgv = append([]string(nil), argv...)
-			return out
-		}
-		outerCheck := append([]string(nil), argv...)
-		outerCheck[scriptIdx] = ":"
-		if rule, detail := g.guardCtxRunArgv(outerCheck); rule != "" {
-			out.rule, out.detail = rule, detail
-			return out
-		}
-		// The outer env prefix taints the payload, and the resolved dialect
-		// (sh -> bash) decides $'...' acceptance.
-		_, _, _, envAs, exhausted := peelWrappersWithIndex(argv)
-		if exhausted {
-			out.rule, out.detail = ruleSubagentNestedAgent, "dynamic code payload"
-			return out
-		}
-		innerTaint := envAs.taintedSentinelNames()
-		effPath := envAs.effectivePATHFrom(os.Getenv("PATH"))
-		selfExe, _, selfErr := resolvedSelfExe()
-		edits, rule, detail := collectHcGateEdits(rawScript, selfExe, innerTaint, hcShellDialectBash(argv[0], effPath), g.strictReadonly)
-		if rule != "" {
-			out.rule, out.detail = rule, detail
-			return out
-		}
-		execText := rawScript
-		var prov *hcGateProvenance
-		if len(edits) > 0 {
-			if selfErr != nil || selfExe == "" {
-				out.rule = ruleSubagentNestedAgent
-				out.detail = "hc send (self exe unresolved)"
+			// The outer env prefix taints the payload, and the resolved dialect
+			// (sh -> bash) decides $'...' acceptance.
+			_, _, _, envAs, exhausted := peelWrappersWithIndex(argv)
+			if exhausted {
+				out.rule, out.detail = ruleSubagentNestedAgent, "dynamic code payload"
 				return out
 			}
-			var err error
-			execText, prov, err = applyHcGateEdits(rawScript, edits)
-			if err != nil {
-				out.rule = ruleSubagentNestedAgent
-				out.detail = "hc rewrite"
+			innerTaint := envAs.taintedSentinelNames()
+			effPath := envAs.effectivePATHFrom(os.Getenv("PATH"))
+			selfExe, _, selfErr := resolvedSelfExe()
+			isBash := hcShellDialectBash(argv[0], effPath)
+			edits, rule, detail := collectHcGateEdits(rawScript, selfExe, innerTaint, isBash, g.strictReadonly)
+			if rule != "" {
+				out.rule, out.detail = rule, detail
 				return out
 			}
-		}
-		if rule, detail := g.guardPreparedShell(execText, innerTaint, prov); rule != "" {
-			out.rule, out.detail = rule, detail
-			return out
-		}
-		execArgv := append([]string(nil), argv...)
-		execArgv[scriptIdx] = execText
-		if stdin != "" {
-			// A -c shell reads its program from the script word, not stdin:
-			// stdin is data for the script. Only a real stdin-program target
-			// (none here) could justify a rewrite.
-			targets := stdinProgramTargetsWithEnv(outerCheck, 0, envAssignments{}, os.Getenv("PATH"))
-			if len(targets) > 0 {
-				if envTaint2, ok := stdinSingleShellTarget(targets, sshTunnelsStdinProgram(outerCheck, os.Getenv("PATH"))); ok {
-					sp := g.prepareCtxRunShellEnv(stdin, envTaint2)
+			execText := rawScript
+			var prov *hcGateProvenance
+			if len(edits) > 0 {
+				if selfErr != nil || selfExe == "" {
+					out.rule = ruleSubagentNestedAgent
+					out.detail = "hc send (self exe unresolved)"
+					return out
+				}
+				var err error
+				execText, prov, err = applyHcGateEdits(rawScript, edits)
+				if err != nil {
+					out.rule = ruleSubagentNestedAgent
+					out.detail = "hc rewrite"
+					return out
+				}
+			}
+			if rule, detail := g.guardPreparedShellEnv(execText, envAs, nil, prov); rule != "" {
+				out.rule, out.detail = rule, detail
+				return out
+			}
+			execArgv := append([]string(nil), argv...)
+			execArgv[scriptIdx] = execText
+			if stdin != "" {
+				// stdin may be rewritten into a prepared shell program ONLY
+				// when every segment of the script that could touch the
+				// stream resolves to a local shell head — the outerCheck
+				// argv (script slot = ":") has no stdin-program target, so
+				// the real script text must be segmented under its own
+				// dialect. A data consumer (jq . ; sh), a glued -c or an
+				// ssh tunnel (`bash -c 'ssh host sh'`) leaves the stream as
+				// data and screens it through guardCtxRunStdin on the REAL
+				// execArgv (never the ":"-stubbed outerCheck), which also
+				// escalates strictReadonly for remote targets.
+				if mergedEnvAs, ok := scriptAllowsLocalShellStdinPrepare(execText, isBash, envAs, os.Getenv("PATH")); ok {
+					sp := g.prepareCtxRunShellEnv(stdin, mergedEnvAs)
 					if sp.rule != "" {
 						out.rule, out.detail = sp.rule, sp.detail
 						return out
 					}
 					out.execStdin = sp.execCode
-				} else if rule, detail := g.guardCtxRunStdin(outerCheck, stdin); rule != "" {
+				} else if rule, detail := g.guardCtxRunStdin(execArgv, stdin); rule != "" {
 					out.rule, out.detail = rule, detail
 					return out
 				}
 			}
+			out.execArgv = execArgv
+			return out
 		}
-		out.execArgv = execArgv
-		return out
+		// Glued -c / missing slot: fall through to the plain branch.
 	}
 
-	// No -c script word: plain argv plus optional stdin program.
+	// Plain argv (no clean -c script word) plus optional stdin program. A
+	// glued -c argv lands here too: its stdin is only ever SCREENED, never
+	// rewritten — unwrapShellArgv decodes `sh -ce 'x'` into "e\nx" whose
+	// script/option boundary is ambiguous, so the bytes must stay data and
+	// face guardCtxRunStdin verbatim.
 	if rule, detail := g.guardCtxRunArgv(argv); rule != "" {
 		out.rule, out.detail = rule, detail
 		return out
@@ -1342,10 +1373,6 @@ func (g guardCall) prepareCtxRunArgv(argv []string, stdin string) preparedArgv {
 				sp := g.prepareCtxRunShellEnv(stdin, envAs)
 				if sp.rule != "" {
 					out.rule, out.detail = sp.rule, sp.detail
-					return out
-				}
-				if rule, detail := g.guardCtxRunStdin(argv, sp.execCode); rule != "" {
-					out.rule, out.detail = rule, detail
 					return out
 				}
 				out.execStdin = sp.execCode
@@ -1370,11 +1397,19 @@ func (g guardCall) prepareCtxRunArgv(argv []string, stdin string) preparedArgv {
 // that an `<selfExe> --hc-gate` call was minted by prepare*, never argv shape,
 // SameFile or a diagnostic string. Pure-check callers pass nil.
 func (g guardCall) guardPreparedShell(code string, envTaint map[string]bool, prov *hcGateProvenance) (rule, detail string) {
-	caller := currentCallerIdentity()
+	return g.guardPreparedShellEnv(code, envAssignments{}, envTaint, prov)
+}
+
+// guardPreparedShellEnv is guardPreparedShell under the env ops peeled off
+// the calling argv: the caller identity is seededWith(envAs) so pathEnv and
+// envTaint match the environment the payload will really run under, then
+// extraTaint merges any additional tainted names (execute_file's
+// FILE_CONTENT). This is the ONLY guard that may see hcProv: a pure-check
+// caller has prov == nil and can never mint an allowed `<selfExe> --hc-gate`.
+func (g guardCall) guardPreparedShellEnv(code string, envAs envAssignments, extraTaint map[string]bool, prov *hcGateProvenance) (rule, detail string) {
+	caller := currentCallerIdentity().seededWith(envAs)
 	caller.hcProv = prov
-	if len(envTaint) > 0 {
-		caller.envTaint = mergeEnvTaint(caller.envTaint, envTaint)
-	}
+	caller.envTaint = mergeEnvTaint(caller.envTaint, extraTaint)
 	if g.subagent {
 		if hit := guardShellSubagentDepthEnv(code, 0, caller, caller.envTaint); hit != "" {
 			if hit == "ctxmode index" || hit == roSSHWriteHit {

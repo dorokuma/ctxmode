@@ -63,12 +63,18 @@ trap cleanup EXIT
 
 cat >"$WORK/stub.go" <<'STUB'
 // Recording hc stand-in: appends its argv (JSON) to HC_STUB_LOG and exits 0.
+// The fixed CTXMODE-NS-HC-STANDIN tag is what TestMain's
+// mustVerifyOuterTestIsolation greps for inside every masked
+// hc/herdr-core/sbx path: a path that serves bytes WITHOUT the tag is the
+// real host binary (mask missing) and the gate refuses to run.
 package main
 
 import (
 	"encoding/json"
 	"os"
 )
+
+const standinTag = "CTXMODE-NS-HC-STANDIN"
 
 func main() {
 	path := os.Getenv("HC_STUB_LOG")
@@ -80,7 +86,7 @@ func main() {
 		os.Exit(3)
 	}
 	defer f.Close()
-	_ = json.NewEncoder(f).Encode(os.Args)
+	_ = json.NewEncoder(f).Encode(append([]string{standinTag}, os.Args...))
 }
 STUB
 
@@ -103,13 +109,18 @@ fi
 
 HOST_HC=${NS_HOST_HC:-/root/.local/bin/herdr-core}
 
+# No CTXMODE_TEST_* names are exported into the payload: the outer boundary
+# is kernel state (mount ns + ro stand-in + dropped caps + private /proc),
+# and the only outward escape evidence is the stand-in's own recording log.
+# In-test --hc-gate children still arm their pin through each test's own
+# newHcE2E/withIsolatedHcPath helpers.
 set +e
 "$REPO/scripts/ns-hc-isolate.sh" \
   --standin "$STUB_BIN" \
   --real "$HOST_HC" \
   --stub-log "$STUB_LOG" \
   --note "go test $HEAD_SHA" \
-  -- env CTXMODE_TEST_HC_STUB="$STUB_BIN" HC_STUB_LOG="$STUB_LOG" go "${GO_ARGS[@]}" 2>&1 | tee -a "$LOG"
+  -- env HC_STUB_LOG="$STUB_LOG" go "${GO_ARGS[@]}" 2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
 

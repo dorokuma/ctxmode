@@ -2066,18 +2066,58 @@ func screenCtxmodeGateHead(typedHead []string, seg shellSegment, prov *hcGatePro
 		}
 		return ""
 	}
-	// Option zone before the subcommand: a --hc-gate or any dynamic word could
-	// expand into it at runtime (`a=--hc-gate; ctxmode "$a" send … `).
-	for _, a := range typedHead[1:] {
-		if !strings.HasPrefix(a, "-") {
-			break
+	// Option zone before the subcommand: scan indices 1.. until the first
+	// static non-'-' word (the subcommand). Everything in that zone — a
+	// --hc-gate spelling, a value-carrying global option whose value is not
+	// a single word, or ANY dynamic word (`a=--hc-gate; ctxmode "$a" send …`,
+	// ctxmode "$@", ctxmode -"$x") — fails closed; the subcommand's own
+	// operands (ctxmode search --hc-gate, ctxmode search "$q") stay free.
+	for i := 1; i < len(typedHead); {
+		a := typedHead[i]
+		if a == "--" {
+			// os.Args[1] == "--" can never reach runHcGate.
+			return ""
 		}
-		if a == "--hc-gate" {
+		if a == "--hc-gate" || strings.HasPrefix(a, "--hc-gate=") {
 			return "ctxmode --hc-gate"
+		}
+		if a == "-workdir" || a == "--workdir" || a == "-config" || a == "--config" {
+			// Known value-carrying global option: the next word is its value.
+			// A missing value or a value that can split at runtime fails
+			// closed; --workdir "$PWD" / --workdir "$PWD/x" stays open.
+			if i+1 >= len(typedHead) {
+				return "ctxmode " + a
+			}
+			if !isSingleWordOptionValue(typedHead[i+1]) {
+				return "ctxmode dynamic option"
+			}
+			i += 2
+			continue
+		}
+		if strings.HasPrefix(a, "-workdir=") || strings.HasPrefix(a, "--workdir=") ||
+			strings.HasPrefix(a, "-config=") || strings.HasPrefix(a, "--config=") {
+			val := a[strings.IndexByte(a, '=')+1:]
+			if !isSingleWordOptionValue(val) {
+				return "ctxmode dynamic option"
+			}
+			i++
+			continue
+		}
+		if a == "-h" || a == "--help" || a == "-version" || a == "--version" || a == "-V" {
+			i++
+			continue
 		}
 		if isDynamicArg(a) {
 			return "ctxmode dynamic option"
 		}
+		if strings.HasPrefix(a, "-") {
+			// Unknown static option: keep scanning — a later dynamic word or
+			// --hc-gate still fails closed.
+			i++
+			continue
+		}
+		// First static non-'-' word: the subcommand — its operands are free.
+		return ""
 	}
 	return ""
 }
@@ -3881,9 +3921,17 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			inner := caller.seededWith(envAs)
 			// Provenance crosses a `sh -c` boundary ONLY when the script word is
 			// the exact rewritten Type-B slot of this buffer (same buffer, exact
-			// span, exact decoded text). Any other -c payload keeps nil.
+			// span, exact decoded text). The slot is re-located with the SAME
+			// peel + -c walk prepare* used to mint it, so no other word — even
+			// one carrying identical decoded text — can inherit provenance.
 			if entryProv != nil {
-				inner.hcProv = entryProv.innerProvMatching(seg.srcCode, seg.argWords, text)
+				if _, headIdx, _, _, exhausted := peelWrappersWithIndex(seg.argv); !exhausted && headIdx >= 0 {
+					if scriptRel, _, glued, slotOK := locateShellCSlot(seg.argv[headIdx:]); slotOK && !glued && scriptRel >= 0 {
+						if absIdx := headIdx + scriptRel; absIdx >= 0 && absIdx < len(seg.argWords) {
+							inner.hcProv = entryProv.innerProvAt(seg.srcCode, seg.argWords[absIdx], text)
+						}
+					}
+				}
 			}
 			// The -c payload parses under the RESOLVED shell dialect: a
 			// same-family alias (sh -> bash) keeps its typed base, but the
@@ -4013,7 +4061,9 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return ""
 		}
 		if execMode {
-			return peelResolvedSegDepth(head[k:], seg, kind, depth+1, caller)
+			// watch -x spawns the operand as a process whose fd 0 is the
+			// outer stdin stream: pass the stdin projection only.
+			return peelResolvedSegDepth(head[k:], stdinOnlySeg(seg), kind, depth+1, caller)
 		}
 		text := strings.Join(head[k:], " ")
 		if isDynamicArg(text) {
@@ -4036,7 +4086,8 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return guardShellSubagentDepth(cmdText, depth+1, caller)
 		}
 		if inner < len(head) {
-			return peelResolvedSegDepth(head[inner:], seg, kind, depth+1, caller)
+			// flock fd N command: fd 0 is inherited from the outer stream.
+			return peelResolvedSegDepth(head[inner:], stdinOnlySeg(seg), kind, depth+1, caller)
 		}
 		return ""
 	}
@@ -4121,6 +4172,22 @@ func xargsHasArgFile(xargsOpts []string) bool {
 	return false
 }
 
+// stdinOnlySeg projects a shellSegment onto ONLY its true stdin-source
+// fields: the parts of the enclosing command line that decide where the
+// nested command's fd 0 comes from. argv/argWords/srcCode/gateProvenanced
+// are all zeroed — a derived segment must never inherit the outer
+// command's words (a rewritten `<selfExe> --hc-gate` leaf would otherwise
+// leak its provenance into the child's screen), and redirectFile is an
+// OUTPUT field that says nothing about the child's stdin.
+func stdinOnlySeg(s shellSegment) shellSegment {
+	return shellSegment{
+		pipedStdin:  s.pipedStdin,
+		stdinRedir:  s.stdinRedir,
+		heredocText: s.heredocText,
+		hereString:  s.hereString,
+	}
+}
+
 // xargsDerivedSeg models the shellSegment seen by the target command of
 // xargs: with -a/--arg-file, the child inherits outerSeg's stdin stream;
 // without -a, xargs consumes outerSeg's stdin to build trailing argv tokens
@@ -4130,7 +4197,9 @@ func xargsHasArgFile(xargsOpts []string) bool {
 // words into the remote login shell command string.
 func xargsDerivedSeg(xargsOpts, targetArgv []string, outerSeg shellSegment, pathEnv string) shellSegment {
 	if xargsHasArgFile(xargsOpts) {
-		return outerSeg
+		// The child inherits the outer stdin stream — but only the stdin
+		// facts, never the outer words or their provenance.
+		return stdinOnlySeg(outerSeg)
 	}
 	hasOuterInput := outerSeg.pipedStdin || outerSeg.stdinRedir ||
 		outerSeg.hereString != "" || len(outerSeg.heredocText) > 0
@@ -5621,7 +5690,9 @@ func screenFindArgsSeg(args []string, outerSeg shellSegment, kind byte, depth in
 				}
 				innerSeg := shellSegment{}
 				if a == "-ok" || a == "-okdir" {
-					innerSeg = outerSeg
+					// -ok/-okdir share find's own stdin stream: inherit ONLY
+					// the outer stdin facts, never the outer words.
+					innerSeg = stdinOnlySeg(outerSeg)
 				}
 				if hit := peelResolvedSegDepth(inner, innerSeg, kind, depth, caller); hit != "" {
 					if hit == roSSHWriteHit {
@@ -14663,11 +14734,14 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 	if len(targets) == 0 {
 		return "", ""
 	}
-	gSeg := g
-	if gSeg.readonly && !gSeg.strictReadonly && sshTunnelsStdinProgram(argv, os.Getenv("PATH")) {
-		gSeg.strictReadonly = true
-	}
 	for _, t := range targets {
+		gSeg := g
+		if gSeg.readonly && !gSeg.strictReadonly &&
+			(t.remote || sshTunnelsStdinProgram(argv, os.Getenv("PATH"))) {
+			// The stream leaves this host (ssh forwards it): a
+			// read-only-but-not-strict caller faces the strict screen.
+			gSeg.strictReadonly = true
+		}
 		if t.lang == "" {
 			if r, d := gSeg.guardCtxRunShellEnv(stdin, t.envAs); r != "" {
 				return r, d
@@ -14690,12 +14764,16 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 		return "", ""
 	}
 	for _, seg := range splitShellSegments(command) {
-		if seg.depthExceeded {
+		if seg.depthExceeded || seg.parseErr != "" {
+			detail := seg.parseErr
+			if seg.depthExceeded {
+				detail = depthExceededHit
+			}
 			if g.strictReadonly {
-				return ruleReadonlyWrite, depthExceededHit
+				return ruleReadonlyWrite, detail
 			}
 			if g.subagent {
-				return ruleSubagentNestedAgent, depthExceededHit
+				return ruleSubagentNestedAgent, detail
 			}
 			return "", ""
 		}
@@ -14706,11 +14784,12 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 		if len(targets) == 0 {
 			continue
 		}
-		gSeg := g
-		if gSeg.readonly && !gSeg.strictReadonly && sshTunnelsStdinProgram(seg.argv, os.Getenv("PATH")) {
-			gSeg.strictReadonly = true
-		}
 		for _, t := range targets {
+			gSeg := g
+			if gSeg.readonly && !gSeg.strictReadonly &&
+				(t.remote || sshTunnelsStdinProgram(seg.argv, os.Getenv("PATH"))) {
+				gSeg.strictReadonly = true
+			}
 			if t.lang == "" {
 				if r, d := gSeg.guardCtxRunShellEnv(stdin, t.envAs); r != "" {
 					return r, d
@@ -14910,6 +14989,14 @@ func pythonHasBareOpenIdent(masked string) bool {
 type stdinTarget struct {
 	lang  string
 	envAs envAssignments
+	// remote marks a target whose stdin program runs on a REMOTE host: it
+	// is minted only by the ssh branch below (an ssh remote command that
+	// itself reads a program from stdin) and rides collectSegs up through
+	// any `bash -c 'ssh host sh'` unwrap that peelToSSHHead cannot reach.
+	// Remote bytes must NEVER be rewritten into a local
+	// `<selfExe> --hc-gate` call, and a read-only-but-not-strict caller
+	// screening them escalates to the strict rules.
+	remote bool
 }
 
 func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignments, basePath string) []stdinTarget {
@@ -14966,7 +15053,14 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 		if hit != "" {
 			return nil
 		}
-		return collectSegs(splitShellSegments(remoteCmd), envAssignments{}, os.Getenv("PATH"), true)
+		targets := collectSegs(splitShellSegments(remoteCmd), envAssignments{}, os.Getenv("PATH"), true)
+		// Every target of an ssh remote command runs OFF this host: the
+		// stream is forwarded verbatim, so mark it remote even when the
+		// remote program is a local-shell-shaped head (ssh host sh).
+		for i := range targets {
+			targets[i].remote = true
+		}
+		return targets
 	}
 	if innerText, has := unwrapShellArgv(head); has {
 		if isDynamicArg(innerText) {

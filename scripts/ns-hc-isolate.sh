@@ -9,24 +9,33 @@
 #   never reaches the gate, so the pin cannot stop them. `.profile` /
 #   `.bash_profile` are fixture hygiene, NOT an isolation control. Any test,
 #   contract matrix, negative case or sub-shell that can produce a send must
-#   therefore run under a REAL outer OS boundary: a private mount namespace in
-#   which the host hc/herdr-core inode IS the recording stub.
+#   therefore run under a REAL outer OS boundary: a private mount+PID+net
+#   namespace in which every host hc/herdr-core/sbx inode IS the recording
+#   stand-in, capabilities are dropped, and noNewPrivs is set.
 #
 # WHAT IT DOES
-#   1. Outer: resolves the host hc target, captures host dev:ino, sha256 and a
-#      /proc/self/mounts digest.
-#   2. Enters `unshare -m --propagation private`.
+#   1. Outer: enumerates every hc/herdr-core/sbx entry across the trusted
+#      bin dirs AND the caller's PATH (resolving each through readlink -f),
+#      captures dev:ino + sha256 for the primary --real target and a mounts
+#      digest.
+#   2. Enters `unshare --mount --pid --net --fork --propagation private`.
 #   3. Inner hard assertions (no `|| true`, no fallback):
-#        - inner mount ns != host mount ns
-#        - findmnt -n -o PROPAGATION -T "$HC_REAL" == "private"
-#        - read-only bind of the stand-in ELF over the host hc target
-#        - second PROPAGATION assertion still "private"
-#        - inner dev:ino / sha256 equal the stand-in and differ from the host
-#   4. Runs the caller's command inside that namespace.
-#   5. Outer re-checks host dev:ino, sha256 and the mounts digest are unchanged.
+#        - inner mount ns != host mount ns; inner PID ns has a private /proc
+#          (mount --make-rprivate / ; mount -t proc proc /proc)
+#        - findmnt -n -o PROPAGATION -T <target> == "private" before AND
+#          after every bind
+#        - read-only bind of the stand-in ELF over EVERY enumerated target
+#          (plus its readlink -f resolution, deduplicated)
+#        - a read-only empty tmpfs over the host herdr runtime socket dir
+#          when present
+#        - inner dev:ino / sha256 equal the stand-in and differ from host
+#   4. Drops privileges with setpriv --no-new-privs --inh-caps=-all
+#      --ambient-caps=-all --bounding-set=-all and runs the caller's command.
+#   5. Outer re-checks host dev:ino, sha256 and the mounts digest are
+#      unchanged.
 #
-# STAGE A STATUS: written, syntax-checked (`bash -n`) and NOT executed. Running
-# it requires the parent agent's explicit stage-B approval.
+# STAGE A STATUS: written, syntax-checked (`bash -n`) and NOT executed.
+# Running it requires the parent agent's explicit stage-B approval.
 #
 # Usage:
 #   ns-hc-isolate.sh --standin <stub-elf> [--real <host-hc>] [--stub-log <file>] \
@@ -42,42 +51,101 @@ note() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool missing: $1"; }
 
+# Trusted bin dirs + the caller's PATH: every hc/herdr-core/sbx entry under
+# them (and its readlink -f resolution) must end up masked. Passed to the
+# inner phase as a newline-separated list via NS_TARGETS.
+enumerate_targets() {
+  local dirs d name p resolved
+  declare -A seen=()
+  for d in /root/.local/bin /root/bin /root/.cargo/bin \
+           /root/.local/share/mise/shims \
+           /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    seen[$d]=1
+  done
+  local IFS=':'
+  for d in $PATH; do
+    [[ -n $d && $d == /* ]] && seen[$d]=1
+  done
+  unset IFS
+  for name in hc herdr-core sbx; do
+    for d in "${!seen[@]}"; do
+      p=$d/$name
+      if [[ -e $p && ! -d $p ]]; then
+        printf '%s\n' "$p"
+        resolved=$(readlink -f "$p" 2>/dev/null || true)
+        [[ -n $resolved && $resolved != "$p" ]] && printf '%s\n' "$resolved"
+      fi
+    done
+  done | sort -u
+}
+
 # ---------------------------------------------------------------- inner mode
 if [[ ${1:-} == "--inner" ]]; then
   shift
   [[ $# -ge 1 ]] || die "inner mode needs a command"
-  : "${NS_HC_REAL:?}" "${NS_STANDIN:?}" "${NS_HOST_NS:?}"
-  : "${NS_HOST_DEVID:?}" "${NS_HOST_SHA:?}" "${NS_HOST_MOUNTS:?}"
+  : "${NS_STANDIN:?}" "${NS_HOST_NS:?}"
   : "${NS_STANDIN_DEVID:?}" "${NS_STANDIN_SHA:?}"
+  : "${NS_HOST_DEVID:?}" "${NS_HOST_SHA:?}"
+  : "${NS_TARGETS:?}"
 
   need findmnt
   need mount
   need sha256sum
   need stat
   need readlink
+  need setpriv
 
   inner_ns=$(readlink /proc/self/ns/mnt)
   [[ -n $inner_ns ]] || die "cannot read inner mount namespace"
   [[ $inner_ns != "$NS_HOST_NS" ]] || die "inner mount ns $inner_ns equals host $NS_HOST_NS (unshare did not isolate)"
 
-  prop=$(findmnt -n -o PROPAGATION -T "$NS_HC_REAL") || die "findmnt failed for $NS_HC_REAL"
-  [[ $prop == "private" ]] || die "propagation of $NS_HC_REAL is '$prop', want 'private'"
+  # Private propagation for every mount we inherited, then a fresh private
+  # /proc so /proc/1 is the inner init (the payload), not the host's
+  # systemd/init — that is what TestMain's mustVerifyOuterTestIsolation
+  # asserts.
+  mount --make-rprivate / || die "mount --make-rprivate / failed"
+  mount -t proc proc /proc || die "private /proc mount failed"
 
-  mount --bind "$NS_STANDIN" "$NS_HC_REAL" || die "bind $NS_STANDIN -> $NS_HC_REAL failed"
-  mount -o remount,bind,ro "$NS_HC_REAL" || die "remount,bind,ro $NS_HC_REAL failed"
+  mask_one() {
+    local target=$1 prop inner_devid inner_sha
+    prop=$(findmnt -n -o PROPAGATION -T "$target") || die "findmnt failed for $target"
+    [[ $prop == "private" ]] || die "propagation of $target is '$prop', want 'private'"
 
-  prop=$(findmnt -n -o PROPAGATION -T "$NS_HC_REAL") || die "findmnt failed after remount"
-  [[ $prop == "private" ]] || die "propagation after remount is '$prop', want 'private'"
+    mount --bind "$NS_STANDIN" "$target" || die "bind $NS_STANDIN -> $target failed"
+    mount -o remount,bind,ro "$target" || die "remount,bind,ro $target failed"
 
-  inner_devid=$(stat -c '%d:%i' "$NS_HC_REAL") || die "stat $NS_HC_REAL failed"
-  [[ $inner_devid == "$NS_STANDIN_DEVID" ]] || die "inner hc dev:ino $inner_devid != standin $NS_STANDIN_DEVID"
-  [[ $inner_devid != "$NS_HOST_DEVID" ]] || die "inner hc dev:ino still the host inode $NS_HOST_DEVID"
-  inner_sha=$(sha256sum "$NS_HC_REAL" | cut -d' ' -f1)
-  [[ $inner_sha == "$NS_STANDIN_SHA" ]] || die "inner hc sha256 $inner_sha != standin $NS_STANDIN_SHA"
-  [[ $inner_sha != "$NS_HOST_SHA" ]] || die "inner hc sha256 still the host binary"
+    prop=$(findmnt -n -o PROPAGATION -T "$target") || die "findmnt failed after remount for $target"
+    [[ $prop == "private" ]] || die "propagation after remount is '$prop', want 'private'"
 
-  note "isolated: hc=$NS_HC_REAL sha256=$inner_sha (stand-in), propagation=private"
-  exec "$@"
+    inner_devid=$(stat -c '%d:%i' "$target") || die "stat $target failed"
+    [[ $inner_devid == "$NS_STANDIN_DEVID" ]] || die "inner $target dev:ino $inner_devid != standin $NS_STANDIN_DEVID"
+    [[ $inner_devid != "$NS_HOST_DEVID" ]] || die "inner $target dev:ino still the host inode $NS_HOST_DEVID"
+    inner_sha=$(sha256sum "$target" | cut -d' ' -f1)
+    [[ $inner_sha == "$NS_STANDIN_SHA" ]] || die "inner $target sha256 $inner_sha != standin $NS_STANDIN_SHA"
+    [[ $inner_sha != "$NS_HOST_SHA" ]] || die "inner $target sha256 still the host binary"
+    note "masked: $target -> stand-in (ro, private)"
+  }
+
+  # Bind the read-only stand-in over EVERY enumerated hc/herdr-core/sbx
+  # path (already resolved + deduplicated by the outer phase).
+  while IFS= read -r target; do
+    [[ -n $target ]] || continue
+    [[ -e $target ]] || die "enumerated target vanished inside ns: $target"
+    mask_one "$target"
+  done <<< "$NS_TARGETS"
+
+  # Seal the host herdr runtime socket directory (if it exists): a test
+  # child must never reach a running host herdr-core through its socket.
+  for sockdir in /root/.local/state/herdr /root/.local/run/herdr /run/herdr-core; do
+    if [[ -d $sockdir ]]; then
+      mount -t tmpfs -o ro,nosuid,nodev tmpfs "$sockdir" || die "tmpfs mask of $sockdir failed"
+      note "masked socket dir: $sockdir (ro tmpfs)"
+    fi
+  done
+
+  note "isolated: ${#@} payload word(s), all targets masked, propagation=private"
+  # Full privilege drop: no-new-privs + zeroed capability sets, then exec.
+  exec setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- "$@"
 fi
 
 # ---------------------------------------------------------------- outer mode
@@ -89,7 +157,7 @@ while [[ $# -gt 0 ]]; do
     --stub-log) STUB_LOG=${2:?}; shift 2 ;;
     --note)    NOTE=${2:?}; shift 2 ;;
     --) shift; break ;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -124,6 +192,20 @@ standin_sha=$(sha256sum "$STANDIN" | cut -d' ' -f1)
 [[ $standin_devid != "$host_devid" ]] || die "stand-in IS the host hc inode"
 [[ $standin_sha != "$host_sha" ]] || die "stand-in IS the host hc binary"
 
+# The enumeration runs on the HOST (the mount table the payload would see
+# unmasked). Every line is masked inside the namespace.
+mapfile -t NS_TARGET_LIST < <(enumerate_targets)
+((${#NS_TARGET_LIST[@]} > 0)) || die "no hc/herdr-core/sbx targets enumerated on host PATH/trusted dirs"
+# The --real resolution must be in the set (it always is via
+# /root/.local/bin, but keep the invariant explicit).
+found_real=0
+for t in "${NS_TARGET_LIST[@]}"; do
+  [[ $t == "$REAL_HC" ]] && found_real=1
+done
+[[ $found_real -eq 1 ]] || NS_TARGET_LIST+=("$REAL_HC")
+NS_TARGETS=$(printf '%s\n' "${NS_TARGET_LIST[@]}")
+printf '%s\n' "$NS_TARGETS" | sed 's/^/  target: /' >&2
+
 if [[ -n $STUB_LOG ]]; then
   mkdir -p "$(dirname "$STUB_LOG")" || die "cannot create stub log dir"
   : >"$STUB_LOG" || die "cannot truncate stub log $STUB_LOG"
@@ -133,12 +215,13 @@ fi
 note "host hc $REAL_HC dev:ino=$host_devid sha256=$host_sha"
 note "stand-in  $STANDIN dev:ino=$standin_devid sha256=$standin_sha"
 
-export NS_HC_REAL=$REAL_HC NS_STANDIN=$STANDIN NS_HOST_NS=$host_ns
-export NS_HOST_DEVID=$host_devid NS_HOST_SHA=$host_sha NS_HOST_MOUNTS=$host_mounts
+export NS_STANDIN=$STANDIN NS_HOST_NS=$host_ns
+export NS_HOST_DEVID=$host_devid NS_HOST_SHA=$host_sha
 export NS_STANDIN_DEVID=$standin_devid NS_STANDIN_SHA=$standin_sha
+export NS_TARGETS
 
 set +e
-unshare -m --propagation private -- "$0" --inner "$@"
+unshare --mount --pid --net --fork --propagation private -- "$0" --inner "$@"
 rc=$?
 set -e
 

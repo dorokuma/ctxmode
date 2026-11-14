@@ -71,16 +71,6 @@ func newHcE2E(t *testing.T) *hcE2EEnv {
 	e.stubBin = buildHcStub(t, e.binDir)
 	e.logPath = filepath.Join(e.home, "captured.jsonl")
 	e.restore = withIsolatedHcPath(t, e.stubBin, e.logPath)
-	// Pin the fake home for --hc-gate CHILD PROCESSES of the test binary:
-	// a spawned `ctxmode.test --hc-gate …` re-runs TestMain in a fresh
-	// process where the package-level testTrustedHomeRoot is empty, and
-	// without this pin the fake home under /tmp is classified as scratch,
-	// the stub is untrusted and findTrustedHcExecutable falls through to
-	// the real hc on PATH (a REAL send — must never happen in a test).
-	if err := os.Setenv("CTXMODE_TEST_TRUSTED_HOME", e.home); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.Unsetenv("CTXMODE_TEST_TRUSTED_HOME") })
 	// bash -l / sh -l (login shells) re-read /etc/profile and reset PATH,
 	// which would drop the stub dir and let the inner --hc-gate fall through to
 	// the REAL hc. Prepend the stub dir via the fake home's .bash_profile AND
