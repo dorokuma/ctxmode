@@ -522,16 +522,31 @@ func syntaxNewWord(t *testing.T, word string) *syntax.Word {
 // artifact (never executes it).
 func prepArgvRule(t *testing.T, role, ro string, argv []string, stdin string) preparedArgv {
 	t.Helper()
+	prevRole := os.Getenv("CTXMODE_ROLE")
+	prevRO := os.Getenv("CTXMODE_READONLY")
 	os.Setenv("CTXMODE_ROLE", role)
 	os.Setenv("CTXMODE_READONLY", ro)
-	defer os.Unsetenv("CTXMODE_ROLE")
-	defer os.Unsetenv("CTXMODE_READONLY")
+	defer restoreHcTestEnv("CTXMODE_ROLE", prevRole)
+	defer restoreHcTestEnv("CTXMODE_READONLY", prevRO)
 	return currentGuardCall().prepareCtxRunArgv(argv, stdin)
+}
+
+// prepShellStdinRule runs prepareCtxRunShellAndStdin under a role and returns
+// the prepared artifact (never executes it).
+func prepShellStdinRule(t *testing.T, role, ro, cmd, stdin string) preparedShell {
+	t.Helper()
+	prevRole := os.Getenv("CTXMODE_ROLE")
+	prevRO := os.Getenv("CTXMODE_READONLY")
+	os.Setenv("CTXMODE_ROLE", role)
+	os.Setenv("CTXMODE_READONLY", ro)
+	defer restoreHcTestEnv("CTXMODE_ROLE", prevRole)
+	defer restoreHcTestEnv("CTXMODE_READONLY", prevRO)
+	return currentGuardCall().prepareCtxRunShellAndStdin(cmd, stdin)
 }
 
 // TestT_STDIN1_RewrittenStdinNoSelfLock pins 1114E §3.1 finding ①: a
 // `hc send` payload arriving on stdin must be REWRITTEN to `<selfExe>
-// --hc-gate` and pass the prov-aware guard inside prepareCtxRunShellEnv —
+// --hc-gate` and pass the prov-aware guard inside prepareCtxRunShellTargets —
 // the rewritten bytes must never re-enter a pure-check stdin guard
 // (hcProv == nil would self-block every legal send).
 func TestT_STDIN1_RewrittenStdinNoSelfLock(t *testing.T) {
@@ -644,14 +659,14 @@ func TestT_STDIN2_CScripStdinMatrix(t *testing.T) {
 	// shell stdin targets whose PATH= prefixes differ must EACH be screened
 	// under its own env — a merged replay ends with the LAST PATH= and the
 	// first target's alias view would escape audit. Plant a blocked-agent
-	// alias (myrunner -> claude) under the trusted <home>/.local/bin: the
+	// alias (myrunner -> pig) under the trusted <home>/.local/bin: the
 	// first segment resolves `myrunner` in $binDir (blocked name), the
 	// second resolves it in /usr/bin (harmless script). Only the per-target
 	// guardPreparedShellEnv pass sees the $binDir view.
 	home := withTestTrustedHome(t)
 	binDir := filepath.Join(home, ".local", "bin")
-	writeTestExecutable(t, filepath.Join(binDir, "claude"), 0o755)
-	if err := os.Symlink(filepath.Join(binDir, "claude"), filepath.Join(binDir, "myrunner")); err != nil {
+	writeTestExecutable(t, filepath.Join(binDir, "pig"), 0o755)
+	if err := os.Symlink(filepath.Join(binDir, "pig"), filepath.Join(binDir, "myrunner")); err != nil {
 		t.Fatal(err)
 	}
 	multiPath := fmt.Sprintf("PATH=%s:/usr/bin:/bin sh ; PATH=/usr/bin:/bin sh", binDir)
@@ -660,7 +675,7 @@ func TestT_STDIN2_CScripStdinMatrix(t *testing.T) {
 		t.Fatalf("multi-target PATH=%s:/usr/bin:/bin + stdin 'myrunner' must block (per-target PATH audit), got ALLOW stdin=%q", binDir, p.execStdin)
 	}
 	// Same shape through the Command-string entry.
-	sp = currentGuardCall().prepareCtxRunShellAndStdin(multiPath, "myrunner")
+	sp = prepShellStdinRule(t, "worker", "", multiPath, "myrunner")
 	if sp.rule == "" {
 		t.Fatalf("Command multi-target PATH= + stdin 'myrunner' must block (per-target PATH audit), got ALLOW stdin=%q", sp.execStdin)
 	}
