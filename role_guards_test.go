@@ -3531,3 +3531,199 @@ func TestGuard_SedTruncatedScriptsNoPanic(t *testing.T) {
 		t.Fatalf("sedExecCommands(s/.*/pig/e) = %v, want [pig]", got)
 	}
 }
+
+// ---------- claude-family blacklist + dispatch-report/env-hook hardening ----------
+
+// TestGuard_ClaudeAgentBlacklist covers the claude/codex nested-agent
+// names: bare heads, absolute paths, env wrappers and the len>=5
+// prefix-derivative spellings (claude-code, claude-pty, claude.x) all
+// block for a sub-agent caller, while short-stem look-alikes stay free.
+func TestGuard_ClaudeAgentBlacklist(t *testing.T) {
+	t.Setenv(auditEnvRole, "worker")
+	t.Setenv(auditEnvReadonly, "")
+
+	blockArgv := [][]string{
+		{"claude"},
+		{"claude", "chat"},
+		{"claude-code"},
+		{"claude-pty"},
+		{"codex"},
+		{"codex", "exec", "ls"},
+		{"claude-x.y"},          // stem. derivative
+		{"claude-extra-tool"},   // stem- derivative
+		{"dispatch-agent-lite"}, // long-stem derivative still blocked
+		{"env", "FOO=1", "claude"},
+		{"/usr/local/bin/claude-code"},
+	}
+	for _, argv := range blockArgv {
+		if got := guardArgvSubagent(argv); got == "" {
+			t.Fatalf("guardArgvSubagent(%v) = allow, want block", argv)
+		}
+	}
+	blockShell := []string{
+		"claude",
+		"claude-code --version",
+		"cd /tmp && codex exec ls",
+		"sh -c 'claude-pty'",
+		"echo x | agy; claude",
+	}
+	for _, code := range blockShell {
+		if got := guardShellSubagent(code); got == "" {
+			t.Fatalf("guardShellSubagent(%q) = allow, want block", code)
+		}
+	}
+	// Code-side: unresolved spawn naming claude/codex/claude-code hits.
+	sub := guardCall{subagent: true}
+	for _, code := range []string{
+		"import subprocess; subprocess.run(cmd)  # claude",
+		"import os; os.system(x)  # codex exec",
+		"import subprocess; subprocess.run(['claude-code'])",
+		"import subprocess; subprocess.run(['claude'])",
+		"import subprocess; subprocess.run(['codex'])",
+	} {
+		if rule, detail := sub.guardCtxRunCode("python", code); rule != ruleSubagentNestedAgent {
+			t.Fatalf("guardCtxRunCode(%q) = (%q,%q), want %s", code, rule, detail, ruleSubagentNestedAgent)
+		}
+	}
+	// Short-stem look-alikes must NOT trip the derivative rule.
+	for _, argv := range [][]string{
+		{"piglet"},
+		{"clauder"},
+		{"claudeX"},
+	} {
+		if isBlockedAgentHead(argv[0]) {
+			t.Fatalf("isBlockedAgentHead(%q) = true, want false", argv[0])
+		}
+	}
+	if !isBlockedAgentHead("claude-code") || !isBlockedAgentHead("claude.x") ||
+		!isBlockedAgentHead("codex-cli") || !isBlockedAgentHead("dispatch-agent-go") {
+		t.Fatal("isBlockedAgentHead misses a derivative")
+	}
+}
+
+// TestGuard_DispatchReportReadonly covers the strict-readonly surface for
+// the dispatch-report channel: only `dispatch-report <t-addr>` and pure
+// query spellings pass; options, extra operands, dynamic words and
+// non-t addrs block.
+func TestGuard_DispatchReportReadonly(t *testing.T) {
+	t.Setenv(auditEnvRole, "reviewer")
+	t.Setenv(auditEnvReadonly, "")
+
+	allow := [][]string{
+		{"dispatch-report", "t42"},
+		{"dispatch-report", "test"},
+		{"dispatch-report", "--help"},
+		{"dispatch-report", "-h"},
+		{"dispatch-report", "--version"},
+		{"dispatch-report", "-V"},
+	}
+	for _, argv := range allow {
+		if got := guardArgvReadonly(argv); got != "" {
+			t.Fatalf("guardArgvReadonly(%v) = %q, want allow", argv, got)
+		}
+	}
+	if got := guardShellReadonly("dispatch-report t42"); got != "" {
+		t.Fatalf("guardShellReadonly(dispatch-report t42) = %q, want allow", got)
+	}
+	block := [][]string{
+		{"dispatch-report"},
+		{"dispatch-report", "review"},
+		{"dispatch-report", "t42", "extra"},
+		{"dispatch-report", "--force", "t42"},
+		{"dispatch-report", "/tmp/x"},
+	}
+	for _, argv := range block {
+		if got := guardArgvReadonly(argv); got == "" {
+			t.Fatalf("guardArgvReadonly(%v) = allow, want block", argv)
+		}
+	}
+	// Sub-agent (worker) callers get the same narrowed surface.
+	t.Setenv(auditEnvRole, "worker")
+	t.Setenv(auditEnvReadonly, "")
+	if got := guardArgvSubagent([]string{"dispatch-report", "t42"}); got != "" {
+		t.Fatalf("worker dispatch-report t42 = %q, want allow", got)
+	}
+	if got := guardArgvSubagent([]string{"dispatch-report", "--evil", "t42"}); got == "" {
+		t.Fatal("worker dispatch-report --evil t42 = allow, want block")
+	}
+}
+
+// TestGuard_EnvHookReportVars covers the DISPATCH_REPORT_PATH /
+// PI_SANDBOX_GO_EXEC_DIR / HC_TERMINAL_ID / HC_SOCKET interception: KEY=VAL
+// prefixes, export/declare wraps, env wrappers and ctx_run args.env all
+// block; Python/JS os.environ rewrite paths block too.
+func TestGuard_EnvHookReportVars(t *testing.T) {
+	vars := []string{
+		"DISPATCH_REPORT_PATH", "PI_SANDBOX_GO_EXEC_DIR",
+		"HC_TERMINAL_ID", "HC_SOCKET",
+	}
+
+	t.Setenv(auditEnvRole, "worker")
+	t.Setenv(auditEnvReadonly, "")
+	for _, v := range vars {
+		for _, code := range []string{
+			v + "=/tmp/x true",
+			"env " + v + "=/tmp/x true",
+			"export " + v + "=/tmp/x",
+			"declare " + v + "=/tmp/x",
+			"export " + v + "=/tmp/x; true",
+			"env -u " + v + " true",
+			"unset " + v,
+		} {
+			if got := guardShellSubagent(code); got == "" {
+				t.Fatalf("guardShellSubagent(%q) = allow, want env block", code)
+			}
+		}
+		// for-loop iter var binds the hook name.
+		if got := guardShellSubagent("for " + v + " in a; do true; done"); got == "" {
+			t.Fatalf("for %s iter var = allow, want block", v)
+		}
+		// ctx_run args.env override.
+		g := guardCall{subagent: true}
+		if rule, detail := g.guardCtxRunEnv(map[string]string{v: "/tmp/x"}); rule == "" {
+			t.Fatalf("guardCtxRunEnv(%s) = allow, want block", v)
+		} else {
+			_ = detail
+		}
+	}
+	// Python/JS env-override rewrites name the hook vars.
+	sub := guardCall{subagent: true}
+	pyBlock := []string{
+		"import os,subprocess\nos.environ['DISPATCH_REPORT_PATH']='/tmp/f'\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ['HC_SOCKET']='/tmp/f'\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ['PI_SANDBOX_GO_EXEC_DIR']='/x'\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ['HC_TERMINAL_ID']='t9'\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.putenv('DISPATCH_REPORT_PATH','/x')\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ.update({'HC_SOCKET':'/x'})\nsubprocess.run(['ls'])",
+		"import os,subprocess\ndel os.environ['HC_SOCKET']\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ[k]=v\nsubprocess.run(['ls'])",
+	}
+	for _, code := range pyBlock {
+		if rule, detail := sub.guardCtxRunCode("python", code); rule != ruleSubagentNestedAgent {
+			t.Fatalf("guardCtxRunCode(%q) = (%q,%q), want %s", code, rule, detail, ruleSubagentNestedAgent)
+		}
+	}
+	jsBlock := []string{
+		"const cp=require('child_process');process.env.HC_SOCKET='/x';cp.execSync('ls')",
+		"const cp=require('child_process');process.env['DISPATCH_REPORT_PATH']='/x';cp.execSync('ls')",
+		"const cp=require('child_process');process.env.HC_TERMINAL_ID='t9';cp.execSync('ls')",
+		"const cp=require('child_process');delete process.env.HC_SOCKET;cp.execSync('ls')",
+		"const cp=require('child_process');delete process.env['HC_TERMINAL_ID'];cp.execSync('ls')",
+	}
+	for _, code := range jsBlock {
+		if rule, detail := sub.guardCtxRunCode("javascript", code); rule != ruleSubagentNestedAgent {
+			t.Fatalf("guardCtxRunCode(%q) = (%q,%q), want %s", code, rule, detail, ruleSubagentNestedAgent)
+		}
+	}
+	// Benign env writes and reads stay free.
+	allow := []struct{ lang, code string }{
+		{"python", "import os,subprocess\nos.environ['FOO']='bar'\nsubprocess.run(['ls'])"},
+		{"python", "import os,subprocess\nprint(os.environ['HC_SOCKET'])\nsubprocess.run(['ls'])"},
+		{"javascript", "const cp=require('child_process');process.env.FOO='b';cp.execSync('ls')"},
+	}
+	for _, tc := range allow {
+		if rule, detail := sub.guardCtxRunCode(tc.lang, tc.code); rule != "" {
+			t.Fatalf("guardCtxRunCode(%q) = (%q,%q), want allow", tc.code, rule, detail)
+		}
+	}
+}

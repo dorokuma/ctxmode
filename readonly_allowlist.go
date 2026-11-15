@@ -369,6 +369,11 @@ func init() {
 	// OUT of this table — they are admitted only as hc's resolved alias in
 	// isAllowedSystemReadonlyAlias.
 	readonlyAllowlist["hc"] = &cmdAllow{check: screenHcSubagent}
+	// dispatch-report is the static second report channel: only
+	// `dispatch-report <t-addr>` (two words, option-free static addr) and the
+	// pure query spellings pass — the same contract screenHcSubagent gives
+	// `hc send`, minus the text operand (the tool reads its own report file).
+	readonlyAllowlist["dispatch-report"] = &cmdAllow{check: screenDispatchReportReadonly}
 	readonlyAllowlist["mount"] = &cmdAllow{check: checkMountReadonly}
 	readonlyAllowlist["kill"] = &cmdAllow{check: checkKillReadonly}
 	readonlyAllowlist["ctxmode"] = &cmdAllow{check: checkCtxmodeReadonly}
@@ -1550,6 +1555,6 @@ search: rg grep find sed
 text: sort uniq cut tr jq diff cmp echo printf true false
 vcs: git
 go_meta: go gofmt ctxmode
-ops: ps pgrep ss journalctl systemctl which date pwd mount kill hc
+ops: ps pgrep ss journalctl systemctl which date pwd mount kill hc dispatch-report
 `)
 }
