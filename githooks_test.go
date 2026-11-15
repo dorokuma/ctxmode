@@ -496,11 +496,11 @@ func TestCommitMsgHook(t *testing.T) {
 		}
 	})
 
-	t.Run("chinese subject in conventional commit passes", func(t *testing.T) {
+	t.Run("chinese subject in conventional commit is rejected", func(t *testing.T) {
 		repo := setup(t)
 		out, code := run(t, repo, "fix(db): 修复缓存 TTL")
-		if code != 0 {
-			t.Fatalf("expected chinese subject in conventional commit to pass, got exit %d:\n%s", code, out)
+		if code == 0 {
+			t.Fatalf("expected chinese subject in conventional commit to be rejected, got pass:\n%s", out)
 		}
 	})
 
