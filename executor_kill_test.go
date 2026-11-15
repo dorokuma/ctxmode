@@ -4,11 +4,48 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
+
+// newTestSleeper returns a unique per-test path to the system sleep binary:
+// a symlink inside t.TempDir(). Tests launch their sleepers through this
+// path so cleanup and waitForNoProc match only THIS test run's own
+// processes by their /proc/<pid>/cmdline — a foreign "sleep" (or another
+// concurrent session's test run) can never be matched or killed.
+func newTestSleeper(t *testing.T) string {
+	t.Helper()
+	sleepBin, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skipf("sleep binary not found: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "ctxmode-test-sleeper")
+	if err := os.Symlink(sleepBin, path); err != nil {
+		t.Fatalf("symlink sleeper: %v", err)
+	}
+	return path
+}
+
+// killTestSleepers SIGKILLs every leftover process whose cmdline contains
+// this test's unique sleeperPath, then polls until they are gone. Matching
+// is by the unique path only — never a global name or argument pattern —
+// so it cannot hit unrelated processes.
+func killTestSleepers(t *testing.T, sleeperPath string) {
+	t.Helper()
+	for _, pidStr := range findProcCmdline(sleeperPath) {
+		if pid, err := strconv.Atoi(pidStr); err == nil {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for len(findProcCmdline(sleeperPath)) > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+}
 
 // findProcCmdline returns the pids of live processes whose cmdline contains
 // marker (NUL separators in /proc/<pid>/cmdline are normalized to spaces).
@@ -45,36 +82,37 @@ func waitForNoProc(t *testing.T, marker string) {
 	}
 }
 
-// TestKill_SetsidDescendantReapedOnTimeout (t-setsid): a `setsid sleep 37 &`
-// grandchild lives in a new session/process group and escapes the pgid-wide
-// kill. The timeout path must sweep the /proc descendant tree before killing
-// and SIGKILL survivors afterwards, so no sleeper outlives the timed-out tool
-// call. Control: a normal completion leaves no sleeper behind.
+// TestKill_SetsidDescendantReapedOnTimeout (t-setsid): a `setsid
+// <sleeper> 37 &` grandchild lives in a new session/process group and
+// escapes the pgid-wide kill. The timeout path must sweep the /proc
+// descendant tree before killing and SIGKILL survivors afterwards, so no
+// sleeper outlives the timed-out tool call. Control: a normal completion
+// leaves no sleeper behind. Sleepers run through a unique per-test
+// symlink (newTestSleeper) so process matching is isolated to this run.
 func TestKill_SetsidDescendantReapedOnTimeout(t *testing.T) {
 	wd := t.TempDir()
 	s := testServerWithWorkdir(t, wd)
-	cleanup := func() {
-		// Best-effort sweep so neither this run nor a failed run leaks sleepers.
-		_ = exec.Command("pkill", "-f", "sleep 37").Run()
-	}
-	cleanup()
-	defer cleanup()
+	sleeper := newTestSleeper(t)
+	// Best-effort sweep of this run's own leftovers only: matching is by
+	// the unique sleeperPath, so foreign sleepers are never killed.
+	t.Cleanup(func() { killTestSleepers(t, sleeper) })
 
 	// Control: same shape, but the job completes normally — the setsid
 	// sleeper exits on its own and nothing is left behind.
 	if _, _, err := s.toolExecute(context.Background(), nil, executeArgs{
-		Command:   "setsid sleep 0.4 & sleep 0.4",
+		Command:   "setsid '" + sleeper + "' 0.4 & '" + sleeper + "' 0.4",
 		TimeoutMs: 30000,
 	}); err != nil {
 		t.Fatalf("control execute: %v", err)
 	}
-	waitForNoProc(t, "sleep 0.4")
+	waitForNoProc(t, sleeper)
 
-	// Timed-out run: timeout 1s while the foreground sleep 37 still runs; the
-	// setsid sleep 37 twin must be reaped by the escapee sweep, not orphaned.
+	// Timed-out run: timeout 1s while the foreground 37s sleeper still
+	// runs; the setsid twin must be reaped by the escapee sweep, not
+	// orphaned.
 	start := time.Now()
 	if _, _, err := s.toolExecute(context.Background(), nil, executeArgs{
-		Command:   "setsid sleep 37 & sleep 37",
+		Command:   "setsid '" + sleeper + "' 37 & '" + sleeper + "' 37",
 		TimeoutMs: 1000,
 	}); err != nil {
 		t.Fatalf("timed-out execute: %v", err)
@@ -85,7 +123,35 @@ func TestKill_SetsidDescendantReapedOnTimeout(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 15*time.Second {
 		t.Fatalf("timed-out execute returned after %v; setsid escapee was not killed and kept the output pipe open", elapsed)
 	}
-	waitForNoProc(t, "sleep 37")
+	waitForNoProc(t, sleeper)
+}
+
+// TestFindProcCmdline_IgnoresForeignSleeper verifies per-test isolation: a
+// sleep started from the system binary (not this test's unique symlink)
+// must never be matched by the test marker, so the cleanup helpers can
+// never kill or wait on a foreign sleeper.
+func TestFindProcCmdline_IgnoresForeignSleeper(t *testing.T) {
+	sleepBin, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skipf("sleep binary not found: %v", err)
+	}
+	sleeper := newTestSleeper(t)
+
+	foreign := exec.Command(sleepBin, "30")
+	if err := foreign.Start(); err != nil {
+		t.Fatalf("start foreign sleeper: %v", err)
+	}
+	foreignPID := strconv.Itoa(foreign.Process.Pid)
+	t.Cleanup(func() {
+		_ = foreign.Process.Kill()
+		_, _ = foreign.Process.Wait()
+	})
+
+	for _, pid := range findProcCmdline(sleeper) {
+		if pid == foreignPID {
+			t.Fatalf("foreign sleeper pid %s matched test marker %q", foreignPID, sleeper)
+		}
+	}
 }
 
 // waitForBgDone polls until the background entry id is marked Done and

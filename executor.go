@@ -2234,10 +2234,27 @@ var roleIdentityEnvKeys = map[string]bool{
 	"CTXMODE_CONFIG":          true,
 }
 
+// reportChannelEnvKeys are the dispatch report-channel variables a
+// role-guarded caller must not override through ctx_run args.env. Unlike
+// roleIdentityEnvKeys these are not CTXMODE_*-prefixed, so they need an
+// explicit deny entry: DISPATCH_REPORT_PATH/DISPATCH_REPORT_PARENT re-target
+// the report collector and notify address the same way an envHookVars
+// assignment does (the shell-side screen already covers them via
+// isEnvHookVar), and CTXMODE_EXTRA_WORKDIRS widens a child ctxmode's
+// workspace set beyond the dispatched extra dirs. Plain (unroled) callers
+// keep the allowlist/prefix behaviour — dispatch-agent itself exports these
+// to its children.
+var reportChannelEnvKeys = map[string]bool{
+	"DISPATCH_REPORT_PATH":   true,
+	"DISPATCH_REPORT_PARENT": true,
+	"CTXMODE_EXTRA_WORKDIRS": true,
+}
+
 // isDeniedEnvKeyForCaller reports keys that must never be overridden (PATH,
 // loader, shell, home, and — for a role-guarded caller — the caller's own
-// role/audit/database identity). The caller classification is passed in, so
-// the env screen and its tests do not have to re-read the process environment.
+// role/audit/database identity and the report-channel binding). The caller
+// classification is passed in, so the env screen and its tests do not have
+// to re-read the process environment.
 func isDeniedEnvKeyForCaller(key string, guarded bool) bool {
 	uk := strings.ToUpper(key)
 	switch uk {
@@ -2248,7 +2265,7 @@ func isDeniedEnvKeyForCaller(key string, guarded bool) bool {
 		"SSLKEYLOGFILE", "TERM":
 		return true
 	}
-	if guarded && roleIdentityEnvKeys[uk] {
+	if guarded && (roleIdentityEnvKeys[uk] || reportChannelEnvKeys[uk]) {
 		return true
 	}
 	if strings.HasPrefix(uk, "LD_") || strings.HasPrefix(uk, "DYLD_") {
