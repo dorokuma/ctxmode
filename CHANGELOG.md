@@ -5,6 +5,13 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Security
+- **Role guards: claude-family nested-agent names, `dispatch-report` allowlist entry, and report/socket env-hook interception (`role_guards.go`, `readonly_allowlist.go`).**
+  - `blockedAgentExecutableList` gains `claude`, `claude-code`, `claude-pty`, `codex`; a new `isBlockedAgentHead` adds the len≥5 prefix-derivative rule — `stem-…`/`stem.…` spellings (`claude-x`, `codex-cli`, `dispatch-agent-lite`) block as the launcher itself while short stems (`pig-*`, `su-*`, `at.*`) and look-alikes (`clauder`, `piglet`) stay exact-match. The derivative check runs in `screenNestedDispatch`'s default branch so a resolved alias the switch owns (`hc -> herdr-core`) is not re-blocked by a coincidental stem match; npm/npx package-spec checks and the conflicting-structural-alias screen use it too. `codeAgentNames` derives from the list as before, so unresolved code spawns naming `claude`/`codex`/`claude-code` also block.
+  - `readonlyAllowlist["dispatch-report"]` admits exactly `dispatch-report <t-addr>` (two static words, `hcSendAddrOK` operand) plus `--help`/`-h`/`--version`/`-V`; every other spelling fails closed for strict read-only and for sub-agent callers (`screenNestedDispatch` case).
+  - `envHookVars` gains `DISPATCH_REPORT_PATH`, `PI_SANDBOX_GO_EXEC_DIR`, `HC_TERMINAL_ID`, `HC_SOCKET` — KEY=VAL prefixes, `env` wrappers, `export`/`declare`/`typeset`/`local`/`readonly`, `for`-loop iter vars, `unset`, arithmetic/parameter-expansion writes and ctx_run `args.env` all block (the existing `isEnvHookVar` fan-out reaches `shell_ast.go`'s hook checks unchanged).
+  - New `codeEnvOverrideHit` (`pyEnvOverrideHit`/`jsEnvOverrideHit`) screens Python/JS env-rewrite paths under the sub-agent guard: `os.environ['K']=v`, `os.putenv`, `environ.update`/`setdefault`, `process.env.K=v`, `process.env['K']=v`, `Object.assign(process.env, …)`. Static keys are judged by `envOverrideKeyVerdict` (hook/taint/sentinel names block, benign names pass); unverifiable dynamic keys fail closed.
+
 ## [5.4.0] - 2026-11-13
 
 ### Changed

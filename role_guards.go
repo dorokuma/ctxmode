@@ -418,6 +418,13 @@ var envHookVars = map[string]bool{
 	// sbx internal child-process spec: a forged value makes sbx execute the
 	// injected JSON spec instead of the CLI args (S-NEW-2).
 	"PI_SANDBOX_INTERNAL_CHILD_SPEC": true,
+	// Dispatch report channel and terminal-control sockets: a sub-agent
+	// re-pointing DISPATCH_REPORT_PATH hands its report to a fake collector;
+	// PI_SANDBOX_GO_EXEC_DIR relocates the sbx-exec payload root; and
+	// HC_TERMINAL_ID/HC_SOCKET re-target hc send to another terminal or a
+	// forged control socket, bypassing the whitelist'd report address.
+	"DISPATCH_REPORT_PATH": true, "PI_SANDBOX_GO_EXEC_DIR": true,
+	"HC_TERMINAL_ID": true, "HC_SOCKET": true,
 }
 
 // pagerSafeVars may be set to "" or "cat" — disabling the pager is the
@@ -1846,6 +1853,13 @@ func unwrapInterpreterInline(argv []string) (lang, code string, ok bool) {
 // two screens cannot drift.
 var blockedAgentExecutableList = []string{
 	"pig", "pi", "agy", "dispatch-agent", "dispatch-agent-go", "grok",
+	// claude family: the CLI, its -code/-pty derivatives and the codex
+	// launcher are all nested-agent surfaces a sub-agent must never reach.
+	// The len>=5 prefix-derivative rule in isBlockedAgentHead covers
+	// `claude-*`/`claude.*` (claude-code, claude-pty, claude-x.y); the
+	// explicit spellings below pin the names so codeAgentNames carries them
+	// verbatim for the in-code identifier scan.
+	"claude", "claude-code", "claude-pty", "codex",
 	// herdr/herdsman are retired as a sub-agent terminal-control surface:
 	// hc is the only sanctioned channel, so even their read-only verbs
 	// block outright now.
@@ -1870,6 +1884,36 @@ var blockedAgentExecutables = func() map[string]bool {
 	}
 	return m
 }()
+
+// blockedAgentDerivMinLen is the minimum stem length for the prefix
+// derivative rule below: only list entries at least this long spawn
+// `name-…`/`name.…` derivatives. Short stems stay exact-match — `pig-x`,
+// `su-x`, `at.job` would otherwise re-identity unrelated tools
+// (pigz/pigz-derivatives, at jobs, systemd units) as blocked agents.
+const blockedAgentDerivMinLen = 5
+
+// isBlockedAgentHead reports whether a resolved command-head basename names
+// a blocked agent executable: an exact blockedAgentExecutables entry, or a
+// `stem-…`/`stem.…` derivative of a list entry whose stem is at least
+// blockedAgentDerivMinLen long. Real agent CLIs ship feature/version
+// binaries under such suffixes (claude-code, claude-pty, claude.x,
+// dispatch-agent-go, codex-cli); matching the stem with a '-' or '.'
+// boundary keeps `claude-x` out without letting `clauder` or `piglet`
+// match.
+func isBlockedAgentHead(base string) bool {
+	if blockedAgentExecutables[base] {
+		return true
+	}
+	for _, n := range blockedAgentExecutableList {
+		if len(n) < blockedAgentDerivMinLen {
+			continue
+		}
+		if strings.HasPrefix(base, n+"-") || strings.HasPrefix(base, n+".") {
+			return true
+		}
+	}
+	return false
+}
 
 // hcSendAddrOK reports whether s is an hc terminal address a sub-agent may
 // send to: `^t[0-9a-z]+$` — the numeric/lettered tN ids only. Named
@@ -1942,6 +1986,27 @@ func screenHcSubagent(headArgv []string) string {
 		return "hc send"
 	}
 	return "hc " + sub
+}
+
+// screenDispatchReportReadonly admits the dispatch-report side channel in
+// exactly one spelling: `dispatch-report <t-addr>` — a static two-word argv
+// whose operand is an hc terminal address (hcSendAddrOK), plus the pure
+// query spellings (`--help`/`-h`/`--version`/`-V`). Every option, extra
+// operand, dynamic word and subcommand blocks: a report must land on the
+// recorded parent terminal, and only a static addr can prove that.
+func screenDispatchReportReadonly(argv []string) string {
+	if isPureQueryInvocation(argv) {
+		return "" // dispatch-report --help / -h / --version / -V
+	}
+	args := argv[1:]
+	if len(args) != 1 {
+		return "dispatch-report"
+	}
+	if strings.HasPrefix(args[0], "-") || isDynamicArg(args[0]) ||
+		!hcSendAddrOK(args[0]) {
+		return "dispatch-report"
+	}
+	return ""
 }
 
 // queryOnlyFlagArgs are the pure query flags of the agent-launcher heads:
@@ -2546,6 +2611,11 @@ func screenNestedDispatch(headArgv []string, pathEnv string, depth int, caller c
 		if isPureQueryInvocation(headArgv) && pureQueryOnlyHeads[base] {
 			continue // `dispatch-agent --version`: nothing is dispatched
 		}
+		// Exact blocked names hit before the switch; the prefix-derivative
+		// check runs only in the default branch so a resolved alias the
+		// switch owns (hc -> herdr-core, a legitimate herder-family target)
+		// is not re-blocked by a coincidental `herdr-`/`dispatch-agent-`
+		// prefix match on its real binary name.
 		if blockedAgentExecutables[base] {
 			return base
 		}
@@ -2555,6 +2625,13 @@ func screenNestedDispatch(headArgv []string, pathEnv string, depth int, caller c
 		// `herdr-core run ...` cannot bypass the `hc` interception.
 		case "hc", "herdr-core":
 			if hit := screenHcSubagent(headArgv); hit != "" {
+				return hit
+			}
+		case "dispatch-report":
+			// Same narrow surface the strict-readonly allowlist grants:
+			// only `dispatch-report <t-addr>` and pure queries; every
+			// other spelling of the report tool blocks for a sub-agent too.
+			if hit := screenDispatchReportReadonly(headArgv); hit != "" {
 				return hit
 			}
 		case "crontab":
@@ -2586,7 +2663,7 @@ func screenNestedDispatch(headArgv []string, pathEnv string, depth int, caller c
 				// whatever the child command is: `tsc` cannot launder
 				// `--package=pig`.
 				for _, spec := range r.packages {
-					if blockedAgentExecutables[filepath.Base(nodePkgSpecBase(spec))] {
+					if isBlockedAgentHead(filepath.Base(nodePkgSpecBase(spec))) {
 						return base + " " + r.verb + " " + spec
 					}
 				}
@@ -2608,6 +2685,10 @@ func screenNestedDispatch(headArgv []string, pathEnv string, depth int, caller c
 				}
 			case npmArgvReject:
 				return r.rejectHit(base)
+			}
+		default:
+			if isBlockedAgentHead(base) {
+				return base
 			}
 		}
 	}
@@ -2981,7 +3062,7 @@ func screenNodeRunnerSubagent(base string, args []string, effPath string, depth 
 				if isDynamicArg(val) {
 					return "dynamic code payload"
 				}
-				if spec := filepath.Base(nodePkgSpecBase(val)); blockedAgentExecutables[spec] {
+				if spec := filepath.Base(nodePkgSpecBase(val)); isBlockedAgentHead(spec) {
 					return base + " " + spec
 				}
 			case "prefix", "userconfig":
@@ -3036,7 +3117,7 @@ func screenNodeRunnerSubagent(base string, args []string, effPath string, depth 
 					return "dynamic code payload"
 				}
 				if ch == 'p' {
-					if spec := filepath.Base(nodePkgSpecBase(val)); blockedAgentExecutables[spec] {
+					if spec := filepath.Base(nodePkgSpecBase(val)); isBlockedAgentHead(spec) {
 						return base + " " + spec
 					}
 				}
@@ -3446,7 +3527,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 				// rules no longer match what will actually run. Same-family
 				// aliases (/bin/sh -> dash, python3 -> python3.13) keep the
 				// typed base.
-				if (isStructuralGuardHead(rb) || isPeeledWrapperBase(rb) || blockedAgentExecutables[rb]) && !sameStructuralFamily(base, rb) {
+				if (isStructuralGuardHead(rb) || isPeeledWrapperBase(rb) || isBlockedAgentHead(rb)) && !sameStructuralFamily(base, rb) {
 					return "conflicting structural alias " + filepath.Base(typedHead[0]) + " -> " + rb
 				}
 			} else {
@@ -9183,6 +9264,316 @@ var codeSpawnPrims = []string{
 // remains fail-closed even though shell/argv ssh is peeled via screenSSHHead.
 var codeAgentNames = append(append([]string(nil), blockedAgentExecutableList...), "ssh")
 
+// codeEnvOverrideHit reports the env-override write inside Python or
+// JavaScript code that a sub-agent must not reach: os.environ['K']=v,
+// os.environ.setdefault/update, os.putenv, process.env.K=v /
+// process.env['K']=v, Object.assign(process.env, …). String bodies are
+// blanked in masked, so bracket keys are re-read from raw code; a key that
+// cannot be statically resolved fails closed (same contract as a dynamic
+// KEY=VAL prefix). Plain reads (os.environ['K'], environ.get, process.env.X
+// on the right of `=`) stay free.
+func codeEnvOverrideHit(language, code, masked string) string {
+	if language == "python" {
+		return pyEnvOverrideHit(code, masked)
+	}
+	if language == "javascript" || language == "typescript" {
+		return jsEnvOverrideHit(code, masked)
+	}
+	return ""
+}
+
+// envOverrideKeyVerdict judges a statically extracted env key (already
+// unquoted). "" allows the write; a non-empty string is the block detail.
+func envOverrideKeyVerdict(key string) string {
+	if key == "" {
+		return "env override dynamic"
+	}
+	if guardTaintVars[key] || isEnvHookVar(key) || sentinelTrustVars[key] {
+		return "env " + key
+	}
+	return ""
+}
+
+// unquoteCodeKey strips a simple quoted literal key (no escapes).
+func unquoteCodeKey(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 {
+		q := s[0]
+		if (q == '\'' || q == '"' || q == '`') && s[len(s)-1] == q {
+			inner := s[1 : len(s)-1]
+			if !strings.ContainsAny(inner, "\\"+string(q)) {
+				return inner, true
+			}
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// skipMaskSpace advances i over spaces (not newlines) in a masked span.
+func skipMaskSpace(s string, i int) int {
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	return i
+}
+
+// maskAssignAfterBracket reports whether masked[i] opens a `[…]` subscript
+// whose closing bracket is immediately followed by an assignment `=` (not
+// `==`, `=>` or a compound `[-+*/%|&^]=` — those still mutate). Returns
+// (keyLo, keyHi, true) when so; the raw key text is code[keyLo:keyHi].
+func maskAssignAfterBracket(masked string, i int) (int, int, bool) {
+	if i >= len(masked) || masked[i] != '[' {
+		return 0, 0, false
+	}
+	depth := 0
+	for j := i; j < len(masked); j++ {
+		switch masked[j] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				k := skipMaskSpace(masked, j+1)
+				if k < len(masked) && masked[k] == '=' &&
+					(k+1 >= len(masked) || masked[k+1] != '=' && masked[k+1] != '>') {
+					return i + 1, j, true
+				}
+				return 0, 0, false
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// pyEnvOverrideHit scans masked Python for os.environ mutation spellings.
+func pyEnvOverrideHit(code, masked string) string {
+	toks := codeTokens(masked)
+	// environ.update / environ.setdefault / os.putenv mutate env without a
+	// visible `=` on the environ name: they always fail closed — a
+	// sub-agent code body has no legitimate need to write process env, and
+	// a dynamic payload could re-target the report/socket hooks.
+	for _, prim := range []string{"environ.update", "environ.setdefault", "environ.__setitem__", "putenv"} {
+		if toks.hasTokenLike(prim) || toks.hasIdent(prim) {
+			return "env override " + prim
+		}
+	}
+	hasDel := toks.hasIdent("del")
+	// os.environ['K']=v / environ['K']=v — mask-blanked key re-read raw.
+	for i := 0; i+7 < len(masked); i++ {
+		if !strings.HasPrefix(masked[i:], "environ") {
+			continue
+		}
+		if i > 0 && isIdentByte(masked[i-1]) {
+			continue
+		}
+		j := skipMaskSpace(masked, i+len("environ"))
+		lo, hi, ok := maskAssignAfterBracket(masked, j)
+		if !ok {
+			// No `=` after the bracket — a read (or `del environ['K']`,
+			// the env clear screened below).
+			if hasDel {
+				if hit := pyDelEnvironKeyHit(code, masked, i); hit != "" {
+					return hit
+				}
+			}
+			continue
+		}
+		key, okKey := unquoteCodeKey(code[lo:hi])
+		if !okKey {
+			// Dynamic key (variable/expression) — cannot prove the target.
+			return "env override dynamic"
+		}
+		if hit := envOverrideKeyVerdict(key); hit != "" {
+			return hit
+		}
+		i = hi
+	}
+	return ""
+}
+
+// pyDelEnvironKeyHit reports whether masked[i] starts `environ` used as the
+// operand of a `del` statement (`del os.environ['K']`, `del environ['K']`) —
+// the in-code equivalent of `unset K`. The key is judged by
+// envOverrideKeyVerdict; reads (`x in os.environ`, `os.environ.get`) are not
+// reached here because the caller only runs this when a `del` ident exists
+// somewhere in the masked code AND the subscript is not followed by `=`.
+func pyDelEnvironKeyHit(code, masked string, envIdx int) string {
+	// Walk back for a `del` at statement position on the same logical line:
+	// `del` may sit at the start or after `;` — any earlier `del` ident
+	// before the nearest `;`/`\n`/`)` boundary counts (conservative:
+	// `del` further left on the same line is the only way a `del` reaches
+	// this subscript).
+	j := envIdx
+	for j > 0 && masked[j-1] != '\n' && masked[j-1] != ';' && masked[j-1] != ')' {
+		j--
+	}
+	if !strings.HasPrefix(strings.TrimLeft(masked[j:], " \t"), "del") &&
+		!toksLineHasDel(masked[j:envIdx]) {
+		return ""
+	}
+	k := skipMaskSpace(masked, envIdx+len("environ"))
+	if k >= len(masked) || masked[k] != '[' {
+		return ""
+	}
+	depth := 0
+	for e := k; e < len(masked); e++ {
+		if masked[e] == '[' {
+			depth++
+		}
+		if masked[e] == ']' {
+			depth--
+			if depth == 0 {
+				key, okKey := unquoteCodeKey(code[k+1 : e])
+				if !okKey {
+					return "env override dynamic"
+				}
+				return envOverrideKeyVerdict(key)
+			}
+		}
+	}
+	return ""
+}
+
+// toksLineHasDel reports whether the masked segment s contains a `del`
+// identifier token.
+func toksLineHasDel(s string) bool {
+	return codeTokens(s).hasIdent("del")
+}
+
+// jsEnvOverrideHit scans masked JavaScript for process.env mutation
+// spellings: `process.env.K=v`, `process.env['K']=v`,
+// `Object.assign(process.env, …)` / `Object.defineProperty(process.env, …)`.
+func jsEnvOverrideHit(code, masked string) string {
+	toks := codeTokens(masked)
+	if toks.hasTokenLike("Object.assign") || toks.hasTokenLike("Object.defineProperty") ||
+		toks.hasTokenLike("Reflect.set") || toks.hasIdent("putenv") {
+		if toks.hasIdent("env") || strings.Contains(masked, "process.env") {
+			return "env override"
+		}
+	}
+	// `delete process.env.K` / `delete process.env['K']` — an env CLEAR,
+	// the in-code equivalent of `unset K`/`env -u K`.
+	if toks.hasIdent("delete") {
+		if hit := jsDeleteEnvHit(code, masked); hit != "" {
+			return hit
+		}
+	}
+	for i := 0; i+11 < len(masked); i++ {
+		if !strings.HasPrefix(masked[i:], "process.env") {
+			continue
+		}
+		if i > 0 && isIdentByte(masked[i-1]) {
+			continue
+		}
+		j := i + len("process.env")
+		j = skipMaskSpace(masked, j)
+		if j >= len(masked) {
+			break
+		}
+		if masked[j] == '[' {
+			lo, hi, ok := maskAssignAfterBracket(masked, j)
+			if !ok {
+				i = j
+				continue
+			}
+			key, okKey := unquoteCodeKey(code[lo:hi])
+			if !okKey {
+				return "env override dynamic"
+			}
+			if hit := envOverrideKeyVerdict(key); hit != "" {
+				return hit
+			}
+			i = hi
+			continue
+		}
+		if masked[j] != '.' {
+			i = j
+			continue
+		}
+		// process.env.NAME …  check whether NAME is followed by `=`.
+		k := j + 1
+		start := k
+		for k < len(masked) && isIdentByte(masked[k]) {
+			k++
+		}
+		name := masked[start:k]
+		if name == "" {
+			i = k
+			continue
+		}
+		k = skipMaskSpace(masked, k)
+		if k < len(masked) && masked[k] == '=' &&
+			(k+1 >= len(masked) || masked[k+1] != '=' && masked[k+1] != '>') {
+			if hit := envOverrideKeyVerdict(name); hit != "" {
+				return hit
+			}
+		}
+		i = k
+	}
+	return ""
+}
+
+// jsDeleteEnvHit screens `delete process.env.<key>` spellings: the key is
+// judged by envOverrideKeyVerdict — hook/taint/sentinel names and
+// unverifiable dynamic keys block, benign names pass (an env delete the
+// spawn never needed).
+func jsDeleteEnvHit(code, masked string) string {
+	for i := 0; i+6 < len(masked); i++ {
+		if !strings.HasPrefix(masked[i:], "delete") {
+			continue
+		}
+		if i > 0 && isIdentByte(masked[i-1]) {
+			continue
+		}
+		j := skipMaskSpace(masked, i+len("delete"))
+		if !strings.HasPrefix(masked[j:], "process.env") {
+			continue
+		}
+		k := skipMaskSpace(masked, j+len("process.env"))
+		if k >= len(masked) {
+			break
+		}
+		if masked[k] == '[' {
+			depth := 0
+			for e := k; e < len(masked); e++ {
+				if masked[e] == '[' {
+					depth++
+				}
+				if masked[e] == ']' {
+					depth--
+					if depth == 0 {
+						key, okKey := unquoteCodeKey(code[k+1 : e])
+						if !okKey {
+							return "env override dynamic"
+						}
+						if hit := envOverrideKeyVerdict(key); hit != "" {
+							return hit
+						}
+						break
+					}
+				}
+			}
+			i = k
+			continue
+		}
+		if masked[k] != '.' {
+			i = k
+			continue
+		}
+		start := k + 1
+		e := start
+		for e < len(masked) && isIdentByte(masked[e]) {
+			e++
+		}
+		if hit := envOverrideKeyVerdict(masked[start:e]); hit != "" {
+			return hit
+		}
+		i = e
+	}
+	return ""
+}
+
 // codeWritePrims are file write/delete/mutate primitives for strict
 // read-only, matched with identifier-boundary edges. Call sites that take a
 // mode argument (open/os.open) are handled separately to keep plain reads
@@ -9406,6 +9797,14 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 				if rawToks.hasIdent("hc") {
 					return ruleSubagentNestedAgent, "code drives hc mutation"
 				}
+			}
+			// An env-override write inside code (os.environ['X']=…,
+			// process.env.X=…, environ.update/putenv/Object.assign) reaches
+			// the spawned child's environment exactly like an `export`
+			// prefix: hook/taint names must block, and an unverifiable
+			// (dynamic) target fails closed.
+			if hit := codeEnvOverrideHit(language, code, masked); hit != "" {
+				return ruleSubagentNestedAgent, hit
 			}
 		}
 	}
