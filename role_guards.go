@@ -1388,7 +1388,22 @@ func splitEnvSPayload(s string) ([]string, bool) {
 					continue
 				}
 				if ch == '$' || ch == '`' {
-					b.WriteString(cmdSubPlaceholderQuoted)
+					// "$@" / "${arr[@]}" / "${!prefix@}" / "${x:-$@}" expand to
+					// one argv word per element even inside double quotes, so they
+					// are NOT split-safe — emit the splittable cmdSubPlaceholder,
+					// not cmdSubPlaceholderQuoted ("$*"/"$$" stay single-word).
+					ph := cmdSubPlaceholderQuoted
+					switch {
+					case ch == '$' && i+1 < len(s) && s[i+1] == '@':
+						ph = cmdSubPlaceholder
+					case ch == '$' && i+1 < len(s) && s[i+1] == '{':
+						if body, ok := envSDollarBraceBody(s, i); ok {
+							if envSBraceBodySplits(body) {
+								ph = cmdSubPlaceholder
+							}
+						}
+					}
+					b.WriteString(ph)
 					i += splitEnvSubLen(s, i)
 					continue
 				}
@@ -1481,6 +1496,46 @@ func splitEnvSubLen(s string, i int) int {
 		}
 		return j - i
 	}
+}
+
+// envSDollarBraceBody returns the inner body of a `${...}` expansion
+// starting at s[i] (s[i]=='$', s[i+1]=='{'), or ("", false) when the braces
+// never close. The body is what envSBraceBodySplits inspects.
+func envSDollarBraceBody(s string, i int) (string, bool) {
+	n := splitEnvSubLen(s, i)
+	// splitEnvSubLen consumed `$` + `{` + body + `}` => n-3 inner bytes.
+	if n < 3 || i+n > len(s) || s[i+n-1] != '}' {
+		return "", false
+	}
+	return s[i+2 : i+n-1], true
+}
+
+// envSBraceBodySplits reports whether a `${body}` expansion (inside double
+// quotes) can field-split into multiple argv words — the @-split forms.
+// "${#...}" (length, prefix '#') is always a single integer word and is
+// excluded. Matches the AST-side paramExpSplitsInDblQuotes.
+func envSBraceBodySplits(body string) bool {
+	if body == "" || strings.HasPrefix(body, "#") {
+		return false // ${#x} length is one word
+	}
+	// ${@...}    — $@ family: ${@}, ${@:1}, ${@/#a/b}, ${@@Q}
+	if strings.HasPrefix(body, "@") {
+		return true
+	}
+	// ${arr[@]} / ${!arr[@]} — element-wise subscript split.
+	if strings.Contains(body, "[@]") {
+		return true
+	}
+	// ${!prefix@} — variable-name list, one word per name.
+	if strings.HasPrefix(body, "!") && strings.HasSuffix(body, "@") && len(body) > 2 {
+		return true
+	}
+	// ${x:-$@} / ${x:-${@}} / ${x:-"$@"} — nested @-split in the default:
+	// any literal "$@" or "${@" inside the body carries the split up.
+	if strings.Contains(body, "$@") || strings.Contains(body, "${@") {
+		return true
+	}
+	return false
 }
 
 // skipEnvOperands consumes env's own arguments (options and NAME=val
@@ -10745,6 +10800,115 @@ func stringHasCmdWord(s, name string) bool {
 	}
 	return false
 }
+
+// stripLeadingCodeComments removes leading whitespace and the run of top
+// comments (`#...`, `//...`, `/*...*/`) at the very start of a foreign-
+// language code buffer, so the first REAL statement head can be read.
+// Only the top of the buffer is stripped — a later comment, string literal
+// or docstring is never touched (a Python ”'docstring”' mid-file is data).
+func stripLeadingCodeComments(code string) string {
+	for {
+		// Drop leading whitespace (incl. newlines) first.
+		code = strings.TrimLeft(code, " \t\r\n")
+		switch {
+		case strings.HasPrefix(code, "//"):
+			if k := strings.IndexByte(code, '\n'); k >= 0 {
+				code = code[k+1:]
+			} else {
+				return ""
+			}
+		case strings.HasPrefix(code, "#"):
+			if k := strings.IndexByte(code, '\n'); k >= 0 {
+				code = code[k+1:]
+			} else {
+				return ""
+			}
+		case strings.HasPrefix(code, "/*"):
+			if k := strings.Index(code, "*/"); k >= 0 {
+				code = code[k+2:]
+			} else {
+				return ""
+			}
+		default:
+			return code
+		}
+	}
+}
+
+// headWord matches [A-Za-z0-9_-]+ — a whole command word including the '-'
+// inside "herdr-core" (so it is never split on the dash).
+func headWord(s string) string {
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-' {
+			i++
+			continue
+		}
+		break
+	}
+	return s[:i]
+}
+
+// infixWord reports whether w is a language infix/modifier keyword that may
+// legitimately follow an identifier in a first statement head (so
+// `hc and x`, `hc in xs`, `hc if cond` are not agent invocations).
+var infixWord = map[string]bool{
+	"and": true, "or": true, "is": true, "in": true, "not": true,
+	"if": true, "else": true, "unless": true, "until": true, "while": true,
+	"for": true, "as": true, "instanceof": true,
+}
+
+// codeHeadIsAgentInvocation reports whether the first statement head of a
+// foreign-language code buffer is an agent command invocation: a first word
+// that is exactly hc / herdr-core / herdr / herdsman followed by horizontal
+// whitespace and an option/quote/non-keyword argument. This catches a bare
+// `hc send t42 ...` fed to `python3 -`/`ruby -`/`perl -` stdin or `-c`, where
+// the foreign runtime never spawns a recognisable primitive — a defence-in-
+// depth fail-closed check independent of the spawn-primitive scan (the
+// program is not rewritten to --hc-gate because 1114E keeps foreign stdin
+// verbatim data).
+func codeHeadIsAgentInvocation(code string) (string, bool) {
+	head := stripLeadingCodeComments(code)
+	w := headWord(head)
+	switch w {
+	case "hc", "herdr-core", "herdr", "herdsman":
+	default:
+		return "", false
+	}
+	rest := head[len(w):]
+	// Require 1+ horizontal whitespace chars after the name (`hc  send`
+	// must hit, `hc=5`/`hc(x)` must not).
+	if rest == "" || (rest[0] != ' ' && rest[0] != '\t') {
+		return "", false
+	}
+	rest = strings.TrimLeft(rest, " \t")
+	if rest == "" {
+		return "", false
+	}
+	c := rest[0]
+	switch {
+	case c == '"' || c == '\'':
+		return w, true // hc "send", hc 'send'
+	case strings.HasPrefix(rest, "--"):
+		return w, true // hc -- send, hc --x
+	case c == '-' && len(rest) > 1 && rest[1] >= 'a' && rest[1] <= 'z':
+		return w, true // hc -h (but not `hc - 1` / `hc -1`)
+	case c == '-' && len(rest) > 1 && rest[1] >= 'A' && rest[1] <= 'Z':
+		return w, true
+	}
+	// An identifier argument (send, kill, t42-free word) that is not a
+	// language infix keyword means the name was used as a command.
+	if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' {
+		arg := headWord(rest)
+		if !infixWord[arg] {
+			return w, true
+		}
+	}
+	return "", false
+}
+
 func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) {
 	if !g.subagent && !g.strictReadonly {
 		return "", ""
@@ -10762,6 +10926,15 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 	caller := g.callerIdentity()
 
 	if g.subagent {
+		// Statement-head check: a bare `hc send …` / `herdr-core …` as the
+		// first statement of foreign-language code never reaches a spawn
+		// primitive (it is a SyntaxError at runtime), so the spawn-gated
+		// hasIdent block below cannot see it. Fail closed here — the check
+		// only fires on a real command head, so `hc = 5`, `--hc-gate`
+		// literals and `fix/hc-feedback-gate` strings stay free.
+		if name, ok := codeHeadIsAgentInvocation(code); ok {
+			return ruleSubagentNestedAgent, "code statement head invokes " + name
+		}
 		rawToks := codeTokens(code)
 		spawn := false
 		for _, prim := range codeSpawnPrims {

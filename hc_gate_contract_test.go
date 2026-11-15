@@ -679,6 +679,30 @@ func TestT_STDIN2_CScripStdinMatrix(t *testing.T) {
 	if sp.rule == "" {
 		t.Fatalf("Command multi-target PATH= + stdin 'myrunner' must block (per-target PATH audit), got ALLOW stdin=%q", sp.execStdin)
 	}
+
+	// 1114G stage-B fix 1: a bare `hc send`/`herdr-core …` as the FIRST
+	// statement head of foreign-language code must block even though the
+	// foreign runtime raises a SyntaxError (no spawn primitive fires, so
+	// the spawn-gated hasIdent scan cannot see it). Defence-in-depth.
+
+	// Inline -c form: python3 -c 'hc send …' blocks.
+	if rule, detail := rtArgvRule("worker", "", []string{"python3", "-c", `hc send t42 "x: $(cat /tmp/r.txt)"`}, ""); rule == "" {
+		t.Fatalf("python3 -c 'hc send …' must block, got ALLOW (detail=%s)", detail)
+	}
+
+	// Leading comment + herdr-core: `# cmt\nherdr-core send …` via
+	// python3 - stdin blocks (comment stripped, head still the agent).
+	p = prepArgvRule(t, "worker", "", []string{"bash", "-c", "python3 -"}, "# cmt\nherdr-core send t42 hi")
+	if p.rule == "" {
+		t.Fatalf("python3 - stdin '# cmt\\nherdr-core send …' must block, got ALLOW stdin=%q", p.execStdin)
+	}
+
+	// Benign lookalike: `hc = 5` is an assignment (no horizontal-space
+	// command head), and a `--hc-gate`/`hc` substring inside a string must
+	// never trip the head check — ALLOW proves no regression to kill.
+	if rule, detail := rtArgvRule("worker", "", []string{"python3", "-c", `hc = 5; print("--hc-gate", hc)`}, ""); rule != "" {
+		t.Fatalf("benign 'hc = 5; print(\"--hc-gate\", hc)' must allow, got %s (%s)", rule, detail)
+	}
 }
 
 // TestT_GLUED1_GluedShellC covers the glued -c matrix rows: spellings with
@@ -756,6 +780,26 @@ func TestT_GATEHEAD1_CtxmodeOptionZone(t *testing.T) {
 		`ctxmode --workdir="$@" search`,
 		`ctxmode --hc-gate send t42 hi`,
 		`ctxmode --hc-gate=x send t42 hi`,
+		// 1114G stage-B fix 2: every double-quoted @-split form expands to
+		// one argv word per element, so it is NOT a split-safe single-word
+		// option value — it must block like bare "$@".
+		`ctxmode --workdir "${arr[@]}" search`,
+		`ctxmode --workdir="${arr[@]}" search`,
+		`ctxmode --workdir "${x:-$@}" search`,
+		`ctxmode --workdir="${x:-$@}" search`,
+		`ctxmode --workdir "${!prefix@}" search`,
+		`ctxmode --workdir "${x:-${arr[@]}}" search`,
+	} {
+		if rule, detail := rtCmdRule("worker", "", cmd, ""); rule == "" {
+			t.Errorf("worker %q: got ALLOW, want block", cmd)
+			_ = detail
+		}
+	}
+	// env -S payload: a double-quoted @-split inside the split-string
+	// operand is screened by the same rule (fail closed on the payload).
+	for _, cmd := range []string{
+		`env -S 'ctxmode --workdir "$@" search'`,
+		`env -S 'ctxmode --workdir "${arr[@]}" search'`,
 	} {
 		if rule, detail := rtCmdRule("worker", "", cmd, ""); rule == "" {
 			t.Errorf("worker %q: got ALLOW, want block", cmd)
@@ -763,13 +807,17 @@ func TestT_GATEHEAD1_CtxmodeOptionZone(t *testing.T) {
 		}
 	}
 	// Allows (worker): subcommand operands are free, and single-word
-	// dynamic option values (quoted $PWD) are fine.
+	// dynamic option values (quoted $PWD, a literal @ default, "$*") are
+	// fine.
 	for _, cmd := range []string{
 		`ctxmode search --hc-gate`,
 		`ctxmode search "$q"`,
 		`ctxmode --workdir="$PWD" search`,
 		`ctxmode --workdir "$PWD" search`,
 		`ctxmode --workdir="$PWD/sub" index`,
+		`ctxmode --workdir "${x:-@}" search`, // literal @ default = one word
+		`ctxmode --workdir "${x:-@@}" search`,
+		`ctxmode --workdir "$*" search`, // "$*" joins to one word
 	} {
 		if rule, detail := rtCmdRule("worker", "", cmd, ""); rule != "" {
 			t.Errorf("worker %q: got BLOCK %s: %s, want ALLOW", cmd, rule, detail)

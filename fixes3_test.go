@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -637,11 +638,33 @@ func TestBackground_Kill_LeaderExitedChildSurviving(t *testing.T) {
 		t.Fatalf("orphan processes %v still running in process group %d after killBackground", remaining, entry.PID)
 	}
 	for _, pid := range surviving {
-		// Confirm process is dead
-		if err := syscall.Kill(pid, 0); err == nil {
+		// Confirm process is dead. A zombie still holds its PID-table entry,
+		// so kill(pid,0) returns nil for it — check the /proc state field too
+		// and treat Z/X (dead, unreaped) as dead, matching the fix that makes
+		// findProcessGroupPIDs ignore zombies in the kill loop above.
+		if err := syscall.Kill(pid, 0); err == nil && !procStatIsDead(pid) {
 			t.Fatalf("child process %d is still alive after killBackground", pid)
 		}
 	}
+}
+
+// procStatIsDead reports whether /proc/<pid>/stat marks the process in a
+// dead state (Z zombie or X/x dead) — a zombie keeps its PID-table entry so
+// kill(pid,0) returns nil even though the process no longer runs.
+func procStatIsDead(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return true // gone
+	}
+	i := bytes.LastIndexByte(data, ')')
+	if i < 0 || i+2 >= len(data) {
+		return false
+	}
+	f := strings.Fields(string(data[i+2:]))
+	if len(f) == 0 {
+		return false
+	}
+	return f[0] == "Z" || f[0] == "X" || f[0] == "x"
 }
 
 func TestBackground_Kill_UnknownIdentity_Refused(t *testing.T) {

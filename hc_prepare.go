@@ -284,26 +284,14 @@ func wordHasAtSplitExpansion(w *syntax.Word) bool {
 	for _, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.ParamExp:
-			if p.Param != nil && p.Param.Value == "@" {
-				return true
-			}
-			if paramExpHasAtIndex(p) {
-				return true
-			}
-			if p.Exp != nil && p.Exp.Word != nil && wordHasAtSplitExpansion(p.Exp.Word) {
+			if paramExpSplitsInDblQuotes(p) {
 				return true
 			}
 		case *syntax.DblQuoted:
 			for _, ip := range p.Parts {
 				switch ipp := ip.(type) {
 				case *syntax.ParamExp:
-					if ipp.Param != nil && ipp.Param.Value == "@" {
-						return true
-					}
-					if paramExpHasAtIndex(ipp) {
-						return true
-					}
-					if ipp.Exp != nil && ipp.Exp.Word != nil && wordHasAtSplitExpansion(ipp.Exp.Word) {
+					if paramExpSplitsInDblQuotes(ipp) {
 						return true
 					}
 				case *syntax.CmdSubst, *syntax.ArithmExp:
@@ -313,6 +301,38 @@ func wordHasAtSplitExpansion(w *syntax.Word) bool {
 				}
 			}
 		}
+	}
+	return false
+}
+
+// paramExpSplitsInDblQuotes reports whether a double-quoted ${...}/$@
+// parameter expansion can field-split into multiple argv words at runtime
+// (and therefore must NOT be emitted as a split-safe cmdSubPlaceholderQuoted).
+// Unlike "$PWD" (single value), "$@" / "${arr[@]}" / "${!prefix@}" /
+// "${x:-$@}" expand to one word PER element even inside double quotes.
+// Returns true when pe != nil && !pe.Length (a ${#...} length is always one
+// integer word) and any of:
+//   - pe.Param.Value == "@"         — $@, ${@}, ${@:1}, ${@/#a/b}, ${@@Q}
+//   - pe.Names == NamesPrefixWords  — "${!prefix@}" (names list, splits)
+//   - paramExpHasAtIndex(pe.Index)  — "${arr[@]}" and "${!arr[@]}"
+//   - pe.Exp.Word carries an @-split — "${x:-$@}", "${x:+$@}",
+//     "${x:-\"${arr[@]}\"}" ("${x:-@}" literal stays false via
+//     wordHasAtSplitExpansion)
+func paramExpSplitsInDblQuotes(pe *syntax.ParamExp) bool {
+	if pe == nil || pe.Length {
+		return false
+	}
+	if pe.Param != nil && pe.Param.Value == "@" {
+		return true
+	}
+	if pe.Names == syntax.NamesPrefixWords {
+		return true
+	}
+	if paramExpHasAtIndex(pe) {
+		return true
+	}
+	if pe.Exp != nil && pe.Exp.Word != nil && wordHasAtSplitExpansion(pe.Exp.Word) {
+		return true
 	}
 	return false
 }

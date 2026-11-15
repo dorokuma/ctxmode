@@ -2871,13 +2871,22 @@ func wordToArg(w *syntax.Word) (string, bool) {
 				break
 			}
 			for _, ip := range p.Parts {
-				lit, ok := ip.(*syntax.Lit)
-				if !ok {
+				switch ipp := ip.(type) {
+				case *syntax.Lit:
+					b.WriteString(decodeDblQuotedLit(ipp.Value))
+				case *syntax.ParamExp:
+					// "$@"/"${arr[@]}"/"${!prefix@}"/"${x:-$@}" still
+					// field-split inside double quotes -> NOT split-safe.
+					static = false
+					if paramExpSplitsInDblQuotes(ipp) {
+						b.WriteString(cmdSubPlaceholder)
+					} else {
+						b.WriteString(cmdSubPlaceholderQuoted)
+					}
+				default:
 					static = false
 					b.WriteString(cmdSubPlaceholderQuoted)
-					continue
 				}
-				b.WriteString(decodeDblQuotedLit(lit.Value))
 			}
 		case *syntax.ParamExp:
 			// Context-free: only $$ (a decimal PID) is known split-safe.
@@ -3078,6 +3087,13 @@ func (c *subCollector) unquotedParamPlaceholder(pe *syntax.ParamExp) string {
 // (text, true) means the part emitted literal text that stays static;
 // (placeholder, false) marks the word dynamic.
 func (c *subCollector) dqParamPlaceholder(pe *syntax.ParamExp) (string, bool) {
+	// A @-splitting expansion must NOT keep the split-safe dq placeholder:
+	// "$@"/"${arr[@]}"/"${!prefix@}"/"${x:-$@}" all expand to one argv word
+	// per element even inside double quotes, so emit the conservative
+	// cmdSubPlaceholder instead (isSplitSafeDynamicWord -> false).
+	if paramExpSplitsInDblQuotes(pe) {
+		return cmdSubPlaceholder, false
+	}
 	name, simple := simpleParamName(pe)
 	if !simple {
 		return cmdSubPlaceholderQuoted, false
