@@ -5,10 +5,11 @@
 # 2. Whitelist types: feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert (case-sensitive)
 # 3. Scope whitelist: [a-z0-9._-]+ (case-sensitive)
 # 4. Colon followed by exactly one space
-# 5. Subject non-empty, <= 72 characters (Unicode chars), English/Chinese allowed
+# 5. Subject non-empty, <= 72 characters, English only (ASCII)
 # 6. Exemptions: lines starting with Merge , Revert , fixup! , squash!
 # 7. Process noise words prevention
 # 8. Secret leak scanning (message + staged diff)
+# 9. English-only: no non-ASCII bytes anywhere in the message (subject + body, including Merge/Revert)
 set -eu
 
 RED='\033[0;31m'
@@ -39,14 +40,22 @@ CLEAN_MSG=$(printf '%s\n' "$RAW_MSG" | grep -v '^[[:space:]]*#' || true)
 # Extract first non-empty line as subject
 SUBJECT_LINE=$(printf '%s\n' "$CLEAN_MSG" | grep -m1 '[^[:space:]]' || true)
 
+# ── 0b. English-only: reject non-ASCII bytes in the message ──────────
+# Applies to the whole message (subject + body), including Merge/Revert
+# commits: one language for all commit titles, no mixing.
+if printf '%s' "$CLEAN_MSG" | grep -qP '[^\x00-\x7F]'; then
+  die "Commit message contains non-ASCII characters. English only." \
+"Write the commit message in English (ASCII only). Translate any Chinese text before committing."
+fi
+
 if [ -z "$SUBJECT_LINE" ]; then
   die "Commit message is empty." \
 "Please provide a valid commit message in the format:
   <type>(<scope>): <subject>
 Examples:
   feat: add timeout configuration
-  fix(db): 修复缓存 TTL
-  docs(readme): 添加入口"
+  fix(db): fix cache TTL
+  docs(readme): add entry point"
 fi
 
 # ── 1. Check for exemptions (Merge, Revert, fixup!, squash!) ────────
