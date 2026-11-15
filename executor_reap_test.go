@@ -1,13 +1,16 @@
 // Tests for reap hardening of the kill paths: the setsid escapee sweep on the
-// ctx-cancel kill paths (runCmd + batch executeCommand) and the conservative
-// killBackground fallback for entries with starttime==0.
+// ctx-cancel kill paths (runCmd + batch executeCommand), the conservative
+// killBackground fallback for entries with starttime==0, and the init-time
+// orphan ctxmode_* temp sweep.
 
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -198,5 +201,71 @@ func TestReap_LimitedBufferConcurrentReadWrite(t *testing.T) {
 	}
 	if !lb.truncatedFlag() {
 		t.Fatal("expected truncated=true after overflow writes")
+	}
+}
+
+// TestSweepOrphanTempFiles_TTLBoundary covers the 7-day reap threshold on
+// unprotected ctxmode_* files: a file younger than the TTL must survive
+// (would have been deleted under the old 24h threshold), one just past the
+// TTL must be reaped, and a protected file must survive even past the TTL.
+// The sweep runs against an isolated TMPDIR only — it must never touch the
+// real /tmp namespace.
+func TestSweepOrphanTempFiles_TTLBoundary(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+
+	now := time.Now()
+	cases := []struct {
+		name      string
+		mtimeAge  time.Duration
+		protected bool
+		wantKept  bool
+	}{
+		{name: "ctxmode_fresh", mtimeAge: time.Hour, wantKept: true},
+		{name: "ctxmode_under_ttl", mtimeAge: 6 * 24 * time.Hour, wantKept: true},
+		{name: "ctxmode_bg_under_ttl.log", mtimeAge: 2 * 24 * time.Hour, wantKept: true},
+		{name: "ctxmode_over_ttl", mtimeAge: 7*24*time.Hour + 10*time.Minute, wantKept: false},
+		{name: "ctxmode_bg_over_ttl.log", mtimeAge: 30 * 24 * time.Hour, wantKept: false},
+		{name: "ctxmode_protected_over_ttl", mtimeAge: 30 * 24 * time.Hour, protected: true, wantKept: true},
+	}
+	for _, c := range cases {
+		full := filepath.Join(os.TempDir(), c.name)
+		if err := os.WriteFile(full, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", c.name, err)
+		}
+		mtime := now.Add(-c.mtimeAge)
+		if err := os.Chtimes(full, mtime, mtime); err != nil {
+			t.Fatalf("chtimes %s: %v", c.name, err)
+		}
+		if c.protected {
+			protectTemp(full)
+			t.Cleanup(func() { unprotectTemp(full) })
+		}
+	}
+	// A non-ctxmode file past the TTL must be ignored by the sweep.
+	other := filepath.Join(os.TempDir(), "unrelated_file")
+	if err := os.WriteFile(other, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-30 * 24 * time.Hour)
+	if err := os.Chtimes(other, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	sweepOrphanTempFiles()
+
+	for _, c := range cases {
+		full := filepath.Join(os.TempDir(), c.name)
+		_, err := os.Stat(full)
+		switch {
+		case c.wantKept && err != nil:
+			t.Errorf("%s (age %v) was removed, want kept", c.name, c.mtimeAge)
+		case !c.wantKept && err == nil:
+			t.Errorf("%s (age %v) was kept, want reaped", c.name, c.mtimeAge)
+		case !c.wantKept && !os.IsNotExist(err):
+			t.Errorf("stat %s: %v", c.name, err)
+		}
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("non-ctxmode file was removed: %v", err)
 	}
 }

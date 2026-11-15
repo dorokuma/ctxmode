@@ -1219,10 +1219,23 @@ func isTempProtected(path string) bool {
 	return protectedTemps[path] > 0
 }
 
+// orphanTempReapTTL bounds how long an unprotected ctxmode_* temp file may
+// sit in os.TempDir() before the init-time sweep reaps it. 7 days is long
+// enough that a temp file belonging to a merely-suspended or long-running
+// process is never mistaken for an orphan.
+const orphanTempReapTTL = 7 * 24 * time.Hour
+
 // init cleans up stale temp files from previous runs that may have been
 // killed (e.g., SIGKILL) before their deferred cleanup could execute.
 // Skips temps still referenced by the background registry (same process).
 func init() {
+	sweepOrphanTempFiles()
+}
+
+// sweepOrphanTempFiles removes unprotected ctxmode_* files in os.TempDir()
+// whose mtime is older than orphanTempReapTTL. Called from init; a package
+// test can invoke it directly under an isolated TMPDIR.
+func sweepOrphanTempFiles() {
 	entries, err := os.ReadDir(os.TempDir())
 	if err != nil {
 		return
@@ -1238,12 +1251,12 @@ func init() {
 			continue
 		}
 		// Background-owned temps use a distinct prefix; if not protected
-		// they belong to a dead prior process and may be reaped after 24h.
+		// they belong to a dead prior process and may be reaped after 7 days.
 		info, err := e.Info()
 		if err != nil {
 			continue
 		}
-		if now.Sub(info.ModTime()) > 24*time.Hour {
+		if now.Sub(info.ModTime()) > orphanTempReapTTL {
 			os.Remove(full)
 		}
 	}
