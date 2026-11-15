@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -12,6 +13,150 @@ import (
 	"testing"
 	"time"
 )
+
+// ============================================================================
+// 项：-workdir 可重复累积（首值保持 primary）+ CTXMODE_EXTRA_WORKDIRS 窄校验
+// ============================================================================
+
+// buildCtxmodeCLI compiles the package once for the CLI probes below: flag
+// accumulation, env extra-dir validation and workspace registration are only
+// observable together through the real `index`/`search` command entry point.
+func buildCtxmodeCLI(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skipf("go toolchain not in PATH: %v", err)
+	}
+	bin := filepath.Join(t.TempDir(), "ctxmode-under-test")
+	out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput()
+	if err != nil {
+		t.Fatalf("go build ctxmode CLI: %v\n%s", err, out)
+	}
+	return bin
+}
+
+func TestCLI_WorkdirFlagsAndExtraEnv(t *testing.T) {
+	bin := buildCtxmodeCLI(t)
+
+	home := t.TempDir() // isolated $HOME so each run resolves its own per-workdir db
+	wd1 := t.TempDir()
+	wd2 := t.TempDir()
+	mustWrite(t, filepath.Join(wd1, "alpha.txt"), "alpha-unique-marker")
+	mustWrite(t, filepath.Join(wd2, "beta.txt"), "beta-unique-marker")
+
+	run := func(t *testing.T, env []string, args ...string) (string, error) {
+		t.Helper()
+		cmd := exec.Command(bin, args...)
+		// Minimal deterministic env: a scratch HOME (per-workdir db under it),
+		// PATH for any runtime lookups, and no inherited CTXMODE_* overrides
+		// that could move the db or the role identity.
+		cmd.Env = append([]string{
+			"PATH=" + os.Getenv("PATH"),
+			"HOME=" + home,
+		}, env...)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	t.Run("RepeatedFlagAccumulatesAndFirstIsPrimary", func(t *testing.T) {
+		// Both -workdir values register: the wd1 file is indexable even
+		// though a later flag named wd2 (last-wins semantics would have
+		// dropped wd1 and refused this file as outside the workspaces).
+		if out, err := run(t, nil, "-workdir", wd1, "-workdir", wd2, "index", filepath.Join(wd1, "alpha.txt")); err != nil {
+			t.Fatalf("index wd1 file with flags -workdir wd1 -workdir wd2: %v\n%s", err, out)
+		}
+		if out, err := run(t, nil, "-workdir", wd1, "-workdir", wd2, "index", filepath.Join(wd2, "beta.txt")); err != nil {
+			t.Fatalf("index wd2 file with flags -workdir wd1 -workdir wd2: %v\n%s", err, out)
+		}
+		// Primary is the FIRST -workdir: the db is keyed on wd1, so the
+		// same flag set finds the doc while the swapped set (wd2 primary)
+		// opens a different, empty db.
+		out, err := run(t, nil, "-workdir", wd1, "-workdir", wd2, "search", "alpha-unique-marker")
+		if err != nil || !strings.Contains(out, "alpha.txt") {
+			t.Fatalf("search on wd1-primary flags: err=%v out=%s", err, out)
+		}
+		out, err = run(t, nil, "-workdir", wd2, "-workdir", wd1, "search", "alpha-unique-marker")
+		if err != nil {
+			t.Fatalf("search on wd2-primary flags: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, "No matches") || strings.Contains(out, "alpha-unique-marker") {
+			t.Fatalf("wd2-primary db must not contain the wd1 doc: %s", out)
+		}
+	})
+
+	t.Run("EmptyFlagValueIgnored", func(t *testing.T) {
+		// `-workdir ""` was a no-op under old last-wins semantics (the
+		// empty value never became a workdir); the accumulating flag must
+		// keep ignoring it instead of absolutizing it to cwd — otherwise
+		// an empty flag silently makes cwd the PRIMARY workdir.
+		if out, err := run(t, nil, "-workdir", "", "-workdir", wd1, "index", filepath.Join(wd1, "alpha.txt")); err != nil {
+			t.Fatalf("index with empty -workdir flag: %v\n%s", err, out)
+		}
+		out, err := run(t, nil, "-workdir", "", "-workdir", wd1, "search", "alpha-unique-marker")
+		if err != nil || !strings.Contains(out, "alpha.txt") {
+			t.Fatalf("search with empty flag + wd1 primary: err=%v out=%s", err, out)
+		}
+		// Trailing empty value must not displace wd1 as primary either.
+		out, err = run(t, nil, "-workdir", wd1, "-workdir", "", "search", "alpha-unique-marker")
+		if err != nil || !strings.Contains(out, "alpha.txt") {
+			t.Fatalf("trailing empty -workdir must not change wd1 primary: err=%v out=%s", err, out)
+		}
+	})
+
+	t.Run("ExtraEnvAppendsAfterFlagRoots", func(t *testing.T) {
+		env := []string{`CTXMODE_EXTRA_WORKDIRS=["` + wd2 + `"]`}
+		// wd2 reaches the workspace set only through the env extra: indexing
+		// a wd2 file with a single -workdir wd1 flag must succeed.
+		if out, err := run(t, env, "-workdir", wd1, "index", filepath.Join(wd2, "beta.txt")); err != nil {
+			t.Fatalf("index via CTXMODE_EXTRA_WORKDIRS: %v\n%s", err, out)
+		}
+		out, err := run(t, env, "-workdir", wd1, "search", "beta-unique-marker")
+		if err != nil || !strings.Contains(out, "beta.txt") {
+			t.Fatalf("search must find extra-env indexed doc: err=%v out=%s", err, out)
+		}
+		// The extra dir is never primary: the env value alone without any
+		// flag keeps cwd semantics, and the db still keys on wd1.
+	})
+
+	t.Run("ExtraEnvRejectsBroadAndReportRoots", func(t *testing.T) {
+		cases := []struct {
+			name, env string
+			want      string
+		}{
+			{"filesystem root", `CTXMODE_EXTRA_WORKDIRS=["/"]`, "too broad"},
+			{"bare tmp", `CTXMODE_EXTRA_WORKDIRS=["/tmp"]`, "too broad"},
+			{"var tmp", `CTXMODE_EXTRA_WORKDIRS=["/var/tmp"]`, "too broad"},
+			{"report root subtree", `CTXMODE_EXTRA_WORKDIRS=["/tmp/herdr-role-reports/default/role-x"]`, "report root"},
+			{"non-normalized", `CTXMODE_EXTRA_WORKDIRS=["/tmp/../etc"]`, "not normalized"},
+			{"relative", `CTXMODE_EXTRA_WORKDIRS=["rel/dir"]`, "not an absolute path"},
+			{"not json", `CTXMODE_EXTRA_WORKDIRS={bad`, "JSON array"},
+			{"non-array json", `CTXMODE_EXTRA_WORKDIRS=123`, "JSON array"},
+		}
+		for _, tc := range cases {
+			out, err := run(t, []string{tc.env}, "-workdir", wd1, "search", "alpha-unique-marker")
+			if err == nil {
+				t.Fatalf("%s: CTXMODE_EXTRA_WORKDIRS=%q accepted, want startup failure\n%s", tc.name, tc.env, out)
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Fatalf("%s: stderr must name the policy reason %q, got: %s", tc.name, tc.want, out)
+			}
+		}
+		// A symlink whose target is a denied root is rejected after
+		// resolution too (link itself looks innocent).
+		link := filepath.Join(t.TempDir(), "tmp-link")
+		if err := os.Symlink("/tmp", link); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		out, err := run(t, []string{`CTXMODE_EXTRA_WORKDIRS=["` + link + `"]`}, "-workdir", wd1, "search", "x")
+		if err == nil || !strings.Contains(out, "too broad") {
+			t.Fatalf("symlink to /tmp must be rejected post-resolution: err=%v out=%s", err, out)
+		}
+		// Narrow policy means narrow: an ordinary absolute dir (even one
+		// that does not exist yet) is accepted without complaint.
+		if out, err := run(t, []string{`CTXMODE_EXTRA_WORKDIRS=["` + filepath.Join(home, "notthere") + `"]`}, "-workdir", wd1, "search", "alpha-unique-marker"); err != nil {
+			t.Fatalf("benign absolute extra dir must not block startup: %v\n%s", err, out)
+		}
+	})
+}
 
 // ============================================================================
 // 项 7：按 workdir 分库 — 不同 workdir 得到不同库路径且数据不互见

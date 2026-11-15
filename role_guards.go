@@ -419,12 +419,18 @@ var envHookVars = map[string]bool{
 	// injected JSON spec instead of the CLI args (S-NEW-2).
 	"PI_SANDBOX_INTERNAL_CHILD_SPEC": true,
 	// Dispatch report channel and terminal-control sockets: a sub-agent
-	// re-pointing DISPATCH_REPORT_PATH hands its report to a fake collector;
-	// PI_SANDBOX_GO_EXEC_DIR relocates the sbx-exec payload root; and
-	// HC_TERMINAL_ID/HC_SOCKET re-target hc send to another terminal or a
-	// forged control socket, bypassing the whitelist'd report address.
-	"DISPATCH_REPORT_PATH": true, "PI_SANDBOX_GO_EXEC_DIR": true,
-	"HC_TERMINAL_ID": true, "HC_SOCKET": true,
+	// re-pointing DISPATCH_REPORT_PATH hands its report to a fake collector
+	// and a rewritten DISPATCH_REPORT_PARENT retargets the notify address
+	// the report lands on; PI_SANDBOX_GO_EXEC_DIR relocates the sbx-exec
+	// payload root; HC_TERMINAL_ID/HC_SOCKET re-target hc send to another
+	// terminal or a forged control socket, bypassing the whitelist'd
+	// report address; and CTXMODE_EXTRA_WORKDIRS widens the ctxmode
+	// workspace set at spawn, letting a role read files outside its
+	// authorized roots.
+	"DISPATCH_REPORT_PATH": true, "DISPATCH_REPORT_PARENT": true,
+	"PI_SANDBOX_GO_EXEC_DIR": true,
+	"HC_TERMINAL_ID":         true, "HC_SOCKET": true,
+	"CTXMODE_EXTRA_WORKDIRS": true,
 }
 
 // pagerSafeVars may be set to "" or "cat" — disabling the pager is the
@@ -9294,13 +9300,43 @@ func envOverrideKeyVerdict(key string) string {
 	return ""
 }
 
-// unquoteCodeKey strips a simple quoted literal key (no escapes).
+// unquoteCodeKey strips a simple quoted literal key (no escapes). A
+// backtick template containing `${` is interpolated at runtime — never a
+// static key — and fails closed so the caller reports
+// `env override dynamic`. Python non-interpolated string/bytes literal
+// prefixes are peeled too, but ONLY before a `'`/`"` quote (`b`/`B`,
+// `r`/`R`, `u`/`U` and the two-letter `br`/`bR`/`Br`/`BR`/`rb`/`rB`/`Rb`/`RB`
+// combinations): `os.environb[b'K']=v` extracts `K` like `os.environ['K']`.
+// Interpolating `f`/`F`/`fr`/`rf` prefixes are never peeled (an f-string key
+// is dynamic and fails closed), and a backtick never takes a prefix —
+// `tag` + backtick is a JS tagged template, not a static key.
 func unquoteCodeKey(s string) (string, bool) {
 	s = strings.TrimSpace(s)
 	if len(s) >= 2 {
 		q := s[0]
+		if q != '\'' && q != '"' && q != '`' {
+			// Try a Python string/bytes literal prefix (1-2 bytes).
+			for pl := 1; pl <= 2 && pl < len(s)-1; pl++ {
+				pq := s[pl]
+				if pq != '\'' && pq != '"' {
+					continue
+				}
+				switch s[:pl] {
+				case "b", "B", "r", "R", "u", "U",
+					"br", "bR", "Br", "BR", "rb", "rB", "Rb", "RB":
+					s = s[pl:]
+					q = pq
+				default:
+					return "", false
+				}
+				break
+			}
+		}
 		if (q == '\'' || q == '"' || q == '`') && s[len(s)-1] == q {
 			inner := s[1 : len(s)-1]
+			if q == '`' && strings.Contains(inner, "${") {
+				return "", false
+			}
 			if !strings.ContainsAny(inner, "\\"+string(q)) {
 				return inner, true
 			}
@@ -9310,18 +9346,43 @@ func unquoteCodeKey(s string) (string, bool) {
 	return "", false
 }
 
-// skipMaskSpace advances i over spaces (not newlines) in a masked span.
+// skipMaskSpace advances i over masked whitespace — ' ', '\t', '\r',
+// '\n', '\v', '\f' — and over Python-style backslash line continuations
+// ('\' followed by optional ' '/'\t'/'\r'/'\v'/'\f' then '\n').
+// String/comment bodies are already blanked in the mask, so a '\\' inside
+// a literal cannot reach here; a '\' not followed by a newline stops the
+// scan (it is not a continuation).
 func skipMaskSpace(s string, i int) int {
-	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
-		i++
+	for i < len(s) {
+		switch s[i] {
+		case ' ', '\t', '\r', '\n', '\v', '\f':
+			i++
+		case '\\':
+			j := i + 1
+			for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\r' || s[j] == '\v' || s[j] == '\f') {
+				j++
+			}
+			if j < len(s) && s[j] == '\n' {
+				i = j + 1
+				continue
+			}
+			return i
+		default:
+			return i
+		}
 	}
 	return i
 }
 
 // maskAssignAfterBracket reports whether masked[i] opens a `[…]` subscript
-// whose closing bracket is immediately followed by an assignment `=` (not
-// `==`, `=>` or a compound `[-+*/%|&^]=` — those still mutate). Returns
-// (keyLo, keyHi, true) when so; the raw key text is code[keyLo:keyHi].
+// whose closing bracket is immediately followed by an assignment — a plain
+// `=` (not `==` or `=>`) or a compound assignment operator (`+=`, `-=`, `*=`,
+// `/=`, `//=`, `%=`, `**=`, `<<=`, `>>=`, `>>>=`, `&=`, `|=`, `^=`, `@=`,
+// `&&=`, `||=`, `??=`). Both forms MUTATE the subscripted slot — an
+// `os.environ['K'] += 'x'` / `process.env['K'] <<= 1` is an env override —
+// so a post-bracket comparison (`['K'] == v`), arrow callback or
+// null-comparison (`['K'] ??= v` is a write, `??` alone is not) stays a read.
+// Returns (keyLo, keyHi, true) when so; the raw key text is code[keyLo:keyHi].
 func maskAssignAfterBracket(masked string, i int) (int, int, bool) {
 	if i >= len(masked) || masked[i] != '[' {
 		return 0, 0, false
@@ -9334,9 +9395,16 @@ func maskAssignAfterBracket(masked string, i int) (int, int, bool) {
 		case ']':
 			depth--
 			if depth == 0 {
+				// Whitespace-wrapped `)` groups between `]` and the write
+				// op — `(os.environ['K'])\n = v` — bind the subscript to
+				// the assignment exactly like an unwrapped target, while
+				// comparison openers (`==`/`!=`/`<=`/`>=`/`=>`) still fail
+				// maskAssignOpAt below.
 				k := skipMaskSpace(masked, j+1)
-				if k < len(masked) && masked[k] == '=' &&
-					(k+1 >= len(masked) || masked[k+1] != '=' && masked[k+1] != '>') {
+				for k < len(masked) && masked[k] == ')' {
+					k = skipMaskSpace(masked, k+1)
+				}
+				if maskAssignOpAt(masked, k) {
 					return i + 1, j, true
 				}
 				return 0, 0, false
@@ -9346,34 +9414,463 @@ func maskAssignAfterBracket(masked string, i int) (int, int, bool) {
 	return 0, 0, false
 }
 
-// pyEnvOverrideHit scans masked Python for os.environ mutation spellings.
+// isMaskSpaceByte reports whether c is a mask-whitespace byte — the set
+// skipMaskSpace crosses (' ', '\t', '\r', '\n', '\v', '\f'). A '\' is
+// NOT whitespace here (a backslash continuation is a skipMaskSpace-level
+// forward concept); for the backward byte checks below a lone '\' simply
+// counts as a non-space byte.
+func isMaskSpaceByte(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f'
+}
+
+// maskDestructAssignTarget reports whether the receiver expression spanning
+// masked[exprLo:exprHi] (an `os.environ`/`process.env` occurrence whose own
+// key/member did NOT take a direct write op) is one ELEMENT of a
+// destructuring assignment target — `[a, env['K']] = […]`,
+// `({p: env.K} = {…})` — so the env slot is written even though no `=`
+// follows the key itself.
+//
+// Wrapped shape: scan backwards from exprLo tracking bracket depth for an
+// unmatched `(`, `[` or `{` enclosing the expression. Each opener must sit
+// in operand position — openIsCallOrSubscript rejects call-argument and
+// subscript positions (`f(…`, `d[…`, `a[i](…`, `fn()[…`), statement-head
+// keywords (`if (1) [K]=v`, `else [K]=v`), ASI/Python statement starts
+// (`let x\n[K]=v`) and `{` literals, where the env expr is either READ or
+// genuinely assigned. The matching closer is then found by depth, a plain
+// `=` right after it (next byte not `=`/`>`) proves the write, otherwise
+// enclosing groups are peeled under the same premise. `==`/`=>` still read
+// as comparisons/arrows.
+//
+// Bare-tuple shape (Python only): when the outermost peel leaves the group
+// followed by `,` rather than `=` — `[env['K']], a = ['/x'], 1` — or when
+// no bracket encloses the expression at all — `env['K'], a = '/x', 1` —
+// pyBareTupleAssignAfter looks for a plain `=` at bracket depth 0 in the
+// same statement after the comma. JavaScript must not use this shape: a
+// comma there is a sequence expression or a multi-declarator (`const a =
+// process.env.K, b = 1` READS env), never a destructuring target.
+func maskDestructAssignTarget(masked string, exprLo, exprHi int, py bool) bool {
+	// Find the nearest unmatched opener enclosing the expression.
+	depth := 0
+	openIdx := -1
+	for j := exprLo - 1; j >= 0; j-- {
+		switch masked[j] {
+		case ')', ']', '}':
+			depth++
+		case '(', '[', '{':
+			if depth == 0 {
+				openIdx = j
+			} else {
+				depth--
+			}
+		}
+		if openIdx >= 0 {
+			break
+		}
+	}
+	if openIdx < 0 {
+		// Bare tuple unpack: `os.environ['K'], a = '/x', 1` (Python only).
+		return py && pyBareTupleAssignAfter(masked, exprHi)
+	}
+	// Peel enclosing groups until the outermost literal wrapper; each level
+	// must sit in operand position (openIsCallOrSubscript rejects call /
+	// subscript openers — the env expr is a read there).
+	for {
+		if openIsCallOrSubscript(masked, openIdx, py) {
+			return false
+		}
+		d := 0
+		closeIdx := -1
+		for j := openIdx + 1; j < len(masked); j++ {
+			switch masked[j] {
+			case '(', '[', '{':
+				d++
+			case ')', ']', '}':
+				if d == 0 {
+					closeIdx = j
+				} else {
+					d--
+				}
+			}
+			if closeIdx >= 0 {
+				break
+			}
+		}
+		if closeIdx < 0 {
+			return false
+		}
+		// `group = …` at THIS level is the destructuring write — the
+		// `=` of `({p:X}={p:Y})` sits between the inner `}` and the
+		// outer `)`, so it must be checked before peeling outward.
+		k := skipMaskSpace(masked, closeIdx+1)
+		if k < len(masked) && masked[k] == '=' &&
+			(k+1 >= len(masked) || (masked[k+1] != '=' && masked[k+1] != '>')) {
+			return true
+		}
+		nested := 0
+		nextOpen := -1
+		for j := openIdx - 1; j >= 0; j-- {
+			switch masked[j] {
+			case ')', ']', '}':
+				nested++
+			case '(', '[', '{':
+				if nested == 0 {
+					nextOpen = j
+				} else {
+					nested--
+				}
+			}
+			if nextOpen >= 0 {
+				break
+			}
+		}
+		if nextOpen < 0 {
+			// Outermost wrapper peeled: the group can still be ONE bare-tuple
+			// element — `[env['K']], a = ['/x'], 1` writes env even though
+			// the outer `]` is followed by `,`, not `=` (Python only).
+			return py && pyBareTupleAssignAfter(masked, closeIdx+1)
+		}
+		openIdx = nextOpen
+	}
+}
+
+// pyBareTupleAssignAfter reports whether masked[pos] — an env expression or
+// a peeled wrapper group sitting at Python statement level — continues into
+// a bare-tuple unpack WRITE: a `,` right after pos (mask whitespace
+// allowed), then at bracket depth 0 within the same statement (`;` or a
+// non-continuation `\n` ends it) a plain `=` — previous byte not in
+// `!<>=`, next byte not `=`/`>`. Only the `=` AFTER the comma writes;
+// `x = [env['K']], 1` keeps its `=` before the comma and returns false —
+// the env expr is a read.
+func pyBareTupleAssignAfter(masked string, pos int) bool {
+	k := skipMaskSpace(masked, pos)
+	if k >= len(masked) || masked[k] != ',' {
+		return false
+	}
+	d := 0
+	for j := k + 1; j < len(masked); j++ {
+		switch masked[j] {
+		case '(', '[', '{':
+			d++
+		case ')', ']', '}':
+			if d > 0 {
+				d--
+			}
+		case ';':
+			if d == 0 {
+				return false
+			}
+		case '\n':
+			if d == 0 && !pyLineContBefore(masked, j) {
+				return false
+			}
+		case '=':
+			if d == 0 &&
+				(j == 0 || strings.IndexByte("!<>=", masked[j-1]) < 0) &&
+				(j+1 >= len(masked) || (masked[j+1] != '=' && masked[j+1] != '>')) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// maskStmtHeadKeyword reports whether w is a statement-head keyword whose
+// parenthesised condition — `if (…)`, `while (…)`, `for (…)`, `with (…)`,
+// `switch (…)`, `catch (…)` — is NOT a call. A `[…]` following such a `)`
+// opens the statement body (a destructuring target), it does not subscript
+// the `)` group.
+func maskStmtHeadKeyword(w string) bool {
+	switch w {
+	case "if", "while", "for", "with", "switch", "catch":
+		return true
+	}
+	return false
+}
+
+// maskPrefixKeyword reports whether w is a keyword after which a `[`/`(`
+// group opens a NEW operand/statement rather than a subscript or call — JS
+// statement/prefix words (`else`, `do`, `return`, `throw`, `yield`,
+// `await`, `case`, `of`, `in`, `void`, `typeof`, `delete`, `if`, `while`,
+// `for`, `with`, `switch`, `catch`) and Python ones (`elif`, `except`,
+// `raise`, `assert`, `del`, `not`, `and`, `or`, `is`, `from`, `import`,
+// plus the shared condition heads). `else [K]=v`, `return [K]` and
+// `del [K]` all put the group at statement/operand head, never in
+// subscript position.
+func maskPrefixKeyword(w string) bool {
+	switch w {
+	case "else", "do", "return", "throw", "yield", "await", "case",
+		"of", "in", "void", "typeof", "delete", "if", "while", "for",
+		"with", "switch", "catch", "elif", "except", "raise", "assert",
+		"del", "not", "and", "or", "is", "from", "import":
+		return true
+	}
+	return false
+}
+
+// maskIdentBefore returns the identifier word whose LAST byte is masked[p]
+// — the maximal run of identifier bytes ending at p (caller guarantees
+// isIdentByte(masked[p])).
+func maskIdentBefore(masked string, p int) string {
+	lo := p
+	for lo-1 >= 0 && isIdentByte(masked[lo-1]) {
+		lo--
+	}
+	return masked[lo : p+1]
+}
+
+// openIsCallOrSubscript reports whether the group opener masked[openIdx]
+// sits in call-argument or subscript position — `fn(…`, `d[…`, `a[0][…`,
+// `fn()[…` — where an env expression inside is READ, versus a
+// statement/operand head where `[…]`/`(…)`/`{…}` may be a destructuring
+// target literal. Checks, in order:
+//   - `{` never opens a call or subscript — it is an object/block literal.
+//   - `(` whose own match takes a plain `=` is a tuple-group target
+//     `(…) = rhs`, never a call read (`f(…)` cannot be assigned).
+//   - skipping mask whitespace backwards: a non-continuation `\n` ends the
+//     statement in Python; in JS a `\n` before a `[` is an ASI statement
+//     break (`let x\n[K]=v` destructures), while `(`/`{` simply continue
+//     a call/operand across lines.
+//   - `]` before the opener is a chained subscript `a[0][…` — read.
+//   - `)` before the opener: its matching `(` preceded by a statement-head
+//     keyword (`if (1) [K]=v` body) makes the group a fresh operand; any
+//     other or missing word (`fn()[K]=v`) is a subscripted call result —
+//     read.
+//   - an identifier: a keyword (else/do/return/…/del/not/and/or/is/
+//     import) puts the group at statement head; any other word makes it a
+//     subscript or call — `d[K]=v` reads K.
+func openIsCallOrSubscript(masked string, openIdx int, py bool) bool {
+	if masked[openIdx] == '{' {
+		return false
+	}
+	if masked[openIdx] == '(' {
+		// `(…) = rhs` is a destructuring target group, not a call read —
+		// a plain `=` after this opener's own match decides before the
+		// backward scan (`=>`/`==` still excluded).
+		d := 0
+		closed := -1
+		for j := openIdx + 1; j < len(masked); j++ {
+			switch masked[j] {
+			case '(', '[', '{':
+				d++
+			case ')', ']', '}':
+				if d == 0 {
+					closed = j
+				} else {
+					d--
+				}
+			}
+			if closed >= 0 {
+				break
+			}
+		}
+		if closed < 0 {
+			return false
+		}
+		if k := skipMaskSpace(masked, closed+1); k < len(masked) &&
+			masked[k] == '=' &&
+			(k+1 >= len(masked) || (masked[k+1] != '=' && masked[k+1] != '>')) {
+			return false
+		}
+	}
+	p := openIdx - 1
+	for p >= 0 && isMaskSpaceByte(masked[p]) {
+		if masked[p] == '\n' {
+			if py {
+				if !pyLineContBefore(masked, p) {
+					return false
+				}
+			} else if masked[openIdx] == '[' {
+				// JS ASI: `x\n[K]` does NOT subscript x — the `[` opens a
+				// new expression statement (array destructuring target).
+				return false
+			}
+		}
+		p--
+	}
+	if p < 0 {
+		return false
+	}
+	switch {
+	case masked[p] == ']':
+		// Chained subscript/call — `a[0][…`.
+		return true
+	case masked[p] == ')':
+		// The opener follows a `)` group: find its `(` and read the word
+		// (if any) right before it.
+		d := 0
+		open := -1
+		for j := p - 1; j >= 0; j-- {
+			switch masked[j] {
+			case ')':
+				d++
+			case '(':
+				if d == 0 {
+					open = j
+				} else {
+					d--
+				}
+			}
+			if open >= 0 {
+				break
+			}
+		}
+		if open < 0 {
+			return true
+		}
+		q := open - 1
+		for q >= 0 && isMaskSpaceByte(masked[q]) {
+			q--
+		}
+		if q < 0 || !isIdentByte(masked[q]) {
+			return true
+		}
+		return !maskStmtHeadKeyword(maskIdentBefore(masked, q))
+	case isIdentByte(masked[p]):
+		return !maskPrefixKeyword(maskIdentBefore(masked, p))
+	}
+	return false
+}
+
+// maskAssignOpAt reports whether masked[i] begins an assignment operator:
+// `=` alone (next byte not `=` or `>`), or a compound write op whose final
+// byte is `=` and whose operator prefix is one the masked-code scanners
+// recognise (`+ - * / % < > & | ^ @ ! ?` — `<<=`, `>>=`, `>>>=`, `//=`,
+// `**=`, `&&=`, `||=`, `??=`, `!=` is excluded below as a comparison).
+// The caller only invokes this immediately after a closing `]` (or, for the
+// JS dot-member form, after a property identifier), so a compound op found
+// here is unambiguously an assignment — there is no `a == b` parse where a
+// leading `+`/`*`/`/`/`%`/`&`/`|`/`^`/`@`/`?` could precede `=` in operand
+// position. `!=` and `??=` differ in kind but are cheap to separate:
+// `!=`/`==`/`===` are comparisons, every other `X=` after the name is a
+// write.
+func maskAssignOpAt(s string, i int) bool {
+	if i >= len(s) {
+		return false
+	}
+	if s[i] == '=' {
+		// `=` is a write only when the next byte cannot make it `==`/`=>`.
+		return i+1 >= len(s) || (s[i+1] != '=' && s[i+1] != '>')
+	}
+	if strings.IndexByte("+-*/%<>&|^@?", s[i]) < 0 {
+		return false
+	}
+	// Scan the operator run: every byte must be an operator char and the
+	// run must end in `=`. `!=` (and `!` alone) never reaches here — `!`
+	// is not in the prefix set, so `!==`/`!=` are comparisons; a lone
+	// `<=`/`>=` is a comparison too and is excluded inside the run.
+	j := i + 1
+	for j < len(s) && strings.IndexByte("+-*/%<>&|^@?=", s[j]) >= 0 {
+		if s[j] == '=' {
+			// `<x=`/`>x=` are shift-assigns only when a second op char
+			// precedes the `=`: a single `<=`/`>=` is a comparison
+			// (same class as `==`/`=>`/`!=`), while `<<=`/`>>=`/`>>>=`
+			// genuinely mutate.
+			if j == i+1 && (s[i] == '<' || s[i] == '>') {
+				return false
+			}
+			// The `=` may not itself be followed by `=` or `>` (`>>==`,
+			// `>>>` alone are not assignments, but `>>=`/`>>>=` are —
+			// the run ends exactly at that `=`).
+			return j+1 >= len(s) || (s[j+1] != '=' && s[j+1] != '>')
+		}
+		j++
+	}
+	return false
+}
+
+// pyEnvOverrideHit scans masked Python for os.environ/os.environb
+// mutation spellings.
 func pyEnvOverrideHit(code, masked string) string {
 	toks := codeTokens(masked)
 	// environ.update / environ.setdefault / os.putenv mutate env without a
 	// visible `=` on the environ name: they always fail closed — a
 	// sub-agent code body has no legitimate need to write process env, and
-	// a dynamic payload could re-target the report/socket hooks.
-	for _, prim := range []string{"environ.update", "environ.setdefault", "environ.__setitem__", "putenv"} {
+	// a dynamic payload could re-target the report/socket hooks. The
+	// `environb.` spellings cover os.environb — Python's byte-keyed
+	// environ view — which mutates the same environment.
+	for _, prim := range []string{"environ.update", "environ.setdefault", "environ.__setitem__", "environ.__delitem__", "environb.update", "environb.setdefault", "environb.__setitem__", "environb.__delitem__", "putenv", "unsetenv"} {
 		if toks.hasTokenLike(prim) || toks.hasIdent(prim) {
 			return "env override " + prim
 		}
 	}
 	hasDel := toks.hasIdent("del")
-	// os.environ['K']=v / environ['K']=v — mask-blanked key re-read raw.
+	// os.environ['K']=v / environ['K']=v / os.environb[b'K']=v —
+	// mask-blanked key re-read raw. `environb` is tried first (longer
+	// prefix): an `environ` left-anchored match on `environb` would treat
+	// the `b` as a stray identifier byte and skip the receiver.
 	for i := 0; i+7 < len(masked); i++ {
-		if !strings.HasPrefix(masked[i:], "environ") {
+		envLen := 0
+		if strings.HasPrefix(masked[i:], "environb") {
+			envLen = len("environb")
+		} else if strings.HasPrefix(masked[i:], "environ") {
+			envLen = len("environ")
+		}
+		if envLen == 0 {
 			continue
 		}
 		if i > 0 && isIdentByte(masked[i-1]) {
 			continue
 		}
-		j := skipMaskSpace(masked, i+len("environ"))
+		// `environment`/`environX` are different names, not the receiver.
+		if i+envLen < len(masked) && isIdentByte(masked[i+envLen]) {
+			continue
+		}
+		// environ\n.update({...}) / environ.pop('K') spellings: a
+		// mutating method after mask whitespace + '.' + whitespace.
+		if m := pyEnvironWriteMethodAfter(masked, i+envLen); m != "" {
+			return "env override environ." + m
+		}
+		j := skipMaskSpace(masked, i+envLen)
 		lo, hi, ok := maskAssignAfterBracket(masked, j)
 		if !ok {
-			// No `=` after the bracket — a read (or `del environ['K']`,
-			// the env clear screened below).
+			// No `=` after the bracket — a read, a `del environ['K']`
+			// operand (screened below), or a destructuring element:
+			// `[a, os.environ['K']] = …` / `os.environ['K'], a = …`
+			// writes the env slot through the tuple/list target.
+			if j < len(masked) && masked[j] == '[' {
+				depth := 0
+				for e := j; e < len(masked); e++ {
+					if masked[e] == '[' {
+						depth++
+					}
+					if masked[e] == ']' {
+						depth--
+						if depth == 0 {
+							// exprLo walks back from `environ` over the
+							// optional `os` + mask space + `.` + mask space
+							// qualifier so the enclosing-bracket scan sees
+							// the whole receiver expression.
+							exprLo := i
+							b := i - 1
+							for b >= 0 && isMaskSpaceByte(masked[b]) {
+								b--
+							}
+							if b >= 0 && masked[b] == '.' {
+								b--
+								for b >= 0 && isMaskSpaceByte(masked[b]) {
+									b--
+								}
+								if b >= 1 && masked[b-1] == 'o' && masked[b] == 's' &&
+									(b-1 == 0 || !isIdentByte(masked[b-2])) {
+									exprLo = b - 1
+								}
+							}
+							if maskDestructAssignTarget(masked, exprLo, e+1, true) {
+								key, okKey := unquoteCodeKey(code[j+1 : e])
+								if !okKey {
+									return "env override dynamic"
+								}
+								if hit := envOverrideKeyVerdict(key); hit != "" {
+									return hit
+								}
+							}
+							break
+						}
+					}
+				}
+			}
 			if hasDel {
-				if hit := pyDelEnvironKeyHit(code, masked, i); hit != "" {
+				if hit := pyDelEnvironKeyHit(code, masked, i, envLen); hit != "" {
 					return hit
 				}
 			}
@@ -9392,31 +9889,71 @@ func pyEnvOverrideHit(code, masked string) string {
 	return ""
 }
 
-// pyDelEnvironKeyHit reports whether masked[i] starts `environ` used as the
-// operand of a `del` statement (`del os.environ['K']`, `del environ['K']`) —
-// the in-code equivalent of `unset K`. The key is judged by
+// pyEnvironWriteMethodAfter reports whether masked[i] — positioned just
+// after an `environ` occurrence — is followed (through mask whitespace)
+// by `.` and a mutating method identifier (`update`, `setdefault`,
+// `__setitem__`, `pop`, `popitem`, `clear` — `get`/`keys`/iterators are
+// reads and stay free). Returns the method name, or "".
+func pyEnvironWriteMethodAfter(masked string, i int) string {
+	j := skipMaskSpace(masked, i)
+	if j >= len(masked) || masked[j] != '.' {
+		return ""
+	}
+	k := skipMaskSpace(masked, j+1)
+	start := k
+	for k < len(masked) && isIdentByte(masked[k]) {
+		k++
+	}
+	switch masked[start:k] {
+	case "update", "setdefault", "__setitem__", "__delitem__", "pop", "popitem", "clear":
+		return masked[start:k]
+	}
+	return ""
+}
+
+// pyDelEnvironKeyHit reports whether masked[envIdx] starts `environ` or
+// `environb` (envLen = the matched receiver length) used as the operand of
+// a `del` statement (`del os.environ['K']`, `del environb[b'K']`) — the
+// in-code equivalent of `unset K`. The key is judged by
 // envOverrideKeyVerdict; reads (`x in os.environ`, `os.environ.get`) are not
 // reached here because the caller only runs this when a `del` ident exists
 // somewhere in the masked code AND the subscript is not followed by `=`.
-func pyDelEnvironKeyHit(code, masked string, envIdx int) string {
-	// Walk back for a `del` at statement position on the same logical line:
-	// `del` may sit at the start or after `;` — any earlier `del` ident
-	// before the nearest `;`/`\n`/`)` boundary counts (conservative:
-	// `del` further left on the same line is the only way a `del` reaches
-	// this subscript).
-	j := envIdx
-	for j > 0 && masked[j-1] != '\n' && masked[j-1] != ';' && masked[j-1] != ')' {
-		j--
+func pyDelEnvironKeyHit(code, masked string, envIdx, envLen int) string {
+	// Locate the statement containing envIdx: a `;` or a `\n` at bracket
+	// depth 0 ends a statement, while `\n` inside an open `(…`/`[…`/`{…`
+	// group or directly behind a `\\` continuation stays inside it — so
+	// `del (\nos.environ['K']\n)` and `del \\\nos.environ['K']` still land in
+	// their `del` statement. Any earlier `del` ident inside the same
+	// statement counts (conservative, same rule as before).
+	stmtStart := 0
+	depth := 0
+	for p := 0; p < envIdx; p++ {
+		switch masked[p] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case ';':
+			if depth == 0 {
+				stmtStart = p + 1
+			}
+		case '\n':
+			if depth == 0 && !pyLineContBefore(masked, p) {
+				stmtStart = p + 1
+			}
+		}
 	}
-	if !strings.HasPrefix(strings.TrimLeft(masked[j:], " \t"), "del") &&
-		!toksLineHasDel(masked[j:envIdx]) {
+	if !strings.HasPrefix(strings.TrimLeft(masked[stmtStart:], " \t"), "del") &&
+		!toksLineHasDel(masked[stmtStart:envIdx]) {
 		return ""
 	}
-	k := skipMaskSpace(masked, envIdx+len("environ"))
+	k := skipMaskSpace(masked, envIdx+envLen)
 	if k >= len(masked) || masked[k] != '[' {
 		return ""
 	}
-	depth := 0
+	depth = 0
 	for e := k; e < len(masked); e++ {
 		if masked[e] == '[' {
 			depth++
@@ -9435,6 +9972,17 @@ func pyDelEnvironKeyHit(code, masked string, envIdx int) string {
 	return ""
 }
 
+// pyLineContBefore reports whether masked[nl] (a '\n') is a backslash line
+// continuation — a `\\` followed only by ' '/'\t'/'\r'/'\v'/'\f' up to the
+// newline.
+func pyLineContBefore(masked string, nl int) bool {
+	b := nl - 1
+	for b >= 0 && (masked[b] == ' ' || masked[b] == '\t' || masked[b] == '\r' || masked[b] == '\v' || masked[b] == '\f') {
+		b--
+	}
+	return b >= 0 && masked[b] == '\\'
+}
+
 // toksLineHasDel reports whether the masked segment s contains a `del`
 // identifier token.
 func toksLineHasDel(s string) bool {
@@ -9443,12 +9991,20 @@ func toksLineHasDel(s string) bool {
 
 // jsEnvOverrideHit scans masked JavaScript for process.env mutation
 // spellings: `process.env.K=v`, `process.env['K']=v`,
-// `Object.assign(process.env, …)` / `Object.defineProperty(process.env, …)`.
+// `Object.assign(process.env, …)` / `Object.defineProperty(process.env, …)` /
+// `Object.defineProperties(process.env, …)` / `Reflect.set(process.env, …)` /
+// `Reflect.defineProperty(process.env, …)` (the qualified names match
+// across mask whitespace around the dot — `Object\n.assign`,
+// `Object\f.assign`).
 func jsEnvOverrideHit(code, masked string) string {
 	toks := codeTokens(masked)
-	if toks.hasTokenLike("Object.assign") || toks.hasTokenLike("Object.defineProperty") ||
-		toks.hasTokenLike("Reflect.set") || toks.hasIdent("putenv") {
-		if toks.hasIdent("env") || strings.Contains(masked, "process.env") {
+	if hasMaskQualCall(masked, "Object", "assign") ||
+		hasMaskQualCall(masked, "Object", "defineProperty") ||
+		hasMaskQualCall(masked, "Object", "defineProperties") ||
+		hasMaskQualCall(masked, "Reflect", "set") ||
+		hasMaskQualCall(masked, "Reflect", "defineProperty") ||
+		hasMaskQualCall(masked, "Reflect", "deleteProperty") || toks.hasIdent("putenv") {
+		if toks.hasIdent("env") || jsProcessEnvAtAny(masked) {
 			return "env override"
 		}
 	}
@@ -9459,14 +10015,14 @@ func jsEnvOverrideHit(code, masked string) string {
 			return hit
 		}
 	}
-	for i := 0; i+11 < len(masked); i++ {
-		if !strings.HasPrefix(masked[i:], "process.env") {
+	for i := 0; i+7 < len(masked); i++ {
+		j := jsProcessEnvAt(masked, i)
+		if j < 0 {
 			continue
 		}
 		if i > 0 && isIdentByte(masked[i-1]) {
 			continue
 		}
-		j := i + len("process.env")
 		j = skipMaskSpace(masked, j)
 		if j >= len(masked) {
 			break
@@ -9474,6 +10030,33 @@ func jsEnvOverrideHit(code, masked string) string {
 		if masked[j] == '[' {
 			lo, hi, ok := maskAssignAfterBracket(masked, j)
 			if !ok {
+				// No direct write op — still a destructuring element when
+				// an enclosing literal group takes the `=`:
+				// `[a, process.env['K']] = …` writes the env slot. The
+				// py flag stays off: a JS comma makes a sequence
+				// expression or a multi-declarator, never a bare tuple
+				// destructuring target, and `x\n[y]` still subscripts.
+				depth := 0
+				for e := j; e < len(masked); e++ {
+					if masked[e] == '[' {
+						depth++
+					}
+					if masked[e] == ']' {
+						depth--
+						if depth == 0 {
+							if maskDestructAssignTarget(masked, i, e+1, false) {
+								key, okKey := unquoteCodeKey(code[j+1 : e])
+								if !okKey {
+									return "env override dynamic"
+								}
+								if hit := envOverrideKeyVerdict(key); hit != "" {
+									return hit
+								}
+							}
+							break
+						}
+					}
+				}
 				i = j
 				continue
 			}
@@ -9491,8 +10074,7 @@ func jsEnvOverrideHit(code, masked string) string {
 			i = j
 			continue
 		}
-		// process.env.NAME …  check whether NAME is followed by `=`.
-		k := j + 1
+		k := skipMaskSpace(masked, j+1)
 		start := k
 		for k < len(masked) && isIdentByte(masked[k]) {
 			k++
@@ -9502,9 +10084,21 @@ func jsEnvOverrideHit(code, masked string) string {
 			i = k
 			continue
 		}
+		// process.env.NAME <op>= v — plain `=` or a compound write op
+		// (shared maskAssignOpAt; `NAME == v`/`NAME ?? v` stay reads).
+		// Whitespace-wrapped closing `)`s are transparent too:
+		// `(process.env.K)\n = v` writes the member all the same.
 		k = skipMaskSpace(masked, k)
-		if k < len(masked) && masked[k] == '=' &&
-			(k+1 >= len(masked) || masked[k+1] != '=' && masked[k+1] != '>') {
+		for k < len(masked) && masked[k] == ')' {
+			k = skipMaskSpace(masked, k+1)
+		}
+		if maskAssignOpAt(masked, k) {
+			if hit := envOverrideKeyVerdict(name); hit != "" {
+				return hit
+			}
+		} else if maskDestructAssignTarget(masked, i, k, false) {
+			// `({p: process.env.K} = …)` writes the member through the
+			// enclosing destructuring literal.
 			if hit := envOverrideKeyVerdict(name); hit != "" {
 				return hit
 			}
@@ -9512,6 +10106,73 @@ func jsEnvOverrideHit(code, masked string) string {
 		i = k
 	}
 	return ""
+}
+
+// jsProcessEnvAt reports whether masked[i] begins the `process.env`
+// receiver, tolerating mask whitespace around the dot
+// (`process\n.env.K`). Returns the index just past `env`, or -1.
+func jsProcessEnvAt(masked string, i int) int {
+	if !strings.HasPrefix(masked[i:], "process") {
+		return -1
+	}
+	j := skipMaskSpace(masked, i+len("process"))
+	if j >= len(masked) || masked[j] != '.' {
+		return -1
+	}
+	j = skipMaskSpace(masked, j+1)
+	if !strings.HasPrefix(masked[j:], "env") {
+		return -1
+	}
+	// `environment`/`envX` are a different property, not the receiver.
+	if j+len("env") < len(masked) && isIdentByte(masked[j+len("env")]) {
+		return -1
+	}
+	return j + len("env")
+}
+
+// hasMaskQualCall reports whether masked contains `recv.method` as a
+// qualified call spelling with mask whitespace tolerated around the dot
+// (`Object\n.assign`, `Object\f.assign`). Both edges are identifier
+// boundaries: a `myObject.assign` or `Object.assignX` does not count.
+func hasMaskQualCall(masked, recv, method string) bool {
+	idx := 0
+	for {
+		k := strings.Index(masked[idx:], recv)
+		if k < 0 {
+			return false
+		}
+		pos := idx + k
+		if pos > 0 && isIdentByte(masked[pos-1]) {
+			idx = pos + len(recv)
+			continue
+		}
+		j := skipMaskSpace(masked, pos+len(recv))
+		if j >= len(masked) || masked[j] != '.' {
+			idx = pos + len(recv)
+			continue
+		}
+		m := skipMaskSpace(masked, j+1)
+		if strings.HasPrefix(masked[m:], method) &&
+			(m+len(method) >= len(masked) || !isIdentByte(masked[m+len(method)])) {
+			return true
+		}
+		idx = pos + len(recv)
+	}
+}
+
+// jsProcessEnvAtAny reports whether the `process.env` receiver occurs
+// anywhere in masked (whitespace around the dots tolerated, identifier
+// boundaries respected — unlike a bare substring scan).
+func jsProcessEnvAtAny(masked string) bool {
+	for i := 0; i+7 < len(masked); i++ {
+		if i > 0 && isIdentByte(masked[i-1]) {
+			continue
+		}
+		if jsProcessEnvAt(masked, i) >= 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // jsDeleteEnvHit screens `delete process.env.<key>` spellings: the key is
@@ -9526,11 +10187,22 @@ func jsDeleteEnvHit(code, masked string) string {
 		if i > 0 && isIdentByte(masked[i-1]) {
 			continue
 		}
-		j := skipMaskSpace(masked, i+len("delete"))
-		if !strings.HasPrefix(masked[j:], "process.env") {
+		// A `.` immediately before the `delete` ident is member access —
+		// `x.delete` is an ordinary property/method name, not the unary
+		// operator — while member access does NOT continue across mask
+		// whitespace, so a real unary `delete` on the next statement still
+		// screens. Checking only the adjacent byte keeps
+		// `api.delete\nconsole.log(process.env.K)` free and blocks
+		// `let q=1.\ndelete process.env.K` (the `.` glues to `1.`).
+		if i > 0 && masked[i-1] == '.' {
 			continue
 		}
-		k := skipMaskSpace(masked, j+len("process.env"))
+		j := skipMaskSpace(masked, i+len("delete"))
+		k := jsProcessEnvAt(masked, j)
+		if k < 0 {
+			continue
+		}
+		k = skipMaskSpace(masked, k)
 		if k >= len(masked) {
 			break
 		}
@@ -9561,7 +10233,7 @@ func jsDeleteEnvHit(code, masked string) string {
 			i = k
 			continue
 		}
-		start := k + 1
+		start := skipMaskSpace(masked, k+1)
 		e := start
 		for e < len(masked) && isIdentByte(masked[e]) {
 			e++

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sync/singleflight"
 
@@ -562,12 +563,26 @@ func chunkContent(content string) []string {
 
 // splitLongText splits s into pieces of at most max bytes, breaking only at
 // valid UTF-8 rune boundaries (lossless: joining the pieces reproduces s).
+// Each cut is an O(1) rune-boundary back-off: a rune is at most
+// utf8.UTFMax bytes, so at most utf8.UTFMax-1 continuation bytes can sit
+// between the cut and its rune start. The previous version called
+// truncateUTF8 on the remaining string every iteration — a full validity
+// scan each round — and degraded quadratically on multi-megabyte
+// single-line input.
 func splitLongText(s string, max int) []string {
 	var parts []string
 	for len(s) > max {
-		cut := truncateUTF8(s, max)
-		if cut == "" {
-			// Invalid UTF-8 leading byte; advance one byte to guarantee progress.
+		cut := s[:max]
+		// Back off while the byte after the cut is a continuation byte
+		// (s[len(cut)] always exists: len(cut) <= max < len(s)). At most
+		// utf8.UTFMax-1 steps: a longer run of continuation bytes is invalid
+		// input, and cutting there is still lossless.
+		for back := 0; len(cut) > 0 && back < utf8.UTFMax-1 && !utf8.RuneStart(s[len(cut)]); back++ {
+			cut = cut[:len(cut)-1]
+		}
+		if len(cut) == 0 {
+			// Guaranteed progress, same as the old s[:1] fallback: emit one
+			// byte verbatim so the loop always advances.
 			cut = s[:1]
 		}
 		parts = append(parts, cut)
@@ -591,11 +606,12 @@ func (s *server) indexContentLocked(docPath, content string) (int, error) {
 		return 0, err
 	}
 	chunks := chunkContent(content)
-	for _, chunk := range chunks {
-		if err := checkSensitiveContent(chunk); err != nil {
-			return 0, err
-		}
-	}
+	// No per-chunk checkSensitiveContent here: the full-content check above
+	// already refused the whole payload, and Store.ReplaceExactAndChunks
+	// re-checks every chunk before any mutation (prior to opening its
+	// transaction), so a second
+	// identical scan at this layer was a pure duplicate (and doubled the
+	// sensitive-pattern cost on multi-megabyte fetches).
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.store.ReplaceExactAndChunks(docPath, chunks); err != nil {

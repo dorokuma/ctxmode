@@ -849,6 +849,31 @@ func TestChunkContent_ForceSplitsOversizedParagraph(t *testing.T) {
 	})
 }
 
+// TestSplitLongText_LargeSingleLine is a regression test for the quadratic
+// per-cut rescan in the old splitLongText: a 10MB no-newline string must be
+// cut at rune boundaries into <=max pieces that join back losslessly, in
+// well under a second even under -race.
+func TestSplitLongText_LargeSingleLine(t *testing.T) {
+	const max = 4000
+	big := strings.Repeat("a", 10*1024*1024) + "界" // 10MB+3B, no blank lines
+	start := time.Now()
+	parts := splitLongText(big, max)
+	elapsed := time.Since(start)
+	if strings.Join(parts, "") != big {
+		t.Fatal("split must be lossless")
+	}
+	for i, p := range parts {
+		if len(p) > max {
+			t.Fatalf("part %d is %d bytes (max %d)", i, len(p), max)
+		}
+	}
+	// Linear-time bound, generous for -race: the old implementation took
+	// minutes here; 30s is still an order of magnitude above the real cost.
+	if elapsed > 30*time.Second {
+		t.Fatalf("splitLongText took %v on a 10MB single line (quadratic regression)", elapsed)
+	}
+}
+
 // ---------- #8 search hint uses ctx_kb action=search ----------
 
 func TestToolFetchAndIndex_SearchHintUsesCtxKB(t *testing.T) {

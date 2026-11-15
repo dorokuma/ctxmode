@@ -46,4 +46,25 @@ action argument (ctx_stats takes none).
   names directly; agy (Antigravity CLI) exposes them as MCP tools under server
   "ctxmode" (lazy schemas in ~/.gemini/antigravity-cli/mcp/ctxmode/, called via
   call_mcp_tool).
+
+## Dispatch report channel
+
+A dispatched role reports completion through the dispatch-report helper
+once, with one ctx_run execute call:
+
+  argv  = ["dispatch-report", "<parent terminal id>"]   (the static t-id from the dispatch)
+  stdin = <complete UTF-8 report body, 1 byte to 1 MiB>
+
+- That argv+stdin form is the ONLY delivery entry point — never pipe the
+  report through a shell string, hc send, or a file redirect. The helper
+  itself atomically writes the report file and sends the parent a short
+  "报告已写入 path=<abs> bytes=<n> sha256=<hex>" notice; the parent compares that
+  digest against the full file it reads, which is the delivery proof. During the
+  dispatcher upgrade window a pre-upgrade helper emits the notice WITHOUT the
+  sha256= field — the parent then verifies the path+bytes fields and reads the
+  full file, treating digest verification as available only when sha256= is
+  present.
+- A ".sent" marker next to the report is dispatcher-side dedup only
+  (at-least-once notify) — never a signal you need to act on.
+- No extra flags or retries: one call, one report.
 `

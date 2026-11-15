@@ -103,9 +103,9 @@ func fatal(s *Store, format string, args ...any) {
 
 func main() {
 	defer shutdownBackground()
-	var workdir string
+	var workdirFlags stringListFlag
 	var configPath string
-	flag.StringVar(&workdir, "workdir", "", "workspace root (default: cwd)")
+	flag.Var(&workdirFlags, "workdir", "workspace root (repeatable; first value is the primary workdir, default: cwd)")
 	flag.StringVar(&configPath, "config", "", "path to config file")
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, cliUsage())
@@ -130,15 +130,38 @@ func main() {
 	}
 	workdirs := cfg.Workdirs
 
-	// If -workdir flag was given, prepend it so it becomes workdirs[0];
-	// the deduplication loop below preserves order and removes duplicates.
-	if workdir != "" {
-		absWd, err := filepath.Abs(workdir)
+	// Explicit -workdir flags (repeatable) prepend in order: the first
+	// given value becomes workdirs[0] (the primary), later ones extend the
+	// workspace set. The deduplication loop below preserves order and
+	// removes duplicates.
+	for i := len(workdirFlags) - 1; i >= 0; i-- {
+		if workdirFlags[i] == "" {
+			// Old last-wins semantics ignored `-workdir ""` entirely (the
+			// empty string never reached the workspace set); keep the same
+			// treatment now that the flag accumulates.
+			continue
+		}
+		absWd, err := filepath.Abs(workdirFlags[i])
 		if err != nil {
 			fatal(nil, "bad workdir: %v", err)
 		}
 		workdirs = append([]string{absWd}, workdirs...)
 	}
+
+	// Dispatch extra workdirs: a dispatcher injects the role's additional
+	// baseline directories as a JSON []string in CTXMODE_EXTRA_WORKDIRS
+	// (pig/agy MCP env inheritance; claude-code already spells them as
+	// repeated -workdir flags). These append AFTER the flag/config roots —
+	// never primary — and pass a narrow policy: each must be an absolute
+	// normalized directory outside the broad roots (`/`, bare `/tmp`,
+	// `/var/tmp`) and outside the report root tree
+	// (/tmp/herdr-role-reports/**) so one dispatch cannot read another
+	// session's reports.
+	extra, err := extraWorkdirsFromEnv()
+	if err != nil {
+		fatal(nil, "%v", err)
+	}
+	workdirs = append(workdirs, extra...)
 
 	// Deduplicate and absolutize all workdirs.
 	seen := make(map[string]bool)
@@ -227,6 +250,76 @@ func main() {
 }
 
 // ---------- configuration ----------
+
+// stringListFlag is a repeatable string flag: every occurrence appends in
+// order (flag.Value contract), unlike flag.StringVar where the last value
+// silently overwrites earlier ones.
+type stringListFlag []string
+
+func (f *stringListFlag) String() string { return strings.Join(*f, ",") }
+
+func (f *stringListFlag) Set(v string) error {
+	*f = append(*f, v)
+	return nil
+}
+
+// dispatchReportRoot is the report directory root the dispatcher hands out
+// (parent dir of each session's report dir). It must never be registered as
+// a workspace root from CTXMODE_EXTRA_WORKDIRS: that would let one role's
+// ctxmode read (and index) every other session's report files.
+const dispatchReportRoot = "/tmp/herdr-role-reports"
+
+// extraWorkdirsFromEnv reads CTXMODE_EXTRA_WORKDIRS — the dispatcher's
+// channel for adding a role's extra baseline directories beyond the flag
+// and config roots — and returns the validated list. The value must be a
+// JSON array of strings; each entry must be an absolute path that
+// normalizes to itself (no "."/".." segments or trailing separators) and
+// survives a narrow deny policy applied to the symlink-resolved path too:
+// "/", bare "/tmp" and "/var/tmp" are too broad (they would expose every
+// other dispatch's temp state), and the report root tree is refused
+// outright. An invalid value is a startup error, never a silent skip: a
+// dispatcher injecting garbage must see the failure.
+func extraWorkdirsFromEnv() ([]string, error) {
+	raw := strings.TrimSpace(os.Getenv("CTXMODE_EXTRA_WORKDIRS"))
+	if raw == "" {
+		return nil, nil
+	}
+	var dirs []string
+	if err := json.Unmarshal([]byte(raw), &dirs); err != nil {
+		return nil, fmt.Errorf("CTXMODE_EXTRA_WORKDIRS must be a JSON array of absolute paths: %v", err)
+	}
+	for _, d := range dirs {
+		if d == "" || !filepath.IsAbs(d) {
+			return nil, fmt.Errorf("CTXMODE_EXTRA_WORKDIRS entry %q is not an absolute path", d)
+		}
+		clean := filepath.Clean(d)
+		if clean != d {
+			return nil, fmt.Errorf("CTXMODE_EXTRA_WORKDIRS entry %q is not normalized", d)
+		}
+		if err := extraWorkdirAllowed(d); err != nil {
+			return nil, err
+		}
+		if real, err := filepath.EvalSymlinks(d); err == nil && real != d {
+			if err := extraWorkdirAllowed(real); err != nil {
+				return nil, fmt.Errorf("CTXMODE_EXTRA_WORKDIRS entry %q resolves to a rejected path: %v", d, err)
+			}
+		}
+	}
+	return dirs, nil
+}
+
+// extraWorkdirAllowed applies the dispatch-extra deny policy to one already
+// absolute, cleaned path.
+func extraWorkdirAllowed(d string) error {
+	switch d {
+	case "/", "/tmp", "/var/tmp":
+		return fmt.Errorf("CTXMODE_EXTRA_WORKDIRS entry %q is too broad to register as a workspace root", d)
+	}
+	if d == dispatchReportRoot || strings.HasPrefix(d, dispatchReportRoot+"/") {
+		return fmt.Errorf("CTXMODE_EXTRA_WORKDIRS entry %q is inside the dispatch report root %q", d, dispatchReportRoot)
+	}
+	return nil
+}
 
 // appConfig is the fully loaded runtime configuration.
 type appConfig struct {
@@ -1469,18 +1562,20 @@ func (s *server) migrateFromJSON() error {
 }
 
 // truncateUTF8 truncates a string to the given byte limit at a valid UTF-8 boundary.
-// Fast path: if the full string is valid UTF-8, the only possible issue is at the
-// truncation boundary — use DecodeLastRuneInString (O(1) per step) to back up.
-// Slow path: if the full string has mid-string invalid bytes, scan forward to find
-// the longest valid UTF-8 prefix (single pass, O(n)).
+// Fast path: if the truncated window is valid UTF-8, the only possible issue
+// is at the truncation boundary — use DecodeLastRuneInString (O(1) per step)
+// to back up. Slow path: if the window has mid-string invalid bytes, scan
+// forward to find the longest valid UTF-8 prefix. Both paths only inspect
+// the first maxBytes bytes, so cost is O(maxBytes), never O(len(s)) — bytes
+// past the window are returned untouched and cannot affect the result.
 func truncateUTF8(s string, maxBytes int) string {
 	if len(s) <= maxBytes {
 		return s
 	}
 	truncated := s[:maxBytes]
 
-	// Fast path: full string is valid UTF-8, only truncation boundary matters.
-	if utf8.ValidString(s) {
+	// Fast path: window is valid UTF-8, only the truncation boundary matters.
+	if utf8.ValidString(truncated) {
 		for len(truncated) > 0 {
 			r, size := utf8.DecodeLastRuneInString(truncated)
 			if r != utf8.RuneError || size == 0 {
@@ -1491,7 +1586,7 @@ func truncateUTF8(s string, maxBytes int) string {
 		return truncated
 	}
 
-	// Slow path: original has mid-string invalid bytes.
+	// Slow path: the window has mid-string invalid bytes.
 	// Single forward pass to find the longest valid UTF-8 prefix.
 	for i := 0; i < len(truncated); {
 		r, size := utf8.DecodeRuneInString(truncated[i:])

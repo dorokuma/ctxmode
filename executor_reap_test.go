@@ -18,14 +18,6 @@ import (
 	"time"
 )
 
-// reapSleeperCleanup kills any leftover "sleep 120" escapees from earlier or
-// failed runs. The [p] character class keeps the pattern from matching this
-// pkill's own command line (a literal "sleep 120" pattern would self-match
-// pkill's own argv under -f).
-func reapSleeperCleanup() {
-	_ = exec.Command("pkill", "-f", "slee[p] 120").Run()
-}
-
 // waitBackgroundDone polls until the background entry id is marked Done.
 func waitBackgroundDone(t *testing.T, id string) {
 	t.Helper()
@@ -44,21 +36,21 @@ func waitBackgroundDone(t *testing.T, id string) {
 }
 
 // TestReap_BatchSetsidEscapeeKilledOnCtxTimeout (t-reap-batch): red-team
-// repro. A batch command `setsid sleep 120 & sleep 120` with timeout_ms=2000
-// hits the ctx.Done kill path in executeCommand. The setsid escapee lives in
-// a new session and escapes the process-group kill; without the escapee sweep
-// it keeps the output pipe open, cmd.Wait never returns, and the batch call
-// hangs until the sleeper exits by itself (observed: 45s+). The call must
-// return promptly and leave no sleeper behind.
+// repro. A batch command `setsid <sleeper> 120 & <sleeper> 120` with
+// timeout_ms=2000 hits the ctx.Done kill path in executeCommand. The setsid
+// escapee lives in a new session and escapes the process-group kill; without
+// the escapee sweep it keeps the output pipe open, cmd.Wait never returns,
+// and the batch call hangs until the sleeper exits by itself (observed:
+// 45s+). The call must return promptly and leave no sleeper behind.
 func TestReap_BatchSetsidEscapeeKilledOnCtxTimeout(t *testing.T) {
 	srv := newTestServer(t)
 	srv.workdirs = []string{t.TempDir()}
-	reapSleeperCleanup()
-	t.Cleanup(reapSleeperCleanup)
+	sleeper := newTestSleeper(t)
+	t.Cleanup(func() { killTestSleepers(t, sleeper) })
 
 	start := time.Now()
 	res, _, err := srv.toolBatchExecute(context.Background(), nil, batchArgs{
-		Commands:  []batchCommand{{Label: "setsid", Command: "setsid sleep 120 & sleep 120"}},
+		Commands:  []batchCommand{{Label: "setsid", Command: "setsid '" + sleeper + "' 120 & '" + sleeper + "' 120"}},
 		TimeoutMs: 2000,
 	})
 	if err != nil {
@@ -72,22 +64,23 @@ func TestReap_BatchSetsidEscapeeKilledOnCtxTimeout(t *testing.T) {
 		t.Fatalf("expected one cancelled (failed) command result, got %+v", resp.Commands)
 	}
 	// 2s timeout + 3s SIGTERM grace + drain margin. A leaked escapee holds
-	// the output pipe, so cmd.Wait — and this call — blocks until sleep 120
-	// exits by itself.
+	// the output pipe, so cmd.Wait — and this call — blocks until the
+	// sleeper exits by itself.
 	if elapsed := time.Since(start); elapsed > 15*time.Second {
 		t.Fatalf("batch call returned after %v; setsid escapee kept the output pipe open", elapsed)
 	}
-	waitForNoProc(t, "sleep 120")
+	waitForNoProc(t, sleeper)
 }
 
 // TestReap_ExecuteSetsidEscapeeKilledOnCtxCancel (t-reap-execute): the
-// ctx.Done kill path in runCmd must run the same escapee sweep as the timeout
-// path, so a `setsid sleep 120 & sleep 120` job cancelled mid-flight leaves
-// no escapee behind and returns promptly instead of hanging on the pipe.
+// ctx.Done kill path in runCmd must run the same escapee sweep as the
+// timeout path, so a `setsid <sleeper> 120 & <sleeper> 120` job cancelled
+// mid-flight leaves no escapee behind and returns promptly instead of
+// hanging on the pipe.
 func TestReap_ExecuteSetsidEscapeeKilledOnCtxCancel(t *testing.T) {
 	s := testServerWithWorkdir(t, t.TempDir())
-	reapSleeperCleanup()
-	t.Cleanup(reapSleeperCleanup)
+	sleeper := newTestSleeper(t)
+	t.Cleanup(func() { killTestSleepers(t, sleeper) })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	// Cancel once the shell has forked the setsid escapee (it forks within a
@@ -97,7 +90,7 @@ func TestReap_ExecuteSetsidEscapeeKilledOnCtxCancel(t *testing.T) {
 
 	start := time.Now()
 	if _, _, err := s.toolExecute(ctx, nil, executeArgs{
-		Command:   "setsid sleep 120 & sleep 120",
+		Command:   "setsid '" + sleeper + "' 120 & '" + sleeper + "' 120",
 		TimeoutMs: 60000,
 	}); err != nil {
 		t.Fatalf("toolExecute: %v", err)
@@ -105,7 +98,7 @@ func TestReap_ExecuteSetsidEscapeeKilledOnCtxCancel(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 15*time.Second {
 		t.Fatalf("cancelled execute returned after %v; setsid escapee kept the output pipe open", elapsed)
 	}
-	waitForNoProc(t, "sleep 120")
+	waitForNoProc(t, sleeper)
 }
 
 // TestReap_KillBackgroundStarttimeZeroFallback (t-reap-bg): an entry whose
@@ -115,7 +108,9 @@ func TestReap_ExecuteSetsidEscapeeKilledOnCtxCancel(t *testing.T) {
 // Done, so the maxAge timer and the 30s reaper can retire the slot instead of
 // pinning one of the 16 background slots forever.
 func TestReap_KillBackgroundStarttimeZeroFallback(t *testing.T) {
-	cmd := exec.Command("sh", "-c", "sleep 120 & sleep 120")
+	sleeper := newTestSleeper(t)
+	t.Cleanup(func() { killTestSleepers(t, sleeper) })
+	cmd := exec.Command("sh", "-c", "'"+sleeper+"' 120 & '"+sleeper+"' 120")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start: %v", err)
@@ -151,7 +146,7 @@ func TestReap_KillBackgroundStarttimeZeroFallback(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("process group %d survived the fallback group kill", pgid)
 	}
-	waitForNoProc(t, "sleep 120")
+	waitForNoProc(t, sleeper)
 }
 
 // TestReap_LimitedBufferConcurrentReadWrite (t-reap-buf): after a reap path

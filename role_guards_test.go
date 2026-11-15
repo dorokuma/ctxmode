@@ -3646,15 +3646,165 @@ func TestGuard_DispatchReportReadonly(t *testing.T) {
 	if got := guardArgvSubagent([]string{"dispatch-report", "--evil", "t42"}); got == "" {
 		t.Fatal("worker dispatch-report --evil t42 = allow, want block")
 	}
+	// --flush is a dispatcher-side verb, not a role spelling: it fails closed
+	// on the same argv surface.
+	if got := guardArgvSubagent([]string{"dispatch-report", "--flush", "t42"}); got == "" {
+		t.Fatal("worker dispatch-report --flush t42 = allow, want block")
+	}
+}
+
+// TestGuard_CompoundEnvOverride covers compound-assignment env mutation:
+// `os.environ['K'] += v` / `process.env.K op= v` and the bracket forms were
+// previously invisible to the env-override screen, which only looked for a
+// bare `=` after the key. Every write-op spelling must now hit
+// envOverrideKeyVerdict; comparisons (`==`, `!=`, `<=`, `>=`, `??`) and
+// benign keys stay free.
+func TestGuard_CompoundEnvOverride(t *testing.T) {
+	sub := guardCall{subagent: true}
+
+	pyBlock := []string{
+		"import os,subprocess\nos.environ['DISPATCH_REPORT_PATH']+='/e'\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ['DISPATCH_REPORT_PATH']*=0\nos.environ['DISPATCH_REPORT_PATH']+='/e'\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ['HC_SOCKET']//=2\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ['DISPATCH_REPORT_PARENT']<<=1\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ['DISPATCH_REPORT_PARENT']**=2\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ['CTXMODE_EXTRA_WORKDIRS']|='x'\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ['CTXMODE_EXTRA_WORKDIRS']@=x\nsubprocess.run(['ls'])",
+		// Backslash continuation and paren-wrapped write targets.
+		"import os,subprocess\nos.environ['HC_SOCKET'] \\\n = '/x'\nsubprocess.run(['ls'])",
+		"import os,subprocess\n(os.environ['HC_SOCKET']\n) += '/x'\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ\n.update({'HC_SOCKET':'/x'})\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ\n.pop('HC_SOCKET')\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ\n.clear()\nsubprocess.run(['ls'])",
+		// \v/\f are mask whitespace too: form-feed before the write method
+		// and around the subscript write op still screen as env overrides.
+		"import os,subprocess\nos.environ\f.update({'HC_SOCKET':'/x'})\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ['HC_SOCKET']\v='/x'\nsubprocess.run(['ls'])",
+		"import os,subprocess\ndel (\nos.environ['HC_SOCKET']\n)\nsubprocess.run(['ls'])",
+		"import os,subprocess\ndel \\\nos.environ['HC_SOCKET']\nsubprocess.run(['ls'])",
+		// Destructuring element writes: list/tuple targets assign the env
+		// slot even without a `=` behind the subscript (r5/F2).
+		"import os,subprocess\n[os.environ['HC_SOCKET']]=['/x']\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ['HC_SOCKET'], a = '/x', 1\nsubprocess.run(['ls'])",
+		// A peeled list wrapper feeding a bare-tuple unpack still writes
+		// the env slot (r5b mixed tuple target).
+		"import os,subprocess\n[os.environ['HC_SOCKET']], a = ['/x'], 1\nsubprocess.run(['ls'])",
+		// Env-clear primitives beyond `del` (r5/F3).
+		"import os,subprocess\nos.unsetenv('DISPATCH_REPORT_PATH')\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ.__delitem__('HC_SOCKET')\nsubprocess.run(['ls'])",
+		// os.environb — Python's byte-keyed environ view — mutates the same
+		// environment with b'...' byte keys (r6/oracle-ctxmode-r4 S1).
+		"import os,subprocess\nos.environb[b'HC_SOCKET']=b'/x'\nsubprocess.run(['ls'])",
+		"import os,subprocess\ndel os.environb[b'DISPATCH_REPORT_PATH']\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environb.pop(b'HC_SOCKET')\nsubprocess.run(['ls'])",
+	}
+	for _, code := range pyBlock {
+		if rule, detail := sub.guardCtxRunCode("python", code); rule != ruleSubagentNestedAgent {
+			t.Fatalf("guardCtxRunCode(%q) = (%q,%q), want %s", code, rule, detail, ruleSubagentNestedAgent)
+		}
+	}
+	jsBlock := []string{
+		"const cp=require('child_process');process.env.HC_SOCKET+='/x';cp.execSync('ls')",
+		"const cp=require('child_process');process.env['HC_SOCKET']>>>=1;cp.execSync('ls')",
+		"const cp=require('child_process');process.env.DISPATCH_REPORT_PARENT&&='t9';cp.execSync('ls')",
+		"const cp=require('child_process');process.env.DISPATCH_REPORT_PARENT||='t9';cp.execSync('ls')",
+		"const cp=require('child_process');process.env.DISPATCH_REPORT_PARENT??='t9';cp.execSync('ls')",
+		"const cp=require('child_process');process.env.DISPATCH_REPORT_PATH<<=1;cp.execSync('ls')",
+		"const cp=require('child_process');process.env['CTXMODE_EXTRA_WORKDIRS']-=1;cp.execSync('ls')",
+		// Cross-line receiver/member/subscript spellings.
+		"const cp=require('child_process');process.env['DISPATCH_REPORT_PATH']\n='/x';cp.execSync('ls')",
+		"const cp=require('child_process');process\n.env\n.\nHC_SOCKET\n+='/x';cp.execSync('ls')",
+		"const cp=require('child_process');process\n.env.HC_SOCKET='/x';cp.execSync('ls')",
+		"const cp=require('child_process');process.env.\nHC_SOCKET='/x';cp.execSync('ls')",
+		"const cp=require('child_process');(process.env.HC_SOCKET)\n='/x';cp.execSync('ls')",
+		"const cp=require('child_process');delete process.env.\nHC_SOCKET;cp.execSync('ls')",
+		// \v/\f separate receiver/dot/member/write op just like \n (S-A).
+		"const cp=require('child_process');process.env\f.HC_SOCKET='/x';cp.execSync('ls')",
+		"const cp=require('child_process');process.env.HC_SOCKET\x0b<<=1;cp.execSync('ls')",
+		// Qualified call spellings tolerate mask whitespace around the dot
+		// (S-B): `Object .assign` / `Object\n.assign` name the same sink.
+		"const cp=require('child_process');Object .assign(process.env,{HC_SOCKET:'/x'});cp.execSync('ls')",
+		"const cp=require('child_process');Object\n.assign(process.env,{HC_SOCKET:'/x'});cp.execSync('ls')",
+		"const cp=require('child_process');Reflect\f.set(process.env,'HC_SOCKET','/x');cp.execSync('ls')",
+		// `delete` after a member-access dot is a property/method name, not
+		// the unary operator — but a REAL cross-line unary delete still
+		// blocks (O-B).
+		"const cp=require('child_process');delete\nprocess.env.HC_SOCKET;cp.execSync('ls')",
+		// Interpolated template key fails closed as a dynamic key.
+		"const cp=require('child_process');process.env[`DISPATCH_REPORT_PATH${''}`]='/x';cp.execSync('ls')",
+		// A `.` only shields an IMMEDIATELY adjacent `delete` (member
+		// access); `1.\ndelete` is a numeric literal followed by a real
+		// unary delete statement and must still screen (r5/F1).
+		"const cp=require('child_process');let q=1.\ndelete process.env.DISPATCH_REPORT_PATH;cp.execSync('ls')",
+		// Destructuring element writes: the env receiver sits inside a
+		// `[…]`/`{…}` target literal that takes the `=` (r5/F2).
+		"const cp=require('child_process');[process.env.HC_SOCKET]=['/x'];cp.execSync('ls')",
+		"const cp=require('child_process');({p:process.env.HC_SOCKET}={p:'/x'});cp.execSync('ls')",
+		"const cp=require('child_process');[a,process.env.HC_SOCKET]=[1,'/x'];cp.execSync('ls')",
+		// Statement-head / ASI `[…]` groups are destructuring targets, not
+		// subscript reads on the `)` condition or the previous line (r5b).
+		"const cp=require('child_process');if (1) [process.env.HC_SOCKET]=['/x'];cp.execSync('ls')",
+		"const cp=require('child_process');if (0); else [process.env.HC_SOCKET]=['/x'];cp.execSync('ls')",
+		"const cp=require('child_process');let x\n[process.env.HC_SOCKET]=['/x'];cp.execSync('ls')",
+		// Reflect.deleteProperty is an env-clear sink like `delete` (r5/F3).
+		"const cp=require('child_process');Reflect.deleteProperty(process.env,'HC_SOCKET');cp.execSync('ls')",
+		// Reflect.defineProperty / Object.defineProperties write env
+		// members through descriptor objects (r6/oracle-ctxmode-r4 O4).
+		"const cp=require('child_process');Reflect.defineProperty(process.env,'HC_SOCKET',{value:'/x'});cp.execSync('ls')",
+		"const cp=require('child_process');Object.defineProperties(process.env,{HC_SOCKET:{value:'/x'}});cp.execSync('ls')",
+	}
+	for _, code := range jsBlock {
+		if rule, detail := sub.guardCtxRunCode("javascript", code); rule != ruleSubagentNestedAgent {
+			t.Fatalf("guardCtxRunCode(%q) = (%q,%q), want %s", code, rule, detail, ruleSubagentNestedAgent)
+		}
+	}
+	// Comparisons and null-coalescing READS after a subscript/dot member stay
+	// free, as do benign-key compound writes.
+	allow := []struct{ lang, code string }{
+		{"python", "import os,subprocess\nprint(os.environ['HC_SOCKET']=='/x')\nsubprocess.run(['ls'])"},
+		{"python", "import os,subprocess\nprint(os.environ['A']<=os.environ['B'])\nsubprocess.run(['ls'])"},
+		{"python", "import os,subprocess\nprint(os.environ['A']>=1)\nsubprocess.run(['ls'])"},
+		{"python", "import os,subprocess\nos.environ['FOO']+='b'\nsubprocess.run(['ls'])"},
+		// A benign byte-keyed environb write stays free (r6/S1).
+		{"python", "import os,subprocess\nos.environb[b'FOO']=b'bar'\nsubprocess.run(['ls'])"},
+		{"python", "import os,subprocess\nprint(os.environ\n.get('HC_SOCKET'))\nsubprocess.run(['ls'])"},
+		{"python", "import os,subprocess\nprint(os.environ['HC_SOCKET']\n== '/x')\nsubprocess.run(['ls'])"},
+		{"javascript", "const cp=require('child_process');process.env.FOO+='b';cp.execSync('ls')"},
+		{"javascript", "const cp=require('child_process');const x=process.env.HC_SOCKET==='a'?1:2;cp.execSync('ls')"},
+		{"javascript", "const cp=require('child_process');const x=process.env.A??'d';cp.execSync('ls')"},
+		{"javascript", "const cp=require('child_process');const x=process.env.A>=1;cp.execSync('ls')"},
+		{"javascript", "const cp=require('child_process');const x=process.env.HC_SOCKET\n== '/x';cp.execSync('ls')"},
+		{"javascript", "const cp=require('child_process');process.env[`FOO`]='1';cp.execSync('ls')"},
+		// `x.delete` member access does not turn `delete` into the unary
+		// operator; the statement after it stays a read (O-B).
+		{"javascript", "const cp=require('child_process');const f=api.delete\nconsole.log(process.env.HC_SOCKET);cp.execSync('ls')"},
+		// Env receiver used only as a subscript key or a literal VALUE is a
+		// read — only a destructuring TARGET writes it (r5/F2 negatives).
+		{"python", "import os,subprocess\nd={}\nd[os.environ['HC_SOCKET']]=1\nsubprocess.run(['ls'])"},
+		{"javascript", "const cp=require('child_process');const o={};o[process.env.HC_SOCKET]=1;cp.execSync('ls')"},
+		{"javascript", "const cp=require('child_process');const o={p:process.env.HC_SOCKET};cp.execSync('ls')"},
+		// A call result / subscripted call is not a writable destructuring
+		// target — the env expr is a read there (r5b negatives).
+		{"javascript", "const cp=require('child_process');let a; [String(process.env.HC_SOCKET), a]=['x',1];cp.execSync('ls')"},
+		{"javascript", "const cp=require('child_process');const fn=()=>({}); fn()[process.env.HC_SOCKET]=1;cp.execSync('ls')"},
+	}
+	for _, tc := range allow {
+		if rule, detail := sub.guardCtxRunCode(tc.lang, tc.code); rule != "" {
+			t.Fatalf("guardCtxRunCode(%q) = (%q,%q), want allow", tc.code, rule, detail)
+		}
+	}
 }
 
 // TestGuard_EnvHookReportVars covers the DISPATCH_REPORT_PATH /
-// PI_SANDBOX_GO_EXEC_DIR / HC_TERMINAL_ID / HC_SOCKET interception: KEY=VAL
-// prefixes, export/declare wraps, env wrappers and ctx_run args.env all
-// block; Python/JS os.environ rewrite paths block too.
+// DISPATCH_REPORT_PARENT / CTXMODE_EXTRA_WORKDIRS / PI_SANDBOX_GO_EXEC_DIR /
+// HC_TERMINAL_ID / HC_SOCKET interception: KEY=VAL prefixes, export/declare
+// wraps, env wrappers and ctx_run args.env all block; Python/JS os.environ
+// rewrite paths block too.
 func TestGuard_EnvHookReportVars(t *testing.T) {
 	vars := []string{
-		"DISPATCH_REPORT_PATH", "PI_SANDBOX_GO_EXEC_DIR",
+		"DISPATCH_REPORT_PATH", "DISPATCH_REPORT_PARENT",
+		"CTXMODE_EXTRA_WORKDIRS",
+		"PI_SANDBOX_GO_EXEC_DIR",
 		"HC_TERMINAL_ID", "HC_SOCKET",
 	}
 
@@ -3678,7 +3828,10 @@ func TestGuard_EnvHookReportVars(t *testing.T) {
 		if got := guardShellSubagent("for " + v + " in a; do true; done"); got == "" {
 			t.Fatalf("for %s iter var = allow, want block", v)
 		}
-		// ctx_run args.env override.
+		// ctx_run args.env override — the guard hook and the filterExecEnv
+		// deny list both refuse the report-channel set for a role-guarded
+		// caller (the unroled dispatcher itself keeps the CTXMODE_ prefix
+		// passthrough).
 		g := guardCall{subagent: true}
 		if rule, detail := g.guardCtxRunEnv(map[string]string{v: "/tmp/x"}); rule == "" {
 			t.Fatalf("guardCtxRunEnv(%s) = allow, want block", v)
@@ -3686,10 +3839,29 @@ func TestGuard_EnvHookReportVars(t *testing.T) {
 			_ = detail
 		}
 	}
+	for _, v := range []string{"DISPATCH_REPORT_PATH", "DISPATCH_REPORT_PARENT", "CTXMODE_EXTRA_WORKDIRS"} {
+		if !isDeniedEnvKeyForCaller(v, true) {
+			t.Fatalf("isDeniedEnvKeyForCaller(%q, guarded) = false, want deny", v)
+		}
+		if isDeniedEnvKeyForCaller(v, false) {
+			// Unguarded callers sit outside the deny list — but only
+			// CTXMODE_EXTRA_WORKDIRS reaches filterExecEnv's CTXMODE_
+			// prefix passthrough that way; DISPATCH_* keys are still
+			// refused there because they are not on envAllowlist.
+			t.Fatalf("isDeniedEnvKeyForCaller(%q, unguarded) = true, want allow", v)
+		}
+	}
+	if _, err := filterExecEnv(map[string]string{"DISPATCH_REPORT_PARENT": "t1"}); err == nil {
+		t.Fatal("filterExecEnv(DISPATCH_REPORT_PARENT) = nil error, want deny for this role-guarded test process")
+	} else if !strings.Contains(err.Error(), "security denylist") {
+		t.Fatalf("filterExecEnv(DISPATCH_REPORT_PARENT) error = %q, want text naming the security denylist", err)
+	}
 	// Python/JS env-override rewrites name the hook vars.
 	sub := guardCall{subagent: true}
 	pyBlock := []string{
 		"import os,subprocess\nos.environ['DISPATCH_REPORT_PATH']='/tmp/f'\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ['DISPATCH_REPORT_PARENT']='t9'\nsubprocess.run(['ls'])",
+		"import os,subprocess\nos.environ['CTXMODE_EXTRA_WORKDIRS']='[\"/tmp\"]'\nsubprocess.run(['ls'])",
 		"import os,subprocess\nos.environ['HC_SOCKET']='/tmp/f'\nsubprocess.run(['ls'])",
 		"import os,subprocess\nos.environ['PI_SANDBOX_GO_EXEC_DIR']='/x'\nsubprocess.run(['ls'])",
 		"import os,subprocess\nos.environ['HC_TERMINAL_ID']='t9'\nsubprocess.run(['ls'])",
@@ -3706,6 +3878,8 @@ func TestGuard_EnvHookReportVars(t *testing.T) {
 	jsBlock := []string{
 		"const cp=require('child_process');process.env.HC_SOCKET='/x';cp.execSync('ls')",
 		"const cp=require('child_process');process.env['DISPATCH_REPORT_PATH']='/x';cp.execSync('ls')",
+		"const cp=require('child_process');process.env.DISPATCH_REPORT_PARENT='t9';cp.execSync('ls')",
+		"const cp=require('child_process');process.env['CTXMODE_EXTRA_WORKDIRS']='[\"/tmp\"]';cp.execSync('ls')",
 		"const cp=require('child_process');process.env.HC_TERMINAL_ID='t9';cp.execSync('ls')",
 		"const cp=require('child_process');delete process.env.HC_SOCKET;cp.execSync('ls')",
 		"const cp=require('child_process');delete process.env['HC_TERMINAL_ID'];cp.execSync('ls')",
