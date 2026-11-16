@@ -302,7 +302,7 @@ var ctxRunDescription = "PRIMARY for commands/tests/builds. action=execute (shel
 // boolPtr returns a distinct *bool so ToolAnnotations hints are not aliased.
 func boolPtr(v bool) *bool { return &v }
 
-// categoryToolAnnotations returns MCP ToolAnnotations for the six public tools.
+// categoryToolAnnotations returns MCP ToolAnnotations for the public tools.
 // Pointer hints are set explicitly so false values appear in tools/list JSON.
 // Each tool gets its own *bool so mutating one annotation cannot leak to another.
 func categoryToolAnnotations() map[string]*mcp.ToolAnnotations {
@@ -316,6 +316,10 @@ func categoryToolAnnotations() map[string]*mcp.ToolAnnotations {
 		"ctx_bg":  {ReadOnlyHint: false, DestructiveHint: boolPtr(true)},
 		// ctx_stats is read-only diagnostics over in-process counters + the audit log.
 		"ctx_stats": {ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
+		// ctx_report writes the dispatch report file + notifies the parent via
+		// the trusted dispatch-report helper — a one-shot delegated delivery,
+		// not a general read/write surface (still callable by every role).
+		"ctx_report": {ReadOnlyHint: false, DestructiveHint: boolPtr(false), OpenWorldHint: boolPtr(false)},
 	}
 }
 
@@ -366,4 +370,10 @@ func (s *server) registerCategoryTools(srv *mcp.Server) {
 		Description: "Context-consumption statistics for this session: per-tool call counts, bytes returned to the context window, estimated tokens, and bytes kept out of it by auto-indexing into the KB store (every KB write path is covered: oversized ctx_run output, ctx_fs rg auto-index, ctx_kb index, ctx_run action=batch, ctx_kb fetch, legacy migration). Ported from the original context-mode ctx_stats. Set json:true for machine-readable output.",
 		Annotations: ann["ctx_stats"],
 	}, counted(s, "ctx_stats", s.toolCtxStats))
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_report",
+		Description: "Deliver the dispatched role's completion report: delegates to the single trusted `dispatch-report <parent>` helper (same entry as ctx_run argv=[\"dispatch-report\", \"<t-id>\"] + stdin) — validates the DISPATCH_REPORT_PATH binding, writes report.md atomically under the report lock, notifies the parent terminal and marks .sent. content is the complete UTF-8 report body (1 byte .. 1 MiB). Available to every role including strict read-only; only callable when DISPATCH_REPORT_PATH/DISPATCH_REPORT_PARENT are set by the dispatcher.",
+		Annotations: ann["ctx_report"],
+	}, counted(s, "ctx_report", s.toolCtxReport))
 }

@@ -504,7 +504,7 @@ func (s *server) executeBatchSerial(ctx context.Context, commands []batchCommand
 		// A role-guard-blocked command never spawns; the block is not a shell
 		// screen block, so it bypasses executeCommand entirely.
 		if i < len(guardBlocked) && guardBlocked[i] {
-			errMsg := guardBlockedError(guardRules[i], guardDetails[i]).Error()
+			errMsg := blockedReportError(guardBlockedError(guardRules[i], guardDetails[i]), nil, cmd.Command).Error()
 			results[i] = batchResult{
 				Label:      cmd.Label,
 				Command:    cmd.Command,
@@ -565,7 +565,7 @@ func (s *server) executeBatchConcurrent(ctx context.Context, commands []batchCom
 			// A role-guard-blocked command never spawns (see
 			// executeBatchSerial); reported with exit -1 and its rule.
 			if idx < len(guardBlocked) && guardBlocked[idx] {
-				errMsg := guardBlockedError(guardRules[idx], guardDetails[idx]).Error()
+				errMsg := blockedReportError(guardBlockedError(guardRules[idx], guardDetails[idx]), nil, c.Command).Error()
 				results[idx] = batchResult{
 					Label:      c.Label,
 					Command:    c.Command,

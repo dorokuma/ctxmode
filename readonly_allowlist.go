@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -1280,8 +1281,23 @@ func screenReadonlyAllowlist(argv []string) string {
 		return "dynamic command head"
 	}
 	// Reject path-form argv[0] (./ls, /tmp/rg); basename matching alone is unsafe.
+	// Narrow exception (P1): an absolute path naming dispatch-report/hc at a
+	// TRUSTED standard install location (/usr/local/bin or a trusted-home
+	// .local/bin, on-disk verified by admittedReadonlyCanonicalHead) evaluates
+	// under its canonical bare-name argv so argv=["/usr/local/bin/dispatch-report",
+	// "t42"] delivers a report identically to the bare-name spelling. Every
+	// other path-form head — and a non-trusted report path like
+	// /tmp/dispatch-report — keeps the "path command" verdict.
 	if strings.Contains(argv[0], "/") {
-		return "path command"
+		if filepath.IsAbs(argv[0]) && (filepath.Base(argv[0]) == "dispatch-report" || filepath.Base(argv[0]) == "hc") {
+			if canon := admittedReadonlyCanonicalHead(argv[0], os.Geteuid()); canon != "" {
+				argv = append([]string{canon}, argv[1:]...)
+			} else {
+				return "path command"
+			}
+		} else {
+			return "path command"
+		}
 	}
 	// Normalize through canonicalResolvedBase (backed by the closed
 	// gnuCanonicalSet): real Homebrew GNU names (gfind, ggrep, gls, gsed, ...)
@@ -1456,6 +1472,20 @@ func readonlyPrePeelHit(argv []string) string {
 			return "env assign"
 		}
 		if strings.Contains(a, "/") {
+			// The strict-readonly canonical-head grant only applies to the
+			// FIRST word and only to a bare dispatch-report/hc basename at a
+			// trusted install slot (admittedReadonlyCanonicalHead): a
+			// path-form `dispatch-report t42` argv then falls through to the
+			// ordinary screening loop with its canonical argv so the peeled
+			// allowlist step can admit it. Every other path word — and a
+			// path-form head anywhere else — keeps "path command".
+			if i == 0 && filepath.IsAbs(a) &&
+				(filepath.Base(a) == "dispatch-report" || filepath.Base(a) == "hc") {
+				if canon := admittedReadonlyCanonicalHead(a, os.Geteuid()); canon != "" {
+					argv = append([]string{canon}, argv[1:]...)
+					continue
+				}
+			}
 			return "path command"
 		}
 		if shellNoopWords[a] {

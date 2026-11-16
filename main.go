@@ -1,7 +1,7 @@
 // ctxmode: a Go MCP server that virtualizes tool output to save context tokens.
-// v2.0 MCP surface (category tools + action=; ctx_stats takes no action):
+// v2.0 MCP surface (category tools + action=; ctx_stats and ctx_report take no action):
 //
-//	ctx_run, ctx_fs, ctx_git, ctx_kb, ctx_bg, ctx_stats
+//	ctx_run, ctx_fs, ctx_git, ctx_kb, ctx_bg, ctx_stats, ctx_report
 //
 // Internal handlers retain the former ctx_* names; they are not registered as MCP tools.
 package main
@@ -531,7 +531,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 	// args.Env arms a child process exactly like an `env KEY=VAL` prefix.
 	if grule, detail := guard.guardCtxRunEnv(args.Env); grule != "" {
 		audit.setScreen(shellBlock, grule)
-		return nil, nil, guardBlockedError(grule, detail)
+		return nil, nil, blockedReportError(guardBlockedError(grule, detail), args.Argv, args.Command)
 	}
 
 	// Execute: argv mode (no shell) takes priority over command string.
@@ -549,14 +549,14 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		}
 		if grule, detail := guard.guardCtxRunArgv(args.Argv); grule != "" {
 			audit.setScreen(shellBlock, grule)
-			return nil, nil, guardBlockedError(grule, detail)
+			return nil, nil, blockedReportError(guardBlockedError(grule, detail), args.Argv, "")
 		}
 		// stdin payload: if the argv's peeled head is a shell or scripting
 		// interpreter and carries no inline-code flag, the stdin IS the
 		// program — screen it the same way.
 		if grule, detail := guard.guardCtxRunStdin(args.Argv, args.Stdin); grule != "" {
 			audit.setScreen(shellBlock, grule)
-			return nil, nil, guardBlockedError(grule, detail)
+			return nil, nil, blockedReportError(guardBlockedError(grule, detail), args.Argv, "")
 		}
 		argv, aerr := s.validateArgv(args.Argv, cwd)
 		if aerr != nil {
@@ -578,13 +578,13 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 			}
 			if grule, detail := guard.guardCtxRunShell(args.Command); grule != "" {
 				audit.setScreen(shellBlock, grule)
-				return nil, nil, guardBlockedError(grule, detail)
+				return nil, nil, blockedReportError(guardBlockedError(grule, detail), nil, args.Command)
 			}
 			// stdin payload: when a peeled command head is a shell or scripting
 			// interpreter reading its program from stdin, screen the payload.
 			if grule, detail := guard.guardCtxRunStdinForCommand(args.Command, args.Stdin); grule != "" {
 				audit.setScreen(shellBlock, grule)
-				return nil, nil, guardBlockedError(grule, detail)
+				return nil, nil, blockedReportError(guardBlockedError(grule, detail), nil, args.Command)
 			}
 		} else if rt, ok := runtimes[language]; ok {
 			// Non-shell language: record the interpreter that will run the code

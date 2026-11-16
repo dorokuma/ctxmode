@@ -3,11 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // ---------- rule 1: sub-agent nested-dispatch guard ----------
@@ -3650,6 +3654,236 @@ func TestGuard_DispatchReportReadonly(t *testing.T) {
 	// on the same argv surface.
 	if got := guardArgvSubagent([]string{"dispatch-report", "--flush", "t42"}); got == "" {
 		t.Fatal("worker dispatch-report --flush t42 = allow, want block")
+	}
+}
+
+// TestGuard_DispatchReportCanonicalPath covers the trusted standard-path
+// canonicalization (P1a): an absolute dispatch-report/hc head at a real
+// install slot — /usr/local/bin or a trusted-home .local/bin — screens as
+// its canonical bare name for strict read-only AND for 's'-branch
+// sub-agents, while every untrusted path spelling (including a planted
+// /tmp/dispatch-report, a ./ dispatch-report, a FIFO and a 0644 file at a
+// trusted slot) keeps its default-deny verdict.
+func TestGuard_DispatchReportCanonicalPath(t *testing.T) {
+	// /usr/local/bin/dispatch-report -> /root/.local/bin/dispatch-report and
+	// /usr/local/bin/hc -> /root/.local/bin/hc -> herdr-core are the real
+	// deploy layout on the maintainer host; the assertions are gated on the
+	// binaries actually existing so a dev box without the install still runs
+	// the fake-home probes below.
+	realReport := "/usr/local/bin/dispatch-report"
+	if _, err := os.Stat(realReport); err != nil {
+		realReport = ""
+	}
+	realHc := "/usr/local/bin/hc"
+	if _, err := os.Stat(realHc); err != nil {
+		realHc = ""
+	}
+
+	// Isolated probe for the admission predicate itself: FIFO, missing exec
+	// bit and wrong resolved basename all fail inside a trusted slot.
+	t.Run("admittedReadonlyCanonicalHead", func(t *testing.T) {
+		fakeHome := withTestTrustedHome(t)
+		localBin := filepath.Join(fakeHome, ".local", "bin")
+		good := filepath.Join(localBin, "dispatch-report")
+		writeTestExecutable(t, good, 0755)
+		if got := admittedReadonlyCanonicalHead(good, os.Geteuid()); got != "dispatch-report" {
+			t.Fatalf("admit(%s) = %q, want dispatch-report", good, got)
+		}
+		// Non-clean and non-absolute spellings are never admitted. These
+		// probes run while `good` is still a real 0755 executable so the
+		// positive admit above proves the slot itself is valid; raw string
+		// concatenation is deliberate — filepath.Join would Clean away the
+		// non-clean segments and make the assertion vacuous.
+		nonCleanDotDot := localBin + "/../bin/dispatch-report"
+		if got := admittedReadonlyCanonicalHead(nonCleanDotDot, os.Geteuid()); got != "" {
+			t.Fatalf("admit(%s) = %q, want empty", nonCleanDotDot, got)
+		}
+		nonCleanSlash := localBin + "//dispatch-report"
+		if got := admittedReadonlyCanonicalHead(nonCleanSlash, os.Geteuid()); got != "" {
+			t.Fatalf("admit(%s) = %q, want empty", nonCleanSlash, got)
+		}
+		if got := admittedReadonlyCanonicalHead("./dispatch-report", os.Geteuid()); got != "" {
+			t.Fatalf("admit(./) = %q, want empty", got)
+		}
+		// FIFO at the same name is never admitted (would hang the reader).
+		fifo := filepath.Join(localBin, "hc")
+		if err := syscall.Mkfifo(fifo, 0600); err != nil {
+			t.Fatalf("mkfifo: %v", err)
+		}
+		if got := admittedReadonlyCanonicalHead(fifo, os.Geteuid()); got != "" {
+			t.Fatalf("admit(FIFO) = %q, want empty", got)
+		}
+		// 0644 (no execute bit) is never admitted.
+		lazy := filepath.Join(localBin, "dispatch-report")
+		if err := os.Chmod(lazy, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if got := admittedReadonlyCanonicalHead(lazy, os.Geteuid()); got != "" {
+			t.Fatalf("admit(0644) = %q, want empty", got)
+		}
+		// A symlink resolving to a differently-named binary is not the helper.
+		link := filepath.Join(localBin, "dispatch-report")
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("/usr/bin/ls", link); err != nil {
+			t.Fatal(err)
+		}
+		if got := admittedReadonlyCanonicalHead(link, os.Geteuid()); got != "" {
+			t.Fatalf("admit(->ls) = %q, want empty", got)
+		}
+	})
+
+	// Strict read-only (scout): trusted abs path admits as the canonical
+	// name even when PATH cannot resolve the bare name at all.
+	t.Run("readonly-abs-path", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "scout")
+		t.Setenv(auditEnvReadonly, "")
+		t.Setenv("PATH", "/nonexistent")
+		if realReport != "" {
+			if got := guardArgvReadonly([]string{realReport, "t1fp"}); got != "" {
+				t.Fatalf("guardArgvReadonly(%s t1fp) = %q, want allow", realReport, got)
+			}
+			if got := guardArgvReadonly([]string{realReport}); got == "" {
+				t.Fatalf("guardArgvReadonly(%s) = allow, want block (bad argv)", realReport)
+			}
+		}
+		if realHc != "" {
+			if got := guardArgvReadonly([]string{realHc, "send", "t42", "ok"}); got != "" {
+				t.Fatalf("guardArgvReadonly(%s send t42 ok) = %q, want allow", realHc, got)
+			}
+		}
+		// Fake-home install slot works identically.
+		fakeHome := withTestTrustedHome(t)
+		fake := filepath.Join(fakeHome, ".local", "bin", "dispatch-report")
+		writeTestExecutable(t, fake, 0755)
+		if got := guardArgvReadonly([]string{fake, "t1fp"}); got != "" {
+			t.Fatalf("guardArgvReadonly(%s t1fp) = %q, want allow", fake, got)
+		}
+		// Every untrusted/relative/other path spelling keeps the refusal.
+		for _, a := range [][]string{
+			{"/tmp/dispatch-report", "t1fp"},
+			{"./dispatch-report", "t1fp"},
+			{"/tmp/ls"},
+			{"/usr/bin/dispatch-report", "t1fp"}, // not a standard slot
+		} {
+			if got := guardArgvReadonly(a); got == "" {
+				t.Fatalf("guardArgvReadonly(%v) = allow, want block", a)
+			}
+		}
+	})
+
+	// 's' branch (worker/verifier): a path-form report-channel head must
+	// hit the same admission — a planted /tmp/dispatch-report can no
+	// longer ride the bare-name screen, a trusted install path still runs.
+	t.Run("subagent-s-branch", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "worker")
+		t.Setenv(auditEnvReadonly, "")
+		tmp := t.TempDir()
+		fake := filepath.Join(tmp, "dispatch-report")
+		writeTestExecutable(t, fake, 0755)
+		if r, d := currentGuardCall().guardCtxRunArgv([]string{fake, "t1fp"}); r == "" {
+			t.Fatalf("worker %s t1fp = allow, want block (untrusted path)", fake)
+		} else if d == "" {
+			t.Fatal("block detail empty")
+		}
+		if realReport != "" {
+			if r, d := currentGuardCall().guardCtxRunArgv([]string{realReport, "t1fp"}); r != "" {
+				t.Fatalf("worker %s t1fp blocked: %s %s, want allow", realReport, r, d)
+			}
+		}
+		// hc path spellings get the same treatment.
+		fakeHc := filepath.Join(tmp, "hc")
+		writeTestExecutable(t, fakeHc, 0755)
+		if r, _ := currentGuardCall().guardCtxRunArgv([]string{fakeHc, "send", "t42", "ok"}); r == "" {
+			t.Fatalf("worker %s send = allow, want block", fakeHc)
+		}
+		if realHc != "" {
+			if r, d := currentGuardCall().guardCtxRunArgv([]string{realHc, "send", "t42", "ok"}); r != "" {
+				t.Fatalf("worker %s send blocked: %s %s, want allow", realHc, r, d)
+			}
+		}
+	})
+}
+
+// TestGuard_ReportDeliveryHint covers the P1b self-heal hint: a blocked
+// dispatch-report invocation (argv or shell head) gets the ctx_report /
+// argv+stdin guidance, while a command merely mentioning the name mid-token
+// never earns it.
+func TestGuard_ReportDeliveryHint(t *testing.T) {
+	s, _ := auditTestServer(t)
+	t.Setenv(auditEnvRole, "scout")
+	t.Setenv(auditEnvReadonly, "")
+
+	wantHint := func(err error, what string) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), "Report delivery hint:") {
+			t.Fatalf("%s: error missing Report delivery hint: %v", what, err)
+		}
+	}
+	noHint := func(err error, what string) {
+		t.Helper()
+		if err != nil && strings.Contains(err.Error(), "Report delivery hint:") {
+			t.Fatalf("%s: unexpected Report delivery hint: %v", what, err)
+		}
+	}
+
+	// argv spellings blocked by either rule get the hint.
+	_, _, err := s.toolExecute(context.Background(), nil, executeArgs{Argv: []string{"dispatch-report", "--flush", "t1fp"}})
+	wantHint(err, "argv --flush")
+	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Argv: []string{"dispatch-report"}})
+	wantHint(err, "argv bare")
+	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Argv: []string{"/tmp/dispatch-report", "t1fp"}})
+	wantHint(err, "argv untrusted path")
+
+	// shell command strings whose SEGMENT head is dispatch-report get the
+	// hint even though the block reason is "metachar forbidden".
+	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "/usr/local/bin/dispatch-report t1fp"})
+	wantHint(err, "shell path head")
+	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "ls && /usr/local/bin/dispatch-report t1fp"})
+	wantHint(err, "shell second segment")
+	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "dispatch-report --flush t1fp"})
+	wantHint(err, "shell --flush head")
+
+	// Mid-token mentions and unrelated blocks never hint.
+	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "rg dispatch-report . && python3 -c 'print(1)'"})
+	noHint(err, "rg+python3")
+	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "echo dispatch-report t1fp > /tmp/x"})
+	noHint(err, "echo redirect")
+	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Argv: []string{"python3", "-c", "print(1)"}})
+	noHint(err, "python argv")
+
+	// batch per-command errors carry the hint for the report command only.
+	res, _, err := s.toolBatchExecute(context.Background(), nil, batchArgs{
+		Commands: []batchCommand{
+			{Label: "d", Command: "/usr/local/bin/dispatch-report t1fp"},
+			{Label: "r", Command: "python3 -c 'print(1)'"},
+		},
+		Concurrency: 1,
+	})
+	if err != nil {
+		t.Fatalf("toolBatchExecute: %v", err)
+	}
+	var br batchResponse
+	var unmarshalled bool
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			if uerr := json.Unmarshal([]byte(tc.Text), &br); uerr == nil {
+				unmarshalled = true
+			}
+		}
+	}
+	if !unmarshalled {
+		t.Fatalf("no JSON batch response in result content")
+	}
+	if len(br.Commands) != 2 {
+		t.Fatalf("batch results = %d, want 2", len(br.Commands))
+	}
+	if !strings.Contains(br.Commands[0].Error, "Report delivery hint:") {
+		t.Fatalf("batch dispatch-report error missing hint: %q", br.Commands[0].Error)
+	}
+	if strings.Contains(br.Commands[1].Error, "Report delivery hint:") {
+		t.Fatalf("batch python error must not carry hint: %q", br.Commands[1].Error)
 	}
 }
 

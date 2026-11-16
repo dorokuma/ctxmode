@@ -733,6 +733,55 @@ test("扩展层：ctx_stats 已注册且列入 getTools()", async () => {
   }
 })
 
+// ---- 扩展层：ctx_report 必须真的注册（服务端 instructions 已广告它，
+// 不注册则模型调不到），并与 getTools() 清单一致。----
+test("扩展层：ctx_report 已注册且列入 getTools()", async () => {
+  const recvPath = path.join(tmpDir, "report-recv.jsonl")
+  fs.writeFileSync(recvPath, "")
+  process.env.CTXMODE_BIN = writeRecordingStubBin("report-bin")
+  process.env.CTXMODE_TEST_RECV = recvPath
+  process.env.CTXMODE_DISPOSE_WAIT_MS = "50"
+  const { pi, handlers, tools } = fakePi()
+  ctxmodeExtension(pi)
+  try {
+    await (handlers.get("session_start") as (e: unknown, c: unknown) => Promise<void>)(
+      { type: "session_start" },
+      { cwd: tmpDir, ui: { notify() {} } },
+    )
+
+    const ctxReport = tools.get("ctx_report") as {
+      execute: (id: string, p: Record<string, unknown>) => Promise<unknown>
+    }
+    assert.ok(ctxReport, "ctx_report 已注册")
+    assert.ok(
+      newClient().getTools().includes("ctx_report"),
+      "getTools() 必须包含 ctx_report",
+    )
+
+    const call = ctxReport.execute("id-1", { content: "# report\nbody" }).then(
+      (r) => (r as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? "",
+      (e: Error) => `rejected: ${e?.message}`,
+    )
+    const sent = await waitUntil(
+      () => fs.readFileSync(recvPath, "utf8").includes('"ctx_report"'),
+      3000,
+    )
+    assert.ok(sent, "ctx_report 调用必须以该名字发往服务端")
+
+    await (handlers.get("session_shutdown") as () => Promise<void>)()
+    assert.match(
+      await call,
+      /ctxmode disconnected/,
+      "shutdown 后在途调用以 disconnected 文本收尾（与其它工具一致）",
+    )
+  } finally {
+    await (handlers.get("session_shutdown") as () => Promise<void>)()
+    delete process.env.CTXMODE_BIN
+    delete process.env.CTXMODE_TEST_RECV
+    delete process.env.CTXMODE_DISPOSE_WAIT_MS
+  }
+})
+
 test("扩展层：ctx_fs 暴露 resolve 与 related 动作枚举并透传调用", async () => {
   const recvPath = path.join(tmpDir, "fs-resolve-related-recv.jsonl")
   fs.writeFileSync(recvPath, "")
