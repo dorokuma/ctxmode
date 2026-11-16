@@ -12,7 +12,7 @@
 1. **`ctx_stats`**（新只读 MCP 工具，`stats.go`）— 来自 context-mode 的同名工具。本仓已有 audit JSONL（`audit.go`）与 `storeIndexLocked` 入库口径，统计功能只差聚合层：
    - `router.go` 的 `counted()` 泛型包装器包住全部 6 个工具 handler，按响应 `TextContent` 字节数记入 `server.statTools`（新字段 `statMu`/`statTools`/`startedAt`）。
    - `storeIndexLocked` 成功后把入库字节数记入伪工具行 `store` —— 全部索引路径（rg 超限入库、run 输出截断入库、kb index/fetch）的唯一汇合点，一处插桩覆盖 11 个调用点。
-   - **订正（2026-10-07 后补标注，原文不改）**：上面「全部索引路径（…kb index/fetch）的唯一汇合点」这一表述已被 `.agents/notes/20261007-175eb05-audit-residuals.md` 的「既定口径」项订正——kept-out 只统计**经过 `storeIndexLocked` 的索引汇合点**的路径；`ctx_run action=batch` 的超限直存（直接调 `Store.Index`）与 `ctx_kb fetch`（`indexContentLocked` → `Store.ReplaceExactAndChunks`）**不经该汇合点、不计入**。
+   - **订正（2026-10-07 后补标注，原文不改）**：上面「全部索引路径（…kb index/fetch）的唯一汇合点」这一表述已被 `175eb05` 审计期残余清单分片（已核销清理，Git 历史留底）的「既定口径」项订正——kept-out 只统计**经过 `storeIndexLocked` 的索引汇合点**的路径；`ctx_run action=batch` 的超限直存（直接调 `Store.Index`）与 `ctx_kb fetch`（`indexContentLocked` → `Store.ReplaceExactAndChunks`）**不经该汇合点、不计入**。
    - **再订正（2026-10-08，现行口径）**：上面那条「既定口径」其后已被同一笔记第 7 项新增的订正条目推翻——记账已下沉到 `Store`（`Store.onIndexedBytes`），batch 直存与 fetch 分块写**都计入** kept-out，不再存在不计入的 KB 写路径。本行保留仅作沿革记录，现行口径以第 7 项的订正为准。
    - `aggregateAuditLog` 按当前 `session_id` 过滤 audit JSONL，给 lifetime 视图（calls/output/indexed/truncated）。超长行跳过而非整体失败。
    - token 估算 bytes÷4，与 context-mode 相同口径。

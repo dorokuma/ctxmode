@@ -30,6 +30,7 @@ supersedes: ""
 - **O-NEW-2 — `sbx --check -- CMD` / `--check=true` 等组合写法按未知/多参 fail-closed** `[pattern:sbx-wrapper-unwrap-asymmetry]`：`confirmed（consider，保留现状）`。与真实 `parseArgs` 的良性偏差，守卫偏向更严的 fail-closed，无安全风险。
 - **O-R6-1 — `peelWrappersAndSbxAliases` 别名链触界时返回 `cur`（未剥完的 argv）而非最后一次剥出的 `head`** `[pattern:sbx-wrapper-unwrap-asymmetry]`：`confirmed（consider，保留现状）`。`exhausted` 语义本身正确且全部 3 处调用方均先查 `exhausted` 再取 `head`，当前无可达误用，属 API 脆弱点，留后续改动留意。
 - **O-R6-2 — `peelResolvedSegDepth:2894` `sbx` 晋升重筛以 `caller.seededWith(envAs)` 递归导致 `envAs` 二次 seed** `[pattern:sbx-wrapper-unwrap-asymmetry]`：`confirmed（consider，保留现状）`。`PATH=$PATH:/x` 会展开为 `<path>:/x:/x`，重复目录仅使别名解析更宽（fail-safe 方向），纯语义冗余、无绕过面。
+- **W1 — `isAllowedSystemReadonlyAlias` 仅按 basename + 系统标准 PATH 目录解析校验别名，未额外绑定软链目标所在目录**：`wontfix（已拍板不做）`。basename 表本身即系统别名的判定口径，目录绑定属更严的独立信任边界加固，与本轮 sbx 剥离无关，维持现状。
 
 ## 被放弃的方案
 - `sbx --env` 仅 `addAssign` 不加 sentinel 前置检查：`env HOME=/tmp` 对 worker 合法但 sandbox 内重锚 PATH 信任，且任务要求 `HOME=/tmp` 必拦 → 剥离时 fail-closed。
@@ -41,5 +42,5 @@ supersedes: ""
 - `gofmt -l .`、`go vet ./...`、`staticcheck` 全绿。
 
 ## 来源
-- 观察项分诊：`.agents/notes/20261109-v531-hc-allowlist-followup.md` O1；Oracle 审计 `/root/.dev-baseline/gate-ctxmode-peel-sbx-oracle-r1.txt`（M1/S1 + O1/O2 分诊）、`gate-ctxmode-peel-sbx-oracle-r2.txt`（S-NEW-1/S-NEW-2 修复 + O-NEW-1/O-NEW-2 分诊）、`gate-ctxmode-peel-sbx-oracle-r3.txt`（S-R3-1）与 `gate-ctxmode-peel-sbx-oracle-r4.txt`（S-R4-1/S-R4-2 修复）、Reviewer 复审 `/root/.dev-baseline/gate-ctxmode-peel-sbx-reviewer-r1.txt`（M-REV-1/M-REV-2）、Oracle 对抗审计 `/root/.dev-baseline/gate-ctxmode-peel-sbx-oracle-r6.txt`（O-R6-1/O-R6-2 分诊）与 Reviewer R2 `/root/.dev-baseline/gate-ctxmode-peel-sbx-reviewer-r2.txt`（红轮早退 must fix）。
+- 观察项分诊：v5.3.1 验证期审计残余分片 O1（该分片已核销清理，Git 历史留底）；Oracle 审计 `/root/.dev-baseline/gate-ctxmode-peel-sbx-oracle-r1.txt`（M1/S1 + O1/O2 分诊）、`gate-ctxmode-peel-sbx-oracle-r2.txt`（S-NEW-1/S-NEW-2 修复 + O-NEW-1/O-NEW-2 分诊）、`gate-ctxmode-peel-sbx-oracle-r3.txt`（S-R3-1）与 `gate-ctxmode-peel-sbx-oracle-r4.txt`（S-R4-1/S-R4-2 修复）、Reviewer 复审 `/root/.dev-baseline/gate-ctxmode-peel-sbx-reviewer-r1.txt`（M-REV-1/M-REV-2）、Oracle 对抗审计 `/root/.dev-baseline/gate-ctxmode-peel-sbx-oracle-r6.txt`（O-R6-1/O-R6-2 分诊）与 Reviewer R2 `/root/.dev-baseline/gate-ctxmode-peel-sbx-reviewer-r2.txt`（红轮早退 must fix）。
 - 代码：`role_guards.go`（`peelWrappers` case sbx、`isStructuralGuardHead`、`peelResolvedSegDepth` 晋升重筛、`stdinProgramHeadWithEnv` 携带 `envAs` 递归、`envHookVars`/`isEnvHookVar` `PI_SANDBOX_*`、`replTokenInExecSlot`/`xargsFeedsCodeFlag`/`peelToSSHHead`/`sshTunnelsStdinProgram`/`xargsDerivedSeg` 增传 `pathEnv` 与 sbx 别名二次解包、`peelWrappersAndSbxAliases` 有界重复别名重剥替代三处一次性重写）；`readonly_allowlist.go`（`readonlyPrePeelHit`）；`readonly_allowlist_test.go`（`TestGuard_PeelSbxWrapper`、`mustSbxBin`/`mustSymlink` 脚手架）。

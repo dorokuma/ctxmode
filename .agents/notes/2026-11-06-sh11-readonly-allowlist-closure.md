@@ -21,7 +21,7 @@ supersedes: ""
 
 ## 遗留项
 - round-8 consider（非 must fix）：`[pattern:path-trust-user-writable]` PATH 信任表含用户可写目录（`/home/linuxbrew/`、`/.local/bin`、toolchain shim 目录），植入同名恶意二进制可解析为已放行名；已归档 `.agents/notes/2026-11-01-role-guards-non-sandbox-boundaries.md` C10 条。
-- ssh peel 两项结构性观察（`[pattern:code-static-spawn-single-layer]`、`[pattern:indirect-wrapper-seg-stdin]`）见 `2026-11-04-ssh-peel-followups.md`。
+- ssh peel 两项结构性观察（`[pattern:code-static-spawn-single-layer]`、`[pattern:indirect-wrapper-seg-stdin]`）已由 `20261107-r12-path-trust-and-ssh-peel-closure.md` 闭合（原观察分片已核销清理，Git 历史留底）。
 
 ## 来源
 任务【MARK-SH11CLOSE-20261106】收口指令；worktree `/root/workspace/.wt/ctxmode/feat-readonly-allowlist`（已 `git worktree remove`）；登记文件 `.wt/ctxmode/feat-readonly-allowlist.json` status=merged。

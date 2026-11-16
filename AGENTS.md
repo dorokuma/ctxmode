@@ -15,3 +15,8 @@
 
 ## 关联仓库
 - `codegraph-go`：同为 Pi 与 MCP 工具链组件
+- `dispatch-agent`：无 Go 模块依赖，但下列 4 项硬编码协议不变量两仓各自实现、必须锁步同步（任一变更须同批改对侧并复核本笔记）：
+  1. 报告根目录 `/tmp/herdr-role-reports`
+  2. 父终端地址形状 `^t[0-9a-z]+$`（本仓 `hcSendAddrOK`，对端 `config.ReportAddrRe`）
+  3. 角色侧唯一放行拼写 `dispatch-report <t-addr>`；`--flush` 仅限派发器外层调用
+  4. 回执通知格式 `报告已写入 path=<abs> bytes=<n> sha256=<hex>`；`CTXMODE_EXTRA_WORKDIRS` 空串视为未设置
