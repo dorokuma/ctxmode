@@ -4,8 +4,8 @@ package main
 const serverInstructions = `# ctxmode — context virtualization for agent tool output
 
 ctxmode runs code, inspects files and git, and virtualizes large output into a
-local knowledge base to save context tokens. Six tools; five take a required
-action argument (ctx_stats takes none).
+local knowledge base to save context tokens. Seven tools; five take a required
+action argument (ctx_stats and ctx_report take none).
 
 ## Tool map (action)
 
@@ -24,6 +24,9 @@ action argument (ctx_stats takes none).
 - ctx_bg: background processes from ctx_run action=execute background:true. Starting a background job returns immediately and never proactively pushes notifications. After receiving its id, call ctx_bg action=wait once by id or pid (blocking this tool call; default 60000ms, maximum 1 hour; timeout does not kill). Completed results remain wait-addressable through a bounded handoff window even if the detailed registry entry is pruned; after that window the id is unknown. id and pid are mutually exclusive. kill terminates (and wakes waiters); repeated wait is a stable read of the same terminal result, while repeated kill or kill of a completed/expired id returns no-match.
 - ctx_stats: context-consumption statistics for the session: per-tool call counts, bytes returned to the context window, estimated tokens, and bytes kept out of it by auto-indexing into the KB store (every KB write path is covered: oversized ctx_run output, ctx_fs rg auto-index, ctx_kb index, ctx_run action=batch, ctx_kb fetch, legacy migration). No action argument; pass
   json:true for machine-readable output.
+- ctx_report: deliver the dispatched role's completion report via the trusted
+  dispatch-report helper. content=<complete UTF-8 report, 1 byte .. 1 MiB>;
+  requires the dispatcher-set DISPATCH_REPORT_PATH/DISPATCH_REPORT_PARENT env.
 
 ## Usage policy
 
@@ -34,14 +37,16 @@ action argument (ctx_stats takes none).
 - rg: for huge result sets use ctx_kb action=search or ctx_fs rg offset paging.
 - Big outputs are auto-indexed: search ctx_kb instead of re-running.
 - Mutating: ctx_run (executes code/commands), ctx_kb index/fetch/purge (writes
-  the local KB), ctx_bg kill. Everything else is read-only.
+  the local KB), ctx_bg kill, ctx_report (writes the dispatch report). Everything
+  else is read-only.
 - NOT a sandbox: commands and code run with the server process's privileges;
   no security boundary. Use only in trusted environments.
 
 ## Host notes
 
-- Tool names: ctx_run, ctx_fs, ctx_git, ctx_kb, ctx_bg, ctx_stats; action is a
-  required argument for all but ctx_stats (e.g. ctx_fs action=ls path=.).
+- Tool names: ctx_run, ctx_fs, ctx_git, ctx_kb, ctx_bg, ctx_stats, ctx_report;
+  action is a required argument for all but ctx_stats/ctx_report (e.g. ctx_fs
+  action=ls path=.).
 - Grok prefixes the server name onto tool names; pi registers the same tool
   names directly; agy (Antigravity CLI) exposes them as MCP tools under server
   "ctxmode" (lazy schemas in ~/.gemini/antigravity-cli/mcp/ctxmode/, called via
@@ -50,13 +55,15 @@ action argument (ctx_stats takes none).
 ## Dispatch report channel
 
 A dispatched role reports completion through the dispatch-report helper
-once, with one ctx_run execute call:
+once. Two spellings are equally valid delivery entry points — both delegate
+to the same helper, so pick whichever the current rules text offers:
 
-  argv  = ["dispatch-report", "<parent terminal id>"]   (the static t-id from the dispatch)
-  stdin = <complete UTF-8 report body, 1 byte to 1 MiB>
+  ctx_report tool:      content = <complete UTF-8 report body, 1 byte to 1 MiB>
+  ctx_run execute call: argv  = ["dispatch-report", "<parent terminal id>"]   (the static t-id from the dispatch)
+                        stdin = <complete UTF-8 report body, 1 byte to 1 MiB>
 
-- That argv+stdin form is the ONLY delivery entry point — never pipe the
-  report through a shell string, hc send, or a file redirect. The helper
+- These are the ONLY delivery entry points — never pipe the report through
+  a shell string, hc send, or a file redirect. The helper
   itself atomically writes the report file and sends the parent a short
   "报告已写入 path=<abs> bytes=<n> sha256=<hex>" notice; the parent compares that
   digest against the full file it reads, which is the delivery proof. During the

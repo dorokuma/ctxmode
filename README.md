@@ -10,7 +10,7 @@ Supported platform: **Linux**. Background process identity verification reads `/
 
 ## MCP tools (v2)
 
-Six real tools (not skills). Five take **`action=`** plus capability-specific fields; `ctx_stats` takes no action and only accepts `json`:
+Seven real tools (not skills). Five take **`action=`** plus capability-specific fields; `ctx_stats` and `ctx_report` take no action:
 
 | Tool | Actions | Key parameters |
 |------|---------|----------------|
@@ -20,12 +20,13 @@ Six real tools (not skills). Five take **`action=`** plus capability-specific fi
 | **ctx_kb** | `index`, `search`, `fetch`, `stats`, `purge`, `doctor` | `path`; `query`; `url`/`urls`/`source`/`format`/`force`/`maxBytes`/`timeout_ms`/`ttl_ms`; —; `confirm`/`scope`/`sessionId`/`dryRun`; — |
 | **ctx_bg** | `list`, `kill`, `log`, `wait` | —; `id`/`pid`; `id`/`pid`/`tail_lines`/`tail_bytes`; `id`/`pid`/`timeout_ms` |
 | **ctx_stats** | — (no `action=`; single capability) | `json` (machine-readable output) |
+| **ctx_report** | — (no `action=`; dispatch report delivery) | `content` (1 B .. 1 MiB UTF-8; requires dispatcher env) |
 
-Any MCP host (Grok, Pi via the adapter below, agy / Antigravity CLI, …) uses this surface. Grok prefixes the server name (e.g. `ctxmode__ctx_run`); Pi registers the six tool names directly; agy (Antigravity CLI) exposes them under MCP server `ctxmode` (lazy-loaded schemas in `~/.gemini/antigravity-cli/mcp/ctxmode/`, invoked via `call_mcp_tool` with `ServerName: "ctxmode"`).
+Any MCP host (Grok, Pi via the adapter below, agy / Antigravity CLI, …) uses this surface. Grok prefixes the server name (e.g. `ctxmode__ctx_run`); Pi registers the seven tool names directly; agy (Antigravity CLI) exposes them under MCP server `ctxmode` (lazy-loaded schemas in `~/.gemini/antigravity-cli/mcp/ctxmode/`, invoked via `call_mcp_tool` with `ServerName: "ctxmode"`).
 
 ## Pi integration
 
-A Pi-specific TypeScript adapter is maintained in [`integrations/pi/`](integrations/pi/README.md). It registers the **same six tools** (`ctx_run`, `ctx_fs` including `resolve` and `related`, `ctx_git`, `ctx_kb`, `ctx_bg`, `ctx_stats`) and bridges stdio MCP to the Go binary.
+A Pi-specific TypeScript adapter is maintained in [`integrations/pi/`](integrations/pi/README.md). It registers the **same seven tools** (`ctx_run`, `ctx_fs` including `resolve` and `related`, `ctx_git`, `ctx_kb`, `ctx_bg`, `ctx_stats`, `ctx_report`) and bridges stdio MCP to the Go binary.
 
 ## Quick Start
 

@@ -665,7 +665,7 @@ export class CtxmodeClient {
   }
 
   getTools(): string[] {
-    return ["ctx_run", "ctx_fs", "ctx_git", "ctx_kb", "ctx_bg", "ctx_stats"]
+    return ["ctx_run", "ctx_fs", "ctx_git", "ctx_kb", "ctx_bg", "ctx_stats", "ctx_report"]
   }
 
   /** Instructions announced by the server during initialize (absent → null). */
@@ -985,6 +985,22 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
     }),
     async execute(_id, params, signal) {
       return run("ctx_stats", params as Record<string, unknown>, signal)
+    },
+  })
+
+  pi.registerTool({
+    name: "ctx_report",
+    label: "CTX Report",
+    description: "派发角色报告交付：委托唯一真源 dispatch-report 完成加锁、原子写盘、父终端回执与 .sent 去重。content=<完整 UTF-8 报告正文，1 字节至 1 MiB>；仅在派发器设置 DISPATCH_REPORT_PATH/DISPATCH_REPORT_PARENT 时可用，所有角色（含严格只读）可调用。",
+    promptSnippet: "Deliver the dispatched role's completion report via the trusted dispatch-report helper",
+    promptGuidelines: [
+      "Use ctx_report (or ctx_run argv=[\"dispatch-report\", \"<t-id>\"] + stdin) once to deliver the final report; never pipe it through a shell string or hc send.",
+    ],
+    parameters: Type.Object({
+      content: Type.String({ description: "Complete UTF-8 report body (1 byte .. 1 MiB)" }),
+    }),
+    async execute(_id, params, signal) {
+      return run("ctx_report", params as Record<string, unknown>, signal)
     },
   })
 }

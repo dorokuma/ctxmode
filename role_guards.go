@@ -2015,6 +2015,77 @@ func screenDispatchReportReadonly(argv []string) string {
 	return ""
 }
 
+// readonlyCanonicalHeads are the report-channel command heads a role-guarded
+// caller may invoke by absolute path from their standard install locations:
+// dispatch-report (the role-side report spelling) and hc (the terminal
+// client whose `send` subcommand is the notify channel). The map value is
+// the set of resolved-basename aliases the on-disk file may legitimately
+// carry: hc is installed as a symlink to herdr-core (host) or sbx (reviewer
+// sandbox), while dispatch-report is a real binary under its own name only.
+var readonlyCanonicalHeads = map[string][]string{
+	"dispatch-report": {"dispatch-report"},
+	"hc":              {"hc", "herdr-core", "sbx"},
+}
+
+// admittedReadonlyCanonicalHead reports whether arg0 is an absolute path
+// naming a report-channel head at a TRUSTED standard install location —
+// /usr/local/bin/<name> or <trusted-home>/.local/bin/<name> (the
+// trustedHomeDirs() set, which testTrustedHomeRoot extends for tests) — and
+// returns the canonical bare name ("dispatch-report"/"hc") the allowlist
+// and nested-dispatch screens should evaluate in its place. It returns ""
+// for every other spelling (./name, /tmp/name, non-clean or relative
+// paths), so a path-form head keeps its default-deny verdict unless it
+// points at a real install slot.
+//
+// The on-disk file must satisfy isTrustedExecutableOnDisk AND — because
+// ADAPT2 exempts system dirs like /usr/local/bin from the owner and
+// permission checks — an explicit post-EvalSymlinks os.Stat requiring a
+// regular file with an execute bit (a FIFO, socket or 0644 file is never
+// admitted) whose resolved basename is one of the head's alias names (a
+// link to an unrelated binary is never admitted either).
+func admittedReadonlyCanonicalHead(arg0 string, euid int) string {
+	if arg0 == "" || !filepath.IsAbs(arg0) || filepath.Clean(arg0) != arg0 {
+		return ""
+	}
+	dir, base := filepath.Dir(arg0), filepath.Base(arg0)
+	aliases, ok := readonlyCanonicalHeads[base]
+	if !ok {
+		return ""
+	}
+	ok = dir == "/usr/local/bin"
+	if !ok {
+		for _, h := range trustedHomeDirs() {
+			if dir == filepath.Join(h, ".local/bin") {
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok || !isTrustedExecutableOnDisk(arg0, euid) {
+		return ""
+	}
+	resolved, err := filepath.EvalSymlinks(arg0)
+	if err != nil {
+		return ""
+	}
+	rb := filepath.Base(resolved)
+	aliasOK := false
+	for _, a := range aliases {
+		if rb == a {
+			aliasOK = true
+			break
+		}
+	}
+	if !aliasOK {
+		return ""
+	}
+	st, err := os.Stat(resolved)
+	if err != nil || !st.Mode().IsRegular() || st.Mode().Perm()&0o111 == 0 {
+		return ""
+	}
+	return base
+}
+
 // queryOnlyFlagArgs are the pure query flags of the agent-launcher heads:
 // they print and exit without dispatching anything. `--dry-run` and
 // `--print` are deliberately absent — dispatch-agent writes its combined
@@ -2613,7 +2684,25 @@ func screenNestedDispatch(headArgv []string, pathEnv string, depth int, caller c
 	if len(headArgv) == 0 {
 		return ""
 	}
-	for _, base := range headBaseAliasHits(headArgv, pathEnv) {
+	bases := headBaseAliasHits(headArgv, pathEnv)
+	// A path-form head (./x, /tmp/x, ...) whose typed OR resolved basename
+	// lands on a report-channel head must be a trusted standard install
+	// path: screenHcSubagent/screenDispatchReportReadonly judge only the
+	// tail args, so a planted /tmp/dispatch-report would otherwise inherit
+	// the bare-name grant. The same admission the strict-readonly
+	// canonical-head rule applies; every other path-form head keeps the
+	// existing basename dispatch unchanged.
+	if strings.Contains(headArgv[0], "/") {
+		for _, base := range bases {
+			switch base {
+			case "dispatch-report", "hc", "herdr-core":
+				if admittedReadonlyCanonicalHead(headArgv[0], os.Geteuid()) == "" {
+					return "untrusted path binary " + filepath.Base(headArgv[0])
+				}
+			}
+		}
+	}
+	for _, base := range bases {
 		if isPureQueryInvocation(headArgv) && pureQueryOnlyHeads[base] {
 			continue // `dispatch-agent --version`: nothing is dispatched
 		}
@@ -14477,6 +14566,53 @@ func guardBlockedError(rule, detail string) error {
 		detail = readonlyBlockWithHint(detail)
 	}
 	return fmt.Errorf("blocked by role guard (%s): %s", rule, detail)
+}
+
+// reportDeliveryHintText is the self-heal guidance appended when a role
+// guard blocks a dispatch-report invocation.
+const reportDeliveryHintText = "Report delivery hint: call the ctx_report MCP tool (content=\"<report>\"), or ctx_run with action=\"execute\", argv=[\"dispatch-report\", \"<parent-t-id>\"], stdin=\"<report>\" (bare command name, no shell string or flags)"
+
+// blockedReportError returns err unchanged unless it is a role-guard block
+// AND the screened invocation names dispatch-report as a command head — in
+// which case the report-delivery hint is appended so a dispatched role
+// recovers with the right spelling instead of retrying the forbidden form.
+//
+// argv invocations match on filepath.Base(argv[0]) — a bare name or any
+// path spelling (which the guards block as "path command"). Shell command
+// strings match only when dispatch-report is the FIRST WORD of a `;`, `&&`,
+// `||`, `|` or newline separated segment (or of the whole string), so a
+// mid-token mention — `rg dispatch-report .`, `echo dispatch-report x`,
+// `python3 -c 'import dispatch_report'` — can never mis-hint a blocked call
+// into a report retry.
+func blockedReportError(err error, argv []string, command string) error {
+	if err == nil || !strings.Contains(err.Error(), "blocked by role guard") {
+		return err
+	}
+	if len(argv) > 0 && filepath.Base(argv[0]) == "dispatch-report" {
+		return fmt.Errorf("%w %s", err, reportDeliveryHintText)
+	}
+	if command != "" && shellCommandHeadIsReport(command) {
+		return fmt.Errorf("%w %s", err, reportDeliveryHintText)
+	}
+	return err
+}
+
+// shellCommandHeadIsReport reports whether any parsed command segment of
+// code starts with a dispatch-report word (bare or path spelling). The
+// sub-agent AST splitter (splitShellSegments) owns every `;`/`&&`/`||`/`|`
+// /newline boundary plus quoting and heredoc handling, so a mention inside
+// an argument (`rg dispatch-report .`), a quoted string or an env
+// assignment value can never be mistaken for the command head.
+func shellCommandHeadIsReport(code string) bool {
+	for _, seg := range splitShellSegments(code) {
+		if len(seg.argv) == 0 {
+			continue
+		}
+		if filepath.Base(seg.argv[0]) == "dispatch-report" {
+			return true
+		}
+	}
+	return false
 }
 
 // minInt is a tiny local helper (avoid pulling in math for two ints).

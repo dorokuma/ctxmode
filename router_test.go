@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -606,4 +607,285 @@ func TestCategoryToolSchemaAliasesOverMCP(t *testing.T) {
 			t.Fatalf("ctx_git schema missing %q property: %v", alias, schemaFor("ctx_git"))
 		}
 	}
+	// ctx_report is registered, advertises exactly one required property.
+	reportSchema := schemaFor("ctx_report")
+	reqR, _ := reportSchema["required"].([]any)
+	if len(reqR) != 1 || reqR[0] != "content" {
+		t.Fatalf("ctx_report required = %v, want [content]", reqR)
+	}
+}
+
+// TestCtxReportValidation covers the pre-spawn checks: the env binding must
+// name a real dispatch (DISPATCH_REPORT_PATH + a t[0-9a-z]+ parent that is
+// not the caller's own terminal) and the body must be 1 byte .. 1 MiB of
+// valid UTF-8.
+func TestCtxReportValidation(t *testing.T) {
+	s := &server{workdirs: []string{t.TempDir()}}
+	ctx := context.Background()
+
+	call := func() error {
+		_, _, err := s.toolCtxReport(ctx, nil, ctxReportArgs{Content: "body"})
+		return err
+	}
+
+	t.Setenv("DISPATCH_REPORT_PATH", "")
+	t.Setenv("DISPATCH_REPORT_PARENT", "")
+	t.Setenv("HC_TERMINAL_ID", "")
+	if err := call(); err == nil || !strings.Contains(err.Error(), "DISPATCH_REPORT_PATH") {
+		t.Fatalf("unset path: %v", err)
+	}
+
+	t.Setenv("DISPATCH_REPORT_PATH", filepath.Join(t.TempDir(), "a", "report.md"))
+	if err := call(); err == nil || !strings.Contains(err.Error(), "DISPATCH_REPORT_PARENT") {
+		t.Fatalf("unset parent: %v", err)
+	}
+	t.Setenv("DISPATCH_REPORT_PARENT", "bad-addr")
+	if err := call(); err == nil || !strings.Contains(err.Error(), "DISPATCH_REPORT_PARENT") {
+		t.Fatalf("bad parent: %v", err)
+	}
+	t.Setenv("DISPATCH_REPORT_PARENT", "t1fp")
+	t.Setenv("HC_TERMINAL_ID", "t1fp")
+	if err := call(); err == nil || !strings.Contains(err.Error(), "HC_TERMINAL_ID") {
+		t.Fatalf("self parent: %v", err)
+	}
+	t.Setenv("HC_TERMINAL_ID", "tself")
+
+	_, _, err := s.toolCtxReport(ctx, nil, ctxReportArgs{Content: ""})
+	if err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("empty content: %v", err)
+	}
+	_, _, err = s.toolCtxReport(ctx, nil, ctxReportArgs{Content: strings.Repeat("x", ctxReportMaxBody+1)})
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversize content: %v", err)
+	}
+	_, _, err = s.toolCtxReport(ctx, nil, ctxReportArgs{Content: "bad \xff utf8"})
+	if err == nil || !strings.Contains(err.Error(), "UTF-8") {
+		t.Fatalf("invalid utf8: %v", err)
+	}
+}
+
+// TestCtxReportDelegate runs the handler against a fake dispatch-report
+// helper injected via dispatchReportCandidates: the helper sees only the
+// sanitized child environment (host secrets stripped, DISPATCH_REPORT_* and
+// HC_* preserved) and its stdout receipt reaches the caller even on a
+// non-zero exit.
+func TestCtxReportDelegate(t *testing.T) {
+	s := &server{workdirs: []string{t.TempDir()}}
+	ctx := context.Background()
+
+	// The helper must sit at a candidate path whose resolution escapes no
+	// scratch root: build it under the trusted fake home's .local/bin.
+	fakeHome := withTestTrustedHome(t)
+	tmp := filepath.Join(fakeHome, ".local", "bin")
+	if err := os.MkdirAll(tmp, 0755); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(tmp, "helper-state.txt")
+	helper := filepath.Join(tmp, "dispatch-report")
+	script := "#!/bin/sh\n" +
+		"env | sort | grep -E '^(DISPATCH_REPORT_|HC_|TINYFISH_|MARKER_)' > \"" + statePath + "\"\n" +
+		"cat > \"" + filepath.Join(tmp, "stdin-body.txt") + "\"\n" +
+		"if [ \"$1\" = \"t1fp\" ]; then echo 'dispatch-report: status=delivered path=/p bytes=4 sha256=abc parent=t1fp'; exit 0; fi\n" +
+		"echo 'dispatch-report: status=failed path=/p bytes=4 sha256=abc parent=t9 saved=true'\n" +
+		"echo 'hc send failed: exit 1' >&2\nexit 1\n"
+	if err := os.WriteFile(helper, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	prev := dispatchReportCandidates
+	dispatchReportCandidates = func() []string { return []string{helper} }
+	t.Cleanup(func() { dispatchReportCandidates = prev })
+
+	t.Setenv("DISPATCH_REPORT_PATH", filepath.Join(tmp, "a", "report.md"))
+	t.Setenv("DISPATCH_REPORT_PARENT", "t1fp")
+	t.Setenv("HC_TERMINAL_ID", "tself")
+	t.Setenv("TINYFISH_API_KEY", "tf-secret-123")
+	t.Setenv("MARKER_KEEP", "kept")
+
+	res, _, err := s.toolCtxReport(ctx, nil, ctxReportArgs{Content: "body"})
+	if err != nil {
+		t.Fatalf("toolCtxReport: %v", err)
+	}
+	var text string
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			text += tc.Text
+		}
+	}
+	if !strings.Contains(text, "status=delivered") {
+		t.Fatalf("receipt missing from result: %q", text)
+	}
+	body, err := os.ReadFile(filepath.Join(tmp, "stdin-body.txt"))
+	if err != nil || string(body) != "body" {
+		t.Fatalf("helper stdin = %q err=%v, want 'body'", body, err)
+	}
+	envOut, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read helper env: %v", err)
+	}
+	es := string(envOut)
+	if !strings.Contains(es, "DISPATCH_REPORT_PARENT=t1fp") || !strings.Contains(es, "HC_TERMINAL_ID=tself") {
+		t.Fatalf("dispatch env not preserved: %q", es)
+	}
+	if strings.Contains(es, "TINYFISH_API_KEY") {
+		t.Fatalf("host secret leaked to helper env: %q", es)
+	}
+
+	// Non-zero exit still surfaces the stdout receipt (saved=true proof).
+	t.Setenv("DISPATCH_REPORT_PARENT", "t9")
+	_, _, err = s.toolCtxReport(ctx, nil, ctxReportArgs{Content: "body"})
+	if err == nil || !strings.Contains(err.Error(), "saved=true") {
+		t.Fatalf("non-zero exit must carry the stdout receipt: %v", err)
+	}
+	if !strings.Contains(err.Error(), "hc send failed") {
+		t.Fatalf("stderr not merged into error: %v", err)
+	}
+}
+
+// TestCtxReportSlowHelper pins the 35s budget: a helper that sleeps ~17s
+// (longer than the rejected 15s timeout, still well inside the helper's
+// lockWait+hcSend envelope) must complete and return its receipt — the old
+// budget would have SIGKILLed the delivery mid-flight.
+func TestCtxReportSlowHelper(t *testing.T) {
+	if testing.Short() {
+		t.Skip("17s subprocess probe")
+	}
+	s := &server{workdirs: []string{t.TempDir()}}
+	fakeHome := withTestTrustedHome(t)
+	tmp := filepath.Join(fakeHome, ".local", "bin")
+	if err := os.MkdirAll(tmp, 0755); err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(tmp, "dispatch-report")
+	script := "#!/bin/sh\ncat >/dev/null\nsleep 17\necho 'dispatch-report: status=delivered path=/p bytes=1 sha256=x parent=t1fp'\n"
+	if err := os.WriteFile(helper, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	prev := dispatchReportCandidates
+	dispatchReportCandidates = func() []string { return []string{helper} }
+	t.Cleanup(func() { dispatchReportCandidates = prev })
+	t.Setenv("DISPATCH_REPORT_PATH", filepath.Join(tmp, "a", "report.md"))
+	t.Setenv("DISPATCH_REPORT_PARENT", "t1fp")
+	t.Setenv("HC_TERMINAL_ID", "")
+
+	start := time.Now()
+	res, _, err := s.toolCtxReport(context.Background(), nil, ctxReportArgs{Content: "r"})
+	if err != nil {
+		t.Fatalf("17s helper must not be killed: %v", err)
+	}
+	if d := time.Since(start); d < 15*time.Second || d > 34*time.Second {
+		t.Fatalf("elapsed %v outside 15..34s window", d)
+	}
+	var text string
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			text += tc.Text
+		}
+	}
+	if !strings.Contains(text, "status=delivered") {
+		t.Fatalf("receipt missing: %q", text)
+	}
+}
+
+// TestCtxReportFindSkipsBadCandidates covers the candidate walk:
+//   - A: a helper inside a 0777 (world-writable) parent dir is rejected by
+//     the directory write-bit rule even though the file itself is a
+//     perfectly fine 0755 script;
+//   - B: same-basename decoys each hit their own skip branch — a FIFO
+//     (!IsRegular), a 0644 regular file (Perm&0o111==0), a symlink whose
+//     resolved basename is not dispatch-report, and a file under a 0777
+//     subdir (dir write bits) — before a symlink candidate resolves to the
+//     real helper and findDispatchReport returns the RESOLVED path (no
+//     EvalSymlinks→exec TOCTOU), not the symlink spelling.
+func TestCtxReportFindSkipsBadCandidates(t *testing.T) {
+	euid := os.Geteuid()
+
+	// A: 0777 parent dir must be refused even though .local/bin is a
+	// trusted slot — the write-bit check rides along for non-system
+	// dirs. Explicit Chmod so the umask cannot mask 0777.
+	t.Run("writable parent dir rejected", func(t *testing.T) {
+		fakeHome := withTestTrustedHome(t)
+		wbin := filepath.Join(fakeHome, ".local", "bin")
+		if err := os.MkdirAll(wbin, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(wbin, 0777); err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(wbin, "dispatch-report")
+		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		prev := dispatchReportCandidates
+		dispatchReportCandidates = func() []string { return []string{p} }
+		t.Cleanup(func() { dispatchReportCandidates = prev })
+		if got := admittedReadonlyCanonicalHead(p, euid); got != "" {
+			t.Fatalf("admittedReadonlyCanonicalHead(%q) = %q, want \"\"", p, got)
+		}
+		if got := findDispatchReport(euid); got != "" {
+			t.Fatalf("findDispatchReport = %q, want \"\"", got)
+		}
+	})
+
+	// B: decoys must reach — and fail — their own branch. Same-basename
+	// paths under .local/bin/<sub>/ are required so the FIFO/0644 decoys
+	// are not short-circuited by the resolved-basename probe.
+	t.Run("per-branch decoys skipped, resolved path returned", func(t *testing.T) {
+		fakeHome := withTestTrustedHome(t)
+		localBin := filepath.Join(fakeHome, ".local", "bin")
+		mkSub := func(name string) string {
+			d := filepath.Join(localBin, name)
+			if err := os.MkdirAll(d, 0755); err != nil {
+				t.Fatal(err)
+			}
+			return d
+		}
+		// d1: FIFO — hits !st.Mode().IsRegular().
+		d1 := filepath.Join(mkSub("d1"), "dispatch-report")
+		if err := syscall.Mkfifo(d1, 0600); err != nil {
+			t.Fatalf("mkfifo: %v", err)
+		}
+		// d2: 0644 regular file — hits Perm()&0o111 == 0.
+		d2 := filepath.Join(mkSub("d2"), "dispatch-report")
+		if err := os.WriteFile(d2, []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		// d3: symlink to /usr/bin/ls — resolved basename "ls" fails the
+		// resolved-basename probe.
+		d3 := filepath.Join(mkSub("d3"), "dispatch-report")
+		if err := os.Symlink("/usr/bin/ls", d3); err != nil {
+			t.Fatal(err)
+		}
+		// d4: fine file inside a 0777 subdir — dir write-bit rejection.
+		d4dir := mkSub("d4")
+		if err := os.Chmod(d4dir, 0777); err != nil {
+			t.Fatal(err)
+		}
+		d4 := filepath.Join(d4dir, "dispatch-report")
+		if err := os.WriteFile(d4, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		// good: the real helper; goodLink: a same-basename symlink to it
+		// — findDispatchReport must return the RESOLVED path of the
+		// target, not the symlink spelling that was probed.
+		good := filepath.Join(localBin, "dispatch-report")
+		if err := os.WriteFile(good, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		goodLink := filepath.Join(mkSub("d5"), "dispatch-report")
+		if err := os.Symlink(good, goodLink); err != nil {
+			t.Fatal(err)
+		}
+		wantResolved, err := filepath.EvalSymlinks(good)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prev := dispatchReportCandidates
+		dispatchReportCandidates = func() []string {
+			return []string{d1, d2, d3, d4, goodLink}
+		}
+		t.Cleanup(func() { dispatchReportCandidates = prev })
+		if got := findDispatchReport(euid); got != wantResolved {
+			t.Fatalf("findDispatchReport = %q, want resolved %q (not candidate %q)", got, wantResolved, goodLink)
+		}
+	})
 }

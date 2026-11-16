@@ -1,11 +1,11 @@
 # Pi integration
 
 Thin bridge: Pi has **no MCP client**. This extension spawns the `ctxmode`
-binary (MCP over stdio, internal only) and registers six **native Pi tools**
-(`ctx_run`, `ctx_fs`, `ctx_git`, `ctx_kb`, `ctx_bg`, `ctx_stats`). 桥本身**不校验**服务端
+binary (MCP over stdio, internal only) and registers seven **native Pi tools**
+(`ctx_run`, `ctx_fs`, `ctx_git`, `ctx_kb`, `ctx_bg`, `ctx_stats`, `ctx_report`). 桥本身**不校验**服务端
 `ctxmode` 的版本；下文描述的是本仓当前的桥。
 
-边界：桥暴露与 Go MCP 面一致的上述六个工具（`integrations/pi/ctxmode.ts` 的
+边界：桥暴露与 Go MCP 面一致的上述七个工具（`integrations/pi/ctxmode.ts` 的
 `getTools()` 与 `pi.registerTool` 同步），Pi 侧 `ctx_fs` 的动作枚举也已完整对齐
 `router.go` 的 `ls|glob|stat|rg|resolve|related`（含 `resolve` 与 `related`）。
 
