@@ -5,6 +5,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [5.5.0] - 2026-11-16
+
 ### Changed
 - **`githooks/commit-msg`: non-ASCII check no longer depends on PCRE.** The English-only gate now detects leftover bytes after `LC_ALL=C tr -d '\001-\177'` instead of `grep -qP '[^\x00-\x7F]'` — an equivalent-on-valid-inputs non-ASCII-byte test that is stricter on malformed non-ASCII byte sequences, with zero PCRE dependency, so the hook also works where `grep -P` is unavailable. Error text, exit code, and the accept/reject set (newline/tab/printable ASCII pass; multi-byte/UTF-8 rejected) are unchanged.
 - **`AGENTS.md`: cross-repo protocol lockstep invariants pinned under `## 关联仓库`.** The `dispatch-agent` entry now lists the four hardcoded protocol invariants both repos implement independently and must change in lockstep: the report root `/tmp/herdr-role-reports`, the parent-terminal address shape `^t[0-9a-z]+$` (`hcSendAddrOK` / `config.ReportAddrRe`), the sole role-side spelling `dispatch-report <t-addr>` (`--flush` reserved for the dispatcher), and the ack line `报告已写入 path=<abs> bytes=<n> sha256=<hex>` (empty `CTXMODE_EXTRA_WORKDIRS` counts as unset).
