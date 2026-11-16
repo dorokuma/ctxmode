@@ -43,7 +43,10 @@ SUBJECT_LINE=$(printf '%s\n' "$CLEAN_MSG" | grep -m1 '[^[:space:]]' || true)
 # ── 0b. English-only: reject non-ASCII bytes in the message ──────────
 # Applies to the whole message (subject + body), including Merge/Revert
 # commits: one language for all commit titles, no mixing.
-if printf '%s' "$CLEAN_MSG" | grep -qP '[^\x00-\x7F]'; then
+# POSIX-only: LC_ALL=C tr deletes every ASCII char (\001-\177), so the
+# leftover is exactly the set of non-ASCII bytes (\x80-\xFF); no PCRE
+# (grep -P) or LC_COLLATE range semantics involved.
+if [ -n "$(printf '%s' "$CLEAN_MSG" | LC_ALL=C tr -d '\001-\177')" ]; then
   die "Commit message contains non-ASCII characters. English only." \
 "Write the commit message in English (ASCII only). Translate any Chinese text before committing."
 fi

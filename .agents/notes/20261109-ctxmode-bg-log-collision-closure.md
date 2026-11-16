@@ -11,7 +11,7 @@ supersedes: ""
 `registerBackground` 固定重命名为 `ctxmode_bg_<id>.log`（`bg-1` 起算）导致多实例共享 `/tmp` 时互相覆盖/删除活动日志；现改为实例隔离命名 `ctxmode_bg_<pid>_<rand-hex>_<id>.log`，缺陷闭环。
 
 ## 背景
-`executor.go` `runCmd` 先用 `os.CreateTemp(os.TempDir(), "ctxmode_bg_*.log")` 生成进程间唯一的临时日志，但 `registerBackground`（原 `executor.go:263`）随后 `os.Rename` 到固定 `filepath.Join(os.TempDir(), "ctxmode_bg_"+id+".log")`。由于 `bgSeq` 每进程从 1 起算，同一主机上多个 `ctxmode` 进程并发跑后台任务、或宿主 `ctxmode` 后台任务内跑 `go test`（内层测试自身也拉起 `bg-1` 并共享 `/tmp`）时，内层实例会覆盖并清理外层正在使用的 `/tmp/ctxmode_bg_bg-1.log`。该缺陷在 v5.3.1 验证期发现并登记为 `[pattern:ctxmode-bg-log-collision]`（见 `20261109-v531-hc-allowlist-followup.md` 第 4 项）。
+`executor.go` `runCmd` 先用 `os.CreateTemp(os.TempDir(), "ctxmode_bg_*.log")` 生成进程间唯一的临时日志，但 `registerBackground`（原 `executor.go:263`）随后 `os.Rename` 到固定 `filepath.Join(os.TempDir(), "ctxmode_bg_"+id+".log")`。由于 `bgSeq` 每进程从 1 起算，同一主机上多个 `ctxmode` 进程并发跑后台任务、或宿主 `ctxmode` 后台任务内跑 `go test`（内层测试自身也拉起 `bg-1` 并共享 `/tmp`）时，内层实例会覆盖并清理外层正在使用的 `/tmp/ctxmode_bg_bg-1.log`。该缺陷在 v5.3.1 验证期发现并登记为 `[pattern:ctxmode-bg-log-collision]`（原始登记分片属 v5.3.1 验证期审计残余，已核销清理，Git 历史留底）。
 
 ## 决策
 1. 新增包级变量 `bgInstanceID = newBGInstanceID()`：`fmt.Sprintf("%d_%x", os.Getpid(), buf)`，`crypto/rand` 读 4 字节编码为 8 位 hex；`rand.Read` 失败时回退 `time.Now().UnixNano()`（16 位 hex，仍含 PID，隔离性不丢）。
@@ -30,6 +30,6 @@ supersedes: ""
 - **C3 — `os.Rename` 失败回退保留 `os.CreateTemp` 随机路径** `[pattern:graceful-degradation-fallback]`：`confirmed（consider，保留现状）`。若 `os.Rename` 异常失败，`e.LogPath` 保持 `os.CreateTemp` 生成的唯一路径 `ctxmode_bg_<random>.log`，同样具备跨进程无碰撞与生命周期自动清理保证，无需额外改动。
 
 ## 来源
-- 缺陷登记：`.agents/notes/20261109-v531-hc-allowlist-followup.md`（`[pattern:ctxmode-bg-log-collision]`）。
+- 缺陷登记：v5.3.1 验证期审计残余分片登记的 `[pattern:ctxmode-bg-log-collision]`（该分片已核销清理，Git 历史留底）。
 - 代码：`executor.go`（`bgInstanceID`/`newBGInstanceID`、`registerBackground` finalPath、`runCmd` CreateTemp、`init()` 清扫）。
 - 回归：`executor_test.go` `TestBackground_LogPathInstanceScoped`。

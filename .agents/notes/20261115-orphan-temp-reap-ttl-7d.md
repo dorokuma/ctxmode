@@ -25,7 +25,7 @@ supersedes: ""
 ## C 档审查观察项归档（O1–O5）
 本次 `oracle` 终审输出 5 条非阻断 `consider` 观察项，经全仓 `.agents/notes/*.md` 检索核实 5 个标签均为本仓首次记录（1/2），逐条归档：
 
-1. **O1 `[pattern:historical-note-superseded-ttl]`（1/2）**：`20261109-ctxmode-bg-log-collision-closure.md` 与 `20261109-v531-hc-allowlist-followup.md` 中旧 `>24h` 清扫窗口表述属当时历史事实，按 `.agents/notes/README.md`「只加 superseded 链接、不改写旧结论」规范保留原文；由本笔记记录已于 `fix/temp-reap-ttl-7d` 提升至 `orphanTempReapTTL = 7 * 24 * time.Hour`。旧笔记「`defaultBackgroundMaxAge = 1 * time.Hour` 防跨实例误删」结论依然成立，安全余量扩大 7 倍。
+1. **O1 `[pattern:historical-note-superseded-ttl]`（1/2）**：`20261109-ctxmode-bg-log-collision-closure.md` 中旧 `>24h` 清扫窗口表述属当时历史事实，保留原文（v5.3.1 验证期观察分片旧文同述，该分片已核销清理，Git 历史留底）；由本笔记记录已于 `fix/temp-reap-ttl-7d` 提升至 `orphanTempReapTTL = 7 * 24 * time.Hour`。旧笔记「`defaultBackgroundMaxAge = 1 * time.Hour` 防跨实例误删」结论依然成立，安全余量扩大 7 倍。
 2. **O2 `[pattern:tmpfs-orphan-log-footprint]`（1/2）**：极端情况下单实例满载 `maxBackgroundProcs = 16` 个打满 `bgLogMaxBytes = 16MB` 的后台任务遭 `SIGKILL` 跳过 `shutdownBackground` 时，最多约 256MB 残留日志在 `/tmp`（`tmpfs`）保留至 7 天；重启即清空且与宿主 `/etc/tmpfiles.d/tmp.conf` `7d` 策略同界，可接受。
 3. **O3 `[pattern:uncleaned-tmpdir-protect-key]`（1/2）**：当 `TMPDIR` 含重复斜杠（如 `//tmp`）时 `os.CreateTemp` 返回未清洗路径，与 `sweepOrphanTempFiles` 经 `filepath.Join` 清洗后的键字符串潜在不等；属存量行为，且因仓内活后台任务寿命 `<=1h`（`defaultBackgroundMaxAge`）远小于 7 天清扫闸门，实际不可达。
 4. **O4 `[pattern:silent-startup-temp-sweep]`（1/2）**：`sweepOrphanTempFiles` 对 `ReadDir` / `Info` / `Remove` 错误静默忽略无日志，属存量设计（避免在 MCP stdio 启动期污染协议流或刷屏 stderr）。
@@ -37,5 +37,5 @@ supersedes: ""
 - 代码：`executor.go`（`orphanTempReapTTL`、`init()`、`sweepOrphanTempFiles`）。
 - 回归：`executor_reap_test.go` `TestSweepOrphanTempFiles_TTLBoundary`。
 - 变更登记：`CHANGELOG.md` `[Unreleased]` → `Changed`。
-- 关联笔记：`20261109-ctxmode-bg-log-collision-closure.md`、`20261109-v531-hc-allowlist-followup.md`（旧 `>24h` 表述，历史原文保留）。
+- 关联笔记：`20261109-ctxmode-bg-log-collision-closure.md`（旧 `>24h` 表述，历史原文保留）。
 - 审查：`fix/temp-reap-ttl-7d` 分支 `oracle` 终审 O1–O5 观察项、`reviewer` 对 `scripts/notes-index.sh` trap 的核实。

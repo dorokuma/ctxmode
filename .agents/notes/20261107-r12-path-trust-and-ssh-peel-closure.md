@@ -4,7 +4,7 @@ Markdown
 ---
 status: active
 superseded_by: ""
-supersedes: "2026-11-04-ssh-peel-followups.md"
+supersedes: ""
 模块: "ctx_run"
 ---
 
@@ -34,7 +34,7 @@ supersedes: "2026-11-04-ssh-peel-followups.md"
 - **凡 `find -exec` / `xargs -I` 含 `{}` 一律拒绝**：否决。会误杀 `find . -exec grep foo {} +` 与 `find . -exec sh -c 'echo "$1"' _ {} +` 等高频合法命令。
 
 ## 来源
-`role_guards.go`（`isSafePathDirEntry`、`screenPathHeadTrust`、`peelResolvedSegDepth`、`screenSSHHead`、`guardCtxRunCode`、`staticSpawnArgv`、`screenFindArgsSeg`）；`role_guards_r12_test.go`；关联 `2026-11-01-role-guards-non-sandbox-boundaries.md`（C10）与 `2026-11-04-ssh-peel-followups.md`。
+`role_guards.go`（`isSafePathDirEntry`、`screenPathHeadTrust`、`peelResolvedSegDepth`、`screenSSHHead`、`guardCtxRunCode`、`staticSpawnArgv`、`screenFindArgsSeg`）；`role_guards_r12_test.go`；关联 `2026-11-01-role-guards-non-sandbox-boundaries.md`（C10）与 `2026-11-06-sh11-readonly-allowlist-closure.md`（ssh peel 两项结构性观察登记，由本笔记闭合）。
 
 ## 落地补充（相对方案核查残留）
 - 去掉 `trustedHomeDirs()` 在 `HOME=/root`（或未设）时追加 `/home/*` 通配的逻辑；跨用户家目录 PATH 段（如 `/home/otheruser/.local/bin`）一律拒绝。

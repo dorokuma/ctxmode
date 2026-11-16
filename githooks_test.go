@@ -51,17 +51,90 @@ func fakePemHeader(kind string) string {
 	return "-----BEGIN " + kind + " " + "PRIVATE KEY-----"
 }
 
-// hookUsesGrepP reports a real grep -P invocation. Comment lines that mention
-// the flag (for example explaining why it is banned) do not count.
+// hookUsesGrepP reports a real grep -P (PCRE) invocation: a `grep` word
+// followed by an option carrying P inside a single-dash option group
+// (`-P`, `-qP`, `-Pq`) or the long form `--perl-regexp`. Comment lines that
+// mention the flag (for example explaining why it is banned) do not count,
+// and neither do options without P (`-qE`, `-F`) or the literal text
+// "grep -P" inside a non-command context.
 func hookUsesGrepP(data []byte) bool {
 	for _, line := range bytes.Split(data, []byte("\n")) {
 		trim := bytes.TrimSpace(line)
 		if len(trim) == 0 || trim[0] == '#' {
 			continue
 		}
-		if bytes.Contains(trim, []byte("grep -P")) {
+		if grepPHit(trim) {
 			return true
 		}
+	}
+	return false
+}
+
+// grepPHit scans one non-comment line for a grep invocation carrying -P.
+// A `grep` token is a word match (not egrep/fgrep/xgrep). After it, any
+// `-` token is an option: a single-dash group like -qP/-Pq counts when it
+// contains P; an option that takes a required argument (e.g. -e, -f, -m,
+// -A/-B/-C or --regexp/--file without '=') consumes the next word, so a
+// `-P` sitting there is the pattern operand, not an option. --perl-regexp
+// counts directly.
+func grepPHit(line []byte) bool {
+	fields := bytes.Fields(line)
+	for i, f := range fields {
+		if string(f) != "grep" {
+			continue
+		}
+		args := fields[i+1:]
+		for j := 0; j < len(args); j++ {
+			arg := args[j]
+			if len(arg) == 0 || arg[0] != '-' {
+				break // first operand: options ended
+			}
+			if bytes.Equal(arg, []byte("--")) {
+				break // explicit end of options
+			}
+			if len(arg) > 1 && arg[1] == '-' {
+				if bytes.Equal(arg, []byte("--perl-regexp")) {
+					return true
+				}
+				// --name without '=' takes its value as the next word.
+				if !bytes.Contains(arg, []byte("=")) && grepLongOptTakesArg(arg) && j+1 < len(args) {
+					j++
+				}
+				continue
+			}
+			if bytes.IndexByte(arg[1:], 'P') >= 0 {
+				return true
+			}
+			// A short-option group ending in a flag that takes a required
+			// argument (e.g. -e, -f, -m) consumes the next word.
+			if grepLastShortOptTakesArg(arg) && j+1 < len(args) {
+				j++
+			}
+		}
+	}
+	return false
+}
+
+// grepLastShortOptTakesArg reports whether the final flag letter of a
+// single-dash option group consumes the following word as its value.
+func grepLastShortOptTakesArg(arg []byte) bool {
+	switch arg[len(arg)-1] {
+	case 'e', 'f', 'm', 'A', 'B', 'C', 'D', 'd':
+		return true
+	}
+	return false
+}
+
+// grepLongOptTakesArg reports whether a `--long` option spelled without
+// `=value` consumes the following word as its value.
+func grepLongOptTakesArg(arg []byte) bool {
+	switch string(arg) {
+	case "--regexp", "--file", "--max-count", "--after-context",
+		"--before-context", "--context", "--label", "--directories",
+		"--devices", "--binary-files", "--exclude", "--include",
+		"--exclude-from", "--exclude-dir", "--group-separator",
+		"--color", "--colors":
+		return true
 	}
 	return false
 }
@@ -71,6 +144,38 @@ func hookEnv() []string {
 		"GIT_CONFIG_GLOBAL=/dev/null", // isolate from any dev-machine git config
 		"GIT_CONFIG_NOSYSTEM=1",
 	)
+}
+
+// TestHookUsesGrepP locks the grep -P (PCRE) detector used by the hook
+// guards: every PCRE spelling must be caught, comment lines and non-PCRE
+// options must not be.
+func TestHookUsesGrepP(t *testing.T) {
+	trueCases := []string{
+		"grep -P 'x' file",
+		"grep -qP '[^\\x00-\\x7F]' file",
+		"grep -Pq 'x' file",
+		"grep --perl-regexp 'x' file",
+		"grep -i -P 'x' file",
+		"printf '%s' \"$MSG\" | grep -qP 'x'",
+	}
+	for _, c := range trueCases {
+		if !hookUsesGrepP([]byte(c)) {
+			t.Errorf("hookUsesGrepP(%q) = false, want true", c)
+		}
+	}
+	falseCases := []string{
+		"# grep -qP is banned because PCRE is not POSIX",
+		"grep -qE 'x' file",
+		"grep -F 'literal' file",
+		"grep -i 'x' file",
+		"egrep -P 'x' file", // not a bare grep invocation
+		"grep -e '-P' file", // -P is the pattern operand, not an option
+	}
+	for _, c := range falseCases {
+		if hookUsesGrepP([]byte(c)) {
+			t.Errorf("hookUsesGrepP(%q) = true, want false", c)
+		}
+	}
 }
 
 func runGit(t *testing.T, dir string, args ...string) string {

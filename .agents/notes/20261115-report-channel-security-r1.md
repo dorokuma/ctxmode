@@ -50,6 +50,10 @@ tags: [pattern:dispatch-report-channel-env-binding, pattern:ctxmode-extra-workdi
 - `sh /tmp/x.sh` 脚本体不被守卫内容扫描，env 伪造对蓄意攻击不构成
   边界（同 uid 无独立信任根）；本轮定位是投递一致性/防误传。
 - `CTXMODE_ENV_PASSTHROUGH` 关闭敏感键剥离属于宿主显式选择，未变。
+- `CTXMODE_EXTRA_WORKDIRS` 属派发器内部接线环境变量而非面向终端
+  用户的 CLI 参数；`-workdir` 的可重复与 first-wins 宿主接线语义已
+  登记于 `CHANGELOG.md` 与本笔记决策 3；两者均刻意不写入
+  `README.md`（已拍板 wontfix）。
 - 并发/时序行为未改；三轮并发验证属 dispatch-agent 仓职责。
 
 ## r2 补记：基线两处阻塞修复（同分支授权追加）
@@ -112,23 +116,10 @@ tags: [pattern:dispatch-report-channel-env-binding, pattern:ctxmode-extra-workdi
 
 4. **跨仓配对**：`DISPATCH_REPORT_PARENT` 绑定与 `--flush` 动词对应
    dispatch-agent 同批次分支实现（`^t[0-9a-z]+$` 地址形）；本仓侧仅守
-   `dispatch-report <t-addr>` 单拼写。
-
-### oracle-ctxmode-r1 观察项登记
-
-- O1 `[pattern:workdir-flag-vs-extra-env-asymmetry]`（1/2）：`-workdir`（宿主授信）与 `CTXMODE_EXTRA_WORKDIRS`（派发注入、窄根 denylist）策略不对称属刻意设计；后续仓若引入同类双通道应复用此模式。
-- O2 `[pattern:extra-workdirs-denylist-scope]`（1/2）：extras denylist 只拦 `/`、`/tmp`、`/var/tmp` 与报告根树，属最小宽根策略；扩散到 `/etc`/`/var` 会误伤合法 `-workdir`，保持现状。
-- O3 `[pattern:evalsymlinks-existing-path-only]`（1/2）：`extraWorkdirsFromEnv` 仅对已存在路径做 `EvalSymlinks` 复判；不存在路径靠 clean+denylist，属既有取舍。
-- O4 `[pattern:cross-repo-report-root-constant]`（1/2）：`/tmp/herdr-role-reports` 在两仓各自硬编码，属跨仓共享常量无单一来源；后续应提升到共享配置或协议常量。
-- O7 `[pattern:lexical-env-screen-receiver-alias]`（1/2）：词法 env 屏幕不跟踪接收者别名（`e=os.environ`），记为已知边界。
-- O8 `[pattern:truncate-utf8-fffd-window-backoff]`（1/2）：`truncateUTF8` 窗口尾 FFFD 回退上界为 `utf8.UTFMax-1` 字节/步，描述已精确限定。
-- O10 `[pattern:foreign-sleeper-negative-test-strength]`（1/2）：`TestFindProcCmdline_IgnoresForeignSleeper` 为负向断言，强度限于"外来 sleep 不被匹配"，不覆盖全部收割路径。
-- O11 `[pattern:readme-cli-env-flags-undocumented]`（1/2）：`CTXMODE_EXTRA_WORKDIRS`/`-workdir` 可重复语义未在 README 完整记录，留待文档轮次补齐。
-- O5/O6：`DISPATCH_REPORT_PARENT`、`--flush`、`^t[0-9a-z]+$` 与
-  `报告已写入 path=/bytes=/sha256=` 已在对端 `dispatch-agent` 合入
-  `main`（`c9a533d`）；预定部署顺序为本仓 `ctxmode` 门禁合入 `main`
-  并执行 `./deploy.sh` 后，立即在干净的 `dispatch-agent` `main` 执行
-  `./scripts/deploy.sh`。
+   `dispatch-report <t-addr>` 单拼写。跨仓锁步不变量（报告根
+   `/tmp/herdr-role-reports`、`^t[0-9a-z]+$` 地址形、
+   `dispatch-report <t-addr>` 单拼写、回执 `path=/bytes=/sha256=` 形）
+   的权威登记已固化至 `AGENTS.md` 关联仓库段。
 
 ## r4 补记：oracle-ctxmode-r2 should-fix 闭合（同分支授权追加）
 
@@ -170,24 +161,6 @@ tags: [pattern:dispatch-report-channel-env-binding, pattern:ctxmode-extra-workdi
    本含 `security denylist`；`TestCLI_WorkdirFlagsAndExtraEnv` 新增
    `EmptyFlagValueIgnored`。
 
-### oracle-ctxmode-r2 观察项登记
-
-- O-A 并入 `[pattern:lexical-env-screen-receiver-alias]`（1/2 语义不变，
-  范围扩记）：词法屏幕同样不覆盖 `process['env']` 括号接收者拼写
-  （`process['env'].K=v`）、括号方法名接收者拼写（`Object['assign']
-  (process.env, …)`——r5/F4 并入），以及非 `=` 绑定目标
-  （`for (… of/in …)`、`with … as …`——循环/with 头不经单纯 `=`
-  绑定 env 接收者，r5b 并入），与别名/整对象重绑同属已知边界。
-- O-E `[pattern:report-addr-shape-cross-repo-lockstep]`（1/2）：回执行
-  `path=/bytes=/sha256=` 字段形与 `dispatch-report <t-addr>` argv 形在
-  本仓 instructions.go 与 dispatch-agent helper 两侧各自硬编码，属跨
-  仓锁步常量；任一侧改形须同步对侧（dispatch-agent 侧为 2/2 配对项）。
-- O-F `[pattern:extra-workdirs-symlink-policy-asymmetry]`（1/2）：
-  `CTXMODE_EXTRA_WORKDIRS` 对已存在路径做 `EvalSymlinks` 后复判宽根/
-  报告树，而 `-workdir` 与 dedup 主循环只做 `filepath.Abs` 不解析符号
-  链接——`-workdir` 属宿主授信不入 denylist（见 O1/O2），但符号链接
-  解析深度两通道不对称，记为已知取舍（dispatch-agent 侧为 2/2 配对项）。
-
 ## r5 补记：oracle-ctxmode-r3 should-fix 闭合（同分支授权追加）
 
 1. **F1（`.delete` 成员排除过宽）**：`jsDeleteEnvHit` 原向前跨任意 mask
@@ -225,22 +198,6 @@ tags: [pattern:dispatch-report-channel-env-binding, pattern:ctxmode-extra-workdi
    to opening its transaction)`（与 Store 侧 BeginTx 前预检表述一致）；
    `main_test.go` `buildCtxmodeCLI` 开头加 `exec.LookPath("go")` 缺失
    即 `t.Skipf`（无 go 工具链环境下由硬失败转为跳过）。
-
-### oracle-ctxmode-r3 观察项登记
-
-- F4 并入 `[pattern:lexical-env-screen-receiver-alias]`：括号方法名拼
-  写 `Object['assign'](process.env, …)` 与 `process['env']`、接收者别
-  名同属词法屏幕已知边界，已在 CHANGELOG 范围外清单与上方 O-A 一并登
-  记（1/2）。
-- F8 `[pattern:js-qualcall-env-ident-overbroad]`（1/2）：`jsEnvOverrideHit`
-  限定名 sink（Object.assign/defineProperty、Reflect.set/deleteProperty、
-  putenv）的 env 出现前提取 `toks.hasIdent("env")`——代码中任何 `env`
-  标识符（如 `const env={}`）都会满足前提，属偏宽判定；代价仅是把非
-  env 目标误当 env 写拦截（fail-closed 方向、保守安全），接受为既有
-  取舍。
-- F9 `[pattern:cli-test-go-build-assumption]`（1/2）：`buildCtxmodeCLI`
-  原假设 `go` 在 PATH，缺失即 `t.Fatalf`；现 `LookPath` 缺失转
-  `t.Skipf`——测试环境假设类问题，非产品缺陷。
 
 ## r5b 补记：主分支源码复核两处边界收紧（同分支授权追加，未 commit）
 
@@ -307,8 +264,9 @@ jsBlock 加 `if (1) [K]=v`/`else [K]=v`/`let x\n[K]=v`；allow 加
    `Object.defineProperties(process.env,{HC_SOCKET:{value:'/x'}})` 现按
    同 sink 阻断。
 
-4. **S2（跨仓状态更正）**：r3 补记 O5/O6 行原记的跨仓同步待办表述已
-   过期——`DISPATCH_REPORT_PARENT`、`--flush`、`^t[0-9a-z]+$` 与
+4. **S2（跨仓状态更正）**：此前补记中「跨仓同步待 dispatch-agent
+   侧落地」的表述已过期——`DISPATCH_REPORT_PARENT`、`--flush`、
+   `^t[0-9a-z]+$` 与
    `报告已写入 path=/bytes=/sha256=` 已在对端 `dispatch-agent` 合入
    `main`（`c9a533d`）；预定部署顺序为本仓 `ctxmode` 门禁合入 `main`
    并执行 `./deploy.sh` 后，立即在干净的 `dispatch-agent` `main` 执行
@@ -319,73 +277,6 @@ jsBlock 加 `if (1) [K]=v`/`else [K]=v`/`let x\n[K]=v`；allow 加
 `os.environb.pop(b'HC_SOCKET')`；jsBlock 加 `Reflect.defineProperty` 与
 `Object.defineProperties` 两条；allow 加 `os.environb[b'FOO']=b'bar'`
 （良性字节键放行）。
-
-### oracle-ctxmode-r4 观察项登记
-
-- O1 `[pattern:js-asi-newline-bracket-conservative]`（1/2）：
-  `openIsCallOrSubscript` 对 JS `\n[` 保守按语句首处理（ASI）；
-  罕见合法 `x\n[y]` 连续下标语意被按解构目标拦截（fail-closed 方向，
-  保守安全）。
-- O2 `[pattern:destruct-peel-quadratic-pathology]`（1/2）：
-  `maskDestructAssignTarget` 在畸形超深括号嵌套输入下剥层最坏 O(n²)
-  CPU 放大；只影响守卫耗时、不破坏 fail-closed 判定，属拒绝服务面而
-  非绕过面，接受为既有取舍。
-- O3/O4 并入 `[pattern:lexical-env-screen-receiver-alias]`（1/2 范围
-  扩记）：非 Python/JS 语言的 env 写（`ruby`/`perl`/`php`——
-  `codeEnvOverrideHit` 仅覆盖 Python 与 JS/TS；只读角色另由
-  `strictReadonlyBlockLegacyScripting` 整语言拦截）与 JS 非严格
-  `with (process.env) { K = v }` 作用域链写均属词法屏幕已知边界，
-  已在 CHANGELOG 范围外清单一并登记。
-
-### oracle-ctxmode-r5 与 reviewer-ctxmode-r2 终审观察项/建议登记
-
-双方完全收敛同集，以下 3 项均为非阻断观察/建议。
-
-- O-1 / consider-1 并入 `[pattern:lexical-env-screen-receiver-alias]`
-  （更新范围扩记）：`subprocess.run(..., env={...})` /
-  `child_process.execSync(..., {env:{...}})` 子进程参数直传 env、
-  接收者级 `os.environ |= {...}` 与
-  `getattr(os.environb, '__setitem__')` 动态方法名拼写不在
-  `codeEnvOverrideHit` 词法键写扫描范围内（危险嵌套代理名仍由
-  `blockedAgentExecutableList` 拦截，同 UID 词法层非独立信任边界，
-  保持不扩写 `role_guards.go`）。
-- O-2 / consider-3 `[pattern:commit-msg-grep-pcre-assumption]`（1/1）：
-  上游 `4158fb1` 同步的 `githooks/commit-msg:46` 使用 `grep -qP`
-  检查非 ASCII，而既有守卫测试 `githooks_test.go:56-67`
-  `hookUsesGrepP` 仅子串匹配 `"grep -P"` 未命中 `"-qP"`；本机与
-  CI 为 GNU grep 3.11 + PCRE2 故 `TestCommitMsgHook` 正常生效，后
-  续可立项将钩子改为 `LC_ALL=C grep -q '[^ -~]'` 并收紧
-  `hookUsesGrepP` 匹配 `grep -[A-Za-z]*P`（本轮不跨范围改动
-  `githooks/commit-msg`）。
-- O-3 / consider-2 `[pattern:doc-example-assertion-lock]`（1/1）：
-  `CHANGELOG.md:22` 与本文 r6 段列出的
-  `[os.environb[b'HC_SOCKET']]=[b'/x']` 已由 `pyEnvOverrideHit` +
-  `maskDestructAssignTarget` + `unquoteCodeKey` 组合拦截，且
-  `role_guards_test.go` 已分别锁定
-  `[os.environ['HC_SOCKET']]=['/x']` 与
-  `os.environb[b'HC_SOCKET']=b'/x'`，后续触碰
-  `role_guards_test.go` 时可顺手补 1 行合体回归断言。
-
-#### 本仓 `.agents/notes/` `[pattern:...]` 累计频次统计
-
-统计口径：同一笔记文件内同一标签按 1 次计，跨笔记文件累计（共 13
-个笔记文件含 `[pattern:...]`、39 个不同标签）。累计 >=2 的标签：
-
-| 累计频次 | 标签 |
-|---|---|
-| 4 | `[pattern:ctxmode-bg-log-collision]` |
-| 3 | `[pattern:sbx-wrapper-unwrap-asymmetry]` |
-| 3 | `[pattern:path-trust-user-writable]` |
-| 3 | `[pattern:indirect-wrapper-seg-stdin]` |
-| 3 | `[pattern:code-static-spawn-single-layer]` |
-| 2 | `[pattern:role-guards-rt1111-closure]` |
-| 2 | `[pattern:closure-record]` |
-| 2 | `[pattern:argv-parser-out-of-scope-eval]` |
-
-其余 31 个标签各出现 1 次（含本次并入的
-`[pattern:lexical-env-screen-receiver-alias]` 与新登记的
-`[pattern:commit-msg-grep-pcre-assumption]`、
-`[pattern:doc-example-assertion-lock]`）。
 
 ## r7 补记：基线对齐上游 9e61e80（未 commit）
 
