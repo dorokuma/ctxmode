@@ -102,6 +102,11 @@ func fatal(s *Store, format string, args ...any) {
 }
 
 func main() {
+	// Zero DB / .git side effects: --hc-gate must short-circuit before flag.Parse,
+	// ensureDBDir, or any store init.
+	if len(os.Args) >= 2 && os.Args[1] == "--hc-gate" {
+		os.Exit(runHcGate(os.Args[2:]))
+	}
 	defer shutdownBackground()
 	var workdirFlags stringListFlag
 	var configPath string
@@ -547,18 +552,17 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		if serr != nil {
 			return nil, nil, serr
 		}
-		if grule, detail := guard.guardCtxRunArgv(args.Argv); grule != "" {
-			audit.setScreen(shellBlock, grule)
-			return nil, nil, blockedReportError(guardBlockedError(grule, detail), args.Argv, "")
+		prep := guard.prepareCtxRunArgv(args.Argv, args.Stdin)
+		if prep.rule != "" {
+			audit.setScreen(shellBlock, prep.rule)
+			return nil, nil, blockedReportError(guardBlockedError(prep.rule, prep.detail), args.Argv, "")
 		}
-		// stdin payload: if the argv's peeled head is a shell or scripting
-		// interpreter and carries no inline-code flag, the stdin IS the
-		// program — screen it the same way.
-		if grule, detail := guard.guardCtxRunStdin(args.Argv, args.Stdin); grule != "" {
-			audit.setScreen(shellBlock, grule)
-			return nil, nil, blockedReportError(guardBlockedError(grule, detail), args.Argv, "")
+		if opts == nil && prep.execStdin != "" {
+			opts = &runOptions{Stdin: prep.execStdin}
+		} else if opts != nil {
+			opts.Stdin = prep.execStdin
 		}
-		argv, aerr := s.validateArgv(args.Argv, cwd)
+		argv, aerr := s.validateArgv(prep.execArgv, cwd)
 		if aerr != nil {
 			return nil, nil, aerr
 		}
@@ -576,16 +580,19 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 			} else if verdict == shellWarn {
 				logShellScreen(rule, args.Command)
 			}
-			if grule, detail := guard.guardCtxRunShell(args.Command); grule != "" {
-				audit.setScreen(shellBlock, grule)
-				return nil, nil, blockedReportError(guardBlockedError(grule, detail), nil, args.Command)
+			prep := guard.prepareCtxRunShellAndStdin(args.Command, args.Stdin)
+			if prep.rule != "" {
+				audit.setScreen(shellBlock, prep.rule)
+				return nil, nil, blockedReportError(guardBlockedError(prep.rule, prep.detail), nil, args.Command)
 			}
-			// stdin payload: when a peeled command head is a shell or scripting
-			// interpreter reading its program from stdin, screen the payload.
-			if grule, detail := guard.guardCtxRunStdinForCommand(args.Command, args.Stdin); grule != "" {
-				audit.setScreen(shellBlock, grule)
-				return nil, nil, blockedReportError(guardBlockedError(grule, detail), nil, args.Command)
+			execStdin := prep.execStdin
+			if opts == nil && execStdin != "" {
+				opts = &runOptions{Stdin: execStdin}
+			} else if opts != nil {
+				opts.Stdin = execStdin
 			}
+			result, err = runCodeOpts(ctx, language, prep.execCode, cwd, timeout, args.Background, opts)
+			goto executeDone
 		} else if rt, ok := runtimes[language]; ok {
 			// Non-shell language: record the interpreter that will run the code
 			// and screen the code itself for the role guards (spawn/write
@@ -598,6 +605,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		}
 		result, err = runCodeOpts(ctx, language, args.Command, cwd, timeout, args.Background, opts)
 	}
+executeDone:
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1177,21 +1185,25 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		audit.setInterpreter(rt.Exe)
 	}
 
-	// Inject FILE_CONTENT into user code.
-	injectedCode := injectFileContent(language, args.Code, string(fileContent))
+	var injectedCode string
 	if language == "shell" {
-		// runShellOpts screens exactly this string (shellWrapper is the identity
-		// function), so recording it here reports the same verdict the runner
-		// will apply. Other languages run from a temp file and are not screened.
-		audit.setScreen(screenShellBlock(injectedCode))
-		// Role guards apply to the CALLER's code only: injectedCode also
-		// embeds FILE_CONTENT, which is data — scanning it would flag source
-		// files (like role_guards.go itself) that merely name guard tokens.
-		if grule, detail := currentGuardCall().guardCtxRunShell(args.Code); grule != "" {
-			audit.setScreen(shellBlock, grule)
-			return nil, nil, guardBlockedError(grule, detail)
+		// Prepare with FILE_CONTENT taint, then inject, then run the unique artifact.
+		prep := currentGuardCall().prepareCtxRunShellWithTaint(args.Code, map[string]bool{"FILE_CONTENT": true})
+		if prep.rule != "" {
+			audit.setScreen(shellBlock, prep.rule)
+			return nil, nil, guardBlockedError(prep.rule, prep.detail)
+		}
+		injectedCode = injectFileContent("shell", prep.execCode, string(fileContent))
+		if !strings.HasSuffix(injectedCode, "\n"+prep.execCode) {
+			return nil, nil, fmt.Errorf("execute_file: injected code lost prepared suffix")
+		}
+		verdict, rule := screenShellBlock(injectedCode)
+		audit.setScreen(verdict, rule)
+		if verdict == shellBlock {
+			return nil, nil, fmt.Errorf("shell command blocked (%s)", rule)
 		}
 	} else {
+		injectedCode = injectFileContent(language, args.Code, string(fileContent))
 		// Non-shell execute_file: FILE_CONTENT is data; the caller's code is
 		// what the interpreter runs, so it gets the code guard.
 		if grule, detail := currentGuardCall().guardCtxRunCode(language, args.Code); grule != "" {

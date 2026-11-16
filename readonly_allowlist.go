@@ -1245,6 +1245,10 @@ func checkCtxmodeReadonly(argv []string) string {
 				i++
 				continue
 			}
+			// No --hc-gate shortcut here: a bare `ctxmode --hc-gate …` is a
+			// raw user spelling with no provenance and must stay blocked in
+			// both shell and argv mode. The prepare*-minted form is admitted by
+			// screenReadonlyAllowlistSeg on its path head + provenance.
 			if a == "-config" || a == "--config" || strings.HasPrefix(a, "-config=") || strings.HasPrefix(a, "--config=") {
 				return "ctxmode config"
 			}
@@ -1273,7 +1277,37 @@ func checkCtxmodeReadonly(argv []string) string {
 
 // screenReadonlyAllowlist is the primary default-deny gate for a resolved
 // command argv. Returns "" when the argv is within policy.
+// screenPreparedHcGateReadonly admits prepare*-rewritten ctxmode --hc-gate
+// invocations. The runtime gate re-validates addr/text; here we only require
+// the static shape send|query.
+func screenPreparedHcGateReadonly(argv []string) string {
+	if len(argv) < 2 || argv[1] != "--hc-gate" {
+		return "ctxmode --hc-gate"
+	}
+	args := argv[2:]
+	if isPureQueryInvocation(append([]string{"hc"}, args...)) {
+		return ""
+	}
+	if len(args) == 2 && !strings.HasPrefix(args[0], "-") && (args[1] == "--help" || args[1] == "-h") {
+		return ""
+	}
+	if len(args) == 3 && args[0] == "send" && hcSendAddrOK(args[1]) && !strings.HasPrefix(args[1], "-") &&
+		!strings.HasPrefix(args[2], "-") {
+		// Dynamic placeholders are expected in the text slot before runtime expansion.
+		return ""
+	}
+	return "ctxmode --hc-gate"
+}
+
 func screenReadonlyAllowlist(argv []string) string {
+	return screenReadonlyAllowlistSeg(argv, false)
+}
+
+// screenReadonlyAllowlistSeg is screenReadonlyAllowlist with the segment's
+// structured provenance. A path-form head is admitted ONLY when the segment
+// is provenance-backed AND isPreparedHcGateArgv confirms the head is this
+// executable; every other path-form head keeps the "path command" verdict.
+func screenReadonlyAllowlistSeg(argv []string, gateProvenanced bool) string {
 	if len(argv) == 0 {
 		return ""
 	}
@@ -1288,7 +1322,12 @@ func screenReadonlyAllowlist(argv []string) string {
 	// "t42"] delivers a report identically to the bare-name spelling. Every
 	// other path-form head — and a non-trusted report path like
 	// /tmp/dispatch-report — keeps the "path command" verdict.
+	// Exception: prepare*-emitted absolute selfExe --hc-gate … whose span-bound
+	// provenance the caller verified (runtime gate validates the argv).
 	if strings.Contains(argv[0], "/") {
+		if gateProvenanced && isPreparedHcGateArgv(argv) {
+			return screenPreparedHcGateReadonly(argv)
+		}
 		if filepath.IsAbs(argv[0]) && (filepath.Base(argv[0]) == "dispatch-report" || filepath.Base(argv[0]) == "hc") {
 			if canon := admittedReadonlyCanonicalHead(argv[0], os.Geteuid()); canon != "" {
 				argv = append([]string{canon}, argv[1:]...)
@@ -1458,12 +1497,18 @@ func scanAllowedOpts(args []string, entry *cmdAllow) string {
 	return ""
 }
 
-// readonlyPrePeelHit rejects exec/eval/source/`.` / function / coproc / nohup
-// and the peelable wrapper heads before peelWrappers can strip them into a
-// benign head. `sbx` keeps the exact default-deny wording a non-peeled head
+// readonlyPrePeelHitExempt rejects exec/eval/source/`.` / function / coproc /
+// nohup and the peelable wrapper heads before peelWrappers can strip them into
+// a benign head. `sbx` keeps the exact default-deny wording a non-peeled head
 // produces (`unknown command sbx`) so strict-readonly callers get the same
 // verdict the allowlist handed out before sbx became peelable.
-func readonlyPrePeelHit(argv []string) string {
+//
+// headPathExempt exempts WORD 0 only, and only for a provenance-backed
+// rewritten `<selfExe> --hc-gate …` leaf (陷阱 A): the real head contains "/"
+// and would otherwise be killed as "path command" before the allowlist bridge
+// ever sees the verified provenance. Wrappers, assigns and any other path word
+// stay blocked.
+func readonlyPrePeelHitExempt(argv []string, headPathExempt bool) string {
 	i := 0
 	steps := 0
 	for i < len(argv) && steps < peelWrapperMaxSteps {
@@ -1472,6 +1517,9 @@ func readonlyPrePeelHit(argv []string) string {
 			return "env assign"
 		}
 		if strings.Contains(a, "/") {
+			if i == 0 && headPathExempt {
+				return ""
+			}
 			// The strict-readonly canonical-head grant only applies to the
 			// FIRST word and only to a bare dispatch-report/hc basename at a
 			// trusted install slot (admittedReadonlyCanonicalHead): a

@@ -751,6 +751,12 @@ func findProcessGroupPIDs(pgid int, minStartTime uint64) []int {
 		if len(fields) < 20 {
 			continue
 		}
+		// Dead processes still occupy a PID-table entry (kill(pid,0)==nil), so
+		// a zombie would be counted "surviving" forever and SIGKILL against it
+		// is a no-op. Skip the three dead states (Z zombie, X/x dead).
+		if fields[0] == "Z" || fields[0] == "X" || fields[0] == "x" {
+			continue
+		}
 		pgrpVal, err := strconv.Atoi(fields[2]) // field 5 is pgrp (0-indexed 2 after comm)
 		if err != nil || pgrpVal != pgid {
 			continue

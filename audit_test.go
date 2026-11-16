@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -21,6 +22,29 @@ import (
 // It uses os.Setenv rather than t.Setenv on purpose: TestMain has no *testing.T,
 // and t.Setenv only works inside a test (it registers a cleanup with that test).
 func TestMain(m *testing.M) {
+	// FIRST STATEMENT: a test binary is a test binary. Nothing below may run
+	// before the compile-time hc-gate pin is armed, and a --hc-gate child
+	// must fail closed (exit 125) instead of EVER falling through to the host
+	// herdr-core on PATH. Production source never reads these names.
+	inTestBinary = true
+	// --hc-gate short-circuit: contract e2e tests rewrite `hc send` to
+	// `<selfExe> --hc-gate send ...`, and selfExe is THIS test binary, so
+	// exec'ing it must reach runHcGate exactly like the real ctxmode main
+	// does. Without this branch the spawned copy would try to run the go
+	// test flag parser on the gate argv and the delivery chain would break.
+	// mustActivateChildHcGatePin validates the pin environment and exits 125
+	// on any missing/malformed/unsafe input — the gate is never entered
+	// without a verified pin.
+	if len(os.Args) >= 2 && os.Args[1] == "--hc-gate" {
+		mustActivateChildHcGatePin()
+		os.Exit(runHcGate(os.Args[2:]))
+	}
+	// Outer OS-isolation gate: the whole test binary may ONLY run inside the
+	// ns-hc-gotest.sh / ns-hc-isolate.sh boundary. A bare `go test` on the
+	// host (host hc/herdr-core reachable, shared mounts, full capabilities)
+	// is refused with exit 125 — kernel state is the evidence, never a
+	// forgeable env var.
+	mustVerifyOuterTestIsolation()
 	dir, err := os.MkdirTemp("", "ctxmode-audit-test")
 	if err != nil {
 		os.Exit(1)
@@ -35,6 +59,218 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
+}
+
+// ---------- outer OS-isolation gate (stage B) ----------
+
+// hcIsolationRefuse prints the refusal reason and exits 125: the sentinel a
+// test driver recognizes as "refused before any test ran", never 0/1.
+func hcIsolationRefuse(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "test isolation gate: "+format+"\n", args...)
+	os.Exit(125)
+}
+
+// hcIsolationStandinTag is the fixed marker compiled into the recording
+// stand-in by scripts/ns-hc-gotest.sh. A masked hc/herdr-core/sbx path that
+// still serves the REAL binary (no marker) is evidence the bind mount is
+// missing — and is exactly what a bare host run looks like.
+const hcIsolationStandinTag = "CTXMODE-NS-HC-STANDIN"
+
+// hcIsolationShadowTargets enumerates the host paths a stage-B namespace
+// must have masked with the read-only stand-in: every hc / herdr-core / sbx
+// entry in the conventional trusted bin dirs and in the dirs of the
+// inherited PATH. Entries are kept as the ORIGINAL path — a symlink like
+// /root/.local/bin/hc -> herdr-core is listed once (the gate resolves it
+// through EvalSymlinks when checking mountinfo, since mount --bind follows
+// the link and mounts the real target). Missing entries and dangling
+// symlinks are skipped; a symlink counts only when its target exists.
+func hcIsolationShadowTargets() []string {
+	dirs := map[string]bool{}
+	for _, d := range []string{
+		"/root/.local/bin", "/root/bin", "/root/.cargo/bin",
+		"/root/.local/share/mise/shims",
+		"/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin",
+		"/sbin", "/bin",
+	} {
+		dirs[d] = true
+	}
+	for _, d := range filepath.SplitList(os.Getenv("PATH")) {
+		if filepath.IsAbs(d) {
+			dirs[filepath.Clean(d)] = true
+		}
+	}
+	var out []string
+	for _, name := range []string{"hc", "herdr-core", "sbx"} {
+		for d := range dirs {
+			p := filepath.Join(d, name)
+			fi, err := os.Lstat(p)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				hcIsolationRefuse("cannot lstat %s: %v", p, err)
+			}
+			if fi.IsDir() {
+				continue
+			}
+			// A symlink only counts when its target exists (a dangling
+			// link can never be masked: mount --bind would fail on it
+			// anyway and nothing real sits behind it).
+			fi, err = os.Stat(p)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				hcIsolationRefuse("cannot stat %s: %v", p, err)
+			}
+			if fi.IsDir() {
+				continue
+			}
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// hcIsolationMountinfo parses /proc/self/mountinfo into (mountpoint,
+// optional-fields, mount-options) triples. The third element is pre[5] —
+// the per-mountpoint option list where `remount,bind,ro` sets `ro` —
+// never the superblock options post[2] (which stay rw for a ro bind).
+func hcIsolationMountinfo() (rootShared bool, mounts map[string][2]string) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		hcIsolationRefuse("cannot read /proc/self/mountinfo: %v", err)
+	}
+	mounts = map[string][2]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		// mountinfo: id parent dev root mountpoint options - fstype src super
+		sep := strings.Index(line, " - ")
+		if sep < 0 {
+			continue
+		}
+		pre := strings.Fields(line[:sep])
+		post := strings.Fields(line[sep+3:])
+		if len(pre) < 6 || len(post) < 3 {
+			continue
+		}
+		mp := strings.ReplaceAll(pre[4], `\040`, " ")
+		optional := ""
+		if len(pre) > 6 {
+			optional = strings.Join(pre[6:], " ")
+		}
+		mounts[mp] = [2]string{optional, pre[5]}
+		if mp == "/" {
+			// Overwrite-assignment (not a sticky OR): only the real /
+			// line's own propagation flag counts.
+			rootShared = strings.Contains(optional, "shared:")
+		}
+	}
+	return rootShared, mounts
+}
+
+// hcIsolationCapField parses one Cap* hex field from /proc/self/status and
+// reports whether it carries any of the named capabilities.
+func hcIsolationHasCap(status, field string, caps ...uint) bool {
+	for _, line := range strings.Split(status, "\n") {
+		if !strings.HasPrefix(line, field+":") {
+			continue
+		}
+		v, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, field+":")), 16, 64)
+		if err != nil {
+			hcIsolationRefuse("cannot parse %s in /proc/self/status: %v", field, err)
+		}
+		for _, c := range caps {
+			if v&(1<<c) != 0 {
+				return true
+			}
+		}
+		return false
+	}
+	hcIsolationRefuse("missing %s in /proc/self/status", field)
+	return false
+}
+
+// mustVerifyOuterTestIsolation refuses (exit 125) to run the test binary
+// anywhere but inside the stage-B mount/PID/net namespace. Every check is
+// kernel state — nothing a test process or a hostile PATH can forge:
+//
+//  1. /proc/self/status: NoNewPrivs must be 1 and neither CapEff nor CapBnd
+//     may carry CAP_SYS_ADMIN / CAP_SYS_PTRACE / CAP_DAC_READ_SEARCH
+//     (setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all
+//     leaves both masks at 0).
+//  2. /proc/1/comm must NOT be systemd/init: the private PID namespace and
+//     its private /proc remove the /proc/1/root escape hatch.
+//  3. mountinfo: the / mount must not be propagation-shared, and every
+//     enumerated hc/herdr-core/sbx path must sit under its OWN read-only
+//     mount (mount opts contain ro), refuse O_WRONLY with EROFS, and read
+//     back the compiled-in stand-in tag — proving the host binary is
+//     masked, not merely missing.
+func mustVerifyOuterTestIsolation() {
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		hcIsolationRefuse("cannot read /proc/self/status: %v", err)
+	}
+	s := string(status)
+	if !strings.Contains(s, "NoNewPrivs:\t1") {
+		hcIsolationRefuse("NoNewPrivs is not 1 (run under ns-hc-gotest.sh)")
+	}
+	// CAP_SYS_ADMIN=21, CAP_SYS_PTRACE=19, CAP_DAC_READ_SEARCH=2
+	for _, field := range []string{"CapEff", "CapBnd"} {
+		if hcIsolationHasCap(s, field, 21, 19, 2) {
+			hcIsolationRefuse("%s still carries a dangerous capability", field)
+		}
+	}
+	comm, err := os.ReadFile("/proc/1/comm")
+	if err != nil {
+		hcIsolationRefuse("cannot read /proc/1/comm: %v", err)
+	}
+	switch strings.TrimSpace(string(comm)) {
+	case "systemd", "init":
+		hcIsolationRefuse("PID 1 is the host init (%s): no private PID namespace", strings.TrimSpace(string(comm)))
+	}
+	rootShared, mounts := hcIsolationMountinfo()
+	if rootShared {
+		hcIsolationRefuse("root mount is propagation-shared: no private mount namespace")
+	}
+	targets := hcIsolationShadowTargets()
+	if len(targets) == 0 {
+		hcIsolationRefuse("no hc/herdr-core/sbx shadow targets enumerated: nothing proves the namespace")
+	}
+	for _, p := range targets {
+		// mount --bind follows symlinks: the mount sits on the REAL path
+		// (e.g. /root/.local/bin/herdr-core for the hc symlink), so
+		// mountinfo must be checked on EvalSymlinks(p), never on p
+		// itself — mountinfo never lists a symlink as a mountpoint.
+		realP, err := filepath.EvalSymlinks(p)
+		if err != nil || realP == "" {
+			hcIsolationRefuse("cannot resolve %s: %v", p, err)
+		}
+		mnt, ok := mounts[realP]
+		if !ok {
+			hcIsolationRefuse("%s (resolves to %s) is not its own mount point (host binary reachable)", p, realP)
+		}
+		if !strings.Contains(","+mnt[1]+",", ",ro,") {
+			hcIsolationRefuse("%s (resolves to %s) mount is not read-only (opts %q)", p, realP, mnt[1])
+		}
+		fd, oerr := syscall.Open(p, syscall.O_WRONLY, 0)
+		if oerr == nil {
+			_ = syscall.Close(fd)
+			hcIsolationRefuse("%s accepted O_WRONLY on a supposedly ro stand-in", p)
+		}
+		if oerr != syscall.EROFS {
+			hcIsolationRefuse("%s O_WRONLY error %v, want EROFS", p, oerr)
+		}
+		body, rerr := os.ReadFile(p)
+		if rerr != nil {
+			hcIsolationRefuse("cannot read masked %s: %v", p, rerr)
+		}
+		if !strings.Contains(string(body), hcIsolationStandinTag) {
+			hcIsolationRefuse("%s does not serve the stand-in (tag %q missing): host binary exposed", p, hcIsolationStandinTag)
+		}
+	}
 }
 
 // auditRecordKeys is the fixed field set every audit line must carry.

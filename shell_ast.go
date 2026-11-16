@@ -345,9 +345,17 @@ func checkCommentsAndContinuations(code string, f *syntax.File, strictReadonly b
 // roSegment is one readonly-parsed command segment with stdin metadata.
 type roSegment struct {
 	argv         []string
+	argWords     []*syntax.Word // parallel to argv (nil when unavailable)
 	pipedStdin   bool
 	heredocText  []heredocBody
 	redirectFile string
+	// srcCode is the exact buffer this segment was parsed from, and
+	// gateProvenanced marks a segment minted by roWalkPreparedHcSend from a
+	// prepare*-verified provenance. Both are copied verbatim into the
+	// shellSegment handed to peelResolvedSegDepth — never inferred from argv
+	// shape.
+	srcCode         string
+	gateProvenanced bool
 }
 
 func parseReadonlyShellAST(code string) (argvs [][]string, rejectReason string) {
@@ -363,6 +371,14 @@ func parseReadonlyShellAST(code string) (argvs [][]string, rejectReason string) 
 }
 
 func parseReadonlyShellSegments(code string) (segs []roSegment, rejectReason string) {
+	return parseReadonlyShellSegmentsMode(code, false, nil)
+}
+
+func parseReadonlyShellSegmentsPrepare(code string, prov *hcGateProvenance) (segs []roSegment, rejectReason string) {
+	return parseReadonlyShellSegmentsMode(code, true, prov)
+}
+
+func parseReadonlyShellSegmentsMode(code string, prepare bool, prov *hcGateProvenance) (segs []roSegment, rejectReason string) {
 	if hit := checkShellBytes(code, true); hit != "" {
 		return nil, hit
 	}
@@ -375,22 +391,26 @@ func parseReadonlyShellSegments(code string) (segs []roSegment, rejectReason str
 		return nil, hit
 	}
 	var out []roSegment
-	if hit := roWalkFile(code, file, &out, false); hit != "" {
+	if hit := roWalkFileMode(code, file, &out, false, prepare, prov); hit != "" {
 		return nil, hit
 	}
 	return out, ""
 }
 
 func roWalkFile(code string, f *syntax.File, out *[]roSegment, pipeIn bool) string {
+	return roWalkFileMode(code, f, out, pipeIn, false, nil)
+}
+
+func roWalkFileMode(code string, f *syntax.File, out *[]roSegment, pipeIn bool, prepare bool, prov *hcGateProvenance) string {
 	for i, st := range f.Stmts {
-		if hit := roWalkStmt(code, st, out, pipeIn && i == 0); hit != "" {
+		if hit := roWalkStmtMode(code, st, out, pipeIn && i == 0, prepare, prov); hit != "" {
 			return hit
 		}
 	}
 	return ""
 }
 
-func roWalkStmt(code string, st *syntax.Stmt, out *[]roSegment, pipeIn bool) string {
+func roWalkStmtMode(code string, st *syntax.Stmt, out *[]roSegment, pipeIn bool, prepare bool, prov *hcGateProvenance) string {
 	if st.Negated {
 		return "control flow '!' forbidden"
 	}
@@ -405,19 +425,19 @@ func roWalkStmt(code string, st *syntax.Stmt, out *[]roSegment, pipeIn bool) str
 	}
 	switch cmd := st.Cmd.(type) {
 	case *syntax.CallExpr:
-		return roWalkCall(code, st, cmd, out, pipeIn)
+		return roWalkCallMode(code, st, cmd, out, pipeIn, prepare, prov)
 	case *syntax.BinaryCmd:
 		switch cmd.Op {
 		case syntax.Pipe, syntax.PipeAll:
-			if hit := roWalkStmt(code, cmd.X, out, pipeIn); hit != "" {
+			if hit := roWalkStmtMode(code, cmd.X, out, pipeIn, prepare, prov); hit != "" {
 				return hit
 			}
-			return roWalkStmt(code, cmd.Y, out, true)
+			return roWalkStmtMode(code, cmd.Y, out, true, prepare, prov)
 		case syntax.AndStmt, syntax.OrStmt:
-			if hit := roWalkStmt(code, cmd.X, out, pipeIn); hit != "" {
+			if hit := roWalkStmtMode(code, cmd.X, out, pipeIn, prepare, prov); hit != "" {
 				return hit
 			}
-			return roWalkStmt(code, cmd.Y, out, false)
+			return roWalkStmtMode(code, cmd.Y, out, false, prepare, prov)
 		default:
 			return fmt.Sprintf("unsupported syntax node %T op=%v", cmd, cmd.Op)
 		}
@@ -437,12 +457,21 @@ func roWalkStmt(code string, st *syntax.Stmt, out *[]roSegment, pipeIn bool) str
 	}
 }
 
-func roWalkCall(code string, st *syntax.Stmt, call *syntax.CallExpr, out *[]roSegment, pipeIn bool) string {
+func roWalkCallMode(code string, st *syntax.Stmt, call *syntax.CallExpr, out *[]roSegment, pipeIn bool, prepare bool, prov *hcGateProvenance) string {
 	if len(call.Assigns) > 0 {
 		return "env assign forbidden Hint: 禁止 VAR=val 前缀；需要环境变量时只用 LANG/LC_ALL/TZ 经 ctx_run env"
 	}
 	if len(call.Args) < 1 {
 		return "empty command"
+	}
+	// Prepare-mode: allow ONLY a prov-verified rewritten
+	// `<selfExe> --hc-gate send addr text` call; recurse into CmdSubst for
+	// readonly screening. A user-typed raw --hc-gate carries no provenance and
+	// falls through to the ordinary (blocking) roWord path.
+	if prepare {
+		if hit := roWalkPreparedHcSend(code, st, call, out, pipeIn, prov); hit != "not-hc" {
+			return hit
+		}
 	}
 	argv := make([]string, 0, len(call.Args))
 	for i, w := range call.Args {
@@ -452,7 +481,7 @@ func roWalkCall(code string, st *syntax.Stmt, call *syntax.CallExpr, out *[]roSe
 		}
 		argv = append(argv, s)
 	}
-	seg := roSegment{argv: argv, pipedStdin: pipeIn}
+	seg := roSegment{argv: argv, argWords: call.Args, pipedStdin: pipeIn, srcCode: code}
 	for _, r := range st.Redirs {
 		hb, redirFile, hit := roCheckRedirect(code, call, r)
 		if hit != "" {
@@ -466,6 +495,98 @@ func roWalkCall(code string, st *syntax.Stmt, call *syntax.CallExpr, out *[]roSe
 		}
 	}
 	*out = append(*out, seg)
+	return ""
+}
+
+// roWalkPreparedHcSend handles the prepare*-minted gate form ONLY. It returns
+// "not-hc" for every other call. The four-word `hc send <addr> <text>`
+// disguise is gone: a static hc send is already covered by the ordinary
+// roWord + readonlyAllowlist["hc"] path, and pretending the head was "hc"
+// laundered /tmp/hc and herdr-core into an allowed call.
+func roWalkPreparedHcSend(code string, st *syntax.Stmt, call *syntax.CallExpr, out *[]roSegment, pipeIn bool, prov *hcGateProvenance) string {
+	args := call.Args
+	if len(args) != 5 || prov == nil {
+		return "not-hc"
+	}
+	head, ok0 := wordToArg(args[0])
+	flag, ok1 := wordToArg(args[1])
+	send, ok2 := wordToArg(args[2])
+	addr, ok3 := wordToArg(args[3])
+	if !ok0 || !ok1 || !ok2 || !ok3 {
+		return "not-hc"
+	}
+	// Accept any absolute selfExe (test binaries are not named "ctxmode").
+	if !strings.Contains(head, "/") || flag != "--hc-gate" || send != "send" ||
+		!hcSendAddrOK(addr) || strings.HasPrefix(addr, "-") {
+		return "not-hc"
+	}
+	// The span-bound proof: head/flag must be EXACTLY the words the rewriter
+	// minted in THIS buffer. A raw user-typed --hc-gate can never satisfy it.
+	if !prov.hasGateCall(code, args[0], args[1]) {
+		return "not-hc"
+	}
+	if !isPreparedHcGateArgv([]string{head, flag, send, addr, "ok"}) {
+		return "not-hc"
+	}
+	textWord := args[4]
+	if !isGuaranteedSingleArgWord(textWord, false) {
+		return "not-hc"
+	}
+	if strings.HasPrefix(staticWordPrefix(textWord), "-") {
+		return "not-hc"
+	}
+	if hit := roWalkHcTextCmdSubsts(code, textWord, out); hit != "" {
+		return hit
+	}
+	// Keep the REAL head and mark the segment as provenance-backed; the
+	// strict-readonly screens bridge on gateProvenanced to skip the first-word
+	// path rejection (陷阱 A) without ever trusting argv shape.
+	argv := []string{head, "--hc-gate", "send", addr, "ok"} // static stand-in; the gate validates real text
+	seg := roSegment{argv: argv, argWords: args, pipedStdin: pipeIn, srcCode: code, gateProvenanced: true}
+	for _, r := range st.Redirs {
+		hb, redirFile, hit := roCheckRedirect(code, call, r)
+		if hit != "" {
+			return hit
+		}
+		if hb != nil {
+			seg.heredocText = append(seg.heredocText, *hb)
+		}
+		if redirFile != "" {
+			seg.redirectFile = redirFile
+		}
+	}
+	*out = append(*out, seg)
+	return ""
+}
+
+func roWalkHcTextCmdSubsts(code string, textWord *syntax.Word, out *[]roSegment) string {
+	if textWord == nil {
+		return "empty command"
+	}
+	for _, part := range textWord.Parts {
+		switch p := part.(type) {
+		case *syntax.Lit, *syntax.SglQuoted:
+			continue
+		case *syntax.DblQuoted:
+			if p.Dollar {
+				return `$"..." quoting forbidden`
+			}
+			for _, ip := range p.Parts {
+				switch ipp := ip.(type) {
+				case *syntax.Lit:
+					continue
+				case *syntax.CmdSubst:
+					if hit := roWalkFile(code, &syntax.File{Stmts: ipp.Stmts}, out, false); hit != "" {
+						return hit
+					}
+				default:
+					return "shell expansion inside double quotes forbidden"
+				}
+			}
+		default:
+			return "not-hc"
+		}
+	}
 	return ""
 }
 
@@ -1114,6 +1235,7 @@ func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVarian
 			return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 		}
 		col.segs = dedupeSegTail(col.segs, pre)
+		markSecondaryDialect(col.segs, pre)
 	} else if !useBashVariant && bashFile != nil {
 		pre := len(col.segs)
 		col.walkStmts(bashFile.Stmts, stdinFeed{piped: pipeIn})
@@ -1121,8 +1243,21 @@ func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVarian
 			return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 		}
 		col.segs = dedupeSegTail(col.segs, pre)
+		markSecondaryDialect(col.segs, pre)
 	}
 	return col.segs, true
+}
+
+// markSecondaryDialect flags the segments appended by the non-primary dialect
+// walk. The primary block [0,pre) is left untouched by dedupeSegTail, so the
+// boundary is exact.
+func markSecondaryDialect(segs []shellSegment, pre int) {
+	if pre <= 0 {
+		return
+	}
+	for i := pre; i < len(segs); i++ {
+		segs[i].secondaryDialect = true
+	}
 }
 
 func dedupeSegTail(segs []shellSegment, pre int) []shellSegment {
@@ -1807,11 +1942,13 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 	}
 
 	argv := make([]string, 0, len(call.Assigns)+len(call.Args))
+	argWords := make([]*syntax.Word, 0, len(call.Assigns)+len(call.Args))
 	// SH11 F9: a backgrounded statement runs in a subshell — its assigns
 	// never bind in the parent shell (walkStmt already closed allowBind on
 	// the whole subtree).
 	for _, a := range call.Assigns {
 		argv = append(argv, c.assignToPrefix(a))
+		argWords = append(argWords, nil) // prefix assigns have no command Word
 		if a.Name != nil && !a.Naked {
 			if len(call.Args) == 0 {
 				// Pure assignment statement — eligible for staticVars.
@@ -1831,6 +1968,9 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 				if name, single := singleSimpleParamExp(w); single {
 					if words, ok := c.enumCmdWords[name]; ok && len(words) > 0 {
 						argv = append(argv, words...)
+						for range words {
+							argWords = append(argWords, nil) // expanded; no 1:1 Word
+						}
 						continue
 					}
 				}
@@ -1841,6 +1981,7 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 				s, ok := c.wordToArg(w)
 				if ok && isSafeAbsPathVal(s) {
 					argv = append(argv, s)
+					argWords = append(argWords, w)
 					continue
 				}
 				saved := c.enumVars
@@ -1848,20 +1989,24 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 				s, _ = c.wordToArg(w)
 				c.enumVars = saved
 				argv = append(argv, s)
+				argWords = append(argWords, w)
 				continue
 			}
 		}
 		s, _ := c.wordToArg(w)
 		argv = append(argv, s)
+		argWords = append(argWords, w)
 	}
 	// POSIX parses `export NAME=VAL` as CallExpr (bash uses DeclClause).
 	c.noteDeclCallBinds(argv)
 
 	seg := shellSegment{
 		argv:         argv,
+		argWords:     argWords,
 		pipedStdin:   feed.piped,
 		backgrounded: st.Background,
 		processSubst: callHasProcSubst(call),
+		srcCode:      c.code,
 	}
 	c.applyRedirs(&seg, st.Redirs, feed)
 	if len(seg.argv) > 0 || seg.redirectFile != "" || len(seg.heredocText) > 0 ||
@@ -2726,13 +2871,22 @@ func wordToArg(w *syntax.Word) (string, bool) {
 				break
 			}
 			for _, ip := range p.Parts {
-				lit, ok := ip.(*syntax.Lit)
-				if !ok {
+				switch ipp := ip.(type) {
+				case *syntax.Lit:
+					b.WriteString(decodeDblQuotedLit(ipp.Value))
+				case *syntax.ParamExp:
+					// "$@"/"${arr[@]}"/"${!prefix@}"/"${x:-$@}" still
+					// field-split inside double quotes -> NOT split-safe.
+					static = false
+					if paramExpSplitsInDblQuotes(ipp) {
+						b.WriteString(cmdSubPlaceholder)
+					} else {
+						b.WriteString(cmdSubPlaceholderQuoted)
+					}
+				default:
 					static = false
 					b.WriteString(cmdSubPlaceholderQuoted)
-					continue
 				}
-				b.WriteString(decodeDblQuotedLit(lit.Value))
 			}
 		case *syntax.ParamExp:
 			// Context-free: only $$ (a decimal PID) is known split-safe.
@@ -2933,6 +3087,13 @@ func (c *subCollector) unquotedParamPlaceholder(pe *syntax.ParamExp) string {
 // (text, true) means the part emitted literal text that stays static;
 // (placeholder, false) marks the word dynamic.
 func (c *subCollector) dqParamPlaceholder(pe *syntax.ParamExp) (string, bool) {
+	// A @-splitting expansion must NOT keep the split-safe dq placeholder:
+	// "$@"/"${arr[@]}"/"${!prefix@}"/"${x:-$@}" all expand to one argv word
+	// per element even inside double quotes, so emit the conservative
+	// cmdSubPlaceholder instead (isSplitSafeDynamicWord -> false).
+	if paramExpSplitsInDblQuotes(pe) {
+		return cmdSubPlaceholder, false
+	}
 	name, simple := simpleParamName(pe)
 	if !simple {
 		return cmdSubPlaceholderQuoted, false
