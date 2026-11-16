@@ -314,7 +314,7 @@ func wordHasAtSplitExpansion(w *syntax.Word) bool {
 // integer word) and any of:
 //   - pe.Param.Value == "@"         — $@, ${@}, ${@:1}, ${@/#a/b}, ${@@Q}
 //   - pe.Names == NamesPrefixWords  — "${!prefix@}" (names list, splits)
-//   - paramExpHasAtIndex(pe.Index)  — "${arr[@]}" and "${!arr[@]}"
+//   - paramExpHasAtIndex(pe)          — "${arr[@]}" and "${!arr[@]}"
 //   - pe.Exp.Word carries an @-split — "${x:-$@}", "${x:+$@}",
 //     "${x:-\"${arr[@]}\"}" ("${x:-@}" literal stays false via
 //     wordHasAtSplitExpansion)
