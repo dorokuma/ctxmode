@@ -18,7 +18,7 @@
 - `dispatch-agent`：无 Go 模块依赖，但下列 4 项硬编码协议不变量两仓各自实现、必须锁步同步（任一变更须同批改对侧并复核本笔记）：
   1. 报告根目录 `/tmp/herdr-role-reports`
   2. 父终端地址形状 `^t[0-9a-z]+$`（本仓 `hcSendAddrOK`，对端 `config.ReportAddrRe`）
-  3. 角色侧唯一放行拼写 `dispatch-report <t-addr>`；`--flush` 仅限派发器外层调用（本仓 MCP 工具 `ctx_report` 内部委托同一 `dispatch-report <t-addr>` 子进程，非新协议入口）
+  3. 角色侧唯一交付入口为 MCP 工具 `ctx_report`（内部委托 `dispatch-report <t-addr>` 原子写 `report.md` 与 `.meta` provenance；`ctx_run` 全角色封禁 `dispatch-report`，`--flush` 仅限派发器外层且强校验 `.meta`；`pi-extensions/go/sandbox/preset.go` 的 `DefaultReviewerTools` 保留 `dispatch-report` 仅作为沙盒内 `ctx_report` 子进程 `exec` 的 Landlock 许可）
   4. 回执通知格式 `报告已写入 path=<abs> bytes=<n> sha256=<hex>`；`CTXMODE_EXTRA_WORKDIRS` 空串视为未设置
 ## Release Policy / 发布规范
 

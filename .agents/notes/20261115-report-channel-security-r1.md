@@ -1,5 +1,6 @@
 ---
-status: active
+status: superseded
+superseded_by: 20261117-ctx-report-sole-entry.md
 tags: [pattern:dispatch-report-channel-env-binding, pattern:ctxmode-extra-workdirs-policy]
 ---
 # 报告通路第二轮加固：复合赋值写算子 + 父绑定 env + extras 工作区

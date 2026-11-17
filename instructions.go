@@ -54,16 +54,15 @@ action argument (ctx_stats and ctx_report take none).
 
 ## Dispatch report channel
 
-A dispatched role reports completion through the dispatch-report helper
-once. Two spellings are equally valid delivery entry points — both delegate
-to the same helper, so pick whichever the current rules text offers:
+A dispatched role reports completion once through the ctx_report tool — the
+ONLY delivery entry point (dispatch-report is not callable via ctx_run):
 
   ctx_report tool:      content = <complete UTF-8 report body, 1 byte to 1 MiB>
-  ctx_run execute call: argv  = ["dispatch-report", "<parent terminal id>"]   (the static t-id from the dispatch)
-                        stdin = <complete UTF-8 report body, 1 byte to 1 MiB>
 
-- These are the ONLY delivery entry points — never pipe the report through
-  a shell string, hc send, or a file redirect. The helper
+- The ctx_report tool delegates internally to the trusted 'dispatch-report
+  <parent>' helper — never pipe the report through a shell string, hc send,
+  or a file redirect, and never invoke dispatch-report via ctx_run (the role
+  guards block every spelling). The helper
   itself atomically writes the report file and sends the parent a short
   "报告已写入 path=<abs> bytes=<n> sha256=<hex>" notice; the parent compares that
   digest against the full file it reads, which is the delivery proof. During the

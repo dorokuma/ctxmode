@@ -373,7 +373,7 @@ func (s *server) registerCategoryTools(srv *mcp.Server) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctx_report",
-		Description: "Deliver the dispatched role's completion report: delegates to the single trusted `dispatch-report <parent>` helper (same entry as ctx_run argv=[\"dispatch-report\", \"<t-id>\"] + stdin) — validates the DISPATCH_REPORT_PATH binding, writes report.md atomically under the report lock, notifies the parent terminal and marks .sent. content is the complete UTF-8 report body (1 byte .. 1 MiB). Available to every role including strict read-only; only callable when DISPATCH_REPORT_PATH/DISPATCH_REPORT_PARENT are set by the dispatcher.",
+		Description: "Deliver the dispatched role's completion report: delegates to the single trusted `dispatch-report <parent>` helper — validates the DISPATCH_REPORT_PATH binding, writes report.md atomically under the report lock, notifies the parent terminal and marks .sent. content is the complete UTF-8 report body (1 byte .. 1 MiB). Available to every role including strict read-only; only callable when DISPATCH_REPORT_PATH/DISPATCH_REPORT_PARENT are set by the dispatcher.",
 		Annotations: ann["ctx_report"],
 	}, counted(s, "ctx_report", s.toolCtxReport))
 }

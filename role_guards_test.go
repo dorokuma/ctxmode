@@ -3605,65 +3605,201 @@ func TestGuard_ClaudeAgentBlacklist(t *testing.T) {
 	}
 }
 
-// TestGuard_DispatchReportReadonly covers the strict-readonly surface for
-// the dispatch-report channel: only `dispatch-report <t-addr>` and pure
-// query spellings pass; options, extra operands, dynamic words and
-// non-t addrs block.
-func TestGuard_DispatchReportReadonly(t *testing.T) {
-	t.Setenv(auditEnvRole, "reviewer")
-	t.Setenv(auditEnvReadonly, "")
-
-	allow := [][]string{
+// TestGuard_DispatchReportBlocked covers the v6.0.0 closure of the
+// ctx_run dispatch-report side channel: EVERY role — the strict
+// read-only set, worker/verifier sub-agents — blocks every
+// dispatch-report spelling (bare, absolute path, wrapper-wrapped,
+// <t-addr>, --flush, --help) through both the argv and the shell
+// screens; ctx_report is the sole report-delivery entry.
+func TestGuard_DispatchReportBlocked(t *testing.T) {
+	argvs := [][]string{
+		{"dispatch-report"},
 		{"dispatch-report", "t42"},
 		{"dispatch-report", "test"},
 		{"dispatch-report", "--help"},
 		{"dispatch-report", "-h"},
 		{"dispatch-report", "--version"},
 		{"dispatch-report", "-V"},
-	}
-	for _, argv := range allow {
-		if got := guardArgvReadonly(argv); got != "" {
-			t.Fatalf("guardArgvReadonly(%v) = %q, want allow", argv, got)
-		}
-	}
-	if got := guardShellReadonly("dispatch-report t42"); got != "" {
-		t.Fatalf("guardShellReadonly(dispatch-report t42) = %q, want allow", got)
-	}
-	block := [][]string{
-		{"dispatch-report"},
 		{"dispatch-report", "review"},
 		{"dispatch-report", "t42", "extra"},
 		{"dispatch-report", "--force", "t42"},
+		{"dispatch-report", "--flush", "t42"},
 		{"dispatch-report", "/tmp/x"},
+		{"env", "FOO=1", "dispatch-report", "t42"},
+		{"xargs", "dispatch-report"},
 	}
-	for _, argv := range block {
-		if got := guardArgvReadonly(argv); got == "" {
-			t.Fatalf("guardArgvReadonly(%v) = allow, want block", argv)
+	shells := []string{
+		"dispatch-report t42",
+		"dispatch-report --flush t42",
+		"dispatch-report --help",
+		"sh -c 'dispatch-report t42'",
+		"ls && dispatch-report t42",
+		"echo x | dispatch-report t42",
+	}
+
+	// Every phase is a named subtest so a -run filter (e.g.
+	// `TestGuard_DispatchReportBlocked/code/csharp`) exercises ONLY that
+	// leaf on an earlier baseline — the argv/shell phases can never mask
+	// the code/awk/npm assertions behind a parent t.Fatal.
+
+	// Strict read-only roles: the allowlist entry is gone, so every
+	// spelling fails closed.
+	t.Run("argv", func(t *testing.T) {
+		for _, role := range []string{"scout", "planner", "researcher", "reviewer", "oracle"} {
+			t.Run(role, func(t *testing.T) {
+				t.Setenv(auditEnvRole, role)
+				t.Setenv(auditEnvReadonly, "")
+				for _, argv := range argvs {
+					if got := guardArgvReadonly(argv); got == "" {
+						t.Fatalf("%s guardArgvReadonly(%v) = allow, want block", role, argv)
+					}
+				}
+			})
 		}
-	}
-	// Sub-agent (worker) callers get the same narrowed surface.
+		// Non-strict sub-agents (worker/verifier) get the same unconditional
+		// block via screenNestedDispatch's dispatch-report case.
+		for _, role := range []string{"worker", "verifier"} {
+			t.Run(role, func(t *testing.T) {
+				t.Setenv(auditEnvRole, role)
+				t.Setenv(auditEnvReadonly, "")
+				for _, argv := range argvs {
+					if got := guardArgvSubagent(argv); got == "" {
+						t.Fatalf("%s guardArgvSubagent(%v) = allow, want block", role, argv)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("shell", func(t *testing.T) {
+		for _, role := range []string{"scout", "planner", "researcher", "reviewer", "oracle"} {
+			t.Run(role, func(t *testing.T) {
+				t.Setenv(auditEnvRole, role)
+				t.Setenv(auditEnvReadonly, "")
+				for _, code := range shells {
+					if got := guardShellReadonly(code); got == "" {
+						t.Fatalf("%s guardShellReadonly(%q) = allow, want block", role, code)
+					}
+				}
+			})
+		}
+		for _, role := range []string{"worker", "verifier"} {
+			t.Run(role, func(t *testing.T) {
+				t.Setenv(auditEnvRole, role)
+				t.Setenv(auditEnvReadonly, "")
+				for _, code := range shells {
+					if got := guardShellSubagent(code); got == "" {
+						t.Fatalf("%s guardShellSubagent(%q) = allow, want block", role, code)
+					}
+				}
+			})
+		}
+	})
+
+	// v6.0.0 C2 closure: dispatch-report now sits in
+	// blockedAgentExecutableList, so the five sub-agent screens that derive
+	// from the master list also close — dynamic interpreter spawns
+	// (allResolved=false falls back to the codeAgentNames scan), non-Python
+	// runtimes whose spawn args can never be resolved statically, dynamic
+	// awk command sinks (programNamesBlockedAgent), npm/npx package specs
+	// (isBlockedAgentHead) and foreign-interpreter bare statement heads
+	// (codeHeadIsAgentInvocation).
 	t.Setenv(auditEnvRole, "worker")
-	t.Setenv(auditEnvReadonly, "")
-	if got := guardArgvSubagent([]string{"dispatch-report", "t42"}); got != "" {
-		t.Fatalf("worker dispatch-report t42 = %q, want allow", got)
+	sub := guardCall{subagent: true}
+	codeCases := []struct {
+		name string
+		lang string
+		code string
+	}{
+		// Dynamic Python spawn: the argv is not statically resolved, so the
+		// mere dispatch-report identifier must fail closed via codeAgentNames.
+		{name: "python dynamic spawn env parent", lang: "python",
+			code: "import os, subprocess\nsubprocess.run([\"dispatch-report\", os.environ[\"DISPATCH_REPORT_PARENT\"]], input=b\"r\")"},
+		{name: "python dynamic spawn var argv", lang: "python",
+			code: "import subprocess\ncmd = [\"dispatch-report\", \"--flush\", \"t42\"]\nsubprocess.run(cmd)"},
+		// Non-Python/JS runtimes: codeStaticSpawnsDetailed always reports
+		// unresolved there, so even a literal spawn is caught by the same
+		// identifier fallback.
+		{name: "ruby system dispatch-report", lang: "ruby",
+			code: "system(\"dispatch-report\", \"t42\")"},
+		{name: "go exec.Command dispatch-report", lang: "go",
+			code: "package main\nimport \"os/exec\"\nfunc f() { exec.Command(\"dispatch-report\", \"t42\").Run() }"},
+		// C4: C# (dotnet-script) process-start primitives — the normal
+		// System.Diagnostics API surface — now reach the spawn gate, so the
+		// allResolved=false identifier fallback blocks a dispatch-report
+		// spawn there too.
+		{name: "csharp Process.Start dispatch-report", lang: "csharp",
+			code: "System.Diagnostics.Process.Start(\"dispatch-report\", \"--flush \" + System.Environment.GetEnvironmentVariable(\"DISPATCH_REPORT_PARENT\")).WaitForExit();"},
+		{name: "csharp ProcessStartInfo dispatch-report", lang: "csharp",
+			code: "var p = new System.Diagnostics.Process();\np.StartInfo = new System.Diagnostics.ProcessStartInfo(\"dispatch-report\", \"t42\");\np.Start();"},
+		{name: "csharp StartInfo FileName dispatch-report", lang: "csharp",
+			code: "var p = new System.Diagnostics.Process();\np.StartInfo.FileName = \"dispatch-report\";\np.Start();"},
+		// C4 isomorphic primitive sweep: Go/Rust/Elixir spawn spellings that
+		// bypass the previously tabulated primitives.
+		{name: "go os.StartProcess dispatch-report", lang: "go",
+			code: "package main\nimport \"os\"\nfunc f() { os.StartProcess(\"/root/.local/bin/dispatch-report\", []string{\"dispatch-report\", \"t42\"}, nil) }"},
+		{name: "go syscall.StartProcess dispatch-report", lang: "go",
+			code: "package main\nimport \"syscall\"\nfunc f() { syscall.StartProcess(\"/root/.local/bin/dispatch-report\", []string{\"dispatch-report\", \"t42\"}, nil) }"},
+		{name: "rust process::Command dispatch-report", lang: "rust",
+			code: "use std::process;\nfn f() { process::Command::new(\"dispatch-report\").arg(\"t42\").status(); }"},
+		{name: "elixir os.cmd dispatch-report", lang: "elixir",
+			code: ":os.cmd('dispatch-report t42')"},
+		// Foreign-interpreter bare statement head (never reaches a spawn
+		// primitive — defence-in-depth fail-closed check).
+		{name: "bare statement head dispatch-report", lang: "python",
+			code: "dispatch-report t42"},
+		{name: "bare statement head dispatch-report --flush", lang: "ruby",
+			code: "dispatch-report --flush t42"},
 	}
-	if got := guardArgvSubagent([]string{"dispatch-report", "--evil", "t42"}); got == "" {
-		t.Fatal("worker dispatch-report --evil t42 = allow, want block")
+	for _, tc := range codeCases {
+		t.Run("code/"+tc.name, func(t *testing.T) {
+			t.Setenv(auditEnvRole, "worker")
+			t.Setenv(auditEnvReadonly, "")
+			rule, detail := sub.guardCtxRunCode(tc.lang, tc.code)
+			if rule != ruleSubagentNestedAgent {
+				t.Fatalf("guardCtxRunCode(%s, %q) = (%q, %q), want %s block",
+					tc.lang, tc.code, rule, detail, ruleSubagentNestedAgent)
+			}
+		})
 	}
-	// --flush is a dispatcher-side verb, not a role spelling: it fails closed
-	// on the same argv surface.
-	if got := guardArgvSubagent([]string{"dispatch-report", "--flush", "t42"}); got == "" {
-		t.Fatal("worker dispatch-report --flush t42 = allow, want block")
-	}
+
+	// Dynamic awk command sink: a non-literal command expression is only
+	// allowed when the program names no blocked head — dispatch-report now
+	// counts via programNamesBlockedAgent (derived from codeAgentNames).
+	t.Run("awk_dynamic", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "worker")
+		t.Setenv(auditEnvReadonly, "")
+		dynAwk := []string{"awk", "BEGIN{c=\"dispatch-report\"; system(c)}"}
+		if got := guardArgvSubagent(dynAwk); got == "" {
+			t.Fatalf("guardArgvSubagent(%v) = allow, want block (dynamic awk cmd)", dynAwk)
+		}
+	})
+	// npx -p/--package spec naming dispatch-report hits the package-spec
+	// branch of the runner screen.
+	t.Run("npm_family", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "worker")
+		t.Setenv(auditEnvReadonly, "")
+		for _, argv := range [][]string{
+			{"npx", "-p", "dispatch-report", "dispatch-report", "t42"},
+			{"npm", "exec", "--", "dispatch-report", "t42"},
+		} {
+			if got := guardArgvSubagent(argv); got == "" {
+				t.Fatalf("guardArgvSubagent(%v) = allow, want block", argv)
+			}
+		}
+	})
 }
 
 // TestGuard_DispatchReportCanonicalPath covers the trusted standard-path
-// canonicalization (P1a): an absolute dispatch-report/hc head at a real
-// install slot — /usr/local/bin or a trusted-home .local/bin — screens as
-// its canonical bare name for strict read-only AND for 's'-branch
-// sub-agents, while every untrusted path spelling (including a planted
-// /tmp/dispatch-report, a ./ dispatch-report, a FIFO and a 0644 file at a
-// trusted slot) keeps its default-deny verdict.
+// canonicalization (P1a) after the v6.0.0 report-channel closure: an
+// absolute hc head at a real install slot — /usr/local/bin or a
+// trusted-home .local/bin — screens as its canonical bare name for strict
+// read-only AND for 's'-branch sub-agents, while dispatch-report is no
+// longer a canonical head at all: even a REAL helper at a trusted install
+// slot blocks for every role (bare name, strict readonly and worker
+// alike), and every untrusted path spelling (a planted
+// /tmp/dispatch-report, ./ dispatch-report, a FIFO or a 0644 file) keeps
+// its default-deny verdict.
 func TestGuard_DispatchReportCanonicalPath(t *testing.T) {
 	// /usr/local/bin/dispatch-report -> /root/.local/bin/dispatch-report and
 	// /usr/local/bin/hc -> /root/.local/bin/hc -> herdr-core are the real
@@ -3679,34 +3815,46 @@ func TestGuard_DispatchReportCanonicalPath(t *testing.T) {
 		realHc = ""
 	}
 
-	// Isolated probe for the admission predicate itself: FIFO, missing exec
-	// bit and wrong resolved basename all fail inside a trusted slot.
+	// Isolated probe for the admission predicate itself: dispatch-report is
+	// no longer in readonlyCanonicalHeads, so even a real helper at a
+	// trusted slot is never admitted; the hc side keeps the full
+	// FIFO/exec-bit/resolved-basename discipline.
 	t.Run("admittedReadonlyCanonicalHead", func(t *testing.T) {
 		fakeHome := withTestTrustedHome(t)
 		localBin := filepath.Join(fakeHome, ".local", "bin")
-		good := filepath.Join(localBin, "dispatch-report")
+		// dispatch-report is no longer a canonical head: the predicate
+		// refuses it even at a real trusted install slot.
+		report := filepath.Join(localBin, "dispatch-report")
+		writeTestExecutable(t, report, 0755)
+		if got := admittedReadonlyCanonicalHead(report, os.Geteuid()); got != "" {
+			t.Fatalf("admit(%s) = %q, want empty (dispatch-report is not a canonical head)", report, got)
+		}
+		good := filepath.Join(localBin, "hc")
 		writeTestExecutable(t, good, 0755)
-		if got := admittedReadonlyCanonicalHead(good, os.Geteuid()); got != "dispatch-report" {
-			t.Fatalf("admit(%s) = %q, want dispatch-report", good, got)
+		if got := admittedReadonlyCanonicalHead(good, os.Geteuid()); got != "hc" {
+			t.Fatalf("admit(%s) = %q, want hc", good, got)
 		}
 		// Non-clean and non-absolute spellings are never admitted. These
 		// probes run while `good` is still a real 0755 executable so the
 		// positive admit above proves the slot itself is valid; raw string
 		// concatenation is deliberate — filepath.Join would Clean away the
 		// non-clean segments and make the assertion vacuous.
-		nonCleanDotDot := localBin + "/../bin/dispatch-report"
+		nonCleanDotDot := localBin + "/../bin/hc"
 		if got := admittedReadonlyCanonicalHead(nonCleanDotDot, os.Geteuid()); got != "" {
 			t.Fatalf("admit(%s) = %q, want empty", nonCleanDotDot, got)
 		}
-		nonCleanSlash := localBin + "//dispatch-report"
+		nonCleanSlash := localBin + "//hc"
 		if got := admittedReadonlyCanonicalHead(nonCleanSlash, os.Geteuid()); got != "" {
 			t.Fatalf("admit(%s) = %q, want empty", nonCleanSlash, got)
 		}
-		if got := admittedReadonlyCanonicalHead("./dispatch-report", os.Geteuid()); got != "" {
+		if got := admittedReadonlyCanonicalHead("./hc", os.Geteuid()); got != "" {
 			t.Fatalf("admit(./) = %q, want empty", got)
 		}
 		// FIFO at the same name is never admitted (would hang the reader).
 		fifo := filepath.Join(localBin, "hc")
+		if err := os.Remove(fifo); err != nil {
+			t.Fatal(err)
+		}
 		if err := syscall.Mkfifo(fifo, 0600); err != nil {
 			t.Fatalf("mkfifo: %v", err)
 		}
@@ -3714,15 +3862,21 @@ func TestGuard_DispatchReportCanonicalPath(t *testing.T) {
 			t.Fatalf("admit(FIFO) = %q, want empty", got)
 		}
 		// 0644 (no execute bit) is never admitted.
-		lazy := filepath.Join(localBin, "dispatch-report")
+		lazy := filepath.Join(localBin, "hc")
+		if err := os.Remove(lazy); err != nil {
+			t.Fatal(err)
+		}
+		writeTestExecutable(t, lazy, 0755)
 		if err := os.Chmod(lazy, 0644); err != nil {
 			t.Fatal(err)
 		}
 		if got := admittedReadonlyCanonicalHead(lazy, os.Geteuid()); got != "" {
 			t.Fatalf("admit(0644) = %q, want empty", got)
 		}
-		// A symlink resolving to a differently-named binary is not the helper.
-		link := filepath.Join(localBin, "dispatch-report")
+		// A symlink resolving to a differently-named binary is not the
+		// helper: hc may resolve to herdr-core/sbx, never to an unrelated
+		// name like ls.
+		link := filepath.Join(localBin, "hc")
 		if err := os.Remove(link); err != nil {
 			t.Fatal(err)
 		}
@@ -3734,18 +3888,20 @@ func TestGuard_DispatchReportCanonicalPath(t *testing.T) {
 		}
 	})
 
-	// Strict read-only (scout): trusted abs path admits as the canonical
-	// name even when PATH cannot resolve the bare name at all.
+	// Strict read-only (scout): a trusted abs hc path admits as the
+	// canonical name even when PATH cannot resolve the bare name at all,
+	// while a trusted dispatch-report path now blocks like any other
+	// path-form head.
 	t.Run("readonly-abs-path", func(t *testing.T) {
 		t.Setenv(auditEnvRole, "scout")
 		t.Setenv(auditEnvReadonly, "")
 		t.Setenv("PATH", "/nonexistent")
 		if realReport != "" {
-			if got := guardArgvReadonly([]string{realReport, "t1fp"}); got != "" {
-				t.Fatalf("guardArgvReadonly(%s t1fp) = %q, want allow", realReport, got)
+			if got := guardArgvReadonly([]string{realReport, "t1fp"}); got == "" {
+				t.Fatalf("guardArgvReadonly(%s t1fp) = allow, want block", realReport)
 			}
 			if got := guardArgvReadonly([]string{realReport}); got == "" {
-				t.Fatalf("guardArgvReadonly(%s) = allow, want block (bad argv)", realReport)
+				t.Fatalf("guardArgvReadonly(%s) = allow, want block", realReport)
 			}
 		}
 		if realHc != "" {
@@ -3753,12 +3909,18 @@ func TestGuard_DispatchReportCanonicalPath(t *testing.T) {
 				t.Fatalf("guardArgvReadonly(%s send t42 ok) = %q, want allow", realHc, got)
 			}
 		}
-		// Fake-home install slot works identically.
+		// A fake-home install slot blocks identically for dispatch-report
+		// while an hc helper at the same slot still admits.
 		fakeHome := withTestTrustedHome(t)
 		fake := filepath.Join(fakeHome, ".local", "bin", "dispatch-report")
 		writeTestExecutable(t, fake, 0755)
-		if got := guardArgvReadonly([]string{fake, "t1fp"}); got != "" {
-			t.Fatalf("guardArgvReadonly(%s t1fp) = %q, want allow", fake, got)
+		if got := guardArgvReadonly([]string{fake, "t1fp"}); got == "" {
+			t.Fatalf("guardArgvReadonly(%s t1fp) = allow, want block", fake)
+		}
+		fakeHc := filepath.Join(fakeHome, ".local", "bin", "hc")
+		writeTestExecutable(t, fakeHc, 0755)
+		if got := guardArgvReadonly([]string{fakeHc, "send", "t42", "ok"}); got != "" {
+			t.Fatalf("guardArgvReadonly(%s send t42 ok) = %q, want allow", fakeHc, got)
 		}
 		// Every untrusted/relative/other path spelling keeps the refusal.
 		for _, a := range [][]string{
@@ -3773,9 +3935,10 @@ func TestGuard_DispatchReportCanonicalPath(t *testing.T) {
 		}
 	})
 
-	// 's' branch (worker/verifier): a path-form report-channel head must
-	// hit the same admission — a planted /tmp/dispatch-report can no
-	// longer ride the bare-name screen, a trusted install path still runs.
+	// 's' branch (worker/verifier): a path-form report-channel head hits
+	// the same admission — a planted /tmp/dispatch-report can no longer
+	// ride the bare-name screen, and even a REAL trusted-slot helper
+	// blocks now that dispatch-report is unconditionally denied.
 	t.Run("subagent-s-branch", func(t *testing.T) {
 		t.Setenv(auditEnvRole, "worker")
 		t.Setenv(auditEnvReadonly, "")
@@ -3788,8 +3951,10 @@ func TestGuard_DispatchReportCanonicalPath(t *testing.T) {
 			t.Fatal("block detail empty")
 		}
 		if realReport != "" {
-			if r, d := currentGuardCall().guardCtxRunArgv([]string{realReport, "t1fp"}); r != "" {
-				t.Fatalf("worker %s t1fp blocked: %s %s, want allow", realReport, r, d)
+			if r, d := currentGuardCall().guardCtxRunArgv([]string{realReport, "t1fp"}); r == "" {
+				t.Fatalf("worker %s t1fp = allow, want block (report channel closed)", realReport)
+			} else if d != "dispatch-report" {
+				t.Fatalf("worker %s block detail = %q, want dispatch-report", realReport, d)
 			}
 		}
 		// hc path spellings get the same treatment.
@@ -3806,85 +3971,277 @@ func TestGuard_DispatchReportCanonicalPath(t *testing.T) {
 	})
 }
 
-// TestGuard_ReportDeliveryHint covers the P1b self-heal hint: a blocked
-// dispatch-report invocation (argv or shell head) gets the ctx_report /
-// argv+stdin guidance, while a command merely mentioning the name mid-token
-// never earns it.
+// TestGuard_ReportDeliveryHint covers the v6.0.0 single-entry self-heal
+// hint: a blocked dispatch-report invocation (argv or shell head, on ANY
+// ctx_run action — execute, batch, run_task, execute_file) gets the
+// ctx_report-only guidance, while a command merely mentioning the name
+// mid-token never earns it.
 func TestGuard_ReportDeliveryHint(t *testing.T) {
 	s, _ := auditTestServer(t)
+	workdir := s.workdirs[0]
 	t.Setenv(auditEnvRole, "scout")
 	t.Setenv(auditEnvReadonly, "")
 
-	wantHint := func(err error, what string) {
+	wantHint := func(t *testing.T, err error, what string) {
 		t.Helper()
 		if err == nil || !strings.Contains(err.Error(), "Report delivery hint:") {
 			t.Fatalf("%s: error missing Report delivery hint: %v", what, err)
 		}
+		// v6.0.0: the hint must name ctx_report as the ONLY entry and must
+		// not still advertise the removed ctx_run argv spelling.
+		if !strings.Contains(err.Error(), "ctx_report") {
+			t.Fatalf("%s: hint missing ctx_report entry: %v", what, err)
+		}
+		if strings.Contains(err.Error(), "argv=[\"dispatch-report\"") {
+			t.Fatalf("%s: hint still advertises the removed ctx_run spelling: %v", what, err)
+		}
 	}
-	noHint := func(err error, what string) {
+	noHint := func(t *testing.T, err error, what string) {
 		t.Helper()
 		if err != nil && strings.Contains(err.Error(), "Report delivery hint:") {
 			t.Fatalf("%s: unexpected Report delivery hint: %v", what, err)
 		}
 	}
 
-	// argv spellings blocked by either rule get the hint.
-	_, _, err := s.toolExecute(context.Background(), nil, executeArgs{Argv: []string{"dispatch-report", "--flush", "t1fp"}})
-	wantHint(err, "argv --flush")
-	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Argv: []string{"dispatch-report"}})
-	wantHint(err, "argv bare")
-	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Argv: []string{"/tmp/dispatch-report", "t1fp"}})
-	wantHint(err, "argv untrusted path")
+	// argv spellings blocked by either rule get the hint. Each phase is a
+	// named subtest so a -run filter (e.g. the c4_csharp_hint leaf below)
+	// is never masked by an earlier sequential t.Fatal.
+	t.Run("argv_and_shell_hints", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "scout")
+		t.Setenv(auditEnvReadonly, "")
+		_, _, err := s.toolExecute(context.Background(), nil, executeArgs{Argv: []string{"dispatch-report", "--flush", "t1fp"}})
+		wantHint(t, err, "argv --flush")
+		_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Argv: []string{"dispatch-report"}})
+		wantHint(t, err, "argv bare")
+		_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Argv: []string{"dispatch-report", "t42"}})
+		wantHint(t, err, "argv t-addr")
+		_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Argv: []string{"/tmp/dispatch-report", "t1fp"}})
+		wantHint(t, err, "argv untrusted path")
 
-	// shell command strings whose SEGMENT head is dispatch-report get the
-	// hint even though the block reason is "metachar forbidden".
-	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "/usr/local/bin/dispatch-report t1fp"})
-	wantHint(err, "shell path head")
-	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "ls && /usr/local/bin/dispatch-report t1fp"})
-	wantHint(err, "shell second segment")
-	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "dispatch-report --flush t1fp"})
-	wantHint(err, "shell --flush head")
+		// shell command strings whose SEGMENT head is dispatch-report get the
+		// hint even though the block reason is "metachar forbidden".
+		_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "/usr/local/bin/dispatch-report t1fp"})
+		wantHint(t, err, "shell path head")
+		_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "ls && /usr/local/bin/dispatch-report t1fp"})
+		wantHint(t, err, "shell second segment")
+		_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "dispatch-report --flush t1fp"})
+		wantHint(t, err, "shell --flush head")
+	})
 
 	// Mid-token mentions and unrelated blocks never hint.
-	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "rg dispatch-report . && python3 -c 'print(1)'"})
-	noHint(err, "rg+python3")
-	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "echo dispatch-report t1fp > /tmp/x"})
-	noHint(err, "echo redirect")
-	_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Argv: []string{"python3", "-c", "print(1)"}})
-	noHint(err, "python argv")
+	t.Run("mid_token_no_hint", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "scout")
+		t.Setenv(auditEnvReadonly, "")
+		_, _, err := s.toolExecute(context.Background(), nil, executeArgs{Command: "rg dispatch-report . && python3 -c 'print(1)'"})
+		noHint(t, err, "rg+python3")
+		_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Command: "echo dispatch-report t1fp > /tmp/x"})
+		noHint(t, err, "echo redirect")
+		_, _, err = s.toolExecute(context.Background(), nil, executeArgs{Argv: []string{"python3", "-c", "print(1)"}})
+		noHint(t, err, "python argv")
+	})
 
 	// batch per-command errors carry the hint for the report command only.
-	res, _, err := s.toolBatchExecute(context.Background(), nil, batchArgs{
-		Commands: []batchCommand{
-			{Label: "d", Command: "/usr/local/bin/dispatch-report t1fp"},
-			{Label: "r", Command: "python3 -c 'print(1)'"},
-		},
-		Concurrency: 1,
-	})
-	if err != nil {
-		t.Fatalf("toolBatchExecute: %v", err)
-	}
-	var br batchResponse
-	var unmarshalled bool
-	for _, c := range res.Content {
-		if tc, ok := c.(*mcp.TextContent); ok {
-			if uerr := json.Unmarshal([]byte(tc.Text), &br); uerr == nil {
-				unmarshalled = true
+	t.Run("batch_per_command", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "scout")
+		t.Setenv(auditEnvReadonly, "")
+		res, _, err := s.toolBatchExecute(context.Background(), nil, batchArgs{
+			Commands: []batchCommand{
+				{Label: "d", Command: "/usr/local/bin/dispatch-report t1fp"},
+				{Label: "r", Command: "python3 -c 'print(1)'"},
+			},
+			Concurrency: 1,
+		})
+		if err != nil {
+			t.Fatalf("toolBatchExecute: %v", err)
+		}
+		var br batchResponse
+		var unmarshalled bool
+		for _, c := range res.Content {
+			if tc, ok := c.(*mcp.TextContent); ok {
+				if uerr := json.Unmarshal([]byte(tc.Text), &br); uerr == nil {
+					unmarshalled = true
+				}
 			}
 		}
-	}
-	if !unmarshalled {
-		t.Fatalf("no JSON batch response in result content")
-	}
-	if len(br.Commands) != 2 {
-		t.Fatalf("batch results = %d, want 2", len(br.Commands))
-	}
-	if !strings.Contains(br.Commands[0].Error, "Report delivery hint:") {
-		t.Fatalf("batch dispatch-report error missing hint: %q", br.Commands[0].Error)
-	}
-	if strings.Contains(br.Commands[1].Error, "Report delivery hint:") {
-		t.Fatalf("batch python error must not carry hint: %q", br.Commands[1].Error)
-	}
+		if !unmarshalled {
+			t.Fatalf("no JSON batch response in result content")
+		}
+		if len(br.Commands) != 2 {
+			t.Fatalf("batch results = %d, want 2", len(br.Commands))
+		}
+		if !strings.Contains(br.Commands[0].Error, "Report delivery hint:") {
+			t.Fatalf("batch dispatch-report error missing hint: %q", br.Commands[0].Error)
+		}
+		if strings.Contains(br.Commands[1].Error, "Report delivery hint:") {
+			t.Fatalf("batch python error must not carry hint: %q", br.Commands[1].Error)
+		}
+	})
+
+	// run_task (custom argv naming dispatch-report) and execute_file
+	// (shell code whose head is dispatch-report) carry the same hint —
+	// every ctx_run action, not only execute/batch.
+	t.Run("run_task_and_execute_file", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "worker")
+		_, _, err := s.toolRunTask(context.Background(), nil, runTaskArgs{
+			Kind: "custom",
+			Args: []string{"dispatch-report", "t42"},
+		})
+		wantHint(t, err, "run_task custom dispatch-report")
+
+		t.Setenv(auditEnvRole, "verifier")
+		// The file must live inside the server workdir (execute_file resolves
+		// path against the workspace fence).
+		script := filepath.Join(workdir, "s.txt")
+		if err := os.WriteFile(script, []byte("data"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = s.toolExecuteFile(context.Background(), nil, executeFileArgs{
+			Path:     script,
+			Language: "shell",
+			Code:     "dispatch-report t42",
+		})
+		wantHint(t, err, "execute_file shell dispatch-report")
+	})
+
+	// Non-shell `code`: a static python spawn naming dispatch-report is
+	// invisible to the shell lexer — the guard detail itself names
+	// `dispatch-report` as the blocked head and still earns the hint
+	// (oracle 1.2 / Q1).
+	t.Run("code_spawns", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "worker")
+		_, _, err := s.toolExecute(context.Background(), nil, executeArgs{
+			Language: "python",
+			Command:  "import subprocess\nsubprocess.run([\"dispatch-report\", \"t42\"])",
+		})
+		wantHint(t, err, "python static spawn dispatch-report")
+
+		// C2: a DYNAMIC python spawn (argv not statically resolved) blocks via
+		// the codeAgentNames identifier fallback — detail
+		// "code spawns dispatch-report" must still earn the hint through the
+		// new ` dispatch-report` suffix branch.
+		_, _, err = s.toolExecute(context.Background(), nil, executeArgs{
+			Language: "python",
+			Command:  "import os, subprocess\nsubprocess.run([\"dispatch-report\", os.environ[\"DISPATCH_REPORT_PARENT\"]])",
+		})
+		wantHint(t, err, "python dynamic spawn dispatch-report")
+	})
+
+	t.Run("run_task_env_wrap", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "worker")
+		// C2/SF-1: run_task custom argv naming dispatch-report whose ENV hits
+		// the hook screen (GIT_PAGER) must still carry the hint — the env
+		// interception site now passes args.Args for kind="custom".
+		_, _, err := s.toolRunTask(context.Background(), nil, runTaskArgs{
+			Kind: "custom",
+			Args: []string{"dispatch-report", "t42"},
+			Env:  map[string]string{"GIT_PAGER": "/tmp/x"},
+		})
+		wantHint(t, err, "run_task custom dispatch-report + env hook")
+
+		// C2: a fixed-kind run_task extra arg mentioning dispatch-report is NOT
+		// a report delivery attempt — no hint (args.Args only feeds the hint
+		// matcher for kind="custom").
+		_, _, err = s.toolRunTask(context.Background(), nil, runTaskArgs{
+			Kind: "go_test",
+			Args: []string{"dispatch-report"},
+			Env:  map[string]string{"GIT_PAGER": "/tmp/x"},
+		})
+		noHint(t, err, "run_task go_test extra arg + env hook")
+	})
+
+	// C2/OBS-1: an untrusted-path verdict whose crafted basename ends in
+	// " dispatch-report" is a path-trust diagnosis, not a delivery
+	// attempt — no hint.
+	t.Run("untrusted_path_no_hint", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "worker")
+		venvBin := filepath.Join(withTestTrustedHome(t), ".venv", "bin")
+		if err := os.MkdirAll(venvBin, 0755); err != nil {
+			t.Fatal(err)
+		}
+		craft := filepath.Join(venvBin, "foo: dispatch-report")
+		if err := os.WriteFile(craft, []byte("#!/bin/sh\nexit 0\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", venvBin+":/usr/bin:/bin")
+		_, _, err := s.toolExecute(context.Background(), nil, executeArgs{
+			Argv: []string{"foo: dispatch-report"},
+		})
+		noHint(t, err, "untrusted path binary foo: dispatch-report")
+	})
+
+	// C4: wrapped interpreter / dynamic-awk spellings keep the
+	// dispatch-report command identity in the guard detail, so the
+	// ctx_report hint still reaches the caller — and a C# Process.Start
+	// spawn blocks with the same hint. Each spelling lives in its own leaf
+	// subtest so a failure here is never masked by a sibling.
+
+	// C# dotnet-script spawn primitives (Process.Start /
+	// ProcessStartInfo / .StartInfo) now reach the spawn gate.
+	t.Run("c4_csharp_hint", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "worker")
+		t.Setenv(auditEnvReadonly, "")
+		_, _, err := s.toolExecute(context.Background(), nil, executeArgs{
+			Language: "csharp",
+			Command:  "System.Diagnostics.Process.Start(\"dispatch-report\", \"--flush \" + System.Environment.GetEnvironmentVariable(\"DISPATCH_REPORT_PARENT\")).WaitForExit();",
+		})
+		wantHint(t, err, "csharp Process.Start dispatch-report")
+	})
+
+	// Interpreter -c peel: the inner detail naming dispatch-report is
+	// passed through instead of collapsing to `python inline code`.
+	t.Run("c4_argv_python_hint", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "worker")
+		t.Setenv(auditEnvReadonly, "")
+		_, _, err := s.toolExecute(context.Background(), nil, executeArgs{
+			Argv: []string{"python3", "-c", "import os, subprocess; subprocess.run(['dispatch-report', os.environ['DISPATCH_REPORT_PARENT']])"},
+		})
+		wantHint(t, err, "argv python3 -c dispatch-report")
+	})
+
+	// Shell pipeline wrapping the same interpreter -c payload.
+	t.Run("c4_shell_python_hint", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "worker")
+		t.Setenv(auditEnvReadonly, "")
+		_, _, err := s.toolExecute(context.Background(), nil, executeArgs{
+			Command: "echo seed | python3 -c \"import os, subprocess; subprocess.run(['dispatch-report', os.environ['DISPATCH_REPORT_PARENT']])\"",
+		})
+		wantHint(t, err, "shell piped python3 -c dispatch-report")
+	})
+
+	// Dynamic awk command naming dispatch-report keeps the report
+	// identity: `awk dynamic cmd dispatch-report`.
+	t.Run("c4_awk_dynamic_hint", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "worker")
+		t.Setenv(auditEnvReadonly, "")
+		_, _, err := s.toolExecute(context.Background(), nil, executeArgs{
+			Argv: []string{"awk", "BEGIN{c=\"dispatch-report\"; system(c)}"},
+		})
+		wantHint(t, err, "awk dynamic cmd dispatch-report")
+	})
+
+	// Negative controls: non-report blocks keep their original detail
+	// and earn no hint.
+	t.Run("c4_non_report_no_hint", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "worker")
+		t.Setenv(auditEnvReadonly, "")
+		_, _, err := s.toolExecute(context.Background(), nil, executeArgs{
+			Argv: []string{"python3", "-c", "import subprocess; subprocess.run(['pig'])"},
+		})
+		if err == nil || !strings.Contains(err.Error(), "python inline code") {
+			t.Fatalf("python3 -c pig: want 'python inline code' block, got %v", err)
+		}
+		noHint(t, err, "python3 -c pig")
+		_, _, err = s.toolExecute(context.Background(), nil, executeArgs{
+			Argv: []string{"awk", "BEGIN{c=\"pig\"; system(c)}"},
+		})
+		if err == nil || !strings.Contains(err.Error(), "awk dynamic cmd") {
+			t.Fatalf("awk pig: want 'awk dynamic cmd' block, got %v", err)
+		}
+		if err != nil && strings.Contains(err.Error(), "awk dynamic cmd dispatch-report") {
+			t.Fatalf("awk pig: detail wrongly names dispatch-report: %v", err)
+		}
+		noHint(t, err, "awk dynamic cmd pig")
+	})
 }
 
 // TestGuard_CompoundEnvOverride covers compound-assignment env mutation:

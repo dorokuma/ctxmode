@@ -370,11 +370,6 @@ func init() {
 	// OUT of this table — they are admitted only as hc's resolved alias in
 	// isAllowedSystemReadonlyAlias.
 	readonlyAllowlist["hc"] = &cmdAllow{check: screenHcSubagent}
-	// dispatch-report is the static second report channel: only
-	// `dispatch-report <t-addr>` (two words, option-free static addr) and the
-	// pure query spellings pass — the same contract screenHcSubagent gives
-	// `hc send`, minus the text operand (the tool reads its own report file).
-	readonlyAllowlist["dispatch-report"] = &cmdAllow{check: screenDispatchReportReadonly}
 	readonlyAllowlist["mount"] = &cmdAllow{check: checkMountReadonly}
 	readonlyAllowlist["kill"] = &cmdAllow{check: checkKillReadonly}
 	readonlyAllowlist["ctxmode"] = &cmdAllow{check: checkCtxmodeReadonly}
@@ -1315,20 +1310,19 @@ func screenReadonlyAllowlistSeg(argv []string, gateProvenanced bool) string {
 		return "dynamic command head"
 	}
 	// Reject path-form argv[0] (./ls, /tmp/rg); basename matching alone is unsafe.
-	// Narrow exception (P1): an absolute path naming dispatch-report/hc at a
-	// TRUSTED standard install location (/usr/local/bin or a trusted-home
-	// .local/bin, on-disk verified by admittedReadonlyCanonicalHead) evaluates
-	// under its canonical bare-name argv so argv=["/usr/local/bin/dispatch-report",
-	// "t42"] delivers a report identically to the bare-name spelling. Every
-	// other path-form head — and a non-trusted report path like
-	// /tmp/dispatch-report — keeps the "path command" verdict.
+	// Narrow exception (P1): an absolute path naming hc at a TRUSTED standard
+	// install location (/usr/local/bin or a trusted-home .local/bin, on-disk
+	// verified by admittedReadonlyCanonicalHead) evaluates under its canonical
+	// bare-name argv so argv=["/usr/local/bin/hc","send","t42","ok"] is
+	// judged exactly like the bare-name spelling. Every other path-form head —
+	// and a non-trusted path like /tmp/hc — keeps the "path command" verdict.
 	// Exception: prepare*-emitted absolute selfExe --hc-gate … whose span-bound
 	// provenance the caller verified (runtime gate validates the argv).
 	if strings.Contains(argv[0], "/") {
 		if gateProvenanced && isPreparedHcGateArgv(argv) {
 			return screenPreparedHcGateReadonly(argv)
 		}
-		if filepath.IsAbs(argv[0]) && (filepath.Base(argv[0]) == "dispatch-report" || filepath.Base(argv[0]) == "hc") {
+		if filepath.IsAbs(argv[0]) && filepath.Base(argv[0]) == "hc" {
 			if canon := admittedReadonlyCanonicalHead(argv[0], os.Geteuid()); canon != "" {
 				argv = append([]string{canon}, argv[1:]...)
 			} else {
@@ -1521,14 +1515,13 @@ func readonlyPrePeelHitExempt(argv []string, headPathExempt bool) string {
 				return ""
 			}
 			// The strict-readonly canonical-head grant only applies to the
-			// FIRST word and only to a bare dispatch-report/hc basename at a
-			// trusted install slot (admittedReadonlyCanonicalHead): a
-			// path-form `dispatch-report t42` argv then falls through to the
-			// ordinary screening loop with its canonical argv so the peeled
-			// allowlist step can admit it. Every other path word — and a
-			// path-form head anywhere else — keeps "path command".
-			if i == 0 && filepath.IsAbs(a) &&
-				(filepath.Base(a) == "dispatch-report" || filepath.Base(a) == "hc") {
+			// FIRST word and only to a bare hc basename at a trusted install
+			// slot (admittedReadonlyCanonicalHead): a path-form `hc send t42 ok`
+			// argv then falls through to the ordinary screening loop with its
+			// canonical argv so the peeled allowlist step can admit it. Every
+			// other path word — and a path-form head anywhere else — keeps
+			// "path command".
+			if i == 0 && filepath.IsAbs(a) && filepath.Base(a) == "hc" {
 				if canon := admittedReadonlyCanonicalHead(a, os.Geteuid()); canon != "" {
 					argv = append([]string{canon}, argv[1:]...)
 					continue
@@ -1633,6 +1626,6 @@ search: rg grep find sed
 text: sort uniq cut tr jq diff cmp echo printf true false
 vcs: git
 go_meta: go gofmt ctxmode
-ops: ps pgrep ss journalctl systemctl which date pwd mount kill hc dispatch-report
+ops: ps pgrep ss journalctl systemctl which date pwd mount kill hc
 `)
 }
