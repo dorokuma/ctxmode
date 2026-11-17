@@ -20,4 +20,18 @@ jobs:
           node-version: "24"
       - run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
+      - name: Install host isolation target fixture
+        # A clean Ubuntu runner has no hc/herdr-core anywhere: TestMain's
+        # mustVerifyOuterTestIsolation needs at least one real target to
+        # enumerate-and-mask (an empty set means "nothing proves the
+        # namespace" and the suite refuses to run). Install an inert
+        # placeholder at /usr/local/bin — deliberately WITHOUT the
+        # CTXMODE-NS-HC-STANDIN tag, so inside the namespace the ro bind
+        # is what supplies the tag, exactly like a real host binary.
+        run: |
+          fixture=$(mktemp)
+          printf '#!/bin/sh\necho "UNMASKED-HOST-HC" >&2\nexit 99\n' > "$fixture"
+          sudo install -m 0755 "$fixture" /usr/local/bin/herdr-core
+          rm -f "$fixture"
+          sudo ln -sf /usr/local/bin/herdr-core /usr/local/bin/hc
       - run: make check

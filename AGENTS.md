@@ -2,7 +2,7 @@
 档位：L2
 
 ## 铁律
-1. **构建与测试**：`make check` 是唯一检查入口，覆盖 `gofmt`、`staticcheck`（本地版本与 CI 一致：`honnef.co/go/tools/cmd/staticcheck@2025.1.1`）、`go vet`、`go test -race`、`go build` 及有 `node` / CI 环境下的 `integrations/pi/*.test.ts`；本机 zero-node 无 `node` 时仅跳过 Pi 扩展单测，`CI=true` 强制要求 `node`。部署由 agent 直接执行 `./deploy.sh`（编译 → initialize 验证 → 原子替换运行中二进制），**不设人工步骤**。
+1. **构建与测试**：`make check` 是唯一检查入口，覆盖 `gofmt`、`staticcheck`（本地版本与 CI 一致：`honnef.co/go/tools/cmd/staticcheck@2025.1.1`）、`go vet`、`go build` 及有 `node` / CI 环境下的 `integrations/pi/*.test.ts`；其中 `go test -race` 经 `./scripts/ns-hc-gotest.sh` 在外层 mount/PID/net 命名空间内执行（测试二进制绑定只读 hc/herdr-core/sbx stand-in、清能力并降权），裸 `go test` 会被 `TestMain` 的外层隔离门禁以 exit 125 拒绝；本机 zero-node 无 `node` 时仅跳过 Pi 扩展单测，`CI=true` 强制要求 `node`。部署由 agent 直接执行 `./deploy.sh`（编译 → initialize 验证 → 原子替换运行中二进制），**不设人工步骤**。
 2. **零 Node 依赖**：核心代码为纯 Go 实现，禁止引入 NPM/NodeJS 运行时依赖。
 3. **变更登记**：任何改动须在 `CHANGELOG.md` 的 `[Unreleased]` 段落登记。
 4. **提交与门禁**：提交、分支、门禁与收口按 `/root/.pig/agent/SYSTEM.md` §4（维护者本机由全局 `/root/.git-hooks` 执行提交扫描；仓内 `githooks/` 为可选增强、未接管 `hooksPath`）。
