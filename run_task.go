@@ -106,9 +106,18 @@ func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args r
 	}
 	// Caller-supplied env overrides get the same execution-hook screen as
 	// ctx_run execute (GIT_PAGER=/tmp/x etc. must not arm the task child).
+	// A `custom` run_task argv names the task child directly, so a
+	// dispatch-report argv blocked here on env still earns the ctx_report
+	// self-heal hint; fixed kinds never pass args.Args (a go_test extra
+	// argument mentioning dispatch-report is not a report delivery
+	// attempt).
 	if grule, detail := guard.guardCtxRunEnv(args.Env); grule != "" {
 		audit.setScreen(shellBlock, grule)
-		return nil, nil, guardBlockedError(grule, detail)
+		var hintArgv []string
+		if args.Kind == "custom" {
+			hintArgv = args.Args
+		}
+		return nil, nil, blockedReportError(guardBlockedError(grule, detail), hintArgv, "")
 	}
 
 	// Env allowlist (same as ctx_run action=execute / P1).
@@ -142,7 +151,7 @@ func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args r
 	prep := guard.prepareCtxRunArgv(argv, "")
 	if prep.rule != "" {
 		audit.setScreen(shellBlock, prep.rule)
-		return nil, nil, guardBlockedError(prep.rule, prep.detail)
+		return nil, nil, blockedReportError(guardBlockedError(prep.rule, prep.detail), argv, "")
 	}
 
 	// custom (and any path-like argv[0]) go through validateArgv, which now only

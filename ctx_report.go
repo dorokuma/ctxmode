@@ -21,8 +21,11 @@ import (
 // the whole delivery contract (DISPATCH_REPORT_PATH fd-chain validation,
 // .dispatch-report.lock serialization, atomic report.md install, the
 // `hc send <parent>` receipt notify and the .sent dedup marker) to the single
-// trusted `dispatch-report <parent>` helper — the same entry point the
-// ctx_run argv spelling uses, so there is exactly one delivery truth source.
+// trusted `dispatch-report <parent>` helper, exec'd directly as a subprocess
+// — ctx_report is the sole report delivery entry point and, for sub-agent
+// roles, dispatch-report is never callable through ctx_run (the main agent
+// is unaffected by the role guards), so there is exactly one delivery
+// truth source.
 //
 // A dispatched role may call it with any role identity (strict read-only
 // included): the tool itself never opens the report path, never runs a shell

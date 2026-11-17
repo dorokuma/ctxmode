@@ -1940,8 +1940,12 @@ var blockedAgentExecutableList = []string{
 	"claude", "claude-code", "claude-pty", "codex",
 	// herdr/herdsman are retired as a sub-agent terminal-control surface:
 	// hc is the only sanctioned channel, so even their read-only verbs
-	// block outright now.
-	"herdr", "herdsman",
+	// block outright now. dispatch-report joins the same list (v6.0.0):
+	// ctx_report is the sole role-side delivery entry, so every spelling —
+	// bare/path head, <t-addr>, --flush, --help — blocks for a role-guarded
+	// caller; the name is NOT in pureQueryOnlyHeads, so even a
+	// `dispatch-report --version` query blocks like `pig --version`.
+	"herdr", "herdsman", "dispatch-report",
 	// Detached session managers let a sub-agent spawn an agent outside the
 	// audited ctx_run surface.
 	"tmux", "screen",
@@ -2209,44 +2213,24 @@ func screenHcSubagent(headArgv []string) string {
 	return "hc " + sub
 }
 
-// screenDispatchReportReadonly admits the dispatch-report side channel in
-// exactly one spelling: `dispatch-report <t-addr>` — a static two-word argv
-// whose operand is an hc terminal address (hcSendAddrOK), plus the pure
-// query spellings (`--help`/`-h`/`--version`/`-V`). Every option, extra
-// operand, dynamic word and subcommand blocks: a report must land on the
-// recorded parent terminal, and only a static addr can prove that.
-func screenDispatchReportReadonly(argv []string) string {
-	if isPureQueryInvocation(argv) {
-		return "" // dispatch-report --help / -h / --version / -V
-	}
-	args := argv[1:]
-	if len(args) != 1 {
-		return "dispatch-report"
-	}
-	if strings.HasPrefix(args[0], "-") || isDynamicArg(args[0]) ||
-		!hcSendAddrOK(args[0]) {
-		return "dispatch-report"
-	}
-	return ""
-}
-
 // readonlyCanonicalHeads are the report-channel command heads a role-guarded
 // caller may invoke by absolute path from their standard install locations:
-// dispatch-report (the role-side report spelling) and hc (the terminal
-// client whose `send` subcommand is the notify channel). The map value is
-// the set of resolved-basename aliases the on-disk file may legitimately
-// carry: hc is installed as a symlink to herdr-core (host) or sbx (reviewer
-// sandbox), while dispatch-report is a real binary under its own name only.
+// hc, the terminal client whose `send` subcommand is the notify channel. The
+// map value is the set of resolved-basename aliases the on-disk file may
+// legitimately carry: hc is installed as a symlink to herdr-core (host) or
+// sbx (reviewer sandbox). dispatch-report is deliberately absent — it is not
+// a role-side spelling at all: ctx_report is the sole report entry and it
+// execs the helper itself, so every ctx_run spelling of dispatch-report
+// (bare, path, query or --flush) blocks for a role-guarded caller.
 var readonlyCanonicalHeads = map[string][]string{
-	"dispatch-report": {"dispatch-report"},
-	"hc":              {"hc", "herdr-core", "sbx"},
+	"hc": {"hc", "herdr-core", "sbx"},
 }
 
 // admittedReadonlyCanonicalHead reports whether arg0 is an absolute path
 // naming a report-channel head at a TRUSTED standard install location —
 // /usr/local/bin/<name> or <trusted-home>/.local/bin/<name> (the
 // trustedHomeDirs() set, which testTrustedHomeRoot extends for tests) — and
-// returns the canonical bare name ("dispatch-report"/"hc") the allowlist
+// returns the canonical bare name ("hc") the allowlist
 // and nested-dispatch screens should evaluate in its place. It returns ""
 // for every other spelling (./name, /tmp/name, non-clean or relative
 // paths), so a path-form head keeps its default-deny verdict unless it
@@ -2902,15 +2886,14 @@ func screenNestedDispatch(headArgv []string, pathEnv string, depth int, caller c
 	bases := headBaseAliasHits(headArgv, pathEnv)
 	// A path-form head (./x, /tmp/x, ...) whose typed OR resolved basename
 	// lands on a report-channel head must be a trusted standard install
-	// path: screenHcSubagent/screenDispatchReportReadonly judge only the
-	// tail args, so a planted /tmp/dispatch-report would otherwise inherit
-	// the bare-name grant. The same admission the strict-readonly
-	// canonical-head rule applies; every other path-form head keeps the
-	// existing basename dispatch unchanged.
+	// path: screenHcSubagent judges only the tail args, so a planted
+	// /tmp/hc would otherwise inherit the bare-name grant. The same
+	// admission the strict-readonly canonical-head rule applies; every
+	// other path-form head keeps the existing basename dispatch unchanged.
 	if strings.Contains(headArgv[0], "/") {
 		for _, base := range bases {
 			switch base {
-			case "dispatch-report", "hc", "herdr-core":
+			case "hc", "herdr-core":
 				if admittedReadonlyCanonicalHead(headArgv[0], os.Geteuid()) == "" {
 					return "untrusted path binary " + filepath.Base(headArgv[0])
 				}
@@ -2935,13 +2918,6 @@ func screenNestedDispatch(headArgv []string, pathEnv string, depth int, caller c
 		// `herdr-core run ...` cannot bypass the `hc` interception.
 		case "hc", "herdr-core":
 			if hit := screenHcSubagent(headArgv); hit != "" {
-				return hit
-			}
-		case "dispatch-report":
-			// Same narrow surface the strict-readonly allowlist grants:
-			// only `dispatch-report <t-addr>` and pure queries; every
-			// other spelling of the report tool blocks for a sub-agent too.
-			if hit := screenDispatchReportReadonly(headArgv); hit != "" {
 				return hit
 			}
 		case "crontab":
@@ -4033,7 +4009,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			g.readonly = true
 		}
 		if rule, detail := g.guardCtxRunCode(lang, code); rule != "" {
-			if detail == roSSHWriteHit || detail == "ctxmode index" {
+			if detail == roSSHWriteHit || detail == "ctxmode index" || isReportGuardDetail(detail) {
 				return detail
 			}
 			return lang + " inline code"
@@ -6571,8 +6547,13 @@ func screenAwkSubagent(args []string, depth int, caller callerIdentity) string {
 		}
 		if lit.dynamic {
 			// Dynamic command text: only fails when the program itself names
-			// a blocked agent/orchestrator identifier.
+			// a blocked agent/orchestrator identifier. A dispatch-report hit
+			// keeps the report command identity in the detail so
+			// blockedReportError appends the ctx_report hint.
 			if programNamesBlockedAgent(program) {
+				if codeTokens(program).hasIdent("dispatch-report") {
+					return "awk dynamic cmd dispatch-report"
+				}
 				return "awk dynamic cmd"
 			}
 			continue
@@ -9678,6 +9659,9 @@ var codeSpawnPrims = []string{
 	"eval(", "exec(", "Function(",
 	"process.binding", "process.dlopen",
 	"System.cmd", "Port.open", "system2(",
+	"Process.Start", "ProcessStartInfo", ".StartInfo",
+	"os.StartProcess", "syscall.StartProcess",
+	"process::Command", "os.cmd",
 }
 
 // codeAgentNames are the blocked nested-agent identifiers inside code.
@@ -10862,7 +10846,8 @@ var infixWord = map[string]bool{
 
 // codeHeadIsAgentInvocation reports whether the first statement head of a
 // foreign-language code buffer is an agent command invocation: a first word
-// that is exactly hc / herdr-core / herdr / herdsman followed by horizontal
+// that is exactly hc / herdr-core / herdr / herdsman / dispatch-report
+// followed by horizontal
 // whitespace and an option/quote/non-keyword argument. This catches a bare
 // `hc send t42 ...` fed to `python3 -`/`ruby -`/`perl -` stdin or `-c`, where
 // the foreign runtime never spawns a recognisable primitive — a defence-in-
@@ -10873,7 +10858,7 @@ func codeHeadIsAgentInvocation(code string) (string, bool) {
 	head := stripLeadingCodeComments(code)
 	w := headWord(head)
 	switch w {
-	case "hc", "herdr-core", "herdr", "herdsman":
+	case "hc", "herdr-core", "herdr", "herdsman", "dispatch-report":
 	default:
 		return "", false
 	}
@@ -15024,7 +15009,7 @@ func guardBlockedError(rule, detail string) error {
 
 // reportDeliveryHintText is the self-heal guidance appended when a role
 // guard blocks a dispatch-report invocation.
-const reportDeliveryHintText = "Report delivery hint: call the ctx_report MCP tool (content=\"<report>\"), or ctx_run with action=\"execute\", argv=[\"dispatch-report\", \"<parent-t-id>\"], stdin=\"<report>\" (bare command name, no shell string or flags)"
+const reportDeliveryHintText = "Report delivery hint: call the ctx_report MCP tool (content=\"<report>\"); dispatch-report is not callable via ctx_run"
 
 // blockedReportError returns err unchanged unless it is a role-guard block
 // AND the screened invocation names dispatch-report as a command head — in
@@ -15037,9 +15022,22 @@ const reportDeliveryHintText = "Report delivery hint: call the ctx_report MCP to
 // `||`, `|` or newline separated segment (or of the whole string), so a
 // mid-token mention — `rg dispatch-report .`, `echo dispatch-report x`,
 // `python3 -c 'import dispatch_report'` — can never mis-hint a blocked call
-// into a report retry.
+// into a report retry. A non-shell `code` spawn (`subprocess.run([...
+// "dispatch-report" ...])`) is unreachable by that shell lexer, so the
+// rendered guard error's ruleSubagentNestedAgent detail is consulted
+// instead: an exact `dispatch-report` detail, or any detail whose final
+// word is `dispatch-report` (`code spawns dispatch-report`,
+// `code statement head invokes dispatch-report`, `npm exec dispatch-report`,
+// `npx dispatch-report`, `awk dynamic cmd dispatch-report`-style hits), earns the hint —
+// while the `untrusted path binary <head>`/`planted shadow binary`
+// prefixes keep their own diagnosis and never append it (a crafted
+// `foo: dispatch-report` basename is a path-trust verdict, not a report
+// delivery attempt).
 func blockedReportError(err error, argv []string, command string) error {
 	if err == nil || !strings.Contains(err.Error(), "blocked by role guard") {
+		return err
+	}
+	if strings.Contains(err.Error(), reportDeliveryHintText) {
 		return err
 	}
 	if len(argv) > 0 && filepath.Base(argv[0]) == "dispatch-report" {
@@ -15048,7 +15046,29 @@ func blockedReportError(err error, argv []string, command string) error {
 	if command != "" && shellCommandHeadIsReport(command) {
 		return fmt.Errorf("%w %s", err, reportDeliveryHintText)
 	}
+	const nestedPrefix = "blocked by role guard (" + ruleSubagentNestedAgent + "): "
+	if msg := err.Error(); strings.HasPrefix(msg, nestedPrefix) {
+		detail := strings.TrimPrefix(msg, nestedPrefix)
+		if isReportGuardDetail(detail) {
+			return fmt.Errorf("%w %s", err, reportDeliveryHintText)
+		}
+	}
 	return err
+}
+
+// isReportGuardDetail reports whether a ruleSubagentNestedAgent detail
+// names dispatch-report as the intercepted command: an exact
+// `dispatch-report` detail or a ` dispatch-report` final word (`code
+// spawns dispatch-report`, `code statement head invokes dispatch-report`,
+// `npm exec dispatch-report`, `npx dispatch-report`, `awk dynamic cmd
+// dispatch-report`). The `untrusted path binary <head>`/`planted shadow
+// binary` prefixes keep their own path-trust diagnosis — a crafted
+// `foo: dispatch-report` basename is not a report delivery attempt.
+func isReportGuardDetail(detail string) bool {
+	return detail == "dispatch-report" ||
+		(!strings.HasPrefix(detail, "untrusted path binary ") &&
+			!strings.HasPrefix(detail, "planted shadow binary ") &&
+			strings.HasSuffix(detail, " dispatch-report"))
 }
 
 // shellCommandHeadIsReport reports whether any parsed command segment of

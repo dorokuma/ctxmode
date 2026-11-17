@@ -219,6 +219,9 @@ func TestCategoryToolAnnotations(t *testing.T) {
 	check("ctx_run", false, true, &ow)
 	check("ctx_kb", false, true, nil)
 	check("ctx_bg", false, true, nil)
+	check("ctx_stats", true, false, nil)
+	closed := false
+	check("ctx_report", false, false, &closed)
 }
 
 func TestCategoryToolAnnotationsIndependentPointers(t *testing.T) {
@@ -818,8 +821,16 @@ func TestCtxReportFindSkipsBadCandidates(t *testing.T) {
 		prev := dispatchReportCandidates
 		dispatchReportCandidates = func() []string { return []string{p} }
 		t.Cleanup(func() { dispatchReportCandidates = prev })
-		if got := admittedReadonlyCanonicalHead(p, euid); got != "" {
-			t.Fatalf("admittedReadonlyCanonicalHead(%q) = %q, want \"\"", p, got)
+		// hc is still a readonly canonical head: the same 0777-dir refusal
+		// must reject its admission probe too (dispatch-report is no longer
+		// a canonical head at all, so admitting it there would be a vacuous
+		// assertion).
+		hcDecoy := filepath.Join(wbin, "hc")
+		if err := os.WriteFile(hcDecoy, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if got := admittedReadonlyCanonicalHead(hcDecoy, euid); got != "" {
+			t.Fatalf("admittedReadonlyCanonicalHead(%q) = %q, want \"\"", hcDecoy, got)
 		}
 		if got := findDispatchReport(euid); got != "" {
 			t.Fatalf("findDispatchReport = %q, want \"\"", got)

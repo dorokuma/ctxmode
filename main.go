@@ -35,7 +35,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "5.6.0"
+const Version = "6.0.0"
 
 // toolIndex walk / size limits.
 const (
@@ -600,7 +600,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 			audit.setInterpreter(rt.Exe)
 			if grule, detail := guard.guardCtxRunCode(language, args.Command); grule != "" {
 				audit.setScreen(shellBlock, grule)
-				return nil, nil, guardBlockedError(grule, detail)
+				return nil, nil, blockedReportError(guardBlockedError(grule, detail), nil, args.Command)
 			}
 		}
 		result, err = runCodeOpts(ctx, language, args.Command, cwd, timeout, args.Background, opts)
@@ -1191,7 +1191,7 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		prep := currentGuardCall().prepareCtxRunShellWithTaint(args.Code, map[string]bool{"FILE_CONTENT": true})
 		if prep.rule != "" {
 			audit.setScreen(shellBlock, prep.rule)
-			return nil, nil, guardBlockedError(prep.rule, prep.detail)
+			return nil, nil, blockedReportError(guardBlockedError(prep.rule, prep.detail), nil, args.Code)
 		}
 		injectedCode = injectFileContent("shell", prep.execCode, string(fileContent))
 		if !strings.HasSuffix(injectedCode, "\n"+prep.execCode) {
@@ -1208,7 +1208,7 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		// what the interpreter runs, so it gets the code guard.
 		if grule, detail := currentGuardCall().guardCtxRunCode(language, args.Code); grule != "" {
 			audit.setScreen(shellBlock, grule)
-			return nil, nil, guardBlockedError(grule, detail)
+			return nil, nil, blockedReportError(guardBlockedError(grule, detail), nil, args.Code)
 		}
 	}
 
