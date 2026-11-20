@@ -5,6 +5,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Changed
+- **Tool-schema guidance hardening for `ctx_git` and `ctx_fs` (`router.go`, `instructions.go`).** `ctxGitArgs` fields now carry `jsonschema` descriptions: `cwd` as the in-workspace repository dir, `path` explicitly as a single git pathspec passed to git as-is (git's own pathspec matching applies; no separate glob parameter, no shell expansion), `stat`/`unified`/`staged` marked diff-only, and `n`/`limit`/`max_count`/`oneline` marked log-only with the n>limit>max_count precedence documented. The `ctx_git` tool `Description` states that only `status`/`diff`/`log` exist and that `path` is a single git pathspec passed through to git — no separate `glob` parameter, no shell expansion — directing file globbing or multi-pattern filtering to `ctx_fs` or `ctx_run argv=["git", ...]`. The `ctx_fs` tool `Description` and the `instructions.go` tool-map now state that only mounted workspace directories are reachable and out-of-workspace paths (e.g. `/tmp`) are refused — pointing callers to the host's own file-reading tool (e.g. `Read`) for known outside files. Behavior is unchanged: no new parameters, `additionalProperties` strict validation untouched.
+
 ## [6.0.0] - 2026-11-17
 
 ### Breaking

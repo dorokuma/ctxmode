@@ -142,18 +142,18 @@ func (s *server) toolCtxFs(ctx context.Context, req *mcp.CallToolRequest, args c
 
 type ctxGitArgs struct {
 	Action  string `json:"action" jsonschema:"status|diff|log"`
-	CWD     string `json:"cwd,omitempty"`
-	Path    string `json:"path,omitempty"`
-	Stat    bool   `json:"stat,omitempty"`
-	Unified int    `json:"unified,omitempty"`
-	Staged  bool   `json:"staged,omitempty"`
-	N       int    `json:"n,omitempty"`
+	CWD     string `json:"cwd,omitempty" jsonschema:"Repository working directory; must be inside a mounted workspace (default: workdir root)"`
+	Path    string `json:"path,omitempty" jsonschema:"A single git pathspec relative to cwd, used by diff and log (ignored by status); passed to git as-is, so git's own pathspec matching applies — there is no separate glob parameter and no shell expansion. For file globbing or multi-pattern filtering use ctx_fs, or ctx_run argv=[\"git\", ...]"`
+	Stat    bool   `json:"stat,omitempty" jsonschema:"diff only: if true, only show the --stat summary"`
+	Unified int    `json:"unified,omitempty" jsonschema:"diff only: context lines for the unified diff (-U)"`
+	Staged  bool   `json:"staged,omitempty" jsonschema:"diff only: if true, show the staged (--cached) diff"`
+	N       int    `json:"n,omitempty" jsonschema:"log only: number of commits (default: 20, hard max: 100)"`
 	// Limit / MaxCount are accepted aliases for N on action=log. They exist so
 	// the inferred schema allows the spellings hosts commonly send instead of
 	// rejecting the call with `unexpected additional properties ["limit"]`.
-	Limit    int   `json:"limit,omitempty"`
-	MaxCount int   `json:"max_count,omitempty"`
-	Oneline  *bool `json:"oneline,omitempty"`
+	Limit    int   `json:"limit,omitempty" jsonschema:"log only: alias of n; used when n is unset or <= 0 (wins over max_count)"`
+	MaxCount int   `json:"max_count,omitempty" jsonschema:"log only: alias of n; used when n and limit are both unset or <= 0"`
+	Oneline  *bool `json:"oneline,omitempty" jsonschema:"log only: one-line --oneline format (default: true)"`
 }
 
 func (s *server) toolCtxGit(ctx context.Context, req *mcp.CallToolRequest, args ctxGitArgs) (*mcp.CallToolResult, any, error) {
@@ -337,7 +337,8 @@ func (s *server) registerCategoryTools(srv *mcp.Server) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctx_fs",
-		Description: "Workspace filesystem (sandboxed). action=ls (list), glob (pattern), " +
+		Description: "Workspace filesystem (sandboxed): only directories mounted as ctxmode workdirs are reachable — paths outside (e.g. /tmp) are refused; use the host's own file-reading tool (e.g. Read) for known out-of-workspace files. " +
+			"action=ls (list), glob (pattern), " +
 			"stat (metadata), rg (content search; default limit=20; matches > limit auto-indexed to ctx_kb with summary returned; use offset for linear paging), " +
 			"resolve (fuzzy-ranked file lookup from an approximate/@-style path; ported from pi-fff), related (files related to a given file: test/impl pairs, same stem, siblings). Prefer over ad-hoc shell find/ls/rg when possible.",
 		Annotations: ann["ctx_fs"],
@@ -345,8 +346,9 @@ func (s *server) registerCategoryTools(srv *mcp.Server) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctx_git",
-		Description: "Read-only git. action=status (porcelain -b), diff (optional path/stat/staged), " +
-			"log (n, path, oneline). No commit/push/reset.",
+		Description: "Read-only git. Only action=status (porcelain -b), diff (path/stat/staged/unified), " +
+			"log (n or limit/max_count, path, oneline). No commit/push/reset. " +
+			"path is a single git pathspec passed to git as-is (git's own pathspec matching applies): no separate glob parameter, no shell expansion; for file globbing or multi-pattern filtering use ctx_fs or ctx_run argv=[\"git\", ...].",
 		Annotations: ann["ctx_git"],
 	}, counted(s, "ctx_git", s.toolCtxGit))
 

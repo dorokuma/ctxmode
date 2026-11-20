@@ -329,6 +329,78 @@ func TestCtxRunDescriptionListsAllRunTaskKinds(t *testing.T) {
 	}
 }
 
+// TestCtxGitFsToolDescriptionsAndSchema pins the advertised guidance that
+// keeps hosts from hallucinating arguments: ctx_git supports only
+// status/diff/log with path as a single git pathspec (no separate glob
+// parameter, no shell expansion), ctx_fs refuses
+// out-of-workspace paths, and every ctx_git schema property carries a
+// per-field description (with stat/unified/staged documented as diff-only).
+func TestCtxGitFsToolDescriptionsAndSchema(t *testing.T) {
+	ctx := context.Background()
+	s := &server{workdirs: []string{t.TempDir()}}
+	cs := connectCategoryTools(t, ctx, s)
+
+	listed, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	tool := func(name string) *mcp.Tool {
+		t.Helper()
+		for _, tl := range listed.Tools {
+			if tl.Name == name {
+				return tl
+			}
+		}
+		t.Fatalf("tools/list missing %s", name)
+		return nil
+	}
+
+	// ctx_git description: only status/diff/log, single git pathspec with
+	// no separate glob parameter.
+	gitDesc := tool("ctx_git").Description
+	for _, want := range []string{"status", "diff", "log", "pathspec", "no separate glob"} {
+		if !strings.Contains(gitDesc, want) {
+			t.Fatalf("ctx_git description missing %q: %s", want, gitDesc)
+		}
+	}
+
+	// ctx_git schema: every advertised property has a description, and the
+	// diff-only fields say so; status is not described as consuming them.
+	raw, err := json.Marshal(tool("ctx_git").InputSchema)
+	if err != nil {
+		t.Fatalf("marshal ctx_git inputSchema: %v", err)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("unmarshal ctx_git inputSchema: %v", err)
+	}
+	props, _ := schema["properties"].(map[string]any)
+	if len(props) == 0 {
+		t.Fatalf("ctx_git schema has no properties: %v", schema)
+	}
+	for name, p := range props {
+		pm, _ := p.(map[string]any)
+		if d, _ := pm["description"].(string); d == "" {
+			t.Fatalf("ctx_git schema property %q has no description: %v", name, pm)
+		}
+	}
+	for _, name := range []string{"stat", "unified", "staged"} {
+		pm, _ := props[name].(map[string]any)
+		d, _ := pm["description"].(string)
+		if !strings.Contains(d, "diff only") {
+			t.Fatalf("ctx_git schema %q description %q must mark it diff-only", name, d)
+		}
+	}
+
+	// ctx_fs description: sandbox scope and the out-of-workspace refusal.
+	fsDesc := tool("ctx_fs").Description
+	for _, want := range []string{"sandbox", "outside"} {
+		if !strings.Contains(fsDesc, want) {
+			t.Fatalf("ctx_fs description missing %q: %s", want, fsDesc)
+		}
+	}
+}
+
 func TestCtxFsOffsetPassThrough(t *testing.T) {
 	wd := t.TempDir()
 	s := &server{workdirs: []string{wd}}
