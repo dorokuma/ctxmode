@@ -991,10 +991,11 @@ function registerTools(pi: ExtensionAPI, getClient: () => CtxmodeClient | null) 
   pi.registerTool({
     name: "ctx_report",
     label: "CTX Report",
-    description: "派发角色报告交付：委托唯一真源 dispatch-report 完成加锁、原子写盘、父终端回执与 .sent 去重。content=<完整 UTF-8 报告正文，1 字节至 1 MiB>；仅在派发器设置 DISPATCH_REPORT_PATH/DISPATCH_REPORT_PARENT 时可用，所有角色（含严格只读）可调用。",
+    description: "派发角色报告交付：委托唯一真源 dispatch-report 完成加锁、原子写盘、父终端回执与 .sent 去重。content=<完整 UTF-8 报告正文，1 字节至 1 MiB>；所有角色（含严格只读）可调用。报告路径与父终端环境变量由服务端在工具内部读取校验，严禁经 printenv/env/shell 预探测；直接调用 ctx_report(content=\"...\")，写盘路径与回执见返回值。",
     promptSnippet: "Deliver the dispatched role's completion report via the trusted dispatch-report helper",
     promptGuidelines: [
       "Use ctx_report once to deliver the final report; never pipe it through a shell string, hc send, or a ctx_run dispatch-report call (the role guards block it).",
+      "Never probe DISPATCH_REPORT_PATH/DISPATCH_REPORT_PARENT via printenv/env/shell — the tool reads them server-side; call ctx_report(content=\"...\") directly and read the report path and receipt from its return value.",
     ],
     parameters: Type.Object({
       content: Type.String({ description: "Complete UTF-8 report body (1 byte .. 1 MiB)" }),

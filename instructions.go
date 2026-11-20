@@ -32,8 +32,10 @@ action argument (ctx_stats and ctx_report take none).
 - ctx_stats: context-consumption statistics for the session: per-tool call counts, bytes returned to the context window, estimated tokens, and bytes kept out of it by auto-indexing into the KB store (every KB write path is covered: oversized ctx_run output, ctx_fs rg auto-index, ctx_kb index, ctx_run action=batch, ctx_kb fetch, legacy migration). No action argument; pass
   json:true for machine-readable output.
 - ctx_report: deliver the dispatched role's completion report via the trusted
-  dispatch-report helper. content=<complete UTF-8 report, 1 byte .. 1 MiB>;
-  requires the dispatcher-set DISPATCH_REPORT_PATH/DISPATCH_REPORT_PARENT env.
+  dispatch-report helper. content=<complete UTF-8 report, 1 byte .. 1 MiB>.
+  The dispatcher-set report-path/parent environment is read and validated
+  server-side inside the tool — never probe or read it via printenv/env/shell;
+  just call ctx_report(content="...") directly.
 
 ## Usage policy
 
@@ -66,6 +68,12 @@ ONLY delivery entry point (dispatch-report is not callable via ctx_run):
 
   ctx_report tool:      content = <complete UTF-8 report body, 1 byte to 1 MiB>
 
+- The report path and parent terminal id are bound by the dispatcher through
+  environment variables that the tool reads and validates internally. Callers
+  must never probe, read, or forward them via printenv/env/shell — just call
+  ctx_report(content="...") directly; the written report's absolute path and
+  the delivery receipt come back in the tool's return value, so there is no
+  path to look up beforehand.
 - The ctx_report tool delegates internally to the trusted 'dispatch-report
   <parent>' helper — never pipe the report through a shell string, hc send,
   or a file redirect, and never invoke dispatch-report via ctx_run (the role

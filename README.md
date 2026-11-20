@@ -20,7 +20,7 @@ Seven real tools (not skills). Five take **`action=`** plus capability-specific 
 | **ctx_kb** | `index`, `search`, `fetch`, `stats`, `purge`, `doctor` | `path`; `query`; `url`/`urls`/`source`/`format`/`force`/`maxBytes`/`timeout_ms`/`ttl_ms`; —; `confirm`/`scope`/`sessionId`/`dryRun`; — |
 | **ctx_bg** | `list`, `kill`, `log`, `wait` | —; `id`/`pid`; `id`/`pid`/`tail_lines`/`tail_bytes`; `id`/`pid`/`timeout_ms` |
 | **ctx_stats** | — (no `action=`; single capability) | `json` (machine-readable output) |
-| **ctx_report** | — (no `action=`; dispatch report delivery) | `content` (1 B .. 1 MiB UTF-8; requires dispatcher env) |
+| **ctx_report** | — (no `action=`; dispatch report delivery) | `content` (1 B .. 1 MiB UTF-8; dispatcher env is read server-side — never probe it via printenv/env/shell) |
 
 Any MCP host (Grok, Pi via the adapter below, agy / Antigravity CLI, …) uses this surface. Grok prefixes the server name (e.g. `ctxmode__ctx_run`); Pi registers the seven tool names directly; agy (Antigravity CLI) exposes them under MCP server `ctxmode` (lazy-loaded schemas in `~/.gemini/antigravity-cli/mcp/ctxmode/`, invoked via `call_mcp_tool` with `ServerName: "ctxmode"`).
 
