@@ -334,3 +334,63 @@ func mustSymlink(t *testing.T, target, link string) {
 		t.Fatal(err)
 	}
 }
+
+// TestReadonlyAllowlist_Cccc pins the cccc complexity-tool policy: pure
+// query spellings (--help/-h/--version/-V, single arg) and analysis runs
+// that carry BOTH --no-cache and --no-config are admitted; cache/config
+// writers, unknown options and every missing-guard combination fail closed.
+func TestReadonlyAllowlist_Cccc(t *testing.T) {
+	t.Setenv(auditEnvRole, "reviewer")
+	t.Setenv(auditEnvReadonly, "")
+
+	allow := [][]string{
+		{"cccc", "--help"},
+		{"cccc", "-h"},
+		{"cccc", "--version"},
+		{"cccc", "-V"},
+		{"cccc", "--no-cache", "--no-config", "foo.go"},
+		{"cccc", "--no-config", "--no-cache", "--table", "src/"},
+		{"cccc", "--no-cache", "--no-config", "--pretty", "--no-ignore", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "--lang", "go", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "--exclude-lang=rs", "--ext", "go,c", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "--exclude", "dist/**", "--min", "3", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "--max-cognitive", "15", "--max-cyclomatic=10", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "--top-cognitive", "5", "--top-cyclomatic=5", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "--jobs", "2", "-j4", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "--", "-looks-like-flag.go"},
+		{"cccc", "--no-cache", "--no-config", "--no-cache", "--no-config", "a.go"}, // duplicates
+		{"cccc", "--no-cache", "--no-config", "--exclude=-foo", "a.go"},            // glued '-'-leading value stays allowed
+	}
+	block := [][]string{
+		{"cccc"},
+		{"cccc", "foo.go"},                // neither guard flag
+		{"cccc", "--no-cache", "foo.go"},  // --no-config missing
+		{"cccc", "--no-config", "foo.go"}, // --no-cache missing
+		{"cccc", "--help", "foo.go"},      // query flag + extra args
+		{"cccc", "-hV"},                   // glued query cluster
+		{"cccc", "--no-cache", "--no-config", "--version"},
+		{"cccc", "--no-cache", "--no-config", "--cache", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "--cache-file", "/tmp/x", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "--cache-file=/tmp/x", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "--config", "/tmp/c.toml", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "--config=/tmp/c.toml", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "--print-cache-file"},
+		{"cccc", "--no-cache", "--no-config", "--future-opt", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "-x", "a.go"},
+		{"cccc", "--no-cache", "--no-config", "--lang=go=extra", "--cache"},   // glued '=' value then blocked opt
+		{"cccc", "--no-cache", "--no-config", "--lang", "--cache", "a.go"},    // '-'-leading separate value rejected
+		{"cccc", "--no-cache", "--no-config", "-j", "--cache-file", "/tmp/x"}, // bare -j must not swallow an option
+		{"cccc", "--no-cache", "--no-config", "--lang"},                       // valued option at end: missing value
+		{"cccc", "--no-cache", "--no-config", "--jobs", "-"},                  // lone "-" is not a value either
+	}
+	for _, a := range allow {
+		if hit := screenReadonlyAllowlist(a); hit != "" {
+			t.Errorf("screenReadonlyAllowlist(%v) must allow, got %q", a, hit)
+		}
+	}
+	for _, a := range block {
+		if hit := screenReadonlyAllowlist(a); hit == "" {
+			t.Errorf("screenReadonlyAllowlist(%v) must block", a)
+		}
+	}
+}
