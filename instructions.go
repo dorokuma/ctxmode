@@ -13,12 +13,19 @@ action argument (ctx_stats and ctx_report take none).
   execute_file (code over FILE_CONTENT), batch (many commands + optional
   queries), run_task (go_test|go_build|go_vet|npm_test|npm_run_build|
   cargo_test|cargo_build|make|custom; fixed argv). Large output auto-indexed.
-- ctx_fs: sandboxed workspace filesystem. ls (list), glob (pattern), stat
+- ctx_fs: sandboxed workspace filesystem — only mounted workspace
+  directories are reachable; paths outside (e.g. /tmp) are refused, so read
+  known out-of-workspace files with the host's own file-reading tool (e.g.
+  Read). ls (list), glob (pattern), stat
   (metadata), rg (content search), resolve (fuzzy-ranked file lookup from an
   approximate/@-style path), related (files related to a given file: test/impl
   pairs, same stem, siblings). Prefer over ad-hoc shell find/ls/rg.
-- ctx_git: read-only git. status (porcelain -b), diff (path/stat/staged), log
-  (n/path/oneline). No commit/push/reset.
+- ctx_git: read-only git. Only status (porcelain -b), diff (path/stat/staged), log
+  (n or limit/max_count/path/oneline); path is a single git pathspec passed
+  to git as-is (git's own pathspec matching applies) — no separate glob
+  parameter, no shell expansion; use ctx_fs or ctx_run argv=["git", ...]
+  for file globbing or multi-pattern filtering.
+  No commit/push/reset.
 - ctx_kb: local knowledge base. index (path), search (query), fetch
   (URL→markdown→index), stats, purge (confirm:true), doctor (install check).
 - ctx_bg: background processes from ctx_run action=execute background:true. Starting a background job returns immediately and never proactively pushes notifications. After receiving its id, call ctx_bg action=wait once by id or pid (blocking this tool call; default 60000ms, maximum 1 hour; timeout does not kill). Completed results remain wait-addressable through a bounded handoff window even if the detailed registry entry is pruned; after that window the id is unknown. id and pid are mutually exclusive. kill terminates (and wakes waiters); repeated wait is a stable read of the same terminal result, while repeated kill or kill of a completed/expired id returns no-match.
