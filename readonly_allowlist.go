@@ -373,8 +373,108 @@ func init() {
 	readonlyAllowlist["mount"] = &cmdAllow{check: checkMountReadonly}
 	readonlyAllowlist["kill"] = &cmdAllow{check: checkKillReadonly}
 	readonlyAllowlist["ctxmode"] = &cmdAllow{check: checkCtxmodeReadonly}
+	// cccc (complexity metrics): pure-query forms --help/-h/--version/-V plus
+	// analysis runs gated on BOTH --no-cache and --no-config (default deny on
+	// every other option — --cache/--cache-file/--config can write or point
+	// anywhere, --print-cache-file leaks a path). See checkCcccReadonly.
+	// NOTE: this policy models the option semantics of github.com/moznion/cccc
+	// ONLY. A different same-named `cccc` exists (Debian packages Tim
+	// Littlefair's C and C++ Code Counter, which writes .cccc/ output into the
+	// CWD by default); the guard matches the command name, not which binary
+	// sits on PATH, so running the moznion tool is a deployment precondition.
+	readonlyAllowlist["cccc"] = &cmdAllow{check: checkCcccReadonly}
 	// Deleted from strict allowlist (prefer misblock): shells, python*, tar/unzip/
 	// compressors, sqlite3, curl, cd/read/((, gcc/make family, git-fsck.
+}
+
+func checkCcccReadonly(argv []string) string {
+	args := argv[1:]
+	if len(args) == 0 {
+		return "cccc bare"
+	}
+	// Pure-query spellings: exactly one flag, nothing else.
+	if len(args) == 1 {
+		switch args[0] {
+		case "--help", "-h", "--version", "-V":
+			return ""
+		}
+	}
+	sawNoCache := false
+	sawNoConfig := false
+	endOpts := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if endOpts {
+			continue // operand slot after -- (a path operand may start with -)
+		}
+		if a == "--" {
+			endOpts = true
+			continue
+		}
+		if a == "-" || !strings.HasPrefix(a, "-") {
+			continue // path operand
+		}
+		if strings.HasPrefix(a, "--") {
+			name := a[2:]
+			glued := false
+			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				name = name[:eq]
+				glued = true
+			}
+			switch name {
+			case "no-cache":
+				sawNoCache = !glued
+			case "no-config":
+				sawNoConfig = !glued
+			case "table", "pretty", "no-ignore":
+				// boolean flags only; --flag=val is rejected below
+			case "lang", "exclude-lang", "ext", "exclude",
+				"max-cognitive", "max-cyclomatic", "min",
+				"top-cognitive", "top-cyclomatic", "jobs":
+				if glued {
+					// --opt=VAL passes the value through uninterpreted
+					// (--exclude=-foo stays allowed).
+					continue
+				}
+				// Separate form: the value slot must exist and must not start
+				// with '-' (a lone "-" included) — no listed value legitimately
+				// does, so this never lets a denied option pose as a value
+				// (--lang --cache is rejected, never swallowed).
+				if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+					return "cccc --" + name + " missing value"
+				}
+				i++
+				continue
+			default:
+				// --cache/--cache-file/--config/--print-cache-file, -V/--help/
+				// -h/--version in multi-arg form and every unknown option.
+				return "cccc --" + name
+			}
+			if glued {
+				return "cccc --" + name + "= is not a flag"
+			}
+			continue
+		}
+		// Short-option cluster: only -j takes a value (glued in the cluster
+		// tail, or separate in the next argv — same value-slot rule as the
+		// long valued options: missing or '-'-leading rejects). -h/-V are
+		// query flags and are rejected here in multi-arg form.
+		ch := a[1]
+		if ch != 'j' {
+			return "cccc -" + string(ch)
+		}
+		if len(a) == 2 {
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return "cccc -j missing value"
+			}
+			i++ // bare -j: consume the next argv as its value
+		}
+		// else -j4 / -j<rest>: the tail is the value, nothing else to scan
+	}
+	if !sawNoCache || !sawNoConfig {
+		return "cccc requires --no-cache and --no-config"
+	}
+	return ""
 }
 
 func checkSystemctlReadonly(argv []string) string {
@@ -1625,7 +1725,7 @@ files: ls cat head tail wc stat file du tree realpath basename dirname readlink
 search: rg grep find sed
 text: sort uniq cut tr jq diff cmp echo printf true false
 vcs: git
-go_meta: go gofmt ctxmode
+go_meta: go gofmt ctxmode cccc
 ops: ps pgrep ss journalctl systemctl which date pwd mount kill hc
 `)
 }
