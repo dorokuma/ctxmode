@@ -92,14 +92,15 @@ func (s *server) toolRunTask(ctx context.Context, _ *mcp.CallToolRequest, args r
 	}
 	audit.rec.CWD = cwd
 	// Role-guard head screening resolves relative/aliased command names the way
-	// the task child will; pin this call's cwd for the guards below.
-	defer withScreenCwd(cwd)()
+	// the task child will; this call's cwd rides the guardCall as immutable
+	// per-call state (the shared screenCwd global is gone).
 
 	// Role guards (role_guards.go): run_task is a build/test entry point, so a
 	// strict read-only role may not call it at all; every sub-agent caller's
 	// constructed argv is screened for nested dispatch (a `custom` argv could
 	// otherwise name an agent executable). Recorded as screen block + error.
 	guard := currentGuardCall()
+	guard.cwd = cwd
 	if guard.strictReadonly {
 		audit.setScreen(shellBlock, ruleReadonlyWrite)
 		return nil, nil, guardBlockedError(ruleReadonlyWrite, "run_task")

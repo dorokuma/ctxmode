@@ -40,7 +40,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -863,7 +862,7 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 // over pathEnv — each alias resolves under the PATH its own level's
 // env ops install. Exhausted peels and alias chains hitting the bound
 // return exhausted (fail-closed) like peelWrappers.
-func peelWrappersAndSbxAliases(argv []string, pathEnv string) (head []string, envAs envAssignments, effPath string, exhausted bool) {
+func peelWrappersAndSbxAliases(argv []string, pathEnv string, caller callerIdentity) (head []string, envAs envAssignments, effPath string, exhausted bool) {
 	cur := argv
 	effPath = pathEnv
 	for steps := 0; steps < peelWrapperMaxSteps; steps++ {
@@ -877,7 +876,7 @@ func peelWrappersAndSbxAliases(argv []string, pathEnv string) (head []string, en
 		// A PATH alias whose typed name is not a wrapper but resolves to
 		// one (foo -> sbx, myenv -> env) needs its options peeled too:
 		// rewrite the head to the resolved wrapper and loop.
-		if rb := canonicalResolvedBase(resolveHeadBase(h[0], effPath)); rb != "" && rb != hb && isPeeledWrapperBase(rb) {
+		if rb := canonicalResolvedBase(resolveHeadBase(h[0], effPath, caller.screenCwd())); rb != "" && rb != hb && isPeeledWrapperBase(rb) {
 			cur = append([]string{rb}, h[1:]...)
 			continue
 		}
@@ -2043,14 +2042,14 @@ func hasHcControlChars(s string) bool {
 // running executable (path or SameFile). This is an IDENTITY test only — the
 // authorization decision always needs the span-bound provenance, never
 // SameFile alone.
-func headIsCtxmodeOrSelfExe(head0, effPath string) bool {
+func headIsCtxmodeOrSelfExe(head0, effPath, cwd string) bool {
 	if head0 == "" || isDynamicArg(head0) {
 		return false
 	}
 	if canonicalResolvedBase(filepath.Base(head0)) == "ctxmode" {
 		return true
 	}
-	if canonicalResolvedBase(resolveHeadBase(head0, effPath)) == "ctxmode" {
+	if canonicalResolvedBase(resolveHeadBase(head0, effPath, cwd)) == "ctxmode" {
 		return true
 	}
 	self, selfInfo, err := resolvedSelfExe()
@@ -2059,7 +2058,7 @@ func headIsCtxmodeOrSelfExe(head0, effPath string) bool {
 	}
 	cand := head0
 	if !filepath.IsAbs(cand) {
-		cand = filepath.Join(currentScreenCwd(), cand)
+		cand = filepath.Join(cwd, cand)
 	}
 	if filepath.Clean(cand) == self {
 		return true
@@ -2086,7 +2085,7 @@ func screenCtxmodeGateHead(typedHead []string, seg shellSegment, prov *hcGatePro
 		// The rewrite must be the one this prepare* pass minted: same buffer,
 		// exact head word span, exact --hc-gate word span, safe wrappers, no
 		// env -i, and the prepared argv shape.
-		_, headIdx, wrappers, envAs, exhausted := peelWrappersWithIndex(seg.argv)
+		_, headIdx, wrappers, envAs, exhausted := peelWrappersWithIndex(seg.argv, callerIdentity{})
 		if exhausted || headIdx < 0 || len(seg.argWords) != len(seg.argv) {
 			return "ctxmode --hc-gate"
 		}
@@ -2310,12 +2309,16 @@ var pureQueryOnlyHeads = map[string]bool{
 	"dispatch-agent-go": true,
 }
 
-// currentScreenCwd returns the directory relative command spellings resolve
-// against: the ctx_run cwd of the call being screened when a guard set it,
-// else the process working directory (where a bare name would exec anyway).
-func currentScreenCwd() string {
-	if screenCwd != "" {
-		return screenCwd
+// resolveHeadBase resolves relative command spellings against cwd — the
+// ctx_run cwd of the call being screened when a guard carried it in on the
+// caller identity, else the process working directory (where a bare name
+// would exec anyway). cwd is per-call state: it travels inside the
+// immutable callerIdentity that every recursion threads explicitly, never
+// through shared package state, so two calls screened concurrently can no
+// longer pollute each other's resolution base.
+func (c callerIdentity) screenCwd() string {
+	if c.cwd != "" {
+		return c.cwd
 	}
 	if wd, err := os.Getwd(); err == nil {
 		return wd
@@ -2323,30 +2326,10 @@ func currentScreenCwd() string {
 	return ""
 }
 
-// screenCwd is the ctx_run cwd of the call under screening (see
-// withScreenCwd). Empty during unit screening, which makes currentScreenCwd
-// fall back to the process working directory.
-var screenCwd string
-
 // testTrustedHomeRoot is set only by isolated unit tests (via
 // withTestTrustedHome) so tests can build a fake $HOME inside t.TempDir()
 // without weakening the production /tmp ban.
 var testTrustedHomeRoot string
-
-// withScreenCwd records the ctx_run cwd of the call under screening and
-// returns the restore func, for `defer withScreenCwd(cwd)()` at each guarded
-// entry point (execute, execute_file, batch, run_task).
-func withScreenCwd(cwd string) func() {
-	prev := screenCwd
-	if cwd != "" {
-		screenCwd = cwd
-	}
-	runtime.LockOSThread()
-	return func() {
-		screenCwd = prev
-		runtime.UnlockOSThread()
-	}
-}
 
 // transparentShimBins are toolchain version-manager shim multiplexers whose
 // runtime dispatch is keyed on argv[0] (the shim link name) rather than the
@@ -2506,19 +2489,19 @@ func isLinuxbrewPathDir(norm string) bool {
 // shims (mise, asdf, rustup, pyenv, volta, fnm, corepack) preserve the typed
 // tool basename so shim-wrapped interpreters and allowlisted tools keep their
 // real identity.
-func resolveHeadBase(name, pathEnv string) string {
+func resolveHeadBase(name, pathEnv, cwd string) string {
 	if name == "" || isDynamicArg(name) {
 		return ""
 	}
 	target := name
 	if !filepath.IsAbs(target) {
 		if !looksLikePath(target) {
-			p, dot, err := lookPathIn(target, pathEnv)
+			p, dot, err := lookPathIn(target, pathEnv, cwd)
 			if err != nil || (dot && !hasExplicitRelativeSegment(pathEnv)) {
 				return ""
 			}
 			target = p
-		} else if cwd := currentScreenCwd(); cwd != "" {
+		} else if cwd != "" {
 			target = filepath.Join(cwd, target)
 		}
 	}
@@ -2547,13 +2530,13 @@ func hasExplicitRelativeSegment(pathEnv string) bool {
 }
 
 // lookPathIn emulates execvp name resolution over an explicit PATH value:
-// bare names scan each segment (relative segments resolve against the
-// screen cwd, empty segments mean "."); returns (path, foundInDot, err).
-func lookPathIn(name, pathEnv string) (string, bool, error) {
+// bare names scan each segment (relative segments resolve against cwd, the
+// screened call's working directory; empty segments mean "."); returns
+// (path, foundInDot, err).
+func lookPathIn(name, pathEnv, cwd string) (string, bool, error) {
 	if pathEnv == "" {
 		pathEnv = os.Getenv("PATH")
 	}
-	cwd := currentScreenCwd()
 	for _, dir := range strings.Split(pathEnv, ":") {
 		dot := false
 		switch {
@@ -2667,12 +2650,12 @@ func isVersionSuffix(s string) bool {
 // headBaseAliasHits returns every name a command head can resolve to: its
 // own basename plus, when the file behind head[0] is a symlink, the basename
 // of the resolved target.
-func headBaseAliasHits(headArgv []string, pathEnv string) []string {
+func headBaseAliasHits(headArgv []string, pathEnv string, caller callerIdentity) []string {
 	if len(headArgv) == 0 {
 		return nil
 	}
 	out := []string{filepath.Base(headArgv[0])}
-	if b := resolveHeadBase(headArgv[0], pathEnv); b != "" && b != out[0] {
+	if b := resolveHeadBase(headArgv[0], pathEnv, caller.screenCwd()); b != "" && b != out[0] {
 		out = append(out, b)
 	}
 	return out
@@ -2682,11 +2665,11 @@ func headBaseAliasHits(headArgv []string, pathEnv string) []string {
 // pathEnv is not backed by an untrusted/world-writable binary, a symlink
 // escaping into /tmp, or a user-directory binary planted to shadow a core
 // system command (C10: [pattern:path-trust-user-writable]).
-func screenPathHeadTrust(head0, pathEnv string) string {
+func screenPathHeadTrust(head0, pathEnv string, caller callerIdentity) string {
 	if head0 == "" || isDynamicArg(head0) || looksLikePath(head0) || filepath.IsAbs(head0) {
 		return ""
 	}
-	p, dot, err := lookPathIn(head0, pathEnv)
+	p, dot, err := lookPathIn(head0, pathEnv, caller.screenCwd())
 	if err != nil {
 		return ""
 	}
@@ -2708,7 +2691,7 @@ func screenPathHeadTrust(head0, pathEnv string) string {
 			return "untrusted path binary " + head0
 		}
 		resolved = filepath.Clean(resolved)
-		realCwd := filepath.Clean(currentScreenCwd())
+		realCwd := filepath.Clean(caller.screenCwd())
 		if ec, e := filepath.EvalSymlinks(realCwd); e == nil {
 			realCwd = filepath.Clean(ec)
 		}
@@ -2720,18 +2703,18 @@ func screenPathHeadTrust(head0, pathEnv string) string {
 			return ""
 		}
 		resDir := filepath.Clean(filepath.Dir(resolved))
-		if (isSystemPathDir(resDir) || isLinuxbrewPathDir(resDir) || isUserToolchainPathDir(resDir)) &&
-			isTrustedExecutableOnDisk(resolved, euid) {
+		if (isSystemPathDir(resDir) || isLinuxbrewPathDir(resDir) || caller.isUserToolchainPathDir(resDir)) &&
+			isTrustedExecutableOnDiskCwd(resolved, euid, caller.screenCwd()) {
 			return ""
 		}
 		return "untrusted path binary " + head0
 	}
 	dir := filepath.Clean(filepath.Dir(p))
-	inToolchainDir := isUserToolchainPathDir(dir) || isLinuxbrewPathDir(dir)
+	inToolchainDir := caller.isUserToolchainPathDir(dir) || isLinuxbrewPathDir(dir)
 	if !isSystemPathDir(dir) && !inToolchainDir {
 		return ""
 	}
-	if !isTrustedExecutableOnDisk(p, euid) {
+	if !isTrustedExecutableOnDiskCwd(p, euid, caller.screenCwd()) {
 		return "untrusted path binary " + head0
 	}
 	if inToolchainDir && userDirForbiddenShadowHeads[head0] {
@@ -2743,7 +2726,7 @@ func screenPathHeadTrust(head0, pathEnv string) string {
 			rb := filepath.Base(resolved)
 			rdir := filepath.Dir(resolved)
 			if (isSystemPathDir(rdir) || (isLinuxbrewPathDir(rdir) && resolved != filepath.Clean(p))) &&
-				(rb == head0 || isAllowedSystemReadonlyAlias(head0, rb, head0, pathEnv)) {
+				(rb == head0 || isAllowedSystemReadonlyAlias(head0, rb, head0, pathEnv, caller.screenCwd())) {
 				return ""
 			}
 		}
@@ -2758,8 +2741,11 @@ func screenPathHeadTrust(head0, pathEnv string) string {
 // write bits are not judged there (see the note in isTrustedPathDirOnDisk) —
 // and that it does not resolve into /tmp|/var/tmp|/dev/shm|/run.
 func isTrustedExecutableOnDisk(binPath string, euid int) bool {
+	return isTrustedExecutableOnDiskCwd(binPath, euid, "")
+}
+func isTrustedExecutableOnDiskCwd(binPath string, euid int, cwd string) bool {
 	dir := filepath.Clean(filepath.Dir(binPath))
-	if !isTrustedPathDirOnDisk(dir, euid) {
+	if !isTrustedPathDirOnDiskCwd(dir, euid, cwd) {
 		return false
 	}
 	// ADAPT2: a binary in a lexical system PATH dir skips the owner-uid
@@ -2797,12 +2783,12 @@ func isTrustedExecutableOnDisk(binPath string, euid int) bool {
 			return false
 		}
 	}
-	return isTrustedPathDirOnDisk(resDir, euid)
+	return isTrustedPathDirOnDiskCwd(resDir, euid, cwd)
 }
 
 // isAllowedSystemReadonlyAlias reports whether a symlink from typedBase to
 // resolvedBase is a standard OS/distro alias for an allowlisted command.
-func isAllowedSystemReadonlyAlias(typedBase, resolvedBase, head0, pathEnv string) bool {
+func isAllowedSystemReadonlyAlias(typedBase, resolvedBase, head0, pathEnv, cwd string) bool {
 	if typedBase == resolvedBase || transparentShimBins[resolvedBase] {
 		return true
 	}
@@ -2843,7 +2829,7 @@ func isAllowedSystemReadonlyAlias(typedBase, resolvedBase, head0, pathEnv string
 		}
 	}
 	if resolvedBase == "coreutils" || resolvedBase == "busybox" {
-		if p, _, err := lookPathIn(head0, pathEnv); err == nil && isSystemPathDir(filepath.Dir(p)) {
+		if p, _, err := lookPathIn(head0, pathEnv, cwd); err == nil && isSystemPathDir(filepath.Dir(p)) {
 			return true
 		}
 	}
@@ -2854,17 +2840,17 @@ func isAllowedSystemReadonlyAlias(typedBase, resolvedBase, head0, pathEnv string
 // readonly mode resolves through a symlink to a different binary name, the
 // target binary name is also permitted by the readonly allowlist (closing the
 // C10 symlink-to-unlisted-binary bypass).
-func screenReadonlyAliasTarget(typedHead []string, pathEnv string) string {
+func screenReadonlyAliasTarget(typedHead []string, pathEnv string, caller callerIdentity) string {
 	if len(typedHead) == 0 {
 		return ""
 	}
 	typedBase := canonicalResolvedBase(filepath.Base(typedHead[0]))
-	rb := resolveHeadBase(typedHead[0], pathEnv)
+	rb := resolveHeadBase(typedHead[0], pathEnv, caller.screenCwd())
 	if rb == "" {
 		return ""
 	}
 	rbCanon := canonicalResolvedBase(rb)
-	if isAllowedSystemReadonlyAlias(typedBase, rbCanon, typedHead[0], pathEnv) {
+	if isAllowedSystemReadonlyAlias(typedBase, rbCanon, typedHead[0], pathEnv, caller.screenCwd()) {
 		return ""
 	}
 	aliasArgv := append([]string{rbCanon}, typedHead[1:]...)
@@ -2883,7 +2869,7 @@ func screenNestedDispatch(headArgv []string, pathEnv string, depth int, caller c
 	if len(headArgv) == 0 {
 		return ""
 	}
-	bases := headBaseAliasHits(headArgv, pathEnv)
+	bases := headBaseAliasHits(headArgv, pathEnv, caller)
 	// A path-form head (./x, /tmp/x, ...) whose typed OR resolved basename
 	// lands on a report-channel head must be a trusted standard install
 	// path: screenHcSubagent judges only the tail args, so a planted
@@ -2930,7 +2916,7 @@ func screenNestedDispatch(headArgv []string, pathEnv string, depth int, caller c
 			if _, hit := screenGitGlobalArgs(headArgv[1:]); hit != "" {
 				return hit
 			}
-			if hit := screenGitSubagentExecArgs(headArgv[1:]); hit != "" {
+			if hit := screenGitSubagentExecArgs(headArgv[1:], caller); hit != "" {
 				return hit
 			}
 		// npm/pnpm/yarn `exec`/`dlx` fetch-and-run a package binary — the
@@ -3359,7 +3345,7 @@ func screenNodeRunnerSubagent(base string, args []string, effPath string, depth 
 				if !isSingleWordOptionValue(val) {
 					return "dynamic code payload"
 				}
-				if _, ok := resolveNodeRunnerPathOpt(val); !ok {
+				if _, ok := resolveNodeRunnerPathOpt(val, caller.screenCwd()); !ok {
 					return base + " --" + name
 				}
 			case "cache", "registry", "workspace":
@@ -3475,6 +3461,15 @@ type callerIdentity struct {
 	// verified `sh -c` script word; every other cross-buffer recursion clears
 	// it by construction.
 	hcProv *hcGateProvenance
+	// cwd is the ctx_run cwd of the call under screening: immutable per-call
+	// state carried by value on this identity so every recursion resolves
+	// relative heads/PATH segments against THIS call's directory and two
+	// concurrent screens cannot pollute each other (replaces the former
+	// package-level screenCwd, [pattern:shared-guard-cwd]). "" means no
+	// call cwd was pinned — screenCwd() then falls back to the process
+	// working directory, the same semantics the global empty value had
+	// (unit screening).
+	cwd string
 }
 
 // currentCallerIdentity reads the caller's role identity from the process
@@ -3513,9 +3508,12 @@ func (c callerIdentity) seededWith(envAs envAssignments) callerIdentity {
 // callerIdentity returns a callerIdentity consistent with g's role flags so
 // direct unit-test guardCall structs (e.g. guardCall{subagent: true} run
 // under `CTXMODE_ROLE=verifier go test`) never inherit a conflicting role
-// from the outer test runner's process environment.
+// from the outer test runner's process environment. The pinned call cwd
+// rides along so alias/PATH resolution inside the guard sees THIS call's
+// working directory.
 func (g guardCall) callerIdentity() callerIdentity {
 	c := currentCallerIdentity()
+	c.cwd = g.cwd
 	if !g.readonly && !g.strictReadonly {
 		c.readonly = ""
 		if auditRoleIsReadonly(c.role) {
@@ -3789,7 +3787,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		return ""
 	}
 	if len(head) == 0 {
-		if hit := screenEnvAssignments(envAs, kind, caller.role, caller.readonly, ""); hit != "" {
+		if hit := screenEnvAssignments(envAs, kind, caller.role, caller.readonly, "", caller); hit != "" {
 			return hit
 		}
 		return screenPayloads()
@@ -3813,17 +3811,17 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	// worker's `echo --hc-gate` is untouched, while a raw
 	// `./postinstall --hc-gate …`, `ctxmode --hc-gate …` or a dynamic option
 	// word in the ctxmode option zone fails closed.
-	if headIsCtxmodeOrSelfExe(typedHead[0], effPath) {
+	if headIsCtxmodeOrSelfExe(typedHead[0], effPath, caller.screenCwd()) {
 		if hit := screenCtxmodeGateHead(typedHead, seg, entryProv); hit != "" {
 			return hit
 		}
 	}
 	// C10: verify that the winning PATH binary is not an untrusted file or a
 	// planted binary in a user-writable toolchain dir shadowing a system command.
-	if hit := screenPathHeadTrust(typedHead[0], effPath); hit != "" {
+	if hit := screenPathHeadTrust(typedHead[0], effPath, caller); hit != "" {
 		return hit
 	}
-	if rb := resolveHeadBase(head[0], effPath); rb != "" && rb != base {
+	if rb := resolveHeadBase(head[0], effPath, caller.screenCwd()); rb != "" && rb != base {
 		// Only promote the symlink target into head[0]/base when the typed
 		// head is NOT already a structural guard/interpreter head (so
 		// `python3 -> custom_runner` never loses `python3 -c` unwrapping).
@@ -3844,7 +3842,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			}
 		}
 	}
-	if hit := screenEnvAssignments(envAs, kind, caller.role, caller.readonly, base); hit != "" {
+	if hit := screenEnvAssignments(envAs, kind, caller.role, caller.readonly, base, caller); hit != "" {
 		return hit
 	}
 	caller = effCaller
@@ -3896,7 +3894,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return allowlistDetail(hit)
 		}
 		if !gateLeaf {
-			if hit := screenReadonlyAliasTarget(typedHead, effPath); hit != "" {
+			if hit := screenReadonlyAliasTarget(typedHead, effPath, caller); hit != "" {
 				return allowlistDetail(hit)
 			}
 		}
@@ -3934,7 +3932,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 					envAs2.addAssign(a)
 				}
 			}
-			if hit := screenEnvAssignments(envAs2, kind, caller.role, caller.readonly, base); hit != "" {
+			if hit := screenEnvAssignments(envAs2, kind, caller.role, caller.readonly, base, caller); hit != "" {
 				return hit
 			}
 		}
@@ -3956,7 +3954,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			// peel + -c walk prepare* used to mint it, so no other word — even
 			// one carrying identical decoded text — can inherit provenance.
 			if entryProv != nil {
-				if _, headIdx, _, _, exhausted := peelWrappersWithIndex(seg.argv); !exhausted && headIdx >= 0 {
+				if _, headIdx, _, _, exhausted := peelWrappersWithIndex(seg.argv, caller); !exhausted && headIdx >= 0 {
 					if scriptRel, _, glued, slotOK := locateShellCSlot(seg.argv[headIdx:]); slotOK && !glued && scriptRel >= 0 {
 						if absIdx := headIdx + scriptRel; absIdx >= 0 && absIdx < len(seg.argWords) {
 							inner.hcProv = entryProv.innerProvAt(seg.srcCode, seg.argWords[absIdx], text)
@@ -3970,7 +3968,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			// judged as bash, not POSIX sh.
 			shellDialect := base
 			if shellHeads[base] {
-				if rb := canonicalResolvedBase(resolveHeadBase(typedHead[0], effPath)); shellHeads[rb] {
+				if rb := canonicalResolvedBase(resolveHeadBase(typedHead[0], effPath, caller.screenCwd())); shellHeads[rb] {
 					shellDialect = rb
 				}
 			}
@@ -4008,6 +4006,10 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			g.strictReadonly = true
 			g.readonly = true
 		}
+		// The inner code screen resolves under the same call cwd as the
+		// enclosing head — the guardCall must inherit it or the
+		// process-cwd fallback would resolve differently.
+		g.cwd = caller.cwd
 		if rule, detail := g.guardCtxRunCode(lang, code); rule != "" {
 			if detail == roSSHWriteHit || detail == "ctxmode index" || isReportGuardDetail(detail) {
 				return detail
@@ -4036,10 +4038,10 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	}
 	if base == "xargs" {
 		if k := xargsTargetIndex(head); k >= 0 && k < len(head) {
-			if xargsFeedsCodeFlag(head[k:], head, caller.pathEnv) {
+			if xargsFeedsCodeFlag(head[k:], head, caller.pathEnv, caller) {
 				return "dynamic code payload"
 			}
-			if repl := xargsReplToken(head); repl != "" && replTokenInExecSlot(head[k:], repl, caller.pathEnv) {
+			if repl := xargsReplToken(head); repl != "" && replTokenInExecSlot(head[k:], repl, caller.pathEnv, caller) {
 				return "dynamic code payload"
 			}
 			// Nested hc/herdr-core via xargs can receive injected argv at runtime
@@ -4047,11 +4049,11 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			// including help/query — because no -I `xargs hc --help` still appends
 			// stdin words and breaks the two-word pure-query shape.
 			target := head[k:]
-			th, _, teffP, tex := peelWrappersAndSbxAliases(target, caller.pathEnv)
+			th, _, teffP, tex := peelWrappersAndSbxAliases(target, caller.pathEnv, caller)
 			if tex {
 				return "xargs " + depthExceededHit
 			}
-			for _, b := range headBaseAliasHits(th, teffP) {
+			for _, b := range headBaseAliasHits(th, teffP, caller) {
 				if b == "hc" || b == "herdr-core" {
 					return "xargs " + b
 				}
@@ -4060,10 +4062,10 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			// --hc-gate on the xargs line, yet the runtime argv becomes
 			// os.Args[1] == "--hc-gate": an unprovenanced ctxmode/selfExe target
 			// through xargs is blocked unconditionally.
-			if len(th) > 0 && headIsCtxmodeOrSelfExe(th[0], teffP) {
+			if len(th) > 0 && headIsCtxmodeOrSelfExe(th[0], teffP, caller.screenCwd()) {
 				return "xargs ctxmode --hc-gate"
 			}
-			innerSeg := xargsDerivedSeg(head[:k], head[k:], seg, caller.pathEnv)
+			innerSeg := xargsDerivedSeg(head[:k], head[k:], seg, caller.pathEnv, caller)
 			return peelResolvedSegDepth(head[k:], innerSeg, kind, depth+1, caller)
 		}
 		return ""
@@ -4160,7 +4162,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	if hit := screenReadonlyAllowlistSeg(typedHead, seg.gateProvenanced); hit != "" {
 		return allowlistDetail(hit)
 	}
-	return screenReadonlyWritePath(typedHead, effPath)
+	return screenReadonlyWritePath(typedHead, effPath, caller)
 }
 
 // xargsHasArgFile reports whether the xargs option zone (before the target
@@ -4226,7 +4228,7 @@ func stdinOnlySeg(s shellSegment) shellSegment {
 // an ssh invocation whose remote command reads a program from stdin
 // (`echo code | xargs ssh dmit sh`), where OpenSSH joins xargs-appended
 // words into the remote login shell command string.
-func xargsDerivedSeg(xargsOpts, targetArgv []string, outerSeg shellSegment, pathEnv string) shellSegment {
+func xargsDerivedSeg(xargsOpts, targetArgv []string, outerSeg shellSegment, pathEnv string, caller callerIdentity) shellSegment {
 	if xargsHasArgFile(xargsOpts) {
 		// The child inherits the outer stdin stream — but only the stdin
 		// facts, never the outer words or their provenance.
@@ -4234,7 +4236,7 @@ func xargsDerivedSeg(xargsOpts, targetArgv []string, outerSeg shellSegment, path
 	}
 	hasOuterInput := outerSeg.pipedStdin || outerSeg.stdinRedir ||
 		outerSeg.hereString != "" || len(outerSeg.heredocText) > 0
-	if hasOuterInput && sshTunnelsStdinProgram(targetArgv, pathEnv) {
+	if hasOuterInput && sshTunnelsStdinProgram(targetArgv, pathEnv, caller) {
 		return shellSegment{pipedStdin: true}
 	}
 	return shellSegment{}
@@ -4246,11 +4248,11 @@ func xargsDerivedSeg(xargsOpts, targetArgv []string, outerSeg shellSegment, path
 // remote command head / code slot inside an ssh invocation. Data operand
 // positions (`grep foo {}`, `git -C {} status`, `sh -c 'echo "$1"' _ {}`)
 // return false.
-func replTokenInExecSlot(innerArgv []string, token, pathEnv string) bool {
+func replTokenInExecSlot(innerArgv []string, token, pathEnv string, caller callerIdentity) bool {
 	if token == "" || len(innerArgv) == 0 {
 		return false
 	}
-	head, _, effPath, exhausted := peelWrappersAndSbxAliases(innerArgv, pathEnv)
+	head, _, effPath, exhausted := peelWrappersAndSbxAliases(innerArgv, pathEnv, caller)
 	if exhausted || len(head) == 0 {
 		return true
 	}
@@ -4269,7 +4271,7 @@ func replTokenInExecSlot(innerArgv []string, token, pathEnv string) bool {
 		}
 	}
 	base := filepath.Base(head[0])
-	if base == "ssh" || resolveHeadBase(head[0], effPath) == "ssh" {
+	if base == "ssh" || resolveHeadBase(head[0], effPath, caller.screenCwd()) == "ssh" {
 		remoteCmd, hit := parseSSHInvocation(head)
 		if hit != "" {
 			return true
@@ -4279,8 +4281,12 @@ func replTokenInExecSlot(innerArgv []string, token, pathEnv string) bool {
 				continue
 			}
 			// In POSIX sh, a lone "{}" is parsed into shellNoopWords or a
-			// command head containing the token.
-			if replTokenInExecSlot(rseg.argv, token, os.Getenv("PATH")) {
+			// command head containing the token. The remote recursion keeps
+			// ONLY the resolution base of this call (the old shared screenCwd
+			// reached remote segments too): the remote PATH base stays
+			// os.Getenv("PATH") and the remote identity/env taint stay
+			// cleared — nothing else of the local caller crosses.
+			if replTokenInExecSlot(rseg.argv, token, os.Getenv("PATH"), callerIdentity{cwd: caller.cwd}) {
 				return true
 			}
 		}
@@ -4310,7 +4316,7 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 			return h
 		}
 	}
-	langs, stdinIsProg := remoteStdinProgramLangs(remoteCmd)
+	langs, stdinIsProg := remoteStdinProgramLangsCwd(remoteCmd, caller.screenCwd())
 	if seg.pipedStdin && stdinIsProg {
 		if kind == 'r' || callerReadonlyRole(caller) {
 			return roSSHWriteHit
@@ -4367,11 +4373,20 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 	}
 	vehicleOnly := stdinIsProg &&
 		(seg.hereString != "" || len(seg.heredocText) > 0) &&
-		isPureRemoteStdinVehicle(remoteCmd)
+		isPureRemoteStdinVehicleCwd(remoteCmd, caller.screenCwd())
 
 	remoteCaller := caller
 	remoteCaller.envTaint = nil
 	remoteCaller.pathEnv = ""
+	// Remote commands resolve under the remote login env — the remote
+	// PATH base above — but the old shared screenCwd was still the
+	// resolution base for relative heads inside remote segments
+	// (`ssh host ./bin/mytool`, find/xargs replace-tokens landing in an
+	// exec slot, bare-interp stdin detection). Dropping it here would
+	// silently fall back to the process cwd and change every such
+	// verdict, so the call cwd rides along (it is a resolution base,
+	// not identity: role/envTaint/pathEnv stay remote, cleared above).
+	remoteCaller.cwd = caller.cwd
 	if kind == 's' {
 		if h := guardShellSubagentDepthEnv(remoteCmd, depth+1, remoteCaller, nil); h != "" {
 			return h
@@ -4397,8 +4412,10 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 // segments, no output redirect, no write-capable wrapper ops, no env
 // prefixes — anything else can carry an unaudited side effect and is not
 // pure. Input redirections and background/& are rejected by the readonly
-// grammar itself (SH11 MF-1/F7).
-func isPureRemoteStdinVehicle(remoteCmd string) bool {
+// grammar itself (SH11 MF-1/F7). The no-cwd wrapper keeps the legacy
+// unit-screening semantics: resolution falls back to the process working
+// directory, the same base the empty screenCwd had.
+func isPureRemoteStdinVehicleCwd(remoteCmd, cwd string) bool {
 	roSegs, hit := parseReadonlyShellSegments(remoteCmd)
 	if hit != "" || len(roSegs) != 1 {
 		return false
@@ -4421,7 +4438,10 @@ func isPureRemoteStdinVehicle(remoteCmd string) bool {
 	// interpreter whose OWN code primitives (open/write/exec) are far
 	// wider than the shell grammar the body was screened under, so only
 	// a lang == "" head qualifies for the exemption (A-1).
-	lang, isProg := stdinProgramHead(s.argv)
+	// A lang == "" verdict resolves the remote vehicle head under the
+	// same screen cwd the outer caller used (process-cwd fallback when
+	// unset): the old shared screenCwd reached this recursion too.
+	lang, isProg := stdinProgramHeadCwd(s.argv, cwd)
 	return isProg && lang == ""
 }
 
@@ -4429,14 +4449,17 @@ func isPureRemoteStdinVehicle(remoteCmd string) bool {
 // contains a head that reads its program from stdin (a bare remote
 // `sh`/`python3 -` with no inline code). Only then are piped bytes
 // unaudited remote CODE rather than data for the remote command.
-func remoteReadsProgramFromStdin(remoteCmd string) bool {
-	_, reads := remoteStdinProgramLangs(remoteCmd)
+func remoteReadsProgramFromStdinCwd(remoteCmd, cwd string) bool {
+	_, reads := remoteStdinProgramLangsCwd(remoteCmd, cwd)
 	return reads
 }
 
 // remoteStdinProgramLangs returns the interpreter langs of remote heads that
-// read program text from stdin (SF-2).
-func remoteStdinProgramLangs(remoteCmd string) (langs []string, readsProg bool) {
+// read program text from stdin (SF-2). The no-cwd wrapper resolves heads
+// against the process working directory — the base the old empty screenCwd
+// had; the Cwd variant carries the screening call's own cwd so relative
+// remote heads resolve like the outer caller just resolved them.
+func remoteStdinProgramLangsCwd(remoteCmd, cwd string) (langs []string, readsProg bool) {
 	for _, seg := range splitShellSegments(remoteCmd) {
 		if seg.depthExceeded || seg.parseErr != "" {
 			return []string{""}, true
@@ -4445,7 +4468,7 @@ func remoteStdinProgramLangs(remoteCmd string) (langs []string, readsProg bool) 
 			len(seg.heredocText) > 0 || seg.hereString != "" {
 			continue
 		}
-		if lang, isProg := stdinProgramHead(seg.argv); isProg {
+		if lang, isProg := stdinProgramHeadCwd(seg.argv, cwd); isProg {
 			langs = append(langs, lang)
 		}
 	}
@@ -4861,7 +4884,7 @@ var toolchainRelPathHeads = map[string]bool{
 // known system or toolchain directory. A $PATH/${PATH} expansion appears
 // as the unforgeable envPathSelfPlaceholder; every other dynamic or
 // literal-$ segment rejects (SH11 MF-5.1, Q4).
-func pathIsUnsafeForSubagent(val, headBase string) bool {
+func pathIsUnsafeForSubagent(val, headBase string, caller callerIdentity) bool {
 	if val == "" {
 		return true // empty PATH ≡ "."
 	}
@@ -4890,7 +4913,7 @@ func pathIsUnsafeForSubagent(val, headBase string) bool {
 			return true
 		}
 		norm := filepath.Clean(p)
-		if !isSafePathDirEntry(norm) {
+		if !isSafePathDirEntryCwd(norm, caller.screenCwd()) {
 			return true
 		}
 	}
@@ -4962,8 +4985,14 @@ func stripTrustedHomePrefix(norm string) (string, bool) {
 
 // isUserToolchainPathDir reports whether norm is a recognized user-home or
 // project-local development toolchain directory (anchored under a trusted
-// home directory or the active screenCwd).
+// home directory or the caller identity's screen cwd).
+func (c callerIdentity) isUserToolchainPathDir(norm string) bool {
+	return isUserToolchainPathDirCwd(norm, c.screenCwd())
+}
 func isUserToolchainPathDir(norm string) bool {
+	return isUserToolchainPathDirCwd(norm, callerIdentity{}.screenCwd())
+}
+func isUserToolchainPathDirCwd(norm, cwd string) bool {
 	if tail, ok := stripTrustedHomePrefix(norm); ok {
 		for _, toolPref := range []string{
 			"/.local/share/mise/", "/.local/share/fnm/", "/.local/share/nvim/",
@@ -4989,8 +5018,8 @@ func isUserToolchainPathDir(norm string) bool {
 			}
 		}
 	}
-	// Project-local venv / node_modules/.bin under currentScreenCwd().
-	if cwd := currentScreenCwd(); cwd != "" {
+	// Project-local venv / node_modules/.bin under the screen cwd.
+	if cwd != "" {
 		cleanCwd := filepath.Clean(cwd)
 		if !isTmpOrScratchPath(cleanCwd) && strings.HasPrefix(norm, cleanCwd+"/") {
 			rel := norm[len(cleanCwd):]
@@ -5029,7 +5058,7 @@ func statUIDAndPermOK(fi os.FileInfo, euid int, allowSymlinkMode bool) bool {
 // Non-existent directories pass if their nearest existing ancestor is not a
 // scratch path or world-writable, preserving dry-run and cross-machine
 // replay compatibility.
-func isTrustedPathDirOnDisk(norm string, euid int) bool {
+func isTrustedPathDirOnDiskCwd(norm string, euid int, cwd string) bool {
 	if isTmpOrScratchPath(norm) {
 		return false
 	}
@@ -5097,7 +5126,7 @@ func isTrustedPathDirOnDisk(norm string, euid int) bool {
 	if isTmpOrScratchPath(resolved) {
 		return false
 	}
-	if resolved != norm && !isSystemPathDir(resolved) && !isLinuxbrewPathDir(resolved) && !isUserToolchainPathDir(resolved) {
+	if resolved != norm && !isSystemPathDir(resolved) && !isLinuxbrewPathDir(resolved) && !isUserToolchainPathDirCwd(resolved, cwd) {
 		return false
 	}
 	st, err := os.Stat(resolved)
@@ -5113,6 +5142,9 @@ func isTrustedPathDirOnDisk(norm string, euid int) bool {
 // isSafePathDirEntry reports whether a canonicalised absolute PATH segment
 // is a trusted system or development-toolchain directory (C10 hardened).
 func isSafePathDirEntry(norm string) bool {
+	return isSafePathDirEntryCwd(norm, "")
+}
+func isSafePathDirEntryCwd(norm, cwd string) bool {
 	if !filepath.IsAbs(norm) {
 		return false
 	}
@@ -5120,10 +5152,10 @@ func isSafePathDirEntry(norm string) bool {
 	if isTmpOrScratchPath(norm) {
 		return false
 	}
-	if !isSystemPathDir(norm) && !isLinuxbrewPathDir(norm) && !isUserToolchainPathDir(norm) {
+	if !isSystemPathDir(norm) && !isLinuxbrewPathDir(norm) && !isUserToolchainPathDirCwd(norm, cwd) {
 		return false
 	}
-	return isTrustedPathDirOnDisk(norm, os.Geteuid())
+	return isTrustedPathDirOnDiskCwd(norm, os.Geteuid(), cwd)
 }
 
 // isSafeIFSValue reports whether an IFS= value is a benign field-split
@@ -5350,7 +5382,7 @@ func envTruthy(v string) bool {
 //
 // Detail strings name only the variable (never the value): env values can
 // carry secrets and the detail goes into the audit record verbatim.
-func screenEnvAssignments(envAs envAssignments, kind byte, callerRole, callerReadonly, headBase string) string {
+func screenEnvAssignments(envAs envAssignments, kind byte, callerRole, callerReadonly, headBase string, caller callerIdentity) string {
 	effRole := callerRole
 	effReadonly := callerReadonly
 	callerSub := callerRole != "" || envTruthy(callerReadonly)
@@ -5393,7 +5425,7 @@ func screenEnvAssignments(envAs envAssignments, kind byte, callerRole, callerRea
 			// genuine $PATH self-reference pass; empty, relative, tmp, and
 			// unvetted dynamic segments reject (MF-5.1).
 			if op.key == "PATH" {
-				if pathIsUnsafeForSubagent(op.value, headBase) {
+				if pathIsUnsafeForSubagent(op.value, headBase, caller) {
 					return "env PATH"
 				}
 				continue
@@ -5702,21 +5734,21 @@ func screenFindArgsSeg(args []string, outerSeg shellSegment, kind byte, depth in
 			}
 			if j > i+1 {
 				inner := args[i+1 : j]
-				if replTokenInExecSlot(inner, "{}", caller.pathEnv) {
+				if replTokenInExecSlot(inner, "{}", caller.pathEnv, caller) {
 					return "find " + a + " dynamic code payload"
 				}
 				// Nested hc/herdr-core via find -exec* / -ok* receives path args
 				// at runtime ({} replacement / + batching). Block unconditionally.
-				th, _, teffP, tex := peelWrappersAndSbxAliases(inner, caller.pathEnv)
+				th, _, teffP, tex := peelWrappersAndSbxAliases(inner, caller.pathEnv, caller)
 				if tex {
 					return "find " + a + " " + depthExceededHit
 				}
-				for _, b := range headBaseAliasHits(th, teffP) {
+				for _, b := range headBaseAliasHits(th, teffP, caller) {
 					if b == "hc" || b == "herdr-core" {
 						return "find " + a + " " + b
 					}
 				}
-				if len(th) > 0 && headIsCtxmodeOrSelfExe(th[0], teffP) {
+				if len(th) > 0 && headIsCtxmodeOrSelfExe(th[0], teffP, caller.screenCwd()) {
 					return "find " + a + " ctxmode --hc-gate"
 				}
 				innerSeg := shellSegment{}
@@ -5756,9 +5788,8 @@ func screenFindArgsSeg(args []string, outerSeg shellSegment, kind byte, depth in
 // screener so `sh -c 'pig'` cannot route around it. The read-only-inclusive
 // surfaces (ctxmode index) are only reachable through the guardCall entry
 // points, which pass the caller's read-only classification explicitly.
-func guardArgvSubagent(argv []string) string {
-	return peelResolvedDepth(argv, 's', 0, currentCallerIdentity())
-}
+// (Defined beside guardArgvReadonly below so the method+wrapper pair stays
+// together.)
 
 // screenStdinProgram screens text that reaches a head as its PROGRAM on
 // stdin: shell text when lang is "" (a bare sh/bash/… reading stdin),
@@ -5779,6 +5810,10 @@ func screenStdinProgram(text, lang string, kind byte, depth int, caller callerId
 	} else {
 		g.strictReadonly = true
 	}
+	// The inner code screen resolves under the same call cwd as the
+	// enclosing segment — the guardCall must inherit it or the process-cwd
+	// fallback would resolve differently than the head just screened.
+	g.cwd = caller.cwd
 	if rule, detail := g.guardCtxRunCode(lang, text); rule != "" {
 		return detail
 	}
@@ -5807,8 +5842,8 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 	// REMOTE command reads its program from stdin is left for the ssh
 	// model (screenSSHHead) — it returns the remote-aware roSSHWriteHit /
 	// "piped stdin to ssh" verdict.
-	if seg.pipedStdin && !seg.stdinRedir && !sshTunnelsStdinProgram(seg.argv, caller.pathEnv) {
-		if lang, isProg, _ := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv); isProg {
+	if seg.pipedStdin && !seg.stdinRedir && !sshTunnelsStdinProgram(seg.argv, caller.pathEnv, caller) {
+		if lang, isProg, _ := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller); isProg {
 			if lang == "" {
 				return "piped code to shell"
 			}
@@ -5825,7 +5860,7 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 		// R15: the program head may itself hide inside wrappers
 		// (flock/watch/xargs/env) — env ops found at ANY recursion
 		// level are the env the here-string text runs under.
-		if lang, isProg, envAs := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv); isProg {
+		if lang, isProg, envAs := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller); isProg {
 			if hit := screenStdinProgram(seg.hereString, lang, kind, depth, caller.seededWith(envAs)); hit != "" {
 				return hit
 			}
@@ -5843,11 +5878,11 @@ func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller c
 	// feed its base (R4: a remote `PATH=` op leaking into the base drops
 	// the ssx -> ssh resolution; a `PATH=$PATH:` prefix replayed twice
 	// collapses to `:<dir>`).
-	sshTunnel := sshTunnelsStdinProgram(seg.argv, caller.pathEnv)
+	sshTunnel := sshTunnelsStdinProgram(seg.argv, caller.pathEnv, caller)
 	if seg.stdinRedir {
 		return ""
 	}
-	lang, isProg, envAs := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv)
+	lang, isProg, envAs := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller)
 	if !isProg {
 		return ""
 	}
@@ -6149,18 +6184,22 @@ var gitStashReadonlySubs = map[string]bool{
 // under its own basename AND the basename of the file it resolves through
 // (headBaseAliasHits), so an alias like `ln -s /usr/bin/rm /tmp/remove`
 // cannot walk past the write table.
+// screenReadonlyWrite is the no-caller convenience form: it screens
+// under the process-cwd fallback the old empty screenCwd had. Guard
+// recursions that already hold a caller use screenReadonlyWritePath so
+// the call's own cwd reaches alias resolution.
 func screenReadonlyWrite(headArgv []string) string {
-	return screenReadonlyWritePath(headArgv, "")
+	return screenReadonlyWritePath(headArgv, "", callerIdentity{})
 }
 
 // screenReadonlyWritePath is screenReadonlyWrite with an explicit effective
 // PATH for alias resolution (Q4 symlink penetration under envAs overrides).
-func screenReadonlyWritePath(headArgv []string, pathEnv string) string {
+func screenReadonlyWritePath(headArgv []string, pathEnv string, caller callerIdentity) string {
 	if len(headArgv) == 0 {
 		return ""
 	}
 	args := headArgv[1:]
-	for _, base := range headBaseAliasHits(headArgv, pathEnv) {
+	for _, base := range headBaseAliasHits(headArgv, pathEnv, caller) {
 		// `python -m <mod>` runs an arbitrary module: screen it as the command
 		// it actually executes instead of as an interpreter head. Runs before
 		// the alias walk so /usr/bin/python3 and python3 behave identically.
@@ -8240,7 +8279,7 @@ func screenGitGlobalArgs(args []string) (int, string) {
 // (also git fetch --recurse-submodules=<cmd>-style run helpers are not
 // covered — those go through the command whitelist). A non-empty, non-cat
 // pager/exec value is screened as shell text.
-func screenGitSubagentExecArgs(args []string) string {
+func screenGitSubagentExecArgs(args []string, caller callerIdentity) string {
 	// Skip the global options (same walk as screenGitGlobalArgs) to reach
 	// the subcommand operands.
 	i, hit := screenGitGlobalArgs(args)
@@ -8286,7 +8325,7 @@ func screenGitSubagentExecArgs(args []string) string {
 		if val == "" || val == "cat" {
 			continue
 		}
-		if hit := guardShellSubagentDepth(val, 1, currentCallerIdentity()); hit != "" {
+		if hit := guardShellSubagentDepth(val, 1, caller); hit != "" {
 			return "git " + a
 		}
 		// Non-blocked but non-trivial command text still arms a hook — a
@@ -9179,10 +9218,28 @@ func screenInterpFileRun(args []string, base string) string {
 // ---------- end additional head screens ----------
 
 // guardArgvReadonly screens one argv for the strict read-only write guard.
-// A `shell -c` argv is redirected to the shell-text screener.
+// A `shell -c` argv is redirected to the shell-text screener. The legacy
+// package wrapper keeps the pre-refactor semantics exactly: it screens
+// under currentCallerIdentity() (a readonly verifier/reviewer caller stays
+// readonly, never re-classified by guardCall{}.callerIdentity's role
+// coercion) and resolves against the process working directory — the base
+// the old empty screenCwd had.
 func guardArgvReadonly(argv []string) string {
 	return peelResolvedDepth(argv, 'r', 0, currentCallerIdentity())
 }
+
+// guardArgvSubagent is the matching legacy sub-agent wrapper (same
+// currentCallerIdentity + process-cwd semantics). The guardCall methods
+// are the pinned-cwd production path: they carry THIS call's cwd and keep
+// g.callerIdentity's readonly/role reconciliation intact.
+func guardArgvSubagent(argv []string) string {
+	return peelResolvedDepth(argv, 's', 0, currentCallerIdentity())
+}
+func (g guardCall) guardArgvReadonly(argv []string) string {
+	return peelResolvedDepth(argv, 'r', 0, g.callerIdentity())
+}
+
+// guardShellSubagent screens shell command text for nested agent dispatch:
 
 // guardShellReadonly screens shell command text for the strict read-only
 // write guard: every segment's head goes through screenReadonlyWrite, and a
@@ -10947,8 +11004,8 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 					}
 					return ruleSubagentNestedAgent, hit
 				}
-				if _, isProg, _ := stdinProgramHeadWithEnv(argv, 0, envAssignments{}, caller.pathEnv); isProg {
-					if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(argv, caller.pathEnv) {
+				if _, isProg, _ := stdinProgramHeadWithEnv(argv, 0, envAssignments{}, caller.pathEnv, caller); isProg {
+					if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(argv, caller.pathEnv, caller) {
 						return ruleReadonlyWrite, roSSHWriteHit
 					}
 					allResolved = false
@@ -11009,7 +11066,7 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 			if len(argv) == 0 {
 				continue
 			}
-			if hit := screenReadonlyWrite(argv); hit != "" {
+			if hit := screenReadonlyWritePath(argv, "", caller); hit != "" {
 				return ruleReadonlyWrite, hit
 			}
 			return ruleReadonlyWrite, "spawn primitive " + filepath.Base(argv[0])
@@ -12302,11 +12359,11 @@ func consumeNumOptTail(a string, j int, ch byte) int {
 func isHexDigit(b byte) bool {
 	return b >= '0' && b <= '9' || b >= 'a' && b <= 'f' || b >= 'A' && b <= 'F'
 }
-func xargsFeedsCodeFlag(inner, full []string, pathEnv string) bool {
+func xargsFeedsCodeFlag(inner, full []string, pathEnv string, caller callerIdentity) bool {
 	if len(inner) == 0 {
 		return false
 	}
-	head, _, effPath, exhausted := peelWrappersAndSbxAliases(inner, pathEnv)
+	head, _, effPath, exhausted := peelWrappersAndSbxAliases(inner, pathEnv, caller)
 	if exhausted || len(head) == 0 {
 		return false
 	}
@@ -12318,7 +12375,7 @@ func xargsFeedsCodeFlag(inner, full []string, pathEnv string) bool {
 	// code flag (`xargs ssh dmit sh -c`) or a replace-token in the remote
 	// command head / code slot (`xargs -I{} ssh dmit {}`).
 	base := filepath.Base(head[0])
-	if base == "ssh" || resolveHeadBase(head[0], effPath) == "ssh" {
+	if base == "ssh" || resolveHeadBase(head[0], effPath, caller.screenCwd()) == "ssh" {
 		remoteCmd, hit := parseSSHInvocation(head)
 		if hit != "" {
 			return false
@@ -12330,7 +12387,7 @@ func xargsFeedsCodeFlag(inner, full []string, pathEnv string) bool {
 			if len(rseg.argv) == 0 {
 				continue
 			}
-			if xargsFeedsCodeFlag(rseg.argv, full, os.Getenv("PATH")) {
+			if xargsFeedsCodeFlag(rseg.argv, full, os.Getenv("PATH"), callerIdentity{cwd: caller.cwd}) {
 				return true
 			}
 		}
@@ -14623,6 +14680,11 @@ type guardCall struct {
 	subagent       bool
 	readonly       bool
 	strictReadonly bool
+	// cwd is the resolved ctx_run cwd of the call under screening, pinned
+	// by the entry point before any guard runs. "" reproduces the former
+	// screenCwd=="" semantics: resolution falls back to the process
+	// working directory (unit tests and unguarded call sites).
+	cwd string
 }
 
 func currentGuardCall() guardCall {
@@ -14641,8 +14703,9 @@ func (g guardCall) guardCtxRunArgv(argv []string) (rule, detail string) {
 	if !g.subagent && !g.strictReadonly {
 		return "", "" // main agent: no role guard runs at all
 	}
+	caller := g.callerIdentity()
 	if g.subagent {
-		if hit := peelResolvedDepth(argv, 's', 0, currentCallerIdentity()); hit != "" {
+		if hit := peelResolvedDepth(argv, 's', 0, caller); hit != "" {
 			if hit == "ctxmode index" || hit == roSSHWriteHit {
 				return ruleReadonlyWrite, hit
 			}
@@ -14650,7 +14713,7 @@ func (g guardCall) guardCtxRunArgv(argv []string) (rule, detail string) {
 		}
 	}
 	if g.strictReadonly {
-		if hit := guardArgvReadonly(argv); hit != "" {
+		if hit := g.guardArgvReadonly(argv); hit != "" {
 			return ruleReadonlyWrite, hit
 		}
 	}
@@ -14670,7 +14733,7 @@ func (g guardCall) guardCtxRunShellEnv(code string, envAs envAssignments) (rule,
 	if !g.subagent && !g.strictReadonly {
 		return "", "" // main agent: never enters the sub-agent parser
 	}
-	caller := currentCallerIdentity().seededWith(envAs)
+	caller := g.callerIdentity().seededWith(envAs)
 	if g.subagent {
 		if hit := guardShellSubagentDepth(code, 0, caller); hit != "" {
 			if hit == "ctxmode index" || hit == roSSHWriteHit {
@@ -14774,23 +14837,13 @@ func hasInterpScriptExt(a string) bool {
 	return false
 }
 
-func stdinProgramHead(argv []string) (lang string, isInterp bool) {
-	lang, isProg, _ := stdinProgramHeadEnv(argv)
+// stdinProgramHeadCwd is stdinProgramHead with the screening call's
+// resolution base pinned: callers that already hold a callerIdentity pass
+// its cwd so relative heads inside the argv resolve against the call's
+// directory, not the process cwd the zero caller would fall back to.
+func stdinProgramHeadCwd(argv []string, cwd string) (lang string, isInterp bool) {
+	lang, isProg, _ := stdinProgramHeadWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"), callerIdentity{cwd: cwd})
 	return lang, isProg
-}
-
-// stdinProgramHeadEnv is stdinProgramHead plus the environment the resolved
-// stdin-program head runs under: the merged env ops peeled at every
-// recursion level (prefix KEY=VAL, env -i/-u/-S operands, ops inside -c
-// payloads and ssh remote commands). ctx_run stdin payloads and remote
-// heredoc screens must replay them — `sh -c 'env HOME=-exec sh'` runs the
-// stdin text with HOME overridden, so $HOME's placeholder grant is gone.
-func stdinProgramHeadEnv(argv []string) (lang string, isInterp bool, envAs envAssignments) {
-	return stdinProgramHeadDepth(argv, 0)
-}
-
-func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool, envAs envAssignments) {
-	return stdinProgramHeadWithEnv(argv, depth, envAssignments{}, os.Getenv("PATH"))
 }
 
 // stdinProgramHeadWithEnv is stdinProgramHeadDepth carrying the env ops
@@ -14804,8 +14857,8 @@ func stdinProgramHeadDepth(argv []string, depth int) (lang string, isInterp bool
 // caller's effective PATH — its own process PATH at depth 0): a peeled
 // `PATH=$PATH:<dir>` prefix then expands $PATH like the runtime instead
 // of collapsing to `:<dir>` ([pattern:sbx-wrapper-unwrap-asymmetry]).
-func stdinProgramHeadWithEnv(argv []string, depth int, inherited envAssignments, basePath string) (lang string, isInterp bool, envAs envAssignments) {
-	targets := stdinProgramTargetsWithEnv(argv, depth, inherited, basePath)
+func stdinProgramHeadWithEnv(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity) (lang string, isInterp bool, envAs envAssignments) {
+	targets := stdinProgramTargetsWithEnv(argv, depth, inherited, basePath, caller)
 	if len(targets) == 0 {
 		return "", false, inherited
 	}
@@ -14817,7 +14870,7 @@ func stdinProgramHeadWithEnv(argv []string, depth int, inherited envAssignments,
 // pathEnv is the effective PATH the peeled head resolves against: the
 // env ops peeled at each layer replay over it so PATH-injected aliases
 // (foo -> sbx, ssx -> ssh) resolve like the runtime would.
-func peelToSSHHead(argv []string, pathEnv string) []string {
+func peelToSSHHead(argv []string, pathEnv string, caller callerIdentity) []string {
 	cur := argv
 	effPath := pathEnv
 	for depth := 0; depth < peelWrapperMaxSteps && len(cur) > 0; depth++ {
@@ -14831,11 +14884,11 @@ func peelToSSHHead(argv []string, pathEnv string) []string {
 		// skipped the option peel because peelWrappers saw only the typed
 		// name — rewrite the head to the resolved wrapper and loop so its
 		// own options are peeled like a directly typed invocation.
-		if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath)); rb != "" && rb != base && isPeeledWrapperBase(rb) {
+		if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath, caller.screenCwd())); rb != "" && rb != base && isPeeledWrapperBase(rb) {
 			cur = append([]string{rb}, head[1:]...)
 			continue
 		}
-		if base == "ssh" || resolveHeadBase(head[0], effPath) == "ssh" {
+		if base == "ssh" || resolveHeadBase(head[0], effPath, caller.screenCwd()) == "ssh" {
 			return head
 		}
 		switch base {
@@ -14863,8 +14916,8 @@ func peelToSSHHead(argv []string, pathEnv string) []string {
 	}
 	return nil
 }
-func sshTunnelsStdinProgram(argv []string, pathEnv string) bool {
-	head := peelToSSHHead(argv, pathEnv)
+func sshTunnelsStdinProgram(argv []string, pathEnv string, caller callerIdentity) bool {
+	head := peelToSSHHead(argv, pathEnv, caller)
 	if len(head) == 0 {
 		return false
 	}
@@ -14872,7 +14925,7 @@ func sshTunnelsStdinProgram(argv []string, pathEnv string) bool {
 	if hit != "" {
 		return false
 	}
-	return remoteReadsProgramFromStdin(remoteCmd)
+	return remoteReadsProgramFromStdinCwd(remoteCmd, caller.screenCwd())
 }
 
 // guardCtxRunStdin screens a ctx_run stdin payload when the argv's resolved
@@ -14888,14 +14941,15 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 	if stdin == "" || (!g.subagent && !g.strictReadonly) {
 		return "", ""
 	}
-	targets := stdinProgramTargetsWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"))
+	caller := g.callerIdentity()
+	targets := stdinProgramTargetsWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"), caller)
 	if len(targets) == 0 {
 		return "", ""
 	}
 	for _, t := range targets {
 		gSeg := g
 		if gSeg.readonly && !gSeg.strictReadonly &&
-			(t.remote || sshTunnelsStdinProgram(argv, os.Getenv("PATH"))) {
+			(t.remote || sshTunnelsStdinProgram(argv, os.Getenv("PATH"), caller)) {
 			// The stream leaves this host (ssh forwards it): a
 			// read-only-but-not-strict caller faces the strict screen.
 			gSeg.strictReadonly = true
@@ -14921,6 +14975,7 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 	if stdin == "" || (!g.subagent && !g.strictReadonly) {
 		return "", ""
 	}
+	caller := g.callerIdentity()
 	for _, seg := range splitShellSegments(command) {
 		if seg.depthExceeded || seg.parseErr != "" {
 			detail := seg.parseErr
@@ -14938,14 +14993,14 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 			continue
 		}
-		targets := stdinProgramTargetsWithEnv(seg.argv, 0, envAssignments{}, os.Getenv("PATH"))
+		targets := stdinProgramTargetsWithEnv(seg.argv, 0, envAssignments{}, os.Getenv("PATH"), caller)
 		if len(targets) == 0 {
 			continue
 		}
 		for _, t := range targets {
 			gSeg := g
 			if gSeg.readonly && !gSeg.strictReadonly &&
-				(t.remote || sshTunnelsStdinProgram(seg.argv, os.Getenv("PATH"))) {
+				(t.remote || sshTunnelsStdinProgram(seg.argv, os.Getenv("PATH"), caller)) {
 				gSeg.strictReadonly = true
 			}
 			if t.lang == "" {
@@ -15142,7 +15197,7 @@ func isTrustedRelToolchainTarget(resolved, realCwd string, euid int) bool {
 	resDir := filepath.Clean(filepath.Dir(resolved))
 	if tail, ok := stripTrustedHomePrefix(resDir); ok {
 		for _, sub := range []string{"/node_modules/", "/.venv/", "/venv/"} {
-			if strings.Contains(tail+"/", sub) && isTrustedExecutableOnDisk(resolved, euid) {
+			if strings.Contains(tail+"/", sub) && isTrustedExecutableOnDiskCwd(resolved, euid, realCwd) {
 				return true
 			}
 		}
@@ -15192,7 +15247,7 @@ type stdinTarget struct {
 	remote bool
 }
 
-func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignments, basePath string) []stdinTarget {
+func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity) []stdinTarget {
 	if len(argv) == 0 || depth >= shellSplitMaxDepth {
 		return nil
 	}
@@ -15207,22 +15262,22 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 	base := filepath.Base(head[0])
 	if canon := canonicalResolvedBase(base); canon != base {
 		if isPeeledWrapperBase(canon) {
-			return stdinProgramTargetsWithEnv(append([]string{canon}, head[1:]...), depth+1, envAs, basePath)
+			return stdinProgramTargetsWithEnv(append([]string{canon}, head[1:]...), depth+1, envAs, basePath, caller)
 		}
 		head = append([]string{canon}, head[1:]...)
 		base = canon
 	}
 	effPath := envAs.effectivePATHFrom(basePath)
-	if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath)); rb != "" && rb != base {
+	if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath, caller.screenCwd())); rb != "" && rb != base {
 		if isPeeledWrapperBase(rb) {
-			return stdinProgramTargetsWithEnv(append([]string{rb}, head[1:]...), depth+1, envAs, basePath)
+			return stdinProgramTargetsWithEnv(append([]string{rb}, head[1:]...), depth+1, envAs, basePath, caller)
 		}
 		if !isStructuralGuardHead(base) {
 			head = append([]string{rb}, head[1:]...)
 			base = rb
 		}
 	}
-	collectSegs := func(segs []shellSegment, subEnv envAssignments, subPath string, mergeOuter bool) []stdinTarget {
+	collectSegs := func(segs []shellSegment, subEnv envAssignments, subPath string, mergeOuter bool, subCaller callerIdentity) []stdinTarget {
 		var out []stdinTarget
 		for _, seg := range segs {
 			if seg.depthExceeded || seg.parseErr != "" {
@@ -15232,7 +15287,7 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
-			for _, t := range stdinProgramTargetsWithEnv(seg.argv, depth+1, subEnv, subPath) {
+			for _, t := range stdinProgramTargetsWithEnv(seg.argv, depth+1, subEnv, subPath, subCaller) {
 				if mergeOuter {
 					t.envAs = envAs.merged(t.envAs)
 				}
@@ -15246,7 +15301,12 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 		if hit != "" {
 			return nil
 		}
-		targets := collectSegs(splitShellSegments(remoteCmd), envAssignments{}, os.Getenv("PATH"), true)
+		// Remote commands resolve under the remote login env — only the
+		// remote ops feed their PATH replay — but relative heads inside
+		// them still resolve under the screen cwd like the old shared
+		// screenCwd did (the remote ops themselves stay untainted).
+		remoteCaller := callerIdentity{cwd: caller.cwd}
+		targets := collectSegs(splitShellSegments(remoteCmd), envAssignments{}, os.Getenv("PATH"), true, remoteCaller)
 		// Every target of an ssh remote command runs OFF this host: the
 		// stream is forwarded verbatim, so mark it remote even when the
 		// remote program is a local-shell-shaped head (ssh host sh).
@@ -15266,7 +15326,7 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 		default:
 			segs = splitShellSegments(innerText)
 		}
-		return collectSegs(segs, envAs, basePath, false)
+		return collectSegs(segs, envAs, basePath, false, caller)
 	}
 	if _, _, has := unwrapInterpreterInline(head); has {
 		return nil
@@ -15280,17 +15340,17 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 		if isDynamicArg(inner) {
 			return []stdinTarget{{lang: "", envAs: envAs}}
 		}
-		return collectSegs(splitShellSegments(inner), envAs, basePath, false)
+		return collectSegs(splitShellSegments(inner), envAs, basePath, false, caller)
 	case "flock":
 		inner, cmdText := skipFlockArgs(head, 1)
 		if cmdText != "" {
 			if isDynamicArg(cmdText) {
 				return []stdinTarget{{lang: "", envAs: envAs}}
 			}
-			return collectSegs(splitShellSegments(cmdText), envAs, basePath, false)
+			return collectSegs(splitShellSegments(cmdText), envAs, basePath, false, caller)
 		}
 		if inner < len(head) {
-			return stdinProgramTargetsWithEnv(head[inner:], depth+1, envAs, basePath)
+			return stdinProgramTargetsWithEnv(head[inner:], depth+1, envAs, basePath, caller)
 		}
 		return nil
 	case "script":
@@ -15298,7 +15358,7 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 			if isDynamicArg(payload) {
 				return []stdinTarget{{lang: "", envAs: envAs}}
 			}
-			return collectSegs(splitShellSegments(payload), envAs, basePath, false)
+			return collectSegs(splitShellSegments(payload), envAs, basePath, false, caller)
 		}
 		return []stdinTarget{{lang: "", envAs: envAs}}
 	case "watch":
@@ -15313,20 +15373,20 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 			return nil
 		}
 		if execMode {
-			return stdinProgramTargetsWithEnv(head[k:], depth+1, envAs, basePath)
+			return stdinProgramTargetsWithEnv(head[k:], depth+1, envAs, basePath, caller)
 		}
 		text := strings.Join(head[k:], " ")
 		if isDynamicArg(text) {
 			return []stdinTarget{{lang: "", envAs: envAs}}
 		}
-		return collectSegs(splitShellSegments(text), envAs, basePath, false)
+		return collectSegs(splitShellSegments(text), envAs, basePath, false, caller)
 	case "xargs":
 		k := xargsTargetIndex(head)
 		if k >= len(head) {
 			return nil
 		}
-		if xargsFeedsCodeFlag(head[k:], head, effPath) {
-			innerHead, innerEnv, _, innerExhausted := peelWrappersAndSbxAliases(head[k:], effPath)
+		if xargsFeedsCodeFlag(head[k:], head, effPath, caller) {
+			innerHead, innerEnv, _, innerExhausted := peelWrappersAndSbxAliases(head[k:], effPath, caller)
 			envAs = envAs.merged(innerEnv)
 			if !innerExhausted && len(innerHead) > 0 {
 				if l, ok := heredocInterpLang(canonicalResolvedBase(filepath.Base(innerHead[0]))); ok {
@@ -15335,7 +15395,7 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 			}
 			return []stdinTarget{{lang: "", envAs: envAs}}
 		}
-		return stdinProgramTargetsWithEnv(head[k:], depth+1, envAs, basePath)
+		return stdinProgramTargetsWithEnv(head[k:], depth+1, envAs, basePath, caller)
 	}
 	if shellHeads[base] {
 		sawDashDash := false
@@ -15439,10 +15499,10 @@ func isLongOptAbbrev(name, full string, minPrefixLen int) bool {
 // resolveNodeRunnerPathOpt normalizes a path-valued option operand (--prefix /
 // --userconfig) of npx/bunx/pnpx and reports the resolved path plus whether it
 // is safe: single-word, only `~` or `~/...` for tilde (`~user` fails closed),
-// no '..' traversal on dynamic prefixes, relative paths joined against
-// currentScreenCwd(), and neither lexical nor symlink-resolved path inside
-// /tmp|/var/tmp|/dev/shm|/run.
-func resolveNodeRunnerPathOpt(val string) (string, bool) {
+// no '..' traversal on dynamic prefixes, relative paths joined against cwd
+// (the screened call's working directory), and neither lexical nor
+// symlink-resolved path inside /tmp|/var/tmp|/dev/shm|/run.
+func resolveNodeRunnerPathOpt(val string, cwd string) (string, bool) {
 	if val == "" || !isSingleWordOptionValue(val) {
 		return "", false
 	}
@@ -15471,7 +15531,6 @@ func resolveNodeRunnerPathOpt(val string) (string, bool) {
 	case filepath.IsAbs(val):
 		cand = filepath.Clean(val)
 	default:
-		cwd := currentScreenCwd()
 		if cwd == "" {
 			return "", false
 		}

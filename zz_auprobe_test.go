@@ -18,9 +18,14 @@ type auCase struct {
 }
 
 func auGuard(t *testing.T, c auCase) string {
+	return auGuardCwd(t, c, "")
+}
+
+func auGuardCwd(t *testing.T, c auCase, cwd string) string {
 	t.Setenv("CTXMODE_ROLE", c.role)
 	t.Setenv("CTXMODE_READONLY", c.ro)
 	g := currentGuardCall()
+	g.cwd = cwd
 	lang := c.lang
 	if lang == "" {
 		lang = "shell"
@@ -224,13 +229,7 @@ func TestAUProbePath(t *testing.T) {
 	run := func(id, role, cmd, stdin string, prep func(t *testing.T) string) {
 		t.Run(id, func(t *testing.T) {
 			cwd := prep(t)
-			if cwd != "" {
-				defer withScreenCwd(cwd)()
-				old, _ := os.Getwd()
-				os.Chdir(cwd)
-				defer os.Chdir(old)
-			}
-			auPrint(id, role, auGuard(t, auCase{id: id, role: role, cmd: cmd, stdin: stdin}))
+			auPrint(id, role, auGuardCwd(t, auCase{id: id, role: role, cmd: cmd, stdin: stdin}, cwd))
 		})
 	}
 	venv := func(name, target string) func(t *testing.T) string {

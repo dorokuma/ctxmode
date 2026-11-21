@@ -315,6 +315,13 @@ func TestDeployFragment_SecondDeployOverReadonlyPrevSucceeds(t *testing.T) {
 		// Hand the directory to an unprivileged user and re-run the
 		// fragment as them: without rm -f the cp over the read-only
 		// .prev is a real Permission denied.
+		// Chmod while dir is still owned by uid 0: after the chowns
+		// below it would require CAP_FOWNER and EPERM without it.
+		// dir lives under /tmp (world-traversable) so the unprivileged child
+		// can reach and write into it once it owns it.
+		if err := os.Chmod(dir, 0o777); err != nil {
+			t.Skipf("cannot chmod temp dir for unprivileged re-deploy: %v", err)
+		}
 		if err := os.Chown(dir, 65534, 65534); err != nil {
 			t.Skipf("cannot chown temp dir for unprivileged re-deploy: %v", err)
 		}
@@ -323,11 +330,6 @@ func TestDeployFragment_SecondDeployOverReadonlyPrevSucceeds(t *testing.T) {
 		}
 		if err := os.Chown(prev, 65534, 65534); err != nil {
 			t.Skipf("cannot chown .prev for unprivileged re-deploy: %v", err)
-		}
-		// dir lives under /tmp (world-traversable) so the unprivileged child
-		// can reach and write into it once it owns it.
-		if err := os.Chmod(dir, 0o777); err != nil {
-			t.Skipf("cannot chmod temp dir for unprivileged re-deploy: %v", err)
 		}
 		if _, err := exec.LookPath("setpriv"); err != nil {
 			t.Skip("setpriv not available for unprivileged re-deploy")

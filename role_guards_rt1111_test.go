@@ -16,11 +16,18 @@ import (
 // rtCmdRule returns the guard outcome for a shell command + stdin pair.
 // "" means the call passed every guard layer.
 func rtCmdRule(role, ro, cmd, stdin string) (rule, detail string) {
+	return rtCmdRuleCwd(role, ro, cmd, stdin, "")
+}
+
+// rtCmdRuleCwd is rtCmdRule with the call cwd pinned on the guardCall the
+// way main.go now pins it (cwd == "" keeps the process-cwd fallback).
+func rtCmdRuleCwd(role, ro, cmd, stdin, cwd string) (rule, detail string) {
 	os.Setenv("CTXMODE_ROLE", role)
 	os.Setenv("CTXMODE_READONLY", ro)
 	defer os.Unsetenv("CTXMODE_ROLE")
 	defer os.Unsetenv("CTXMODE_READONLY")
 	g := currentGuardCall()
+	g.cwd = cwd
 	if v, _ := screenShellCommand(cmd); v == shellBlock {
 		return "screenBlock", ""
 	}
@@ -31,11 +38,16 @@ func rtCmdRule(role, ro, cmd, stdin string) (rule, detail string) {
 }
 
 func rtArgvRule(role, ro string, argv []string, stdin string) (rule, detail string) {
+	return rtArgvRuleCwd(role, ro, argv, stdin, "")
+}
+
+func rtArgvRuleCwd(role, ro string, argv []string, stdin, cwd string) (rule, detail string) {
 	os.Setenv("CTXMODE_ROLE", role)
 	os.Setenv("CTXMODE_READONLY", ro)
 	defer os.Unsetenv("CTXMODE_ROLE")
 	defer os.Unsetenv("CTXMODE_READONLY")
 	g := currentGuardCall()
+	g.cwd = cwd
 	if rule, detail := g.guardCtxRunArgv(argv); rule != "" {
 		return rule, detail
 	}
@@ -242,7 +254,6 @@ func TestRT_A10_EnvHookCtxmodeKeys(t *testing.T) {
 // blocked executable as the package spec.
 func TestRT_A9_NodeRunner(t *testing.T) {
 	ws := nonTmpWS(t)
-	defer withScreenCwd(ws)()
 
 	block := []string{
 		"npx -c 'unset CTXMODE_ROLE; pig'",
@@ -260,7 +271,7 @@ func TestRT_A9_NodeRunner(t *testing.T) {
 		"npx --userconfig ../../../../../../tmp/evil.npmrc tsc --noEmit",
 	}
 	for _, cmd := range block {
-		if rule, _ := rtCmdRule("worker", "", cmd, ""); rule == "" {
+		if rule, _ := rtCmdRuleCwd("worker", "", cmd, "", ws); rule == "" {
 			t.Errorf("%q: got ALLOW, want block", cmd)
 		}
 	}
@@ -274,7 +285,7 @@ func TestRT_A9_NodeRunner(t *testing.T) {
 		"bunx --bun vitest run",
 	}
 	for _, cmd := range allow {
-		if rule, detail := rtCmdRule("worker", "", cmd, ""); rule != "" {
+		if rule, detail := rtCmdRuleCwd("worker", "", cmd, "", ws); rule != "" {
 			t.Errorf("%q: got BLOCK %s: %s, want ALLOW", cmd, rule, detail)
 		}
 	}
@@ -721,6 +732,26 @@ func TestRT_A1_SSHTightening(t *testing.T) {
 			t.Errorf("%s: got ALLOW, want block", c.name)
 		}
 	}
+	// Legacy argv-wrapper role compat: CTXMODE_ROLE=verifier must keep
+	// guardArgvSubagent's remote-readonly verdict — the wrapper screens
+	// under currentCallerIdentity() so a verifier caller is never
+	// re-classified to worker by the guardCall zero-value. PATH is
+	// pinned to a synthesized empty directory so the PATH head-trust
+	// screen (screenPathHeadTrust) can never pre-reject `ssh` on THIS
+	// host's binary (lookPathIn over one absolute empty dir returns
+	// err → the screen passes the head through), making the exact
+	// remote-readonly detail — not just any non-empty hit — decide the
+	// verdict. Synthesized argv only; no SSH is executed, no host ssh
+	// is read. The subtest restores the env on exit so later loops in
+	// this test never see the synthetic PATH.
+	t.Run("verifier-remote-readonly", func(t *testing.T) {
+		t.Setenv(auditEnvRole, "verifier")
+		t.Setenv(auditEnvReadonly, "")
+		t.Setenv("PATH", t.TempDir())
+		if got := guardArgvSubagent([]string{"ssh", "host", "rm", "-rf", "/tmp/x"}); got != roSSHWriteHit {
+			t.Errorf("guardArgvSubagent(ssh host rm -rf /tmp/x) under verifier with empty PATH dir: got %q, want %q", got, roSSHWriteHit)
+		}
+	})
 	allow := []struct{ name, role, cmd string }{
 		{"worker-ssh-shkc", "worker", "ssh -oBatchMode=yes -o 'StrictHostKeyChecking no' dmit uptime"},
 		{"worker-ssh-sh-heredoc", "worker", "ssh dmit sh <<'EOF'\nuptime\nEOF"},

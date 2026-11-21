@@ -90,10 +90,7 @@ func relVenvLink(t *testing.T, ws, linkName, target string) {
 
 func guardWorker(t *testing.T, cwd, cmd string) string {
 	t.Helper()
-	if cwd != "" {
-		defer withScreenCwd(cwd)()
-	}
-	return rtGuard(t, rtCase{id: t.Name(), role: "worker", cmd: cmd})
+	return rtGuardCwd(t, rtCase{id: t.Name(), role: "worker", cmd: cmd}, cwd)
 }
 
 func TestR3_RelativePATH_SymlinkToTmp(t *testing.T) {
