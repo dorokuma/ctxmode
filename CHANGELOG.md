@@ -5,6 +5,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [6.2.0] - 2026-11-22
+
 ### Fixed
 - **Restore the non-`sbx` SSH/PATH regression assertions dropped with `TestGuard_PeelSbxWrapper` (`readonly_allowlist_test.go`).** The peel-test deletion also removed five still-applicable assertions that only depend on the SSH PATH alias: the `xargs ssx dmit sh` piped-stdin tunnel, the `xargs ssx dmit sh -c` open code slot, `find -exec ssx dmit sh -c {} ;`, and the two stdin-probe PATH seeding boundaries (a remote `PATH=` op must not leak into the local resolution base, and `PATH=$PATH:<dir>` self-reference must not collapse). `TestGuard_SSHPathAliasRegressions` re-pins them verbatim under a neutral name with a fixture that plants ONLY `ssx -> /usr/bin/ssh` — no `sbx`/`foo` stand-in and no `PI_SANDBOX` logic returns.
 
