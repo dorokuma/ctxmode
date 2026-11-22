@@ -5,6 +5,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Changed
+- **README redesigned for readability, with a new Simplified Chinese translation and light/dark logo assets (`README.md`, `README.zh-CN.md`, `assets/logo-dark.svg`, `assets/logo-light.svg`).** The English README is rewritten around a centered hero (theme-switching `<picture>` logo, badges, anchor navigation), a Mermaid data-flow diagram, a six-cell highlights table, a 30-second quick start with a copy-paste `mcpServers` JSON example, a one-line-per-tool overview, and three `<details>` sections (security model, role-scoped read-only mode, local development). The auditor-facing callout, internal dispatcher-protocol details and the hard-coded version line are removed; `README.zh-CN.md` mirrors every section 1:1 in Simplified Chinese. Documentation only — no code, version or behavior change.
+
 ## [6.2.0] - 2026-11-22
 
 ### Fixed

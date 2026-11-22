@@ -1,198 +1,151 @@
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
+  <img alt="ctxmode logo" src="assets/logo-dark.svg" width="64" height="64">
+</picture>
+
 # ctxmode
 
-A 100% NPM/NodeJS-free, Go implementation of Mert Koseoglu's [context-mode](https://github.com/mksglu/context-mode).
+**Stop huge command logs and web pages from blowing up your AI's context window — a local-first Go MCP server that indexes heavy output into SQLite and saves up to 98% of tokens.**
 
-Local-first Model Context Protocol (MCP) server that virtualizes tool outputs, allowing AI coding agents to execute heavy tasks and save up to 98% in token usage.
+[![Go 1.26+](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&labelColor=18181b&logo=go&logoColor=white)](go.mod)
+[![MCP Server](https://img.shields.io/badge/MCP-Server-8b5cf6?style=flat-square&labelColor=18181b)](README.md)
+[![SQLite FTS5](https://img.shields.io/badge/SQLite-FTS5-003B57?style=flat-square&labelColor=18181b&logo=sqlite&logoColor=white)](https://sqlite.org/fts5.html)
+[![License: ELv2](https://img.shields.io/badge/License-ELv2-f59e0b?style=flat-square&labelColor=18181b)](LICENSE)
 
-Current version: **6.2.0**.
+[Quick Start](#quick-start) · [Highlights](#highlights) · [Tools](#tools-overview) · [Architecture](#how-it-works)
 
-Supported platform: **Linux**. Background process identity verification reads `/proc/<pid>/stat`; on other platforms ctxmode still runs, but `ctx_bg` termination is not promised (see [ctx_bg](#ctx_bg--background-process-supervision-from-ctx_run-actionexecute-backgroundtrue)).
+**English** · [简体中文](README.zh-CN.md)
 
-## MCP tools (v2)
+</div>
 
-Seven real tools (not skills). Five take **`action=`** plus capability-specific fields; `ctx_stats` and `ctx_report` take no action:
+## How it works
 
-| Tool | Actions | Key parameters |
-|------|---------|----------------|
-| **ctx_run** | `execute`, `execute_file`, `batch`, `run_task` | `command`/`language`/`timeout_ms`/`background`/`intent`/`cwd`/`argv`/`env`/`stdin`; `path`+`code`; `commands`/`queries`/`concurrency`/`query_scope`; `kind`/`target`/`args`/`timeout_ms` |
-| **ctx_fs** | `ls`, `glob`, `stat`, `rg`, `resolve`, `related` | `path`/`depth`/`include_hidden`/`limit`; `pattern`/`path`/`limit`; `path`; `pattern`/`glob`/`ignore_case`/`context`/`literal`/`offset`; `path`/`limit`; `path`/`limit` |
-| **ctx_git** | `status`, `diff`, `log` | `cwd`; `path`/`stat`/`unified`/`staged`; `n`/`path`/`oneline` |
-| **ctx_kb** | `index`, `search`, `fetch`, `stats`, `purge`, `doctor` | `path`; `query`; `url`/`urls`/`source`/`format`/`force`/`maxBytes`/`timeout_ms`/`ttl_ms`; —; `confirm`/`scope`/`sessionId`/`dryRun`; — |
-| **ctx_bg** | `list`, `kill`, `log`, `wait` | —; `id`/`pid`; `id`/`pid`/`tail_lines`/`tail_bytes`; `id`/`pid`/`timeout_ms` |
-| **ctx_stats** | — (no `action=`; single capability) | `json` (machine-readable output) |
-| **ctx_report** | — (no `action=`; dispatch report delivery) | `content` (1 B .. 1 MiB UTF-8; dispatcher env is read server-side — never probe it via printenv/env/shell) |
+```mermaid
+flowchart LR
+    A["AI Agent<br/>(Claude Code / Cursor / Codex)"] --> B["ctxmode<br/>(Go MCP)"]
+    B --> C["Heavy Output<br/>Command / File / URL &gt;100KB"]
+    C --> D["Local SQLite<br/>FTS5 Index"]
+    D --> E["Compact Summary +<br/>On-Demand Search"]
+    E -.->|"up to 98% tokens saved"| A
+```
 
-Any MCP host (Grok, Pi via the adapter below, agy / Antigravity CLI, …) uses this surface. Grok prefixes the server name (e.g. `ctxmode__ctx_run`); Pi registers the seven tool names directly; agy (Antigravity CLI) exposes them under MCP server `ctxmode` (lazy-loaded schemas in `~/.gemini/antigravity-cli/mcp/ctxmode/`, invoked via `call_mcp_tool` with `ServerName: "ctxmode"`).
+Your agent keeps the exit code and a short tail preview; the full output stays on disk in a local, searchable index — never in the context window.
 
-## Pi integration
+## Highlights
 
-A Pi-specific TypeScript adapter is maintained in [`integrations/pi/`](integrations/pi/README.md). It registers the **same seven tools** (`ctx_run`, `ctx_fs` including `resolve` and `related`, `ctx_git`, `ctx_kb`, `ctx_bg`, `ctx_stats`, `ctx_report`) and bridges stdio MCP to the Go binary.
+| | |
+|---|---|
+| **Zero Node.js, single Go binary** | No NPM runtime to install or audit. Build once, point your client at one file, done. |
+| **Auto-truncates, saves up to 98% tokens** | Any tool output over 100KB is written to a local SQLite index; the agent sees only `exit_code` plus a tail preview. `ctx_stats` counts exactly how many bytes stayed out. |
+| **12-language execution, 50-command batch** | `ctx_run` runs Shell, Go, Python, JS/TS, Rust, PHP, Ruby, R and more; `execute_file` lets a script process a 10MB file directly, and `batch` runs up to 50 commands concurrently. |
+| **Local FTS5 hybrid search + web-to-Markdown** | `ctx_kb` fuses BM25, Porter stemming, Trigram and RRF reranking; `fetch` turns web pages into indexed Markdown with built-in SSRF blocking. |
+| **Repo-aware files, Git & background jobs** | `ctx_fs` resolves fuzzy paths and finds test/impl pairs; `ctx_git` is read-only; `ctx_bg` supervises background processes with streamed logs. |
+| **Secret-safe by default** | Refuses to index `.env` files, private keys and credential stores, and strips sensitive environment variables from every subprocess it spawns. |
 
 ## Quick Start
+
+### 1. Build
 
 ```bash
 git clone https://github.com/dorokuma/ctxmode.git
 cd ctxmode
-bash scripts/install-hooks.sh   # ← MANDATORY: blocks format violations & secret leaks (safely aborts if external hooksPath is set)
 go build -o ctxmode .
 ```
 
-## Git Hooks
+Requires **Go 1.26+** (see `go.mod`). No Node.js, no other runtime dependencies.
 
-`scripts/install-hooks.sh` installs two hard gates into `.git/hooks/`:
+### 2. Connect to your MCP client
 
-| Hook | What it blocks |
-|------|---------------|
-| `commit-msg` | Non-conventional commit formats, process noise words, secret patterns (tokens, keys, passwords) |
-| `pre-push` | Same checks across all outgoing commits |
+ctxmode speaks MCP over stdio. Add it to your client configuration — for example, in `.mcp.json` (Claude Code) or your Cursor `mcp` settings:
 
-Run the script once after `git clone` (for setups using repository-local `.git/hooks/`). If an external or global `core.hooksPath` is active, or if target hooks are symlinks, the script safely refuses to install to avoid overwriting external/global hooks. Commits must follow Conventional Commits format (<= 72 chars subject, English/Chinese allowed) and contain no secrets or process noise.
-
-## Configuration
-
-Optional YAML (`-config` / `$CTXMODE_CONFIG` / `./ctxmode-config.yaml` / `~/.config/ctxmode/config.yaml`):
-
-```yaml
-workdirs:
-  - /path/to/your/project
-  - /path/to/another/project
+```json
+{
+  "mcpServers": {
+    "ctxmode": {
+      "command": "/absolute/path/to/ctxmode",
+      "args": ["-workdir", "/absolute/path/to/your/project"]
+    }
+  }
+}
 ```
 
-`workdirs` defines the workspace roots; every `cwd`/`path` argument is resolved against them (see Tools below). See [`config.example.yaml`](config.example.yaml).
+- `-workdir` (repeatable) declares workspace roots; every `ctx_fs`/`ctx_git` path and every `cwd` is resolved against them. The first value becomes the primary workspace, which owns the index database. Without it, the current directory is used.
+- `-config` points at a YAML file (`ctxmode-config.yaml`) with a `workdirs:` list — see [`config.example.yaml`](config.example.yaml).
 
-Environment variables:
+> [!TIP]
+> Each project gets its own SQLite index at `~/.local/share/ctxmode/<hash>-<basename>/`, so documents indexed in one project are never searchable from another. Run `ctx_stats` inside a session to see live context-consumption numbers — including exactly how many bytes were kept out of the context window.
 
-- `CTXMODE_DB` — absolute path to the SQLite database file; takes priority over the per-workdir default (see Database).
-- `CTXMODE_CONFIG` — path to the YAML config file.
-- `CTXMODE_ENV_PASSTHROUGH=1` — disable the default stripping of sensitive variables from subprocess environments (see [Subprocess environment isolation](#subprocess-environment-isolation)).
-- `CTXMODE_AUDIT_LOG` — `ctx_run` audit target (default `/root/.local/state/ctxmode/audit.jsonl`, which is root-specific; see [the audit bullet](#security-model--not-a-sandbox)). The last path component must be a regular file: a symlink/FIFO/device/directory is refused, so `/dev/stdout` and symlinked paths are not usable as targets (point it at a real file instead). A refused or failed write is logged once and the call still runs.
-- `CTXMODE_ROLE` / `CTXMODE_READONLY=1` — recorded in the audit line as `role`/`caller_readonly` and as the `readonly_role_call` tag, AND enforced by the role guards (`role_guards.go`): a non-empty `CTXMODE_ROLE` or `CTXMODE_READONLY=1` marks the caller a sub-agent and blocks nested dispatch of agent executables (`pig`, `pi`, `agy`, `dispatch-agent`, `dispatch-agent-go`, `grok`), detached-session managers (`tmux`, `screen`), privilege/namespace/scheduler/remote wrappers (`sudo`, `doas`, `su`, `pkexec`, `nsenter`, `unshare`, `chroot`, `systemd-run`, `crontab`, `at`, `ssh`), `herdr`/`herdsman` mutations, execution-hook env assignments (`GIT_PAGER`/`EDITOR`/`LD_PRELOAD`/`BASH_ENV`/`NODE_OPTIONS`/`PYTHONSTARTUP`/…; `GIT_PAGER=cat`/`=` stays free), and clearing `CTXMODE_ROLE`/`CTXMODE_READONLY` (`CTXMODE_ROLE=`, `env -u`, `unset`, and `env -i` unless the same call re-passes a non-empty `CTXMODE_ROLE=`) — from every `ctx_run` branch; a read-only role (`scout|planner|researcher|reviewer|oracle|verifier`, or `CTXMODE_READONLY=1`) additionally blocks `ctx_kb index|purge` (and `ctx_kb fetch` for everyone except `researcher`) plus the equivalent `ctxmode index` CLI/argv spelling, and the strict read-only set (all of them except `verifier`) blocks `ctx_bg kill`, `ctx_run action=run_task`, write/destructive/build command heads, in-place editors, git write subcommands, bare shells/interpreters running script files, and file-output redirects. `CTXMODE_ROLE` accepts `scout|planner|researcher|reviewer|oracle|verifier|worker`; `CTXMODE_READONLY` accepts `1`/`true`.
-- `CTXMODE_RG_BUDGET_MS` — `ctx_fs` rg wall-clock budget in milliseconds (default `10000`; `<=0` disables).
-- `CTXMODE_RG_MAX_LINE_RUNES` — `ctx_fs` rg match-line truncation in UTF-8 runes (default `500`; `<=0` disables). The wildcard-only pattern guard is always-on and has no env switch; pass `literal:true` to search metacharacters as a literal string.
+## Tools Overview
 
-## Security model — NOT a sandbox
+Seven tools. Five take `action=` plus parameters; `ctx_stats` and `ctx_report` do not use action.
 
-**Threat model:** ctxmode runs as root by design. The operator is the
-trusted party; the fences below (sensitive-path deny list, secret-value
-regexes, output gates) exist to keep **untrusted content** - repository
-files, fetched web pages - from leaking into model context or the
-knowledge base. They do not constrain operator privileges and are not a
-substitute for trusting whoever can call the tools. Auditors: do not
-report "runs as root", "arbitrary command execution", or "the removed
-shell-command policy" as findings; they are this documented design.
+| Tool | When to use it |
+|------|----------------|
+| **ctx_run** | Run commands and code. `execute` for shell/argv/12 languages, `execute_file` to process a large file from a script, `batch` for up to 50 parallel commands, `run_task` for structured test/build tasks (`go_test`, `npm_run_build`, `cargo_build`, `make`, …). |
+| **ctx_fs** | Workspace file operations without flooding context: `ls`, `glob`, `stat`, `rg` content search, `resolve` fuzzy path lookup, `related` test/impl pairing. |
+| **ctx_git** | Read-only git: `status`, `diff`, `log`. No commit, push, or reset — ever. |
+| **ctx_kb** | The local knowledge base: `index` files into SQLite FTS5, `search` them with hybrid ranking, `fetch` URLs into indexed Markdown, `stats`/`purge`/`doctor` for housekeeping. |
+| **ctx_bg** | Supervise long-running jobs started with `background:true`: `list`, `kill`, `log`, `wait`. |
+| **ctx_stats** | Answer "how much context did I actually save?" — per-tool call counts, bytes returned to the model, and bytes kept out in the KB. |
+| **ctx_report** | Deliver a structured completion report in dispatched multi-agent sessions (bound server-side by the dispatcher; returns an error outside dispatch). |
 
-ctxmode executes arbitrary commands and code **with the server process's privileges**. There is no sandbox and no security boundary: nothing stops `ctx_run` from running any shell/argv/code, and interpreters can perform any action the server user can. **Run ctxmode only in trusted environments.**
+## More Details
 
-The following are defense-in-depth measures, never a security guarantee:
+### Security model & credential guards
 
-- The `ctx_run` command screen is deliberately narrow: it runs shell `command` strings through a fixed `/bin/sh -c` and only hard-blocks a NUL byte or a command >64 KiB — measured on the entire code segment as received by the shell runner (post-injection), so `execute_file` with the shell language is rejected once the file content plus your `code` exceed 64 KiB even though the `execute_file` file-read limit is 10 MB, while non-shell languages run from a temp file and are not subject to this limit. Its heuristic alerts (encoded/downloaded payload piped into a shell, or a redirect into `/etc/`/`/dev/sd*`) are logged only and write to the log — they do not block execution and do not constitute policy. The same screen runs in argv mode with two adjustments: a NUL byte in **any argument** is a hard block (`argv command blocked (nul_byte)`; `execve` cannot spawn such a process anyway), while an argv whose joined bytes exceed 64 KiB only warns (`oversized`) — argv is not a shell string and killing large build/codegen arguments is exactly what the argv path exists to avoid.
+<details>
+<summary>Expand: what ctxmode guards — and what it does not</summary>
 
-- **argv mode is not path-fenced.** `ctx_run action=execute` with `argv` and `run_task` kind `custom` execute the given file directly; an absolute path is used as-is, a relative path is resolved against `cwd`, and a bare name is resolved through `PATH` — all three are equivalent in what they may run (anything the server user can execute). Only an empty `argv`/`argv[0]` is rejected. The workspace fences (`resolvePath` / `ensureInsideWorkspaces`) still apply to `ctx_fs` and `ctx_git` `path`/`pathspec` arguments and to every `cwd`, and are deliberately not applied to `argv`.
+ctxmode is **not a sandbox**: `ctx_run` executes commands with the server process's privileges, and `argv` mode is not path-fenced. Run it only in trusted environments. On top of that it layers defense-in-depth guards aimed at one specific threat: untrusted content (repo files, fetched pages, huge logs) leaking secrets into model context or onto disk.
 
-- **`ctx_run` calls are audited** (`audit.go`): one JSON line per **call** for `execute`, `execute_file`, `batch` and `run_task` — not per spawned subprocess, and nothing else is covered (`ctx_fs`, `ctx_git`, `ctx_kb`, `ctx_bg` are not audited). Target: `CTXMODE_AUDIT_LOG`, default `/root/.local/state/ctxmode/audit.jsonl`. That default is root-specific: a non-root deployment that does not set the variable gets a failed create, not a trail. The parent directory is created `0700` and the file opened `0600` **only when they are first created** — an existing file keeps the mode it already has, and nothing re-chmods it. "Append-only" describes only how the file is opened (`O_APPEND`); it is **not tamper-proof**: any process running as the same user can truncate, rewrite, delete or forge lines. Each line is built in full and appended under a process-wide mutex (batch runs commands concurrently, so lines never interleave). **Rotation is best effort**: at 32 MiB the file is renamed to `<path>.1` and a fresh file starts; a failed rename (the two measured causes: `<path>.1` is a non-empty directory, or the directory is not writable for the process) is logged once per reason and the line is appended to the current file instead — rotation can never drop a record nor stop later appends. (A same-directory rename is always within one filesystem, so `EXDEV` is not reachable here; a target path that *is* a mount point fails with `EBUSY` instead.) **Only the current file and one `.1` generation are kept** (≈2×32 MiB); older generations are silently overwritten, there is no archive and no compression, and there is no cross-process lock — two ctxmode processes sharing one `CTXMODE_AUDIT_LOG` can both rotate, so the retention window then favors whichever writes faster. If you need history, archive externally, e.g. `logrotate` on that path (`daily`, `rotate 30`, `copytruncate` — do not rely on ctxmode's own rotation for retention) or a periodic `cp <path>.1 /archive/audit-$(date +%F).jsonl` from a timer. The target must be a **dedicated regular file**: the *last path component* is `Lstat`-checked and a symlink, FIFO, directory or device there is refused (logged once per distinct path+reason, then silent) instead of being followed or opened. That check runs **before** the append mutex, and the open additionally uses `O_NONBLOCK` plus a `Stat` re-check on the descriptor, so a hostile target cannot stall the tool surface (a FIFO would otherwise block the open while the mutex is held); a write failure is logged and ignored rather than failing the call. Scope, stated because it is easy to over-read: a symlinked **parent** directory still redirects the trail silently, a hardlink to another file is indistinguishable from a regular file here, and a file the filesystem itself stalls on (hung NFS/FUSE/CIFS mount, frozen block device) can still delay a write — `O_NONBLOCK` protects the open, not a wedged mount. Refusing symlinks also means **`CTXMODE_AUDIT_LOG=/dev/stdout` (or a symlink to an external mount) no longer works**, which matters in containers: point it at a real file, at a path inside a mounted volume, or at a file the container's log collector tails. Fields: `timestamp`, `pid`, `session_id`, `action`, `role` (`CTXMODE_ROLE`), `caller_readonly` (`CTXMODE_READONLY`), `command_type` (`argv`/`command`/`file`/`task`), `raw_cmd` (capped at 64 KiB), `resolved_exe` (the bare name actually resolved via `exec.LookPath`), `cwd`, `background`, `background_id`, `duration_ms`, `exit_code`, `error`, `screen_verdict`/`screen_rule`, `audit_tags`, `env_keys`, `stdin_len`, `indexed`/`index_label`, `commands`, `first_failed_label`, `output_len`, `truncated`. **Process stdout/stderr are never recorded** — they can be huge and are the likeliest place for secrets. The record is not secret-free either: `raw_cmd` is the caller's command (or `execute_file`'s path/language/`code`) and goes through the same sensitive-content patterns used for indexing, replaced by a `[redacted: … len=… sha256=…]` marker on a hit; a hit keeps only a length and digest, and an **unformatted** secret (or a secret outside those patterns) can still land in the line. `env_keys` records the caller's env **key names** and `stdin_len` only a byte count — the values and the stdin payload are never written; a credential-shaped key name (`AKIA…`, `ghp_…`, a JWT) is replaced by `[redacted]`, but a name outside those patterns is recorded as sent, so treat key names as potentially sensitive too. `screen_verdict` is `ok`, `warn` or `block`, or `""` for a call rejected before it was screened. `exit_code` is `-1` for "no exit status of its own" (rejected call, spawn failure, or a background start — the latter also sets `background_id`, and its `output_len` is the length of the start message, not of job output). `batch` folds N commands into `commands` (per-command `label`, `exit_code`, `screen_verdict`/`screen_rule`, `indexed`/`index_label`) plus `first_failed_label` and a call-level `exit_code` that is 0 only when every command succeeded, otherwise the first failing code (including `-1`). Two tags are recorded: `readonly_role_call` (`CTXMODE_ROLE` ∈ `scout`/`planner`/`researcher`/`reviewer`/`oracle`/`verifier`, or `CTXMODE_READONLY=1` — both are set by the dispatch layer that starts the session, so the tag is absent until that layer sets them) and `eval_interpreter`, a **spelling check** over argv, not a detector: it matches explicit inline-code spellings only (`-c`/`-e`/`-p`/`-r` incl. bundled forms like `-lc`/`-ec`/`-pe`, `--eval`/`--print`, `Rscript -e`, `php -r`, `env`/`busybox` wrappers), has known false positives (`bash -e file.sh`, `env -i cmd`, an interpreter reading stdin) and known misses (any spelling not in the table), and never blocks or delays a call. **Enforcement is separate:** the same env inputs drive the role guards (`role_guards.go`), which DO block calls — a blocked call is audited with `screen_verdict`=`block`, `screen_rule`=`subagent_nested_agent` or `readonly_write_blocked`, `exit_code` `-1` and a non-empty `error`.
+- **Sensitive-file fences.** Indexing and file access refuse `.env` files, private keys (`*.pem`, `id_rsa`, …), `credentials.json`, `.npmrc`, `.netrc`, and anything under `.aws`/`.ssh`/`.gnupg`/`.kube`.
+- **Subprocess environment scrubbing.** Child processes never inherit variables whose names look sensitive (`token`, `key`, `secret`, `password`, `credential`, `auth`, `cookie`, `session`, case-insensitive). `CTXMODE_ENV_PASSTHROUGH=1` disables this globally.
+- **SSRF blocking.** `ctx_kb fetch` refuses loopback, link-local, private, CGNAT, reserved and embedded-IPv4 targets — the blocklist is fixed and not env-configurable.
+- **Audit trail.** Every `ctx_run` call appends one JSON line to `CTXMODE_AUDIT_LOG` (default `/root/.local/state/ctxmode/audit.jsonl` — a literal path with no `~`/`$HOME` expansion, so non-root deployments must set `CTXMODE_AUDIT_LOG` explicitly): command, cwd, exit code, verdict. Process stdout/stderr are never recorded, and secret-shaped values in the command are redacted to `[redacted: … len=… sha256=…]` markers.
+- **Pre-execution screen.** A command over 64KiB or containing a NUL byte is hard-blocked; hostile-looking shell idioms are logged but not blocked.
 
-- **Role guards (`role_guards.go`) enforce the dispatch role model.** When `CTXMODE_ROLE` or `CTXMODE_READONLY=1` is set (the dispatch layer sets them for every spawned role), `ctx_run` hard-blocks nested dispatch of agent executables (`pig`, `pi`, `agy`, `dispatch-agent`, `dispatch-agent-go`, `grok`), detached-session managers (`tmux`, `screen`) and privilege/namespace/scheduler/remote wrappers (`sudo`, `doas`, `su`, `pkexec`, `nsenter`, `unshare`, `chroot`, `systemd-run`, `crontab`, `at`, `ssh`) — matched at command position after wrapper peeling (`env` incl. `-S`/`--split-string` payloads, `command`, `exec`, `nohup`, `timeout`, `nice`, `setsid`, `stdbuf`, `busybox`, `ionice`, `taskset`, `chrt`, `watch`, `strace`/`ltrace`, shell keywords `if`/`then`/`elif`/`else`/`while`/`until`/`do`/`!`/`coproc`/`time [-p]`/`{`, honouring `--` terminators; `command -v/-V` stays a read-only builtin query; trailing `fi`/`done`/`}`/`esac` are no-ops) and recursive `sh -c` (incl. glued `-c"..."`), `eval`, `xargs` target-command, `find -exec/-execdir/-ok/-okdir` inner-command, `flock` inner-command, `script -c` payload, `trap` action-argument, and heredoc-body decomposition (`sh <<EOF` / `python3 - <<PY` bodies are screened as shell/interpreter code — `<<-` honours a tab-indented terminator — `cat <<EOF` bodies and `[[ a > b ]]` / `(( a > b ))` comparison operators are not commands; `$(...)`/`` `...` ``/`(...)` nesting past the depth cap fails closed instead of dropping inner commands) — plus `herdr`/`herdsman` mutations (`herdr tab|pane|workspace|agent|server` mutating subcommands, `herdsman on|off`), execution-hook env assignments and unsets (`GIT_PAGER`/`PAGER`/`MANPAGER`/`LESSOPEN`/`GIT_SSH`/`GIT_SSH_COMMAND`/`GIT_ASKPASS`/`GIT_EXTERNAL_DIFF`/`GIT_EDITOR`/`EDITOR`/`VISUAL`/`SEQUENCE_EDITOR`/`BASH_ENV`/`ENV`/`PROMPT_COMMAND`/`LD_PRELOAD`/`LD_AUDIT`/`DYLD_INSERT_LIBRARIES`/`NODE_OPTIONS`/`PYTHONSTARTUP`/`PYTHONINSPECT`/`PERL5OPT`/`PERL5DB`/`RUBYOPT`/`JAVA_TOOL_OPTIONS`/`JDK_JAVA_OPTIONS`/`_JAVA_OPTIONS`; `PAGER`/`GIT_PAGER`/`MANPAGER` keep the `""`/`cat` disabling spellings, `GOOS`/`CGO_ENABLED`/`TZ`/`LC_ALL`/`TMPDIR`/`PATH` stay free), `CTXMODE_ROLE`/`CTXMODE_READONLY` clearing or unsetting, and `git -c`/`--config-env` exec-arming config (`core.pager` — `cat`/`""` exempt — `core.sshcommand`, `core.fsmonitor`, `core.editor`, `sequence.editor`, `core.hookspath`, `core.askpass`, `diff.external`, `credential.helper`, `pager.*`, `alias.*` incl. `!`-values, `filter.*`, `difftool.*`, `mergetool.*`, `--exec-path=<dir>`; bare `git --exec-path` stays free), while `herdr`/`herdsman` read-only queries stay open. The `hc` terminal-control tool is screened the same way: a sub-agent's `hc` whitelist is exactly `hc send <addr> <text>` (two operands, `<addr>` matching `^t[0-9a-z]+$` — the report channel), `hc --help`, `hc --version` and `hc <sub> --help`; every other verb (`run`, `attach`, `read`, `ls`, `get`, `wait`, `keys`, `exec`, `file`, `kill`, `rm`, `label`, `server`, `machine`, `connect`, `update`, unknown verbs) and any extra send options or operands block outright. The main agent (no `CTXMODE_ROLE`, no `CTXMODE_READONLY`) is unaffected. Read-only roles (`scout|planner|researcher|reviewer|oracle|verifier`, or `CTXMODE_READONLY=1`) additionally lose `ctx_kb index|purge`, and `ctx_kb fetch` for all but `researcher`; the strict set (all except `verifier`, which keeps `/tmp` scratch capability for isolated verification clones) also loses `ctx_bg kill`, `ctx_run action=run_task`, filesystem-write/kill command heads (`rm`, `mv`, `cp`, `mkdir`, `dd`, `tee`, `chmod`, `patch`, `rsync`, `kill`, editors `ed`/`ex`/`vi`/`vim`/`nvim`/`nano`/`sponge`, `split`/`csplit`/`fallocate`/`chattr`/`setfattr`/`setfacl`, `mount`/`umount`/`mknod`/`mkfifo`, `uudecode`/`zip`/`7z*`/`rar`/`cpio`/`ar`/`ranlib`/`strip`/`objcopy`, compilers `gcc`/`g++`/`cc`/`c++`/`clang*`/`rustc`/`javac`, build drivers `make`/`gmake`/`cmake`/`ninja`/`meson`, package managers `pip*`/`pipx`/`uv`/`poetry`/`conda`/`gem`/`composer`, `flock`, `script`, `.`/`source`, …), in-place editors (`sed -i` incl. `-i.bak`/`-ni`/`-Ei`, `perl`/`ruby -i`, `awk -i inplace`, `gofmt -w`) plus sed `w`/`W` script-file writes and awk `system(`/`| getline`/`print >` escapes (`$1 > 5`, `/a|b/`, `-f` operands pass), git writes under an explicit read-only subcommand whitelist (`status|diff|log|show|rev-parse|ls-files|ls-tree|ls-remote|cat-file|blame|annotate|grep|describe|merge-base|rev-list|for-each-ref|shortlog|name-rev|check-ignore|check-attr|check-ref-format|var|version|help|diff-tree|diff-files|diff-index|verify-commit|verify-tag|whatchanged|cherry|count-objects|fsck`; dual-mode flag checks keep `git worktree [list]`, `branch --contains/-l/…`, `tag -l/-n/-v`, `config --get/-l`, `remote -v/show/get-url`, `stash list/show` free while any other subcommand — `notes`, `replace`, `update-ref`, `format-patch`, bare `stash`, … — blocks, and `--output` blocks on every subcommand), `systemctl`/`go`/`cargo`/`npm`/`pnpm`/`yarn` write verbs, disk-download flags (`curl -O/-o FILE`, `wget` except `-O -`/`-O /dev/null`/`--spider`), archive write spellings (`tar` except `-t`/`--list`/`--help`/`--version`/`-x` with `-O`; `unzip` except `-l`/`-t`/`-p`/`-v`/`-Z`/`-h`; `gzip`/`gunzip`/`bzip2`/`bunzip2`/`xz`/`unxz`/`zstd`/`unzstd`/`lz4` except `-c`/`-l`/`-t`/`-V`/`-h` spellings), `python -m pip|venv|ensurepip|compileall`, bare shells/interpreters running script files or stdin (`sh script.sh`, `python3 app.py`, `node app.js`, `argv=["sh"]`/`argv=["python3"]`; `-n`/`--version`/`-V`/`--help`/`-h` stay free), `ctx_run` `stdin` payloads feeding a shell/interpreter head (`sh`, `python3`, …; `sh -c`/`python3 -c`/`node -e`/`perl -e`/`php -r`/`python -m` inline spellings mean stdin is data), non-shell interpreter code containing subprocess-spawn or file-write primitives (`__import__`/`importlib`/`ctypes`/`cffi`/`eval(`/`exec(`/`Function(`/`process.binding`/`process.dlopen`/`System.cmd`/`Port.open`/`system2(`, perl/ruby/php backtick-`qx`/`%x`, `open(p,'w')` incl. non-literal modes `open(p,m)`/`mode='r'+'w'` fail-closed, `os.remove`, `fs.writeFileSync`, `child_process.execSync`, …; plain `open(p)`, `open(p,'r')`, `open(p, encoding='utf-8')`, `Path(p).open('r')`, `fs.readFile*` stay free; `go`/`rust`/`csharp` languages are compile-to-disk and block outright), `find -delete`/`-fprint*`, `xargs` targets, and output redirects to real files incl. dynamic `> $(...)` targets (`2>/dev/null`, `2>&1`, `>&-` pass). A blocked call still lands in the audit log (`screen_verdict=block`, `screen_rule=subagent_nested_agent|readonly_write_blocked`, `exit_code=-1`). These guards are a hardening layer, not a sandbox: they assume the caller cannot edit its own environment, and a caller spawning processes outside ctxmode is unaffected.
-- Subprocess environments strip inherited variables whose names look sensitive (`token`, `key`, `secret`, `password`, `passwd`, `credential`, `auth`, `cookie`, `session`, case-insensitive) by default; `CTXMODE_ENV_PASSTHROUGH=1` disables this. Caller-provided `env` overrides truly replace same-named inherited variables (deduplicated map, not appended duplicates), and the allowlist still rejects `PATH`/`HOME`/`SHELL`/`LD_*`/`DYLD_*` etc.
-- Indexing and file-access gates skip secret-like files by default: `.env`/`.env.*`, `.envrc`, anything under a `.env/` directory, private keys (`*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`), `credentials.json`, `.npmrc`, `.netrc`, `antigravity-oauth-token`, `auth.json`, `logins.json`, `plugin-auth.json`, `hosts.yml`/`hosts.yaml`, `.docker/config.json` (not the rest of `.docker/`), and anything under `.aws`/`.ssh`/`.gnupg`/`.kube`. For `Nlink > 1` hardlink protection (`collectSensitiveInodes`), the workspace inode walk skips `skipWalkDirs` plus heavy cache directories (`.cache`, `.cargo`, `.rustup`, `.npm`, `.pnpm-store`) to keep scan performance bounded in large workspaces such as `/root` (direct access by sensitive path name is still blocked by `isSensitiveFilePath`; credential-bearing directories such as `.ssh`, `.aws`, `.gnupg`, `.kube`, `.gemini`, `.pi`, `.grok`, and `.config` are still walked).
-- `ctx_kb action=fetch` refuses SSRF targets: IPv4 and IPv6 loopback, link-local (169.254.0.0/16, fe80::/10), multicast, reserved, private (RFC 1918, fc00::/7), CGNAT and benchmark ranges. Embedded IPv4 in IPv6 (IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96`, RFC 8215 local-use `64:ff9b:1::/48`, 6to4 `2002::/16`, Teredo `2001:0::/32`, ISATAP) is decoded and checked against the same IPv4 list. The blocklist is a single fixed set: the former strict/non-strict split was removed (`CTX_FETCH_STRICT` no longer exists) and the intercepted set cannot be changed via the environment.
+</details>
 
-### Subprocess environment isolation
+### Read-only role mode & multi-agent isolation
 
-Every subprocess ctxmode spawns — `execute`/`execute_file`, `run_task` (including its compile step), `batch`, and the `rg` and `git` helpers — starts from a sanitized environment built by `childEnv` (`executor.go`). By default, inherited variables whose **key name** matches `(?i)token|key|secret|password|passwd|credential|auth|cookie|session` (case-insensitive substring match; values are never inspected) are removed, so API keys, tokens or passwords present in the server's environment never reach a child — whose output is captured and auto-indexed.
+<details>
+<summary>Expand: CTXMODE_ROLE / CTXMODE_READONLY</summary>
 
-Exceptions, in priority order:
+When a dispatcher spawns sub-agents, it sets `CTXMODE_ROLE` (`scout`, `planner`, `researcher`, `reviewer`, `oracle`, `verifier`, `worker`) or `CTXMODE_READONLY=1` in their environment. ctxmode then enforces the role contract on every `ctx_run` call:
 
-- Keys on the `envAllowlist` (`executor.go`) are always kept, even when the name matches the pattern.
-- Caller-provided `env` overrides (already validated by `filterExecEnv`, which still rejects `PATH`/`HOME`/`SHELL`/`LD_*`/`DYLD_*` etc.) are applied last and always win.
-- Everything else that does not match the pattern — `PATH`, `HOME`, `SHELL`, `LANG`, `TZ`, … — is inherited unchanged.
+- **All sub-agent roles** cannot launch nested agent executables, detached-session managers (`tmux`, `screen`), privilege or remote wrappers (`sudo`, `ssh`, `nsenter`, …), and cannot clear their own role marker.
+- **Read-only roles** additionally lose `ctx_kb index`/`purge`/`fetch` writes (`researcher` is the exception: it keeps `ctx_kb fetch` for its tool cache, per `router.go`); the strict set also loses `ctx_bg kill`, `run_task`, write/destructive/build commands, in-place editors, git write subcommands and file-output redirects — leaving a verifiable read-only tool surface.
+- Blocked calls are still written to the audit log with `screen_verdict=block`, so violations are visible instead of silent.
 
-Side effects to be aware of:
+Ordinary single-agent use sets neither variable and is unaffected.
 
-- `SSH_AUTH_SOCK` (contains `auth`) and `XDG_SESSION_*` / `DESKTOP_SESSION` (contain `session`) are stripped too — git remotes over SSH that authenticate via ssh-agent will fail, and session-aware desktop tooling may misbehave. The `git` tool additionally drops all inherited `GIT_*` overrides (see `sanitizedGitEnv` in `git_tools.go`).
-- Stripping is name-based only: a variable like `MYVAR` whose *value* contains a secret still passes through.
+</details>
 
-`CTXMODE_ENV_PASSTHROUGH=1` disables stripping:
+### Local development & testing
 
-- It is a **global switch**: it affects every execution path at once, not a single command.
-- It is read from the ctxmode server process's own environment — `childEnv` calls `os.Getenv("CTXMODE_ENV_PASSTHROUGH")` (`executor.go`). Passing it through `ctx_run`'s `env` parameter has no effect (that env is filtered and applied to the child, not to the server); set it in the parent environment that starts ctxmode, e.g. the shell or MCP host launching the binary.
-- Risk: with passthrough enabled, every subprocess can read **all** sensitive variables of the host. On top of that, ctxmode stores captured output into the local knowledge base as plaintext without redaction once it exceeds the indexing threshold (>100KB, or >5KB with `intent`) — secrets that reach stdout would be persisted to disk. Prefer enabling it only temporarily, and only in trusted environments.
-
-## Tools
-
-### ctx_run — PRIMARY for commands/tests/builds
-
-- `execute` — 12-language subprocess execution (`javascript`, `typescript`, `python`, `shell`, `go`, `rust`, `php`, `perl`, `ruby`, `r`, `elixir`, `csharp`). `command` runs via shell (default language); `argv` execs directly without a shell (preferred). `env` (allowlist-validated), `stdin` (≤1MB), `timeout_ms` (ms, max 1h), `background` (supervise via ctx_bg), `intent`, `cwd` (workdir-resolved). Output >100KB is auto-indexed (with `intent`, >5KB too). Auto-indexed replies include `exit_code` and a tail preview (same contract as `run_task`). **Shell safety boundary:** when `command` runs as shell (language shell/unset) it executes via a fixed, controlled `/bin/sh -c` — the `SHELL` variable is ignored and there is no command allowlist; `argv` skips the shell entirely, so there is no shell string to inject into (preferred). **argv is not path-fenced:** an absolute path is used as-is, a relative path is resolved against `cwd`, and a bare name is resolved via `PATH` — all three are equivalent in what they may execute (anything the server user can run). A pre-execution screen hard-blocks a command >64 KiB and a NUL byte in either the command string or any argv argument — counted on the whole post-injection segment (for `execute_file` with the shell language that is the file content plus your `code` measured together, which can be rejected below the 10 MB file-read limit; non-shell interpreters are not content-screened). It logs (never blocks) a few hostile-looking shell idioms, and an over-length argv is warned about (`oversized`) but never blocked, so large build arguments survive. Every `ctx_run` call — all four entry points — is appended to the audit log (see the security model below).
-- `execute_file` — `path` + `code`: file content is injected as `FILE_CONTENT` and the code processes it. Files ≤10MB; binary files refused. Whole-file Go sources use `var FILE_CONTENT` (legal at package scope); PHP does not add a second `<?php` when the source already has one. Auto-indexed replies match `execute` (`exit_code` + tail preview).
-- `batch` — `commands` (≤50, non-empty unique labels), `queries` (≤20), `concurrency` (1-8, default 1; out-of-range is an error), `query_scope` (`batch`|`global`, default `batch`; invalid is an error), `cwd`, `timeout_ms` (default 30s, max 1h; serial: shared budget, concurrent: per-command). Only output >100KB is indexed (same threshold as `execute`); small output is not persisted. The index write is a direct `Store.Index` call rather than `storeIndexLocked`, but kept-out accounting now lives in the `Store` itself, so batch output **is** counted in `ctx_stats`'s kept-out bytes. `query_scope=batch` searches only this run's indexed command output. **Shell safety boundary:** each `command` uses the same fixed `/bin/sh -c` semantics as `execute` (`SHELL` ignored, no allowlist); a NUL/>64 KiB block on one command fails only that command's result and never cascades to its siblings.
-- `run_task` — structured test/build with fixed argv (no shell): `kind` ∈ `go_test`|`go_build`|`go_vet`|`npm_test`|`npm_run_build`|`cargo_test`|`cargo_build`|`make`|`custom`, `target`, `args`, `timeout_ms` (default 300000, max 3600000), `cwd`, `intent`, `env`. Go kinds accept package targets only (no flag arguments); `custom` requires `args[0]` as the executable, which (like `execute` argv) is **not path-fenced** — it is only normalized (relative paths resolved against `cwd`). Its argv goes through the same pre-execution screen as `execute` argv (NUL block, `oversized` warn) and is recorded in the audit log.
-
-### ctx_fs — workspace filesystem (paths limited to workdirs)
-
-- `ls` — list directory: `path` (omitted, `.`, or `./` is the primary workdir, even when several `workdirs` are configured), `depth` (1-5, default 1; >5 is an error), `include_hidden`, `limit` (default 200, max 2000; >2000 is an error).
-- `glob` — `pattern` (`**` supported), `path` (same default as `ls`), `limit` (default 200, max 2000; >2000 is an error); skips `.git`/`node_modules`/`vendor` and applies basic `.gitignore` rules.
-- `stat` — `path`: size/mode/mtime/symlink/workdir metadata (symlink-aware).
-- `rg` — content search: `pattern` (or `literal`), `path` (same default as `ls`), `glob`, `ignore_case`, `context` (0-5), `limit` (default 20 with summary on, max 500; >500 is an error); system `rg` with `--no-config` (ignores `RIPGREP_CONFIG_PATH` / `~/.ripgreprc`) and a pure-Go fallback; skips binaries. Wildcard-only patterns (`.*`, `*`, `.+`, `.`) are rejected (always-on; pass `literal:true` to search those characters). Match lines longer than 500 runes are truncated (`CTXMODE_RG_MAX_LINE_RUNES`; `<=0` disables). Files over 20KiB (`20*1024` bytes) get a size tag in the summary.
-- `resolve` — fuzzy path resolution: `path` (approximate or `@path`-style reference), `limit` (default 10, max 2000). Returns ranked candidates across all workdirs (exact > suffix > substring > subsequence, boundary-aware; ported from pi-fff's `resolve_file`, pure Go).
-- `related` — related-file ranking: `path` (an existing file), `limit`. Returns test/impl pairs (same stem across `_test.go`/`.test.ts`/`test_*.py` conventions), same-stem other-extension files, directory siblings, and stem-prefix matches, each with a `reason`; ported from pi-fff's `related_files`. Both actions walk under the same gitignore/symlink/sensitive-path fences as glob/rg with a 5s wall-clock budget and a 100k-file cap; when that budget or cap stops the walk early the response reports `truncated: true`, so a partial scan is never returned as if it were complete.
-
-### ctx_git — read-only git (no commit/push/reset)
-
-- `status` — `git status --porcelain=v1 -b` (`cwd`).
-- `diff` — `path`, `stat`, `staged`, `unified`; output hard-truncated (200KB/2000 lines).
-- `log` — `n` (default 20, hard max 100), `path`, `oneline` (default). Ignores repository `log.showSignature` / `gpg.program`.
-
-### ctx_kb — local knowledge base
-
-- `index` — `path` (file or directory) into SQLite FTS5; skips `.git`/`node_modules`, sensitive/secret files, binaries and >1MB files; capped at 5000 files / 100MB total.
-- `search` — `query`: BM25 + Porter + Trigram + RRF + proximity rerank; flood-guarded (default 60-second window; 4 successful queries in the same window start throttling with half results; 9 attempts hard-reject). If one FTS index errors and the other returns no hits, the error is returned (not a silent "no matches"). `ctx_run` batch `query_scope=batch` searches only that batch run's indexed documents and bypasses the guard; it does not search `execute`/`run_task`/fetch output.
-- `fetch` — `url`/`urls` (≤10) → markdown → index; `source`, `format` (markdown/html/json), `force`, `maxBytes` (default 50KB), `timeout_ms` (default 150000), `ttl_ms` (default 24h, 0 = skip cache); SSRF protection as above. URL fragments (`#…`) are stripped before indexing so a user fragment cannot collide with internal `#chunk-` keys. Bodies cut at the 10MB fetch cap are still indexed, and the summary reports `body truncated at 10MB`. Indexed documents are isolated per `format`: the KB path embeds the format (`source:format:url`), so the same URL can coexist as markdown/html/json without overwriting, and re-fetching in one format never touches the others. Re-fetching a short URL does not delete a longer sibling URL. The Pi adapter default request timeout for `fetch` is 150s plus a 30s buffer (and honors `timeout_ms`).
-- `stats` — document/cache/DB statistics, `kept_out_bytes` (this session's bytes written into the KB store instead of the context window; the same figure `ctx_stats` reports as `total_kept_out`), and `session_id` for this server process. **Breaking JSON change:** the per-tool field is now `kept_out_bytes`; the previous name `saved_estimate_bytes` is **no longer returned**, so an external consumer still reading that key must be updated (it was `total_output_bytes - total_input_bytes`, a figure that counted a verbatim-returned output as saved). `total_input_bytes`/`total_output_bytes` are kept as raw counters of what the commands this server ran received and produced — they are **not** a context-saving measure (an output returned in full still counts in full).
-- `purge` — `confirm:true` is mandatory: missing or `false` returns an error (not a silent no-op). `scope=project` wipes the whole KB. `scope=session` deletes documents tagged with `sessionId` (the id from `stats`/`doctor`); execute/batch/run_task/fetch writes from this process are tagged automatically.
-- `doctor` — runtime availability (missing runtimes are listed under `warnings`), FTS5 self-test, storage info, `session_id`.
-
-### ctx_bg — background process supervision (from `ctx_run action=execute background:true`)
-
-- `list` — registered jobs (id/pid/age/exit_code/log availability).
-- `kill` — by `id` or `pid`; PID-reuse guarded via the process starttime read from `/proc/<pid>/stat`.
-- `log` — `id`/`pid`, `tail_lines` (≤10000), `tail_bytes` (≤4MB); newest output (ring-capped at 16MB), with `log_truncated` when the cap fired.
-- `wait` — `id`/`pid`, `timeout_ms` (default 60000, max 1h); never kills on timeout; includes `log_truncated` when the log cap fired.
-- Max 16 concurrent background jobs (exceeding is an error); a caller-provided `timeout_ms` on the launch is honored (default max age 1h); log files capped at 16MB.
-- Platform contract: the `kill` identity check reads `/proc/<pid>/stat` (Linux). On platforms where that file is unavailable the check fails closed — a job with unknown identity is never signaled — so `ctx_bg` termination is only guaranteed on Linux; `list`/`log`/`wait` keep working everywhere.
-
-### ctx_stats — session context-consumption statistics
-- Reports per-tool call counts, bytes returned into the context window, estimated tokens (bytes ÷ 4), bytes written into the KB instead of the context window (the kept-out counter, shown under the `store` row), and the overall savings ratio. The kept-out counter is recorded by a sink installed on the `Store` itself (`Store.onIndexedBytes` → `statRecordKeptOut`), so it covers **every** KB write path: oversized `ctx_run` `execute`/`execute_file`/`run_task` output, `ctx_fs rg` auto-index, `ctx_kb index`, `ctx_run action=batch`'s direct `Store.Index` writes, `ctx_kb action=fetch`'s `Store.ReplaceExactAndChunks` chunked writes, and the legacy JSON migration re-index. Only successful writes are counted.
-- Second section aggregates the ctx_run audit log for the current session: calls, raw output bytes, auto-indexed and truncated counts.
-- `json:true` returns the same report as JSON. Ported from the original context-mode `ctx_stats` (mksglu/context-mode). Counters are recorded after each handler returns; a `ctx_stats` call racing a concurrent sibling call may not include it yet (sequential callers always see complete rows).
-
-## Database
-
-Each primary workdir gets its own SQLite database at `~/.local/share/ctxmode/<hash>-<basename>/context_mode.db`, where `<hash>` is the first 8 bytes of SHA-256 over the primary workdir's absolute path. The on-disk path is opened as a `file:` URI with special characters (`%`, `?`, `#`, spaces) percent-encoded, so a basename or `CTXMODE_DB` containing those characters does not get parsed as URI syntax. Documents indexed in one project are never searchable from another. `CTXMODE_DB` overrides the location entirely. The legacy global shared database (`~/.local/share/ctxmode/context_mode.db`) is **no longer used and is not migrated automatically**.
-
-## Deployment
-
-The agent runs `deploy.sh` directly: the script is non-interactive, needs no confirmation and has **no manual step**. `deploy.sh` builds the binary, verifies it with an `initialize` handshake, and atomically replaces the live binary. Right before the atomic swap it backs up the current live binary to `<BINARY>.prev` (best-effort; a failed backup only disables rollback for that deployment).
-
-The same run also syncs the Pi extension through `integrations/pi/install.sh` (md5-identical target left untouched; destination `PI_CTXMODE_EXT` or `~/.pig/agent/extensions/ctxmode.ts`); a failed sync aborts the deployment, matching the script's existing hard-failure convention. On zero-node hosts — where `~/.pig/agent/extensions/ctxmode` is a symlink to a native Go extension directory containing `go.mod` — the default-destination sync is skipped (any stale `ctxmode.ts` is removed) so `pig` never tries to load a TypeScript extension without Node.js; an explicit `PI_CTXMODE_EXT` still installs.
+<details>
+<summary>Expand: hooks, make check, deploy</summary>
 
 ```bash
-./deploy.sh            # build + verify + atomic deploy (default)
-./deploy.sh rollback   # restore the previous binary
+bash scripts/install-hooks.sh   # install commit-msg + pre-push gates into .git/hooks/
+make check                      # the single gate: gofmt + staticcheck + go vet + namespace-isolated go test -race + go build (+ Pi extension tests when node exists)
 ```
 
-`rollback` runs the same `initialize` verification against `<BINARY>.prev` and only then atomically renames it back over `<BINARY>`, printing the restored version. If `<BINARY>.prev` is missing (no prior deploy, or already consumed by a previous rollback), or verification fails, it exits 1 without touching the live binary. A successful rollback consumes `.prev`; deploying again recreates the backup.
+- `scripts/install-hooks.sh` installs two hard gates: `commit-msg` (Conventional Commits format, no secrets, English-only message) and `pre-push` (same checks across outgoing commits). It safely refuses when an external `core.hooksPath` is set.
+- `make check` is the only supported verification entry point. `go test -race` runs through `scripts/ns-hc-gotest.sh` inside a mount/PID/net namespace; a bare `go test` is rejected by the `TestMain` outer-isolation gate (exit 125).
+- `./deploy.sh` builds, verifies via an `initialize` handshake, and atomically swaps the live binary (with `<BINARY>.prev` backup and `rollback` support).
 
-### Backups
+</details>
 
-A weekly cron job (root, Sunday 06:00 UTC) snapshots every `context_mode.db` under the data root via `sqlite3 .backup` (consistent even while the server is writing), runs `PRAGMA integrity_check` on each snapshot, gzips it, and keeps the last 4 weekly sets in `/root/backups/ctxmode/<YYYY-MM-DD>/<hash>-<basename>.db.gz`. The script lives at `/root/backups/ctxmode/backup-ctxmode.sh` and logs to `/var/log/ctxmode-backup.log`.
+## Platform support
 
-To restore one project's KB:
+**Linux** is fully supported. Background-job identity verification in `ctx_bg` reads `/proc/<pid>/stat`; on other platforms ctxmode still runs but `ctx_bg kill` fails closed (a job with unknown identity is never signaled).
 
-```bash
-gzip -dc /root/backups/ctxmode/<date>/<hash>-<basename>.db.gz > /tmp/restore.db
-sqlite3 ~/.local/share/ctxmode/<hash>-<basename>/context_mode.db ".restore '/tmp/restore.db'"
-# or: stop ctxmode, replace context_mode.db with the snapshot, start ctxmode again
-```
+## Credits & License
 
-## License
+ctxmode is a 100% Go reimplementation of Mert Koseoglu's [context-mode](https://github.com/mksglu/context-mode) — credit to the original author for the idea and the TypeScript implementation.
 
-Elastic License 2.0 (ELv2) — see [LICENSE](LICENSE). Based on original TypeScript work by Mert Koseoglu.
+Licensed under the **Elastic License 2.0 (ELv2)** — see [LICENSE](LICENSE).
