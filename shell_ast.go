@@ -911,8 +911,12 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 				if !ok || isDynamicArg(h) {
 					// A dynamic word is not literally command/builtin. When it
 					// appears AFTER a real command/builtin it could still be
-					// `read`/any mutator the wrapper is hiding → taint all;
-					// as the first word it is just a dynamic head, peel done.
+					// `read`/any mutator the wrapper is hiding → taint all.
+					// As the FIRST word it is still a command head we cannot
+					// vet (`$X "cd /tmp"`, `$(eval) "cd /tmp"`): conservatively
+					// taint PWD/OLDPWD so a later $(pwd) stays dynamic (R5 MF-2).
+					inc("PWD")
+					inc("OLDPWD")
 					if sawWrapper {
 						allTainted = true
 						return false
@@ -969,8 +973,11 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 				base = base[i+1:]
 			}
 			switch base {
-			case "cd", "chdir":
-				// cd implicitly rewrites PWD/OLDPWD in the running shell.
+			case "cd", "chdir", "pushd", "popd", "eval", "source", ".":
+				// Every directory-switch builtin (cd/chdir/pushd/popd) rewrites
+				// PWD/OLDPWD in the running shell, and eval/source/. can hide
+				// one inside its argument text — any sighting taints the $(pwd)
+				// static bind (R3 MF-3).
 				inc("PWD")
 				inc("OLDPWD")
 			case "getopts":
@@ -1111,12 +1118,15 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 // as untrusted inside this script, degrading the PATH/HOME/absolute-dir
 // placeholder grants to plain dynamic placeholders.
 func parseSubagentShellAST(code string, depth int, pipeIn bool, useBashVariant bool) ([]shellSegment, bool) {
-	return parseSubagentShellASTEnv(code, depth, pipeIn, useBashVariant, nil)
+	return parseSubagentShellASTEnv(code, depth, pipeIn, useBashVariant, nil, callerIdentity{})
 }
 
 // parseSubagentShellASTEnv is parseSubagentShellAST plus an envTaint set
-// for the env/ssh AST descent (SH11 F3/Q5).
-func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVariant bool, envTaint map[string]bool) ([]shellSegment, bool) {
+// for the env/ssh AST descent (SH11 F3/Q5). caller carries the screened
+// call's cwd so a bare $(pwd) can bind the directory the inner shell will
+// actually start in — and so any cd/chdir/pushd/popd in the script can
+// invalidate that static bind (task R2-3).
+func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVariant bool, envTaint map[string]bool, caller callerIdentity) ([]shellSegment, bool) {
 	if hit := checkShellBytes(code, false); hit != "" {
 		return []shellSegment{{depthExceeded: true}}, false
 	}
@@ -1154,7 +1164,7 @@ func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVarian
 		}
 	}
 
-	col := &subCollector{code: code, depth: depth, staticVars: map[string]string{}, enumVars: map[string]string{}, taintedVars: map[string]bool{}, enumCmdWords: map[string][]string{}, allowBind: true}
+	col := &subCollector{code: code, depth: depth, staticVars: map[string]string{}, enumVars: map[string]string{}, taintedVars: map[string]bool{}, enumCmdWords: map[string][]string{}, allowBind: true, caller: caller}
 	for name := range envTaint {
 		col.taintedVars[name] = true
 	}
@@ -1316,6 +1326,13 @@ type subCollector struct {
 	ssaBlocked   map[string]bool // G3: writeCount>1 from preScan
 	allowBind    bool            // top-level sequential stmts only (R-Allow-2)
 	fdUnvetted   bool            // inside a function body: unproven dups fail closed (R17 MF-2)
+	// caller is the screened call identity: its cwd is the base a bare
+	// $(pwd) expansion must resolve against, and any cd/chdir/pushd/popd
+	// in the script (or a pre-scan that sees a directory-switch builtin)
+	// taints the static cwd bind — a later $(pwd) then stays a dynamic
+	// placeholder instead of a literal the guard trusts.
+	caller callerIdentity
+	hasCd  bool // any directory-switch builtin seen anywhere in the script
 }
 
 func (c *subCollector) reject() {
@@ -1751,6 +1768,65 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 	}
 	switch cmd := st.Cmd.(type) {
 	case *syntax.CallExpr:
+		// A `PWD=` / `OLDPWD=` assignment anywhere in the script invalidates
+		// the static $(pwd) bind: a later `cd` or prefix assignment can
+		// re-anchor the expansion. preScanVarMutations already taints
+		// PWD/OLDPWD for ANY write (single write counts), which
+		// pwdSwitchTainted() below consults. This check runs BEFORE
+		// emitCall so a `PWD=$(pwd)` sighting cannot self-bind (R3 MF-3).
+		for _, a := range cmd.Assigns {
+			if a.Name != nil && (a.Name.Value == "PWD" || a.Name.Value == "OLDPWD") {
+				c.hasCd = true
+			}
+		}
+		// A directory-switch builtin anywhere in the script invalidates every
+		// later static $(pwd) bind: the collector walks statements in source
+		// order, but a sequential `cd /tmp/evil` earlier in the same stmt list
+		// (or a preScanVarMutations sighting) makes the real cwd at a later
+		// $(pwd) unknowable — the bind must stay dynamic. Leading
+		// `builtin`/`command` wrappers are stripped first so
+		// `builtin pushd /tmp/evil` cannot hide the switch (R3 MF-3).
+		if !c.hasCd && len(cmd.Args) > 0 {
+			args := cmd.Args
+			for len(args) > 0 {
+				h, ok := wordToArg(args[0])
+				if !ok || isDynamicArg(h) {
+					break
+				}
+				base := h
+				if k := strings.LastIndexByte(base, '/'); k >= 0 {
+					base = base[k+1:]
+				}
+				if base != "builtin" && base != "command" {
+					break
+				}
+				args = args[1:]
+				for len(args) > 0 {
+					a, aok := wordToArg(args[0])
+					if !aok || isDynamicArg(a) || a == "--" || !strings.HasPrefix(a, "-") || a == "-" {
+						break
+					}
+					args = args[1:]
+				}
+				if len(args) > 0 {
+					if a, aok := wordToArg(args[0]); aok && a == "--" {
+						args = args[1:]
+					}
+				}
+			}
+			if len(args) > 0 {
+				if h, ok := wordToArg(args[0]); ok {
+					base := h
+					if k := strings.LastIndexByte(base, '/'); k >= 0 {
+						base = base[k+1:]
+					}
+					switch base {
+					case "cd", "chdir", "pushd", "popd", "eval", "source", ".":
+						c.hasCd = true
+					}
+				}
+			}
+		}
 		c.emitCall(st, cmd, feed)
 	case *syntax.BinaryCmd:
 		switch cmd.Op {
@@ -1960,6 +2036,7 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 			}
 		}
 	}
+	enumHeadExpanded := false
 	for i, w := range call.Args {
 		// Command head: for-loop enum binds may expand the head (W-Fix-6
 		// abs-path single words; W11-5 static multi-word command strings).
@@ -1971,6 +2048,7 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 						for range words {
 							argWords = append(argWords, nil) // expanded; no 1:1 Word
 						}
+						enumHeadExpanded = true
 						continue
 					}
 				}
@@ -1999,6 +2077,51 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 	}
 	// POSIX parses `export NAME=VAL` as CallExpr (bash uses DeclClause).
 	c.noteDeclCallBinds(argv)
+
+	// A for-loop enum command head ($X) that expanded to a directory-
+	// switch or code-eval builtin invalidates every later static $(pwd)
+	// bind exactly like a literal `cd` sighting — `for X in cd; do $X
+	// <evil>; done; D=$(pwd)` must stay dynamic (R4 MF-2). The same
+	// builtin/command strip the CallExpr sighting uses applies here.
+	if enumHeadExpanded && !c.hasCd {
+		args := argv
+		// Prefix env assigns (FOO=1 $X "cd ...") sit ahead of the expanded
+		// head word — skip them before the builtin/command strip or the
+		// first word reads as the assignment, not the builtin (R5 MF-2).
+		for len(args) > 0 && isAssignWord(args[0]) {
+			args = args[1:]
+		}
+		for len(args) > 0 {
+			base := args[0]
+			if k := strings.LastIndexByte(base, '/'); k >= 0 {
+				base = base[k+1:]
+			}
+			if base != "builtin" && base != "command" {
+				break
+			}
+			args = args[1:]
+			for len(args) > 0 {
+				a := args[0]
+				if a == "--" || isDynamicArg(a) || !strings.HasPrefix(a, "-") || a == "-" {
+					break
+				}
+				args = args[1:]
+			}
+			if len(args) > 0 && args[0] == "--" {
+				args = args[1:]
+			}
+		}
+		if len(args) > 0 {
+			base := args[0]
+			if k := strings.LastIndexByte(base, '/'); k >= 0 {
+				base = base[k+1:]
+			}
+			switch base {
+			case "cd", "chdir", "pushd", "popd", "eval", "source", ".":
+				c.hasCd = true
+			}
+		}
+	}
 
 	seg := shellSegment{
 		argv:         argv,
@@ -2407,6 +2530,8 @@ func (c *subCollector) newSub() *subCollector {
 		ssaBlocked:   cloneBoolMap(c.ssaBlocked),
 		allowBind:    false,
 		fdUnvetted:   c.fdUnvetted,
+		caller:       c.caller, // $(pwd) binds the same screened cwd inside $(...)
+		hasCd:        c.hasCd,  // an outer cd already sighted stays sighted
 	}
 }
 
@@ -2633,9 +2758,16 @@ func (c *subCollector) staticAssignVal(w *syntax.Word) (string, bool) {
 	if w != nil && len(w.Parts) == 1 {
 		if cs, ok := w.Parts[0].(*syntax.CmdSubst); ok && !cs.Backquotes {
 			if isPwdCallStmts(cs.Stmts) {
-				if wd, err := os.Getwd(); err == nil {
-					return wd, true
+				// A bare $(pwd) binds the caller's screened cwd only while no
+				// directory-switch builtin (cd/chdir/pushd/popd) can run first;
+				// once c.hasCd is set — or the preScanVarMutations pass saw one —
+				// the value is unknowable and the bind must stay dynamic.
+				if !c.hasCd && !c.pwdSwitchTainted() {
+					if wd := c.caller.screenCwd(); wd != "" {
+						return wd, true
+					}
 				}
+				return "", false
 			}
 			if !c.isTainted("TMPDIR") && isMktempDashDCallStmts(cs.Stmts) {
 				return mktempDirPlaceholder, true
@@ -2646,6 +2778,14 @@ func (c *subCollector) staticAssignVal(w *syntax.Word) (string, bool) {
 		return "", false
 	}
 	return c.wordToArg(w)
+}
+
+// pwdSwitchTainted reports whether the whole-script mutation pre-scan saw a
+// directory-switch builtin (cd/chdir/pushd/popd) — those inc PWD/OLDPWD, and
+// preScanVarMutations marks both tainted before the walk starts, so a bare
+// $(pwd) bind in a script containing any of them can never be static.
+func (c *subCollector) pwdSwitchTainted() bool {
+	return c.isTainted("PWD") || c.isTainted("OLDPWD")
 }
 
 // isPwdCallStmts reports whether stmts is exactly `pwd` (no operands).
@@ -3119,13 +3259,18 @@ func (c *subCollector) dqParamPlaceholder(pe *syntax.ParamExp) (string, bool) {
 
 // dqSubstPlaceholder classifies a $(...) inside double quotes: `$(pwd)` and
 // a bare `$(mktemp -d)` (with untainted TMPDIR) are guaranteed to produce a
-// path starting with /, so they carry the absolute-dir dq placeholder.
+// path starting with /, so they carry the absolute-dir dq placeholder — but
+// only while the script cannot have changed directory first (c.hasCd /
+// preScanVarMutations PWD/OLDPWD taint keep $(pwd) fully dynamic then).
 func (c *subCollector) dqSubstPlaceholder(cs *syntax.CmdSubst) string {
 	if cs != nil {
 		// Both backquote and $(...) forms of `pwd` / `mktemp -d` produce an
 		// absolute path (backquotes cannot smuggle a second word in dq).
 		if isPwdCallStmts(cs.Stmts) {
-			return cmdSubPlaceholderAbsDq
+			if !c.hasCd && !c.pwdSwitchTainted() {
+				return cmdSubPlaceholderAbsDq
+			}
+			return cmdSubPlaceholderQuoted
 		}
 		if !c.isTainted("TMPDIR") && isMktempDashDCallStmts(cs.Stmts) {
 			return cmdSubPlaceholderAbsDq
@@ -3135,10 +3280,10 @@ func (c *subCollector) dqSubstPlaceholder(cs *syntax.CmdSubst) string {
 }
 
 // unquotedSubstPlaceholder keeps unquoted $(...) fully dynamic — its output
-// field-splits on IFS. A bare $(pwd) emits the dq-abs placeholder only when
-// IFS is untainted AND the result cannot begin with '-': pwd's output
-// begins with / by definition, but word-splitting could still break it, so
-// unquoted $(pwd) stays plain dynamic (conservative).
+// field-splits on IFS at runtime, so even a bare $(pwd) can never be
+// trusted as a single static directory operand (R3 MF-1): only the
+// double-quoted `"$(pwd)"` dqSubstPlaceholder and the assignment-binding
+// staticAssignVal grant the safe cwd bind.
 func (c *subCollector) unquotedSubstPlaceholder(cs *syntax.CmdSubst) string {
 	return cmdSubPlaceholder
 }

@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -3069,7 +3071,14 @@ func TestGuard_CmdSubArgvIntegrity(t *testing.T) {
 	}{
 		// The substitution's inner command is screened as its own segment
 		// while the outer argv stays whole (no "" head, no torn "status").
-		{name: "git -C $(pwd) ok", code: "git -C $(pwd) status", want: "git dynamic global option"},
+		// R2-3/R4-MF-2/R5-MF-2: $(pwd) binds the screened call's cwd only
+		// while no directory switch can run — a `for X in cd; do $X ...`
+		// enum head, a non-constant command head (`!ok` or dynamic), a
+		// builtin/command-wrapped switch and eval/source/. all invalidate
+		// the static bind, so `git -C <cwd>` passes while `git -C $(pwd)`
+		// blocks on the dynamic option itself and `git -C $(pig)` still
+		// blocks on the nested-agent segment.
+		{name: "git -C $(pwd)", code: "git -C $(pwd) status", want: "git dynamic global option"},
 		{name: "git -C $(pig)", code: "git -C $(pig) status", want: "pig"},
 		{name: "assign prefix pig", code: "A=$(true) pig", want: "pig"},
 		{name: "assign prefix ls ok", code: "A=$(true) ls", want: ""},
@@ -3515,6 +3524,76 @@ func TestGuard_SpawnPrimsAndHeredocBun(t *testing.T) {
 	code = "bun <<'JS'\nrequire('child_process').execSync('pig')\nJS"
 	if got := guardShellSubagent(code); got == "" {
 		t.Fatalf("bun heredoc agent spawn must block")
+	}
+}
+
+// TestGuard_ConcurrentScreenCwdNoPollution is the regression for
+// [pattern:shared-guard-cwd]: two guarded calls screened CONCURRENTLY under
+// different cwds must each resolve the same relative command head against
+// their own directory. Under the old package-level screenCwd a racing
+// withScreenCwd pair COULD swap the resolution base mid-screen; per-call
+// callerIdentity.cwd makes the outcome deterministic. Fixture layout
+// (t.TempDir only, no exec, no host path reads):
+//
+//	cwdA/bin/mytool  -> regular executable (resolves to itself => allow)
+//	cwdB/bin/mytool  -> symlink to cwdB/real/pig (resolves to a blocked
+//	                  agent head => subagent_nested_agent)
+//
+// Both goroutines screen the identical command `./bin/mytool`. The barrier
+// only synchronizes the start; it does NOT reproduce a deterministic
+// old-global interleave (under the old code the swap was a data race, not a
+// guaranteed ordering), it simply maximizes the overlap window across
+// -race runs.
+func TestGuard_ConcurrentScreenCwdNoPollution(t *testing.T) {
+	t.Setenv(auditEnvRole, "worker")
+	t.Setenv(auditEnvReadonly, "")
+
+	mk := func(cwd string, asSymlinkTo string) {
+		t.Helper()
+		bin := filepath.Join(cwd, "bin")
+		if err := os.MkdirAll(bin, 0755); err != nil {
+			t.Fatal(err)
+		}
+		tool := filepath.Join(bin, "mytool")
+		if asSymlinkTo == "" {
+			writeTestExecutable(t, tool, 0755)
+			return
+		}
+		if err := os.Symlink(asSymlinkTo, tool); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cwdA := t.TempDir()
+	cwdB := t.TempDir()
+	mk(cwdA, "")
+	writeTestExecutable(t, filepath.Join(cwdB, "real", "pig"), 0755)
+	mk(cwdB, filepath.Join(cwdB, "real", "pig"))
+
+	const iters = 200
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make(chan string, 2)
+	run := func(cwd, wantRule string) {
+		defer wg.Done()
+		g := currentGuardCall()
+		g.cwd = cwd
+		<-start
+		for i := 0; i < iters; i++ {
+			rule, _ := g.guardCtxRunShell("./bin/mytool")
+			if rule != wantRule {
+				errs <- cwd + " iter " + strconv.Itoa(i) + ": got rule " + rule + " want " + wantRule
+				return
+			}
+		}
+	}
+	wg.Add(2)
+	go run(cwdA, "")                      // own dir: mytool resolves to itself
+	go run(cwdB, ruleSubagentNestedAgent) // own dir: mytool -> pig blocked
+	close(start)
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
 	}
 }
 

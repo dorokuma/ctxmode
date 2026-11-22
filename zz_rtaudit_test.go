@@ -18,9 +18,16 @@ type rtCase struct {
 
 // rtGuard mirrors main.go toolExecute's guard sequence (env -> argv/shell -> stdin / code).
 func rtGuard(t *testing.T, c rtCase) string {
+	return rtGuardCwd(t, c, "")
+}
+
+// rtGuardCwd is rtGuard with the call cwd pinned on the guardCall the way
+// main.go now pins it (cwd == "" keeps the process-cwd fallback).
+func rtGuardCwd(t *testing.T, c rtCase, cwd string) string {
 	t.Setenv("CTXMODE_ROLE", c.role)
 	t.Setenv("CTXMODE_READONLY", c.ro)
 	g := currentGuardCall()
+	g.cwd = cwd
 	lang := c.lang
 	if lang == "" {
 		lang = "shell"
@@ -298,10 +305,7 @@ func TestRTAuditPath(t *testing.T) {
 	run := func(id, role, cmd string, wantAllow bool, prep func(t *testing.T) string) {
 		t.Run(id, func(t *testing.T) {
 			cwd := prep(t)
-			if cwd != "" {
-				defer withScreenCwd(cwd)()
-			}
-			got := rtGuard(t, rtCase{id: id, role: role, cmd: cmd})
+			got := rtGuardCwd(t, rtCase{id: id, role: role, cmd: cmd}, cwd)
 			allow := strings.HasPrefix(got, "ALLOW")
 			if allow != wantAllow {
 				t.Errorf("%s (%s): got %s, wantAllow=%v", id, role, got, wantAllow)

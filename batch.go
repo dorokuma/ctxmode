@@ -257,8 +257,8 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 	}
 	audit.rec.CWD = cwd
 	// Role-guard head screening resolves relative/aliased command names the way
-	// each batched command's shell will; pin this call's cwd for the guards.
-	defer withScreenCwd(cwd)()
+	// each batched command's shell will; this call's cwd rides the guardCall as
+	// immutable per-call state (the shared screenCwd global is gone).
 
 	// Per-command heuristic screen, computed once for the call-level summary and
 	// per-command audit fields. Role guards + hc-gate prepare run in the
@@ -288,10 +288,11 @@ func (s *server) toolBatchExecute(ctx context.Context, _ *mcp.CallToolRequest, a
 		}
 	}
 
-	// Role guards + prepare: synchronous under withScreenCwd (never in
-	// concurrent goroutines — screenCwd is process-global). preps[i].execCode
+	// Role guards + prepare: synchronous in this call, the call's cwd pinned
+	// on the guardCall (the shared screenCwd global is gone). preps[i].execCode
 	// is the unique execution object; audit/batchResult keep raw cmd.Command.
 	guard := currentGuardCall()
+	guard.cwd = cwd
 	preps := make([]preparedShell, len(args.Commands))
 	var guardRule string
 	for i, cmd := range args.Commands {

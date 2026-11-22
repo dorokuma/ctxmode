@@ -72,7 +72,7 @@ func TestDiffPeel_ContractAB_SafeWrapperChains(t *testing.T) {
 		{"nohup timeout env chain", []string{"nohup", "timeout", "-k", "1", "5", "env", "A=1", "B=2", "sh", "-c", "echo ok"}, "sh"},
 	}
 	for _, r := range rows {
-		head, idx, _, _, exhausted := peelWrappersWithIndex(append([]string{}, r.argv...))
+		head, idx, _, _, exhausted := peelWrappersWithIndex(append([]string{}, r.argv...), callerIdentity{})
 		if exhausted {
 			t.Fatalf("%s: prepare peeler exhausted on %v", r.name, r.argv)
 		}
@@ -120,7 +120,7 @@ func TestDiffPeel_ContractB_NoReverseOverPeel(t *testing.T) {
 		{"command", "-p", "--", "ls"},
 	}
 	for _, argv := range corpus {
-		head, idx, _, _, _ := peelWrappersWithIndex(append([]string{}, argv...))
+		head, idx, _, _, _ := peelWrappersWithIndex(append([]string{}, argv...), callerIdentity{})
 		gHead := peelGuardHead(t, argv)
 		if idx > 0 && len(gHead) > 0 && isPeeledWrapperBase(baseName(gHead[0])) && baseName(gHead[0]) != baseName(argv[0]) {
 			t.Fatalf("contract B violated on %v: prepare peeled to idx=%d head=%v while guard head still on wrapper %v", argv, idx, head, gHead)
@@ -193,7 +193,7 @@ func TestDiffPeel_ContractC_NonProvenanceForms(t *testing.T) {
 		// A rows above), NOT part of this difference set.
 	}
 	for _, r := range rows {
-		head, idx, _, envAs, _ := peelWrappersWithIndex(append([]string{}, r.argv...))
+		head, idx, _, envAs, _ := peelWrappersWithIndex(append([]string{}, r.argv...), callerIdentity{})
 		if r.wantIdxSurrender {
 			if idx >= 0 {
 				t.Fatalf("%s: contract C violated — prepare peeler peeled to idx=%d head=%v on non-provenance form %v", r.name, idx, head, r.argv)
@@ -235,7 +235,7 @@ func TestDiffPeel_QueryForm_CommandV(t *testing.T) {
 		{"command", "-V", "hc"},
 		{"command", "-pv", "hc"},
 	} {
-		head, idx, _, _, _ := peelWrappersWithIndex(append([]string{}, argv...))
+		head, idx, _, _, _ := peelWrappersWithIndex(append([]string{}, argv...), callerIdentity{})
 		gHead := peelGuardHead(t, argv)
 		// Both sides report `command` itself as the head (a query, not a
 		// wrapped execution): prepare keeps idx == 0 and head == argv.
@@ -247,7 +247,7 @@ func TestDiffPeel_QueryForm_CommandV(t *testing.T) {
 		}
 	}
 	// Contrast: `command -p -- ls` IS an executed wrapper — both peel.
-	head, idx, _, _, _ := peelWrappersWithIndex([]string{"command", "-p", "--", "ls"})
+	head, idx, _, _, _ := peelWrappersWithIndex([]string{"command", "-p", "--", "ls"}, callerIdentity{})
 	if idx <= 0 || head[0] != "ls" {
 		t.Fatalf("command -p -- ls: prepare head=%v idx=%d", head, idx)
 	}

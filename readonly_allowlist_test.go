@@ -324,7 +324,12 @@ func mustSbxBin(t *testing.T) string {
 	writeTestExecutable(t, filepath.Join(dir, "sbx"), 0555)
 	writeTestExecutable(t, filepath.Join(dir, "ssh"), 0555)
 	mustSymlink(t, "sbx", filepath.Join(dir, "foo"))
-	mustSymlink(t, "ssh", filepath.Join(dir, "ssx"))
+	// ssx points at a REAL system ssh: the R5 resolved-target shadow rule
+	// only blocks targets living in user/toolchain dirs, so a toolchain
+	// alias resolving into /usr/bin keeps the PATH-alias rewrite free.
+	// (A local `ssx -> .local/bin/ssh` file is a planted shadow and fails
+	// the new rule — that is exactly what the rule exists to catch.)
+	mustSymlink(t, "/usr/bin/ssh", filepath.Join(dir, "ssx"))
 	return dir
 }
 

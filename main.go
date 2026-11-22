@@ -35,7 +35,7 @@ import (
 
 // Version is the single source of truth for MCP, doctor, and User-Agent.
 // Keep aligned with CHANGELOG.md latest release.
-const Version = "6.1.0"
+const Version = "6.1.1"
 
 // toolIndex walk / size limits.
 const (
@@ -510,8 +510,9 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 	}
 	audit.rec.CWD = cwd
 	// Role-guard head screening resolves relative/aliased command names the way
-	// the child process will; pin this call's cwd for the guards below.
-	defer withScreenCwd(cwd)()
+	// the child process will; this call's cwd rides the guardCall as immutable
+	// per-call state (the shared screenCwd global is gone) so concurrent calls
+	// cannot pollute each other's resolution.
 
 	// Validate env allowlist and stdin size.
 	filteredEnv, err := filterExecEnv(args.Env)
@@ -531,6 +532,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 	// for strict read-only roles. Runs after startAudit so the blocked call is
 	// still recorded (exit_code -1, screen_verdict block).
 	guard := currentGuardCall()
+	guard.cwd = cwd
 	// Caller-supplied env overrides get the execution-hook screen too: an
 	// envHookVars value (GIT_PAGER=/tmp/x, NODE_OPTIONS=...) handed via
 	// args.Env arms a child process exactly like an `env KEY=VAL` prefix.
@@ -1179,8 +1181,11 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	}
 	audit.setCommand(auditFileCommand(target, language, args.Code), cwd)
 	// Role-guard head screening resolves relative/aliased command names the way
-	// the child process will; pin this call's cwd for the guards below.
-	defer withScreenCwd(cwd)()
+	// the child process will; this call's cwd rides the guardCall as immutable
+	// per-call state (the shared screenCwd global is gone) so concurrent calls
+	// cannot pollute each other's resolution.
+	guardEF := currentGuardCall()
+	guardEF.cwd = cwd
 	if rt, ok := runtimes[language]; ok {
 		audit.setInterpreter(rt.Exe)
 	}
@@ -1188,7 +1193,7 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 	var injectedCode string
 	if language == "shell" {
 		// Prepare with FILE_CONTENT taint, then inject, then run the unique artifact.
-		prep := currentGuardCall().prepareCtxRunShellWithTaint(args.Code, map[string]bool{"FILE_CONTENT": true})
+		prep := guardEF.prepareCtxRunShellWithTaint(args.Code, map[string]bool{"FILE_CONTENT": true})
 		if prep.rule != "" {
 			audit.setScreen(shellBlock, prep.rule)
 			return nil, nil, blockedReportError(guardBlockedError(prep.rule, prep.detail), nil, args.Code)
@@ -1206,7 +1211,7 @@ func (s *server) toolExecuteFile(ctx context.Context, _ *mcp.CallToolRequest, ar
 		injectedCode = injectFileContent(language, args.Code, string(fileContent))
 		// Non-shell execute_file: FILE_CONTENT is data; the caller's code is
 		// what the interpreter runs, so it gets the code guard.
-		if grule, detail := currentGuardCall().guardCtxRunCode(language, args.Code); grule != "" {
+		if grule, detail := guardEF.guardCtxRunCode(language, args.Code); grule != "" {
 			audit.setScreen(shellBlock, grule)
 			return nil, nil, blockedReportError(guardBlockedError(grule, detail), nil, args.Code)
 		}
