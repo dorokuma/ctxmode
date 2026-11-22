@@ -3071,7 +3071,14 @@ func TestGuard_CmdSubArgvIntegrity(t *testing.T) {
 	}{
 		// The substitution's inner command is screened as its own segment
 		// while the outer argv stays whole (no "" head, no torn "status").
-		{name: "git -C $(pwd) ok", code: "git -C $(pwd) status", want: "git dynamic global option"},
+		// R2-3/R4-MF-2/R5-MF-2: $(pwd) binds the screened call's cwd only
+		// while no directory switch can run — a `for X in cd; do $X ...`
+		// enum head, a non-constant command head (`!ok` or dynamic), a
+		// builtin/command-wrapped switch and eval/source/. all invalidate
+		// the static bind, so `git -C <cwd>` passes while `git -C $(pwd)`
+		// blocks on the dynamic option itself and `git -C $(pig)` still
+		// blocks on the nested-agent segment.
+		{name: "git -C $(pwd)", code: "git -C $(pwd) status", want: "git dynamic global option"},
 		{name: "git -C $(pig)", code: "git -C $(pig) status", want: "pig"},
 		{name: "assign prefix pig", code: "A=$(true) pig", want: "pig"},
 		{name: "assign prefix ls ok", code: "A=$(true) ls", want: ""},

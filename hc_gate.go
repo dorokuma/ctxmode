@@ -298,6 +298,16 @@ func findTrustedHcExecutable() (string, error) {
 		if !isSafePathDirEntry(dir) {
 			continue
 		}
+		// Production refuses every non-install-slot PATH entry: a safe
+		// toolchain dir is not enough — the gate must never exec a
+		// ~/.cargo/bin, .venv/bin or node_modules/.bin shadow (R3 SF-2).
+		// Only /usr/local/bin or <trustedHome>/.local/bin qualify.
+		if dir != "/usr/local/bin" {
+			tail, ok := stripTrustedHomePrefix(dir)
+			if !ok || tail != "/.local/bin" {
+				continue
+			}
+		}
 		st, err := os.Stat(cand)
 		if err != nil || st.IsDir() || st.Mode()&0111 == 0 {
 			continue

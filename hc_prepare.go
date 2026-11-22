@@ -400,14 +400,16 @@ func hcGateUnsafePeelBase(b string) bool {
 // exhaustion. The old suffix-match shortcut ("find the peeled head back in
 // argv") is gone — `env -S "sbx --" hc …` can no longer satisfy it.
 func peelWrappersWithIndex(argv []string, caller callerIdentity) (headArgv []string, headIdx int, wrappers []string, envAs envAssignments, exhausted bool) {
-	effPath := envAs.effectivePATHFrom(os.Getenv("PATH"))
+	basePath := caller.effectivePATH()
+	effPath := envAs.effectivePATHFrom(basePath)
+	effCwd := caller.screenCwd()
 	i := 0
 	steps := 0
 	for ; steps < peelWrapperMaxSteps && i < len(argv); steps++ {
 		a := argv[i]
 		if isAssignWord(a) {
 			envAs.addAssign(a)
-			effPath = envAs.effectivePATHFrom(os.Getenv("PATH"))
+			effPath = envAs.effectivePATHFrom(basePath)
 			i++
 			steps--
 			continue
@@ -426,7 +428,7 @@ func peelWrappersWithIndex(argv []string, caller callerIdentity) (headArgv []str
 			return argv[i:], i, wrappers, envAs, false
 		}
 		base := filepath.Base(a)
-		rb := canonicalResolvedBase(resolveHeadBase(a, effPath, caller.screenCwd()))
+		rb := canonicalResolvedBase(resolveHeadBase(a, effPath, effCwd))
 		if hcGateUnsafePeelBase(rb) {
 			return argv[i:], -1, nil, envAs, false
 		}
@@ -474,13 +476,24 @@ func peelWrappersWithIndex(argv []string, caller callerIdentity) (headArgv []str
 						envAs.ops = append(envAs.ops, envOp{kind: 'u', key: name[len("unset="):]})
 						i++
 						continue
-					case name == "chdir" || name == "argv0":
+					case name == "chdir":
+						if i+1 >= len(argv) {
+							return argv[i:], -1, nil, envAs, false
+						}
+						envAs.ops = append(envAs.ops, envOp{kind: 'd', value: argv[i+1]})
+						i += 2
+						continue
+					case name == "argv0":
 						if i+1 >= len(argv) {
 							return argv[i:], -1, nil, envAs, false
 						}
 						i += 2
 						continue
-					case strings.HasPrefix(name, "chdir=") || strings.HasPrefix(name, "argv0="):
+					case strings.HasPrefix(name, "chdir="):
+						envAs.ops = append(envAs.ops, envOp{kind: 'd', value: name[len("chdir="):]})
+						i++
+						continue
+					case strings.HasPrefix(name, "argv0="):
 						i++
 						continue
 					case name == "null" || name == "version" || name == "help":
@@ -512,6 +525,9 @@ func peelWrappersWithIndex(argv []string, caller callerIdentity) (headArgv []str
 								if w[j] == 'u' {
 									envAs.ops = append(envAs.ops, envOp{kind: 'u', key: w[j+1:]})
 								}
+								if w[j] == 'C' {
+									envAs.ops = append(envAs.ops, envOp{kind: 'd', value: w[j+1:]})
+								}
 								j = len(w)
 								continue
 							}
@@ -522,6 +538,9 @@ func peelWrappersWithIndex(argv []string, caller callerIdentity) (headArgv []str
 							}
 							if w[j] == 'u' {
 								envAs.ops = append(envAs.ops, envOp{kind: 'u', key: argv[i+1]})
+							}
+							if w[j] == 'C' {
+								envAs.ops = append(envAs.ops, envOp{kind: 'd', value: argv[i+1]})
 							}
 							consumed = true
 							j = len(w)
@@ -549,7 +568,16 @@ func peelWrappersWithIndex(argv []string, caller callerIdentity) (headArgv []str
 				goto envDone
 			}
 		envDone:
-			effPath = envAs.effectivePATHFrom(os.Getenv("PATH"))
+			effPath = envAs.effectivePATHFrom(basePath)
+			effCwd = caller.seededCwdWith(envAs).screenCwd()
+			// A `d` op with an empty or dynamic target can never re-anchor the
+			// slot walk to a knowable directory — surrender provenance like an
+			// env -i (R3 MF-2), matching peelResolvedSegDepth's fail-closed hit.
+			for _, op := range envAs.ops {
+				if op.kind == 'd' && (op.value == "" || isDynamicArg(op.value)) {
+					return argv[i:], -1, nil, envAs, false
+				}
+			}
 		case "time":
 			i++
 			wrappers = append(wrappers, "time")
@@ -793,7 +821,7 @@ func hcShellDialectBash(head0, effPath string, caller callerIdentity) bool {
 // `hc` at head index 0 may be rewritten (no wrappers, no assigns, no
 // /tmp/hc, no herdr-core), and Type-B (sh -c) is never rewritten at all.
 func collectHcGateEdits(code, selfExe string, envTaint map[string]bool, bashANSI, strictReadonly bool, caller callerIdentity) (edits []byteEdit, rule, detail string) {
-	segs, ok := parseSubagentShellASTEnv(code, 0, false, bashANSI, envTaint)
+	segs, ok := parseSubagentShellASTEnv(code, 0, false, bashANSI, envTaint, caller)
 	if !ok {
 		// Preserve fail-closed: if parse produced a parseErr/depth segment, let
 		// the later guard surface it; no edits.
@@ -911,12 +939,18 @@ func collectInnerShellScriptEdit(seg shellSegment, selfExe string, envTaint map[
 	if !wordIsStaticLiteral(scriptWord) {
 		return nil, "", ""
 	}
-	bashANSI := hcShellDialectBash(head[0], envAs.effectivePATHFrom(os.Getenv("PATH")), caller)
-	// The peeled env overrides (HOME=/x sh -c ...) taint the inner payload
-	// exactly like a caller-level env prefix; losing them lets an inner
-	// `$HOME` keep an abs-dir grant it must not have.
+	// The dialect and every downstream check resolve under the caller
+	// seeded with the peeled env ops — a PATH=<cargoBin> prefix must
+	// drive alias resolution here, never the bare process PATH (R4 SF-1).
+	innerCaller := caller.seededWith(envAs)
+	bashANSI := hcShellDialectBash(head[0], innerCaller.effectivePATH(), innerCaller)
+	// The peeled env overrides (HOME=/x sh -c ..., env -C dir ...) taint
+	// and re-anchor the inner payload exactly like a caller-level env
+	// prefix; losing them lets an inner `$HOME` keep an abs-dir grant it
+	// must not have, and an inner relative head would resolve under the
+	// OUTER cwd instead of the chdir'd one (R3 MF-2).
 	innerTaint := mergeEnvTaint(envTaint, envAs.taintedSentinelNames())
-	innerEdits, rule, detail := collectHcGateEdits(text, selfExe, innerTaint, bashANSI, strictReadonly, caller)
+	innerEdits, rule, detail := collectHcGateEdits(text, selfExe, innerTaint, bashANSI, strictReadonly, innerCaller)
 	if rule != "" {
 		return nil, rule, detail
 	}
@@ -950,15 +984,18 @@ func hcRewritableHcHead(head0, effPath string, caller callerIdentity) bool {
 		if !filepath.IsAbs(abs) {
 			abs = filepath.Join(caller.screenCwd(), abs)
 		}
-		if !isSafePathDirEntry(filepath.Dir(abs)) || !isTrustedExecutableOnDisk(abs, os.Geteuid()) {
-			return false
-		}
-		resolved, err := filepath.EvalSymlinks(abs)
-		if err != nil {
-			return false
-		}
-		b := canonicalResolvedBase(filepath.Base(resolved))
-		return b == "hc" || b == "herdr-core"
+		// A path-form hc head may rewrite ONLY at a real install slot —
+		// /usr/local/bin or <trustedHome>/.local/bin — so a planted
+		// .venv/bin/hc, node_modules/.bin/hc or ~/.cargo/bin/hc is never
+		// laundered into a --hc-gate call (R3 SF-2).
+		return admittedReadonlyCanonicalHead(filepath.Clean(abs), os.Geteuid()) != ""
+	}
+	// A bare-name head must resolve through the effective PATH without
+	// tripping the planted-shadow screen: a PATH carrying .venv/bin or
+	// ~/.cargo/bin whose hc is NOT a trusted install slot fails closed
+	// and leaves the block to the guard's screenPathHeadTrust.
+	if hit := screenPathHeadTrust(head0, effPath, caller); hit != "" {
+		return false
 	}
 	for _, b := range headBaseAliasHits([]string{head0}, effPath, caller) {
 		if b == "hc" || b == "herdr-core" {
@@ -977,9 +1014,11 @@ func collectLeafHcEdit(seg shellSegment, selfExe string, bashANSI, strictReadonl
 	if exhausted || headIdx < 0 {
 		return nil, "", ""
 	}
-	// Disallow env -i / clear.
+	// Disallow env -i / clear and env -C / --chdir: a cwd-changing wrapper
+	// surrenders provenance exactly like a clear (R3 SF-1, matching
+	// screenCtxmodeGateHead's 'c'||'d' contract).
 	for _, op := range envAs.ops {
-		if op.kind == 'c' {
+		if op.kind == 'c' || op.kind == 'd' {
 			return nil, "", ""
 		}
 	}
@@ -991,7 +1030,12 @@ func collectLeafHcEdit(seg shellSegment, selfExe string, bashANSI, strictReadonl
 	if len(head) != 4 || head[1] != "send" {
 		return nil, "", ""
 	}
-	effPath := envAs.effectivePATHFrom(os.Getenv("PATH"))
+	// Both branches resolve under the caller seeded with the peeled env
+	// ops: a PATH=<cargoBin>:$PATH prefix must drive the bare-name hc
+	// resolution and the path-trust screen alike, so a shadow hc can
+	// never be laundered into --hc-gate (R4 MF-3).
+	innerCaller := caller.seededWith(envAs)
+	effPath := innerCaller.effectivePATH()
 	if strictReadonly {
 		// The read-only admission rule: `headIdx == 0` with no wrapper and no
 		// assignment prefix, and head[0] the bare literal "hc". /tmp/hc,
@@ -1003,7 +1047,14 @@ func collectLeafHcEdit(seg shellSegment, selfExe string, bashANSI, strictReadonl
 		if !wordIsStaticLiteral(seg.argWords[0]) {
 			return nil, "", ""
 		}
-	} else if !hcRewritableHcHead(head[0], effPath, caller) {
+		// Even the strict bare-"hc" admission must not rewrite when the
+		// effective PATH planted a shadow hc ahead of the trusted slot
+		// (R3 SF-2): the guard would block the call anyway, and the
+		// rewrite must never bless a head the path-trust screen rejects.
+		if hit := screenPathHeadTrust(head[0], innerCaller.effectivePATH(), innerCaller); hit != "" {
+			return nil, "", ""
+		}
+	} else if !hcRewritableHcHead(head[0], effPath, innerCaller) {
 		return nil, "", ""
 	}
 	addr, text := head[2], head[3]
@@ -1148,10 +1199,41 @@ func (g guardCall) prepareCtxRunShellTargets(code string, targetEnvs []envAssign
 			envTaint[name] = true
 		}
 	}
-	edits, rule, detail := collectHcGateEdits(code, selfExe, envTaint, false, g.strictReadonly, caller)
-	if rule != "" {
-		out.rule, out.detail = rule, detail
-		return out
+	// The edit walk must face the SAME env each target's own PATH view
+	// presents: a PATH=<cargoBin>:$PATH prefix on the stdin-target peel
+	// otherwise lets a shadow hc earn the --hc-gate rewrite the guard
+	// then blesses (R4 MF-1). Every target env whose seeded edit walk
+	// yields a rule rejects the whole prepare.
+	for _, te := range targetEnvs {
+		if _, erule, edetail := collectHcGateEdits(code, selfExe, envTaint, false, g.strictReadonly, caller.seededWith(te)); erule != "" {
+			out.rule, out.detail = erule, edetail
+			return out
+		}
+	}
+	var edits []byteEdit
+	if len(targetEnvs) > 0 {
+		edits, _, _ = collectHcGateEdits(code, selfExe, envTaint, false, g.strictReadonly, caller.seededWith(targetEnvs[0]))
+	} else {
+		edits, _, _ = collectHcGateEdits(code, selfExe, envTaint, false, g.strictReadonly, caller)
+	}
+	// Order-independent fail-closed (R6 SF-1): when the stdin stream feeds
+	// MORE THAN ONE local shell target, the rewrite decision must not
+	// depend on which target's env rode in first — `sh ;
+	// PATH=<cargoBin>:$PATH sh` and `PATH=<cargoBin>:$PATH sh ; sh` are
+	// the same runtime command, yet the first order seeds targetEnvs[0]
+	// with the clean PATH (a rewrite the second target's guard may judge
+	// against the shadow hc it did not collect). If the per-target edit
+	// walks disagree on the edit count, drop the rewrite and let the
+	// per-target guardPreparedShellEnv passes screen the code as-is.
+	if len(edits) > 0 && len(targetEnvs) > 1 {
+		want := len(edits)
+		for i := 1; i < len(targetEnvs); i++ {
+			teEdits, _, _ := collectHcGateEdits(code, selfExe, envTaint, false, g.strictReadonly, caller.seededWith(targetEnvs[i]))
+			if len(teEdits) != want {
+				edits = nil
+				break
+			}
+		}
 	}
 	if len(edits) > 0 && (selfErr != nil || selfExe == "") {
 		out.rule = ruleSubagentNestedAgent
@@ -1229,11 +1311,16 @@ func stdinSingleShellTarget(targets []stdinTarget, sshTunnel bool) ([]envAssignm
 // see the stream (pipe-fed, redirect-fed, heredoc / here-string fed, empty
 // or pure-assignment commands) are skipped.
 func scriptAllowsLocalShellStdinPrepare(code string, bash bool, outerEnv envAssignments, basePath string, caller callerIdentity) ([]envAssignments, bool) {
+	// Seed the outer env ONCE here: every segment, wrapper peel and stdin
+	// target below resolves under the env ops the prepared -c argv installs
+	// (an outer `env -C sub` re-anchors inner heads exactly once — never a
+	// doubled join, and never dropped from the resolution base, R4 MF-1).
+	caller = caller.seededWith(outerEnv)
 	var segs []shellSegment
 	if bash {
-		segs = splitShellSegmentsBash(code)
+		segs = splitShellSegmentsBashCaller(code, caller.envTaint, caller)
 	} else {
-		segs = splitShellSegments(code)
+		segs = splitShellSegmentsCaller(code, caller.envTaint, caller)
 	}
 	sawTarget := false
 	var out []envAssignments
@@ -1354,11 +1441,12 @@ func (g guardCall) prepareCtxRunArgv(argv []string, stdin string) preparedArgv {
 				out.rule, out.detail = ruleSubagentNestedAgent, "dynamic code payload"
 				return out
 			}
+			innerCaller := caller.seededWith(envAs)
 			innerTaint := envAs.taintedSentinelNames()
 			effPath := envAs.effectivePATHFrom(os.Getenv("PATH"))
 			selfExe, _, selfErr := resolvedSelfExe()
-			isBash := hcShellDialectBash(argv[0], effPath, caller)
-			edits, rule, detail := collectHcGateEdits(rawScript, selfExe, innerTaint, isBash, g.strictReadonly, caller)
+			isBash := hcShellDialectBash(argv[0], effPath, innerCaller)
+			edits, rule, detail := collectHcGateEdits(rawScript, selfExe, innerTaint, isBash, g.strictReadonly, innerCaller)
 			if rule != "" {
 				out.rule, out.detail = rule, detail
 				return out
@@ -1379,8 +1467,18 @@ func (g guardCall) prepareCtxRunArgv(argv []string, stdin string) preparedArgv {
 					return out
 				}
 			}
-			if rule, detail := g.guardPreparedShellEnv(execText, envAs, nil, prov); rule != "" {
-				out.rule, out.detail = rule, detail
+			// A bash -c payload must face the BASH dialect on the second
+			// review: $'...', [[ ... ]] and arithmetic are legal bash but
+			// POSIX-syntax errors under LangPOSIX — screening them with the
+			// POSIX parser would reject a prepare*-legal rewrite (R2-7).
+			var gRule, gDetail string
+			if isBash {
+				gRule, gDetail = g.guardPreparedShellEnvBash(execText, envAs, nil, prov)
+			} else {
+				gRule, gDetail = g.guardPreparedShellEnv(execText, envAs, nil, prov)
+			}
+			if gRule != "" {
+				out.rule, out.detail = gRule, gDetail
 				return out
 			}
 			execArgv := append([]string(nil), argv...)
@@ -1396,6 +1494,11 @@ func (g guardCall) prepareCtxRunArgv(argv []string, stdin string) preparedArgv {
 				// data and screens it through guardCtxRunStdin on the REAL
 				// execArgv (never the ":"-stubbed outerCheck), which also
 				// escalates strictReadonly for remote targets.
+				// The outer caller is passed, not the already-seeded innerCaller:
+				// scriptAllowsLocalShellStdinPrepare seeds effCaller itself
+				// (caller.seededWith(outerEnv)), and stdinProgramTargetsWithEnv
+				// applies each level's OWN peeled ops — a double seed here would
+				// replay the outer env -C twice (R4 MF-1).
 				if targetEnvs, ok := scriptAllowsLocalShellStdinPrepare(execText, isBash, envAs, os.Getenv("PATH"), caller); ok {
 					sp := g.prepareCtxRunShellTargets(stdin, targetEnvs)
 					if sp.rule != "" {
@@ -1479,11 +1582,28 @@ func (g guardCall) guardPreparedShell(code string, envTaint map[string]bool, pro
 // FILE_CONTENT). This is the ONLY guard that may see hcProv: a pure-check
 // caller has prov == nil and can never mint an allowed `<selfExe> --hc-gate`.
 func (g guardCall) guardPreparedShellEnv(code string, envAs envAssignments, extraTaint map[string]bool, prov *hcGateProvenance) (rule, detail string) {
+	return g.guardPreparedShellEnvDialect(code, envAs, extraTaint, prov, false)
+}
+
+// guardPreparedShellEnvBash is guardPreparedShellEnv under the bash dialect:
+// a `bash -c` payload's $'...', [[ ... ]] and arithmetic stay legal where
+// the POSIX parser would reject them (R2-7).
+func (g guardCall) guardPreparedShellEnvBash(code string, envAs envAssignments, extraTaint map[string]bool, prov *hcGateProvenance) (rule, detail string) {
+	return g.guardPreparedShellEnvDialect(code, envAs, extraTaint, prov, true)
+}
+
+func (g guardCall) guardPreparedShellEnvDialect(code string, envAs envAssignments, extraTaint map[string]bool, prov *hcGateProvenance, bash bool) (rule, detail string) {
 	caller := g.callerIdentity().seededWith(envAs)
 	caller.hcProv = prov
 	caller.envTaint = mergeEnvTaint(caller.envTaint, extraTaint)
 	if g.subagent {
-		if hit := guardShellSubagentDepthEnv(code, 0, caller, caller.envTaint); hit != "" {
+		var hit string
+		if bash {
+			hit = guardShellSubagentDepthBash(code, 0, caller)
+		} else {
+			hit = guardShellSubagentDepthEnv(code, 0, caller, caller.envTaint)
+		}
+		if hit != "" {
 			if hit == "ctxmode index" || hit == roSSHWriteHit {
 				return ruleReadonlyWrite, hit
 			}

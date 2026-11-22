@@ -314,7 +314,13 @@ func splitShellSegments(code string) []shellSegment {
 // splitShellSegmentsEnv parses shell text with environment-override taint
 // from an outer envAs (HOME=/x sh -c 'PATH=$HOME/x:$PATH git').
 func splitShellSegmentsEnv(code string, envTaint map[string]bool) []shellSegment {
-	segs, ok := parseSubagentShellASTEnv(code, 0, false, false, envTaint)
+	return splitShellSegmentsCaller(code, envTaint, callerIdentity{})
+}
+
+// splitShellSegmentsCaller is splitShellSegmentsEnv with an explicit caller
+// so the inner $(pwd) base matches the screened call's cwd.
+func splitShellSegmentsCaller(code string, envTaint map[string]bool, caller callerIdentity) []shellSegment {
+	segs, ok := parseSubagentShellASTEnv(code, 0, false, false, envTaint, caller)
 	if !ok {
 		if len(segs) > 0 {
 			return segs
@@ -324,14 +330,13 @@ func splitShellSegmentsEnv(code string, envTaint map[string]bool) []shellSegment
 	return segs
 }
 
-// splitShellSegmentsBash parses bash/zsh/ksh/mksh -c payloads with LangBash fail-closed.
-func splitShellSegmentsBash(code string) []shellSegment {
-	return splitShellSegmentsBashEnv(code, nil)
-}
-
-// splitShellSegmentsBashEnv is splitShellSegmentsBash with env taint.
-func splitShellSegmentsBashEnv(code string, envTaint map[string]bool) []shellSegment {
-	segs, ok := parseSubagentShellASTEnv(code, 0, false, true, envTaint)
+// splitShellSegmentsBashCaller parses bash/zsh/ksh/mksh -c payloads with
+// LangBash fail-closed, with an explicit caller so the inner $(pwd) base
+// matches the screened call's cwd (the former caller-less
+// splitShellSegmentsBash/BashEnv wrappers were dropped once every call
+// site threaded its caller — R3 MF-3).
+func splitShellSegmentsBashCaller(code string, envTaint map[string]bool, caller callerIdentity) []shellSegment {
+	segs, ok := parseSubagentShellASTEnv(code, 0, false, true, envTaint, caller)
 	if !ok {
 		if len(segs) > 0 {
 			return segs
@@ -369,9 +374,9 @@ var shellNoopWords = map[string]bool{
 // CTXMODE_ROLE=worker env -i pig (clear AFTER the re-assign) is caught
 // exactly like env -u CTXMODE_ROLE.
 type envOp struct {
-	kind  byte   // 'a' assign, 'u' unset, 'c' clearInherit
+	kind  byte   // 'a' assign, 'u' unset, 'c' clearInherit, 'd' chdir (env -C/--chdir)
 	key   string // variable name (assign/unset only)
-	value string // assigned value (assign only)
+	value string // assigned value (assign only); chdir target dir (chdir only)
 }
 
 // envAssignments records the ordered env operations stripped by
@@ -869,6 +874,7 @@ func peelWrappersAndSbxAliases(argv []string, pathEnv string, caller callerIdent
 		h, _, ea, ex := peelWrappers(cur)
 		envAs = envAs.merged(ea)
 		effPath = ea.effectivePATHFrom(effPath)
+		caller = caller.seededWith(ea)
 		if ex || len(h) == 0 {
 			return h, envAs, effPath, ex
 		}
@@ -1577,7 +1583,22 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) ([]string, []st
 					payloads = append(payloads, envUnknownLongPrefix+"missing operand "+a)
 					i++
 				}
-			case "chdir", "argv0":
+			case "chdir":
+				if hasVal {
+					envAs.ops = append(envAs.ops, envOp{kind: 'd', value: val})
+					i++
+				} else if i+1 < len(argv) {
+					if isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
+						payloads = append(payloads, envUnknownLongPrefix+"dynamic option")
+						return argv[i+1:], payloads, envAs
+					}
+					envAs.ops = append(envAs.ops, envOp{kind: 'd', value: argv[i+1]})
+					i += 2
+				} else {
+					payloads = append(payloads, envUnknownLongPrefix+"missing operand "+a)
+					i++
+				}
+			case "argv0":
 				if hasVal {
 					i++
 				} else if i+1 < len(argv) {
@@ -1655,7 +1676,15 @@ func skipEnvOperands(argv []string, i int, envAs envAssignments) ([]string, []st
 					switch opt {
 					case 'u':
 						envAs.ops = append(envAs.ops, envOp{kind: 'u', key: optVal})
-					case 'C', 'a':
+					case 'C':
+						if consumedNext && isDynamicArg(optVal) && !isSplitSafeDynamicWord(optVal) {
+							payloads = append(payloads, envUnknownLongPrefix+"dynamic option")
+							unknown = true
+							j = len(a)
+							break
+						}
+						envAs.ops = append(envAs.ops, envOp{kind: 'd', value: optVal})
+					case 'a':
 						if consumedNext && isDynamicArg(optVal) && !isSplitSafeDynamicWord(optVal) {
 							payloads = append(payloads, envUnknownLongPrefix+"dynamic option")
 							unknown = true
@@ -2077,20 +2106,25 @@ func headIsCtxmodeOrSelfExe(head0, effPath, cwd string) bool {
 // bare binary or a plain subcommand spelling (ctxmode search …) and for a
 // fully verified `<selfExe> --hc-gate send addr text` leaf; everything else
 // in the --hc-gate / dynamic-option zone fails closed.
-func screenCtxmodeGateHead(typedHead []string, seg shellSegment, prov *hcGateProvenance) string {
+func screenCtxmodeGateHead(typedHead []string, seg shellSegment, prov *hcGateProvenance, caller callerIdentity) string {
 	if len(typedHead) < 2 {
 		return ""
 	}
 	if typedHead[1] == "--hc-gate" {
 		// The rewrite must be the one this prepare* pass minted: same buffer,
 		// exact head word span, exact --hc-gate word span, safe wrappers, no
-		// env -i, and the prepared argv shape.
-		_, headIdx, wrappers, envAs, exhausted := peelWrappersWithIndex(seg.argv, callerIdentity{})
+		// env -i, and the prepared argv shape. The peel re-derives each head
+		// under THIS call's caller cwd (peelResolvedSegDepth carries it), not
+		// the process fallback — a wrapper env -C or nested -c must not
+		// re-anchor the slot walk to a different directory. A cwd-changing
+		// env -C/--chdir inside the wrapper chain surrenders provenance
+		// outright (the prepared slot was minted under the outer cwd).
+		_, headIdx, wrappers, envAs, exhausted := peelWrappersWithIndex(seg.argv, caller)
 		if exhausted || headIdx < 0 || len(seg.argWords) != len(seg.argv) {
 			return "ctxmode --hc-gate"
 		}
 		for _, op := range envAs.ops {
-			if op.kind == 'c' {
+			if op.kind == 'c' || op.kind == 'd' {
 				return "ctxmode --hc-gate"
 			}
 		}
@@ -2131,6 +2165,7 @@ func screenCtxmodeGateHead(typedHead []string, seg shellSegment, prov *hcGatePro
 	// ctxmode "$@", ctxmode -"$x") — fails closed; the subcommand's own
 	// operands (ctxmode search --hc-gate, ctxmode search "$q") stay free.
 	for i := 1; i < len(typedHead); {
+
 		a := typedHead[i]
 		if a == "--" {
 			// os.Args[1] == "--" can never reach runHcGate.
@@ -2450,6 +2485,13 @@ var userDirForbiddenShadowHeads = map[string]bool{
 	"ssh": true, "scp": true, "sftp": true, "rsync": true,
 	"sudo": true, "doas": true, "su": true, "pkexec": true, "nsenter": true, "unshare": true,
 	"chroot": true, "systemd-run": true, "git": true,
+	// Report-channel / dispatcher heads: a planted hc/herdr-core in a
+	// user-writable toolchain dir (.venv/bin, node_modules/.bin,
+	// ~/.cargo/bin) must never shadow the real install slot —
+	// /usr/local/bin/{hc,herdr-core} and <trustedHome>/.local/bin/{...}
+	// stay free via the trusted-dir exemption in screenPathHeadTrust and
+	// admittedReadonlyCanonicalHead (R2-6).
+	"hc": true, "herdr-core": true,
 }
 
 // isSystemPathDir reports whether a cleaned absolute directory path is a
@@ -2691,20 +2733,80 @@ func screenPathHeadTrust(head0, pathEnv string, caller callerIdentity) string {
 			return "untrusted path binary " + head0
 		}
 		resolved = filepath.Clean(resolved)
+		// R5 MF-5/SF-6: the resolved TARGET's basename gets the same planted-
+		// shadow rule the typed head carries below — but ONLY when the target
+		// itself lives in a user/toolchain/workspace dir. A symlink alias
+		// pointing at a real system binary (.venv/bin/mysh -> /bin/sh,
+		// ssx -> /usr/bin/ssh) resolves to a legitimate system location and
+		// must NOT trip the block (the remote boundary and structural-alias
+		// screens judge it downstream); a linuxbrew-dir target only exempts
+		// when the resolved path differs from the lookup path itself. The
+		// hc/herdr-core install slot keeps its existing hcSlotOK exemption.
+		rdir := filepath.Clean(filepath.Dir(resolved))
+		rbShadow := canonicalResolvedBase(filepath.Base(resolved))
+		if userDirForbiddenShadowHeads[rbShadow] &&
+			!isSystemPathDir(rdir) && !(isLinuxbrewPathDir(rdir) && resolved != filepath.Clean(p)) &&
+			rbShadow != head0 && !isAllowedSystemReadonlyAlias(head0, rbShadow, head0, pathEnv, caller.screenCwd()) {
+			absP := filepath.Clean(p)
+			if !filepath.IsAbs(absP) {
+				absP = filepath.Join(caller.screenCwd(), absP)
+			}
+			if !(admittedReadonlyCanonicalHead(absP, euid) != "" &&
+				(head0 == "hc" || head0 == "herdr-core")) {
+				return "planted shadow binary in user path: " + head0
+			}
+		}
 		realCwd := filepath.Clean(caller.screenCwd())
 		if ec, e := filepath.EvalSymlinks(realCwd); e == nil {
 			realCwd = filepath.Clean(ec)
 		}
+		// The hc/herdr-core admission judges the CANDIDATE path the PATH
+		// lookup produced (p), never the EvalSymlinks target (whose
+		// basename is typically herdr-core): /usr/local/bin/hc and
+		// <trustedHome>/.local/bin/hc -> herdr-core stay free while a
+		// .venv/bin/hc or node_modules/.bin/hc symlink — even one whose
+		// target lands back inside the workspace or a toolchain dir —
+		// is a planted shadow and fails closed (R3 SF-2). A symlink ALIAS
+		// name (myhc -> hc, .venv/bin/mysh -> .venv/bin/sh) hits the same
+		// rule through the resolved target's basename (R4 MF-4).
+		rb := canonicalResolvedBase(filepath.Base(resolved))
+		hcSlotOK := func() bool {
+			if head0 != "hc" && head0 != "herdr-core" && rb != "hc" && rb != "herdr-core" {
+				return true
+			}
+			absP := filepath.Clean(p)
+			if !filepath.IsAbs(absP) {
+				absP = filepath.Join(caller.screenCwd(), absP)
+			}
+			return admittedReadonlyCanonicalHead(absP, euid) != "" &&
+				(head0 == "hc" || head0 == "herdr-core")
+		}
 		if realCwd != "" && realCwd != "." && realCwd != string(filepath.Separator) &&
 			(resolved == realCwd || strings.HasPrefix(resolved, realCwd+string(filepath.Separator))) {
+			// A report-channel/dispatcher head that resolved inside the
+			// workspace is only admissible at a REAL install slot
+			// (/usr/local/bin or <trustedHome>/.local/bin). A planted
+			// .venv/bin/hc, node_modules/.bin/hc or <cwd>/hc that the
+			// relative-PATH lookup resolved inside the project tree is a
+			// shadow and must block (R2-6).
+			if !hcSlotOK() {
+				return "planted shadow binary in user path: " + head0
+			}
 			return "" // resolved target stays inside the workspace
 		}
 		if isTrustedRelToolchainTarget(resolved, realCwd, euid) {
+			// A hoisted-monorepo/sibling-worktree hc/herdr-core shadow still
+			// fails closed unless it lands at a real install slot.
+			if !hcSlotOK() {
+				return "planted shadow binary in user path: " + head0
+			}
 			return ""
 		}
-		resDir := filepath.Clean(filepath.Dir(resolved))
-		if (isSystemPathDir(resDir) || isLinuxbrewPathDir(resDir) || caller.isUserToolchainPathDir(resDir)) &&
+		if (isSystemPathDir(rdir) || isLinuxbrewPathDir(rdir) || caller.isUserToolchainPathDir(rdir)) &&
 			isTrustedExecutableOnDiskCwd(resolved, euid, caller.screenCwd()) {
+			if !hcSlotOK() {
+				return "planted shadow binary in user path: " + head0
+			}
 			return ""
 		}
 		return "untrusted path binary " + head0
@@ -2717,14 +2819,69 @@ func screenPathHeadTrust(head0, pathEnv string, caller callerIdentity) string {
 	if !isTrustedExecutableOnDiskCwd(p, euid, caller.screenCwd()) {
 		return "untrusted path binary " + head0
 	}
+	// A symlink alias name (myhc -> hc, myenv -> env, mysh -> sh) escapes
+	// the literal-head0 check, so resolve the candidate once and judge the
+	// TARGET's canonical basename through the same planted-shadow rule
+	// (R5 MF-5/SF-6): when the resolved target itself lives in a
+	// user/toolchain/workspace dir and its basename names a forbidden
+	// shadow head, the alias is a planted shadow — the .local/bin
+	// install-slot exemption stays keyed on the TYPED name (a myhc -> hc
+	// alias there is still a shadow, never an install slot), and a
+	// standard same-name / same-family alias (rb == head0 or
+	// isAllowedSystemReadonlyAlias, e.g. sh -> dash, awk -> mawk) is a
+	// distro spelling, not a shadow. Targets resolving to a real system
+	// dir (/bin/sh, /usr/bin/ssh) — or a linuxbrew dir only when the
+	// symlink is real — likewise stay free, so ssx -> /usr/bin/ssh and
+	// ordinary distro links are never evidence of a planted shadow.
+	resolved := ""
+	rb := ""
+	if r, rerr := filepath.EvalSymlinks(p); rerr == nil {
+		resolved = filepath.Clean(r)
+		rb = canonicalResolvedBase(filepath.Base(resolved))
+	}
+	if resolved != "" {
+		rdir := filepath.Clean(filepath.Dir(resolved))
+		if userDirForbiddenShadowHeads[rb] &&
+			!isSystemPathDir(rdir) && !(isLinuxbrewPathDir(rdir) && resolved != filepath.Clean(p)) &&
+			rb != head0 && !isAllowedSystemReadonlyAlias(head0, rb, head0, pathEnv, caller.screenCwd()) {
+			// The <trustedHome>/.local/bin install slot is the only typed-name
+			// exemption (a myhc -> hc alias there is still a shadow). A
+			// standard same-name / same-family alias (sh -> dash, awk -> mawk,
+			// grep -> ggrep) inside a toolchain dir is a distro spelling, not
+			// a planted shadow, and stays free.
+			localBinSlot := false
+			if tail, ok := stripTrustedHomePrefix(dir); ok && tail == "/.local/bin" {
+				localBinSlot = true
+			}
+			if !(head0 == "hc" || head0 == "herdr-core") || !localBinSlot {
+				return "planted shadow binary in user path: " + head0
+			}
+		}
+	}
 	if inToolchainDir && userDirForbiddenShadowHeads[head0] {
 		if head0 == "git" && isLinuxbrewPathDir(dir) {
 			return ""
 		}
-		if resolved, err := filepath.EvalSymlinks(p); err == nil {
-			resolved = filepath.Clean(resolved)
-			rb := filepath.Base(resolved)
-			rdir := filepath.Dir(resolved)
+		// The hc/herdr-core shadow rule must not kill the REAL install slot
+		// a trusted-home .local/bin legitimately holds (the report channel
+		// admits that same slot via admittedReadonlyCanonicalHead); every
+		// other toolchain dir — .venv/bin, node_modules/.bin, ~/.cargo/bin,
+		// mise shims, project-local venvs — keeps the block. The slot
+		// exemption stays keyed on the TYPED name: a myhc -> hc alias in
+		// .local/bin is still a planted shadow, never an install slot.
+		if head0 == "hc" || head0 == "herdr-core" {
+			if tail, ok := stripTrustedHomePrefix(dir); ok && tail == "/.local/bin" {
+				return ""
+			}
+		}
+		// A standard same-name / same-family alias whose resolved target
+		// lives in a real system dir (sh -> /usr/bin/dash, awk -> mawk,
+		// grep -> ggrep, which -> debianutils.which) is a distro spelling,
+		// not a planted shadow — the R5 resolved-target rule above already
+		// blocks targets planted inside user/toolchain/workspace dirs, so
+		// this exemption can only admit system-dir targets.
+		if resolved != "" {
+			rdir := filepath.Clean(filepath.Dir(resolved))
 			if (isSystemPathDir(rdir) || (isLinuxbrewPathDir(rdir) && resolved != filepath.Clean(p))) &&
 				(rb == head0 || isAllowedSystemReadonlyAlias(head0, rb, head0, pathEnv, caller.screenCwd())) {
 				return ""
@@ -2876,10 +3033,13 @@ func screenNestedDispatch(headArgv []string, pathEnv string, depth int, caller c
 	// /tmp/hc would otherwise inherit the bare-name grant. The same
 	// admission the strict-readonly canonical-head rule applies; every
 	// other path-form head keeps the existing basename dispatch unchanged.
-	if strings.Contains(headArgv[0], "/") {
+	if strings.Contains(headArgv[0], "/") || looksLikePath(headArgv[0]) {
 		for _, base := range bases {
 			switch base {
 			case "hc", "herdr-core":
+				// A dot-prefixed relative head like `.foo` is a path spelling
+				// (looksLikePath), never a PATH lookup — admittedReadonlyCanonicalHead
+				// requires filepath.IsAbs, so it fails closed on this branch.
 				if admittedReadonlyCanonicalHead(headArgv[0], os.Geteuid()) == "" {
 					return "untrusted path binary " + filepath.Base(headArgv[0])
 				}
@@ -3472,6 +3632,16 @@ type callerIdentity struct {
 	cwd string
 }
 
+// effectivePATH returns the PATH the identity resolves against: pathEnv
+// already replayed through every env op seen so far by seededWith, or the
+// process PATH fallback lookPathIn applies to an empty value.
+func (c callerIdentity) effectivePATH() string {
+	if c.pathEnv != "" {
+		return c.pathEnv
+	}
+	return os.Getenv("PATH")
+}
+
 // currentCallerIdentity reads the caller's role identity from the process
 // environment once per top-level guard entry.
 func currentCallerIdentity() callerIdentity {
@@ -3488,8 +3658,12 @@ func currentCallerIdentity() callerIdentity {
 // operands, heredoc bodies, here-strings) uses it so inner placeholder
 // grants match the real env. The effective PATH is replayed too (R7): a
 // PATH=/x prefix must drive alias resolution inside the nested payload.
+// An `env -C DIR`/`env --chdir=DIR` op additionally re-anchors cwd so the
+// inner command's relative heads and any relative PATH segments resolve
+// under the directory env would actually chdir into (R2-4).
 func (c callerIdentity) seededWith(envAs envAssignments) callerIdentity {
 	c.pathEnv = envAs.effectivePATHFrom(c.pathEnv)
+	c = c.seededCwdWith(envAs)
 	extra := envAs.taintedSentinelNames()
 	if len(extra) == 0 {
 		return c
@@ -3502,6 +3676,34 @@ func (c callerIdentity) seededWith(envAs envAssignments) callerIdentity {
 		merged[k] = true
 	}
 	c.envTaint = merged
+	return c
+}
+
+// seededCwdWith applies env -C/--chdir ops in order: each `d` op re-anchors
+// the identity cwd to the resolved target (a relative DIR joins onto the
+// CURRENT screen cwd, then filepath.Clean). An empty or dynamic DIR
+// clears cwd so downstream head/PATH resolution fails closed rather than
+// silently falling back to the outer directory.
+func (c callerIdentity) seededCwdWith(envAs envAssignments) callerIdentity {
+	for _, op := range envAs.ops {
+		if op.kind != 'd' {
+			continue
+		}
+		dir := op.value
+		if dir == "" || isDynamicArg(dir) {
+			c.cwd = ""
+			continue
+		}
+		if !filepath.IsAbs(dir) {
+			base := c.screenCwd()
+			if base == "" {
+				c.cwd = ""
+				continue
+			}
+			dir = filepath.Join(base, dir)
+		}
+		c.cwd = filepath.Clean(dir)
+	}
 	return c
 }
 
@@ -3768,7 +3970,17 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	if exhausted {
 		return depthExceededHit
 	}
+	// An `env -C`/`--chdir` whose directory operand is empty or dynamic can
+	// never be reasoned about: the inner head would resolve under an
+	// unknowable cwd, so the whole peeled head fails closed (R2-4).
+	for _, op := range envAs.ops {
+		if op.kind == 'd' && (op.value == "" || isDynamicArg(op.value)) {
+			return "env -C"
+		}
+	}
 	effCaller := caller.seededWith(envAs)
+	outerCaller := caller
+	caller = effCaller
 	screenPayloads := func() string {
 		for _, payload := range splitPayloads {
 			if strings.HasPrefix(payload, envUnknownLongPrefix) {
@@ -3805,14 +4017,17 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		head = append([]string{canon}, head[1:]...)
 		base = canon
 	}
-	effPath := envAs.effectivePATHFrom(caller.pathEnv)
+	effPath := caller.effectivePATH()
 	// A ctxmode/selfExe head is a direct --hc-gate attempt unless the exact
 	// prepare*-minted provenance of this buffer backs it (P-3 / 裁决 5): a
 	// worker's `echo --hc-gate` is untouched, while a raw
 	// `./postinstall --hc-gate …`, `ctxmode --hc-gate …` or a dynamic option
-	// word in the ctxmode option zone fails closed.
+	// word in the ctxmode option zone fails closed. The gate slot walk
+	// re-derives under the OUTER caller — an env -C re-anchor must not move
+	// the prepared -c slot (R3 MF-2) — while every other screen below runs
+	// under the env -C-switched effCaller.
 	if headIsCtxmodeOrSelfExe(typedHead[0], effPath, caller.screenCwd()) {
-		if hit := screenCtxmodeGateHead(typedHead, seg, entryProv); hit != "" {
+		if hit := screenCtxmodeGateHead(typedHead, seg, entryProv, outerCaller); hit != "" {
 			return hit
 		}
 	}
@@ -3845,7 +4060,6 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 	if hit := screenEnvAssignments(envAs, kind, caller.role, caller.readonly, base, caller); hit != "" {
 		return hit
 	}
-	caller = effCaller
 	if hit := screenPayloads(); hit != "" {
 		return hit
 	}
@@ -3947,14 +4161,17 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return "dynamic code payload"
 		}
 		if kind == 's' {
-			inner := caller.seededWith(envAs)
+			inner := caller
 			// Provenance crosses a `sh -c` boundary ONLY when the script word is
 			// the exact rewritten Type-B slot of this buffer (same buffer, exact
 			// span, exact decoded text). The slot is re-located with the SAME
 			// peel + -c walk prepare* used to mint it, so no other word — even
 			// one carrying identical decoded text — can inherit provenance.
 			if entryProv != nil {
-				if _, headIdx, _, _, exhausted := peelWrappersWithIndex(seg.argv, caller); !exhausted && headIdx >= 0 {
+				// Re-locate the slot under the OUTER caller (matching L3959's
+				// gate-head walk): `caller` here is already envAs-seeded, and an
+				// env -C re-anchor must not move the prepared -c slot (R4 SF-1).
+				if _, headIdx, _, _, exhausted := peelWrappersWithIndex(seg.argv, outerCaller); !exhausted && headIdx >= 0 {
 					if scriptRel, _, glued, slotOK := locateShellCSlot(seg.argv[headIdx:]); slotOK && !glued && scriptRel >= 0 {
 						if absIdx := headIdx + scriptRel; absIdx >= 0 && absIdx < len(seg.argWords) {
 							inner.hcProv = entryProv.innerProvAt(seg.srcCode, seg.argWords[absIdx], text)
@@ -4049,11 +4266,16 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			// including help/query — because no -I `xargs hc --help` still appends
 			// stdin words and breaks the two-word pure-query shape.
 			target := head[k:]
-			th, _, teffP, tex := peelWrappersAndSbxAliases(target, caller.pathEnv, caller)
+			th, tea, teffP, tex := peelWrappersAndSbxAliases(target, caller.pathEnv, caller)
 			if tex {
 				return "xargs " + depthExceededHit
 			}
-			for _, b := range headBaseAliasHits(th, teffP, caller) {
+			// An env -C inside the xargs target re-anchors the target's own
+			// resolution: `xargs env -C <evil> ./myctxmode` resolves against
+			// <evil>, not the outer cwd — the peeled ops must seed the caller
+			// used by both screens (R4 MF-2).
+			tCaller := caller.seededWith(tea)
+			for _, b := range headBaseAliasHits(th, teffP, tCaller) {
 				if b == "hc" || b == "herdr-core" {
 					return "xargs " + b
 				}
@@ -4062,7 +4284,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			// --hc-gate on the xargs line, yet the runtime argv becomes
 			// os.Args[1] == "--hc-gate": an unprovenanced ctxmode/selfExe target
 			// through xargs is blocked unconditionally.
-			if len(th) > 0 && headIsCtxmodeOrSelfExe(th[0], teffP, caller.screenCwd()) {
+			if len(th) > 0 && headIsCtxmodeOrSelfExe(th[0], teffP, tCaller.screenCwd()) {
 				return "xargs ctxmode --hc-gate"
 			}
 			innerSeg := xargsDerivedSeg(head[:k], head[k:], seg, caller.pathEnv, caller)
@@ -4252,26 +4474,53 @@ func replTokenInExecSlot(innerArgv []string, token, pathEnv string, caller calle
 	if token == "" || len(innerArgv) == 0 {
 		return false
 	}
-	head, _, effPath, exhausted := peelWrappersAndSbxAliases(innerArgv, pathEnv, caller)
+	head, tea, effPath, exhausted := peelWrappersAndSbxAliases(innerArgv, pathEnv, caller)
 	if exhausted || len(head) == 0 {
 		return true
 	}
+	// The peeled env ops re-anchor resolution (env -C inside the peeled
+	// head moves its own cwd): resolve the ssh head under the seeded
+	// caller (R5 MF-3). The remote recursion below still crosses the ssh
+	// boundary with a bare callerIdentity (only the local cwd field) —
+	// local pathEnv/envTaint never reach remote segments.
+	tCaller := caller.seededWith(tea)
 	if strings.Contains(head[0], token) {
 		return true
 	}
-	if text, has := unwrapShellArgv(head); has {
-		return strings.Contains(text, token)
-	}
-	if _, code, has := unwrapInterpreterInline(head); has {
-		return strings.Contains(code, token)
-	}
-	for _, slot := range interpCodeSlots(head) {
-		if slot.flagOnly || strings.Contains(slot.text, token) {
+	// A non-ssh alias head (mysh -> /bin/sh under env -C, or a PATH alias
+	// to ssh) must face the SAME code-slot and ssh screens as the typed
+	// name: resolve the peeled head under the seeded caller and screen
+	// the canonical spelling alongside the literal one (R6 MF-1). A
+	// CROSS-FAMILY structural re-identity (one guard head resolving to a
+	// DIFFERENT structural family, `xargs -> /bin/sh`) is a conflict —
+	// fail closed; a same-family link (`hc -> herdr-core`, `sed -> gsed`)
+	// is the ordinary install spelling and only adds the variant.
+	headVariants := [][]string{head}
+	if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath, tCaller.screenCwd())); rb != "" && rb != filepath.Base(head[0]) {
+		if tb := filepath.Base(head[0]); rb != head[0] && isStructuralGuardHead(tb) && isStructuralGuardHead(rb) && !sameStructuralFamily(tb, rb) {
 			return true
 		}
+		headVariants = append(headVariants, append([]string{rb}, head[1:]...))
 	}
-	base := filepath.Base(head[0])
-	if base == "ssh" || resolveHeadBase(head[0], effPath, caller.screenCwd()) == "ssh" {
+	isSSH := false
+	for _, h := range headVariants {
+		if text, has := unwrapShellArgv(h); has && strings.Contains(text, token) {
+			return true
+		}
+		if _, code, has := unwrapInterpreterInline(h); has && strings.Contains(code, token) {
+			return true
+		}
+		for _, slot := range interpCodeSlots(h) {
+			if slot.flagOnly || strings.Contains(slot.text, token) {
+				return true
+			}
+		}
+		b := filepath.Base(h[0])
+		if b == "ssh" || resolveHeadBase(h[0], effPath, tCaller.screenCwd()) == "ssh" {
+			isSSH = true
+		}
+	}
+	if isSSH {
 		remoteCmd, hit := parseSSHInvocation(head)
 		if hit != "" {
 			return true
@@ -5739,16 +5988,19 @@ func screenFindArgsSeg(args []string, outerSeg shellSegment, kind byte, depth in
 				}
 				// Nested hc/herdr-core via find -exec* / -ok* receives path args
 				// at runtime ({} replacement / + batching). Block unconditionally.
-				th, _, teffP, tex := peelWrappersAndSbxAliases(inner, caller.pathEnv, caller)
+				th, tea, teffP, tex := peelWrappersAndSbxAliases(inner, caller.pathEnv, caller)
 				if tex {
 					return "find " + a + " " + depthExceededHit
 				}
-				for _, b := range headBaseAliasHits(th, teffP, caller) {
+				// Same env -C re-anchor as the xargs branch: the peeled ops
+				// seed the caller before alias/self-exe resolution (R4 MF-2).
+				tCaller := caller.seededWith(tea)
+				for _, b := range headBaseAliasHits(th, teffP, tCaller) {
 					if b == "hc" || b == "herdr-core" {
 						return "find " + a + " " + b
 					}
 				}
-				if len(th) > 0 && headIsCtxmodeOrSelfExe(th[0], teffP, caller.screenCwd()) {
+				if len(th) > 0 && headIsCtxmodeOrSelfExe(th[0], teffP, tCaller.screenCwd()) {
 					return "find " + a + " ctxmode --hc-gate"
 				}
 				innerSeg := shellSegment{}
@@ -5947,11 +6199,11 @@ func guardShellSubagentDepth(code string, depth int, caller callerIdentity) stri
 // caller identity's own taint may already carry it; passing it separately
 // keeps remote-command parses untainted — the far side sees its own env).
 func guardShellSubagentDepthEnv(code string, depth int, caller callerIdentity, envTaint map[string]bool) string {
-	return guardShellSubagentDepthSegs(splitShellSegmentsEnv(code, envTaint), depth, caller)
+	return guardShellSubagentDepthSegs(splitShellSegmentsCaller(code, envTaint, caller), depth, caller)
 }
 
 func guardShellSubagentDepthBash(code string, depth int, caller callerIdentity) string {
-	return guardShellSubagentDepthSegs(splitShellSegmentsBashEnv(code, caller.envTaint), depth, caller)
+	return guardShellSubagentDepthSegs(splitShellSegmentsBashCaller(code, caller.envTaint, caller), depth, caller)
 }
 
 func guardShellSubagentDepthSegs(segs []shellSegment, depth int, caller callerIdentity) string {
@@ -12363,49 +12615,69 @@ func xargsFeedsCodeFlag(inner, full []string, pathEnv string, caller callerIdent
 	if len(inner) == 0 {
 		return false
 	}
-	head, _, effPath, exhausted := peelWrappersAndSbxAliases(inner, pathEnv, caller)
+	head, tea, effPath, exhausted := peelWrappersAndSbxAliases(inner, pathEnv, caller)
 	if exhausted || len(head) == 0 {
 		return false
 	}
+	// Same env-op re-anchor as replTokenInExecSlot: the ssh head resolves
+	// under the caller seeded with the peeled ops (R5 MF-3); the remote
+	// recursion keeps the bare remote identity.
+	tCaller := caller.seededWith(tea)
 	repl := xargsReplToken(full)
 	if repl != "" && strings.Contains(head[0], repl) {
 		return true
 	}
+	// Same alias resolution as replTokenInExecSlot: a non-ssh alias head
+	// (mysh -> /bin/sh under env -C, a PATH alias to ssh) must face the
+	// code-slot and ssh screens under BOTH spellings (R6 MF-1). A
+	// CROSS-FAMILY structural re-identity is a conflict — fail closed;
+	// a same-family link (`hc -> herdr-core`) only adds the variant.
+	headVariants := [][]string{head}
+	if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath, tCaller.screenCwd())); rb != "" && rb != filepath.Base(head[0]) {
+		if tb := filepath.Base(head[0]); rb != head[0] && isStructuralGuardHead(tb) && isStructuralGuardHead(rb) && !sameStructuralFamily(tb, rb) {
+			return true
+		}
+		headVariants = append(headVariants, append([]string{rb}, head[1:]...))
+	}
 	// If the inner target is ssh, inspect the remote command for an open
 	// code flag (`xargs ssh dmit sh -c`) or a replace-token in the remote
 	// command head / code slot (`xargs -I{} ssh dmit {}`).
-	base := filepath.Base(head[0])
-	if base == "ssh" || resolveHeadBase(head[0], effPath, caller.screenCwd()) == "ssh" {
-		remoteCmd, hit := parseSSHInvocation(head)
-		if hit != "" {
-			return false
-		}
-		if repl != "" && strings.TrimSpace(remoteCmd) == repl {
-			return true
-		}
-		for _, rseg := range splitShellSegments(remoteCmd) {
-			if len(rseg.argv) == 0 {
-				continue
+	for _, h := range headVariants {
+		b := filepath.Base(h[0])
+		if b == "ssh" || resolveHeadBase(h[0], effPath, tCaller.screenCwd()) == "ssh" {
+			remoteCmd, hit := parseSSHInvocation(h)
+			if hit != "" {
+				return false
 			}
-			if xargsFeedsCodeFlag(rseg.argv, full, os.Getenv("PATH"), callerIdentity{cwd: caller.cwd}) {
+			if repl != "" && strings.TrimSpace(remoteCmd) == repl {
 				return true
 			}
+			for _, rseg := range splitShellSegments(remoteCmd) {
+				if len(rseg.argv) == 0 {
+					continue
+				}
+				if xargsFeedsCodeFlag(rseg.argv, full, os.Getenv("PATH"), callerIdentity{cwd: caller.cwd}) {
+					return true
+				}
+			}
+			return false
 		}
-		return false
 	}
-	if len(head) < 2 {
-		return false
-	}
-	slots := interpCodeSlots(head)
-	if len(slots) == 0 {
-		return false
-	}
-	for _, s := range slots {
-		if s.flagOnly {
-			return true
+	for _, h := range headVariants {
+		if len(h) < 2 {
+			continue
 		}
-		if repl != "" && strings.Contains(s.text, repl) {
-			return true
+		slots := interpCodeSlots(h)
+		if len(slots) == 0 {
+			continue
+		}
+		for _, s := range slots {
+			if s.flagOnly {
+				return true
+			}
+			if repl != "" && strings.Contains(s.text, repl) {
+				return true
+			}
 		}
 	}
 	return false
@@ -14876,6 +15148,7 @@ func peelToSSHHead(argv []string, pathEnv string, caller callerIdentity) []strin
 	for depth := 0; depth < peelWrapperMaxSteps && len(cur) > 0; depth++ {
 		head, _, ea, exhausted := peelWrappers(cur)
 		effPath = ea.effectivePATHFrom(effPath)
+		caller = caller.seededCwdWith(ea)
 		if exhausted || len(head) == 0 {
 			return nil
 		}
@@ -14976,7 +15249,7 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 		return "", ""
 	}
 	caller := g.callerIdentity()
-	for _, seg := range splitShellSegments(command) {
+	for _, seg := range splitShellSegmentsCaller(command, caller.envTaint, caller) {
 		if seg.depthExceeded || seg.parseErr != "" {
 			detail := seg.parseErr
 			if seg.depthExceeded {
@@ -15259,6 +15532,16 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 	if len(head) == 0 {
 		return nil
 	}
+	// Seed only THIS level's freshly-peeled ops BEFORE any early-return
+	// recursion: `inherited` already rode in on `caller` (the recursion
+	// seeds each layer as it descends), so seeding the merged envAs again
+	// would re-apply an outer `env -C` relative dir onto the already-
+	// chdir'd cwd — a doubled join (R4 MF-1). envAs itself is still
+	// recorded whole on the returned stdinTarget so every peeled op stays
+	// visible to the caller. seeding also covers envTaint/pathEnv — a
+	// canon-rewritten recursion (`env -C sub genv ./mysh`) must keep the
+	// -C re-anchor and the `u`/`a` taints it peeled (R5 MF-4).
+	caller = caller.seededWith(ea)
 	base := filepath.Base(head[0])
 	if canon := canonicalResolvedBase(base); canon != base {
 		if isPeeledWrapperBase(canon) {
@@ -15306,7 +15589,7 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 		// them still resolve under the screen cwd like the old shared
 		// screenCwd did (the remote ops themselves stay untainted).
 		remoteCaller := callerIdentity{cwd: caller.cwd}
-		targets := collectSegs(splitShellSegments(remoteCmd), envAssignments{}, os.Getenv("PATH"), true, remoteCaller)
+		targets := collectSegs(splitShellSegmentsCaller(remoteCmd, nil, remoteCaller), envAssignments{}, os.Getenv("PATH"), true, remoteCaller)
 		// Every target of an ssh remote command runs OFF this host: the
 		// stream is forwarded verbatim, so mark it remote even when the
 		// remote program is a local-shell-shaped head (ssh host sh).
@@ -15319,14 +15602,20 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 		if isDynamicArg(innerText) {
 			return []stdinTarget{{lang: "", envAs: envAs}}
 		}
+		// A nested -c script must additionally carry envAs's sentinel
+		// taints (`env -u PWD sh -c 'echo $PWD'`): the caller was seeded
+		// with only this level's `ea` above, so merge the accumulated
+		// envAs taints for the sub-parse (R5 MF-4).
+		subCaller := caller
+		subCaller.envTaint = mergeEnvTaint(subCaller.envTaint, envAs.taintedSentinelNames())
 		var segs []shellSegment
 		switch base {
 		case "bash", "zsh", "ksh", "mksh":
-			segs = splitShellSegmentsBash(innerText)
+			segs = splitShellSegmentsBashCaller(innerText, subCaller.envTaint, subCaller)
 		default:
-			segs = splitShellSegments(innerText)
+			segs = splitShellSegmentsCaller(innerText, subCaller.envTaint, subCaller)
 		}
-		return collectSegs(segs, envAs, basePath, false, caller)
+		return collectSegs(segs, envAs, basePath, false, subCaller)
 	}
 	if _, _, has := unwrapInterpreterInline(head); has {
 		return nil
@@ -15340,14 +15629,14 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 		if isDynamicArg(inner) {
 			return []stdinTarget{{lang: "", envAs: envAs}}
 		}
-		return collectSegs(splitShellSegments(inner), envAs, basePath, false, caller)
+		return collectSegs(splitShellSegmentsCaller(inner, caller.envTaint, caller), envAs, basePath, false, caller)
 	case "flock":
 		inner, cmdText := skipFlockArgs(head, 1)
 		if cmdText != "" {
 			if isDynamicArg(cmdText) {
 				return []stdinTarget{{lang: "", envAs: envAs}}
 			}
-			return collectSegs(splitShellSegments(cmdText), envAs, basePath, false, caller)
+			return collectSegs(splitShellSegmentsCaller(cmdText, caller.envTaint, caller), envAs, basePath, false, caller)
 		}
 		if inner < len(head) {
 			return stdinProgramTargetsWithEnv(head[inner:], depth+1, envAs, basePath, caller)
@@ -15358,7 +15647,7 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 			if isDynamicArg(payload) {
 				return []stdinTarget{{lang: "", envAs: envAs}}
 			}
-			return collectSegs(splitShellSegments(payload), envAs, basePath, false, caller)
+			return collectSegs(splitShellSegmentsCaller(payload, caller.envTaint, caller), envAs, basePath, false, caller)
 		}
 		return []stdinTarget{{lang: "", envAs: envAs}}
 	case "watch":
@@ -15379,17 +15668,27 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 		if isDynamicArg(text) {
 			return []stdinTarget{{lang: "", envAs: envAs}}
 		}
-		return collectSegs(splitShellSegments(text), envAs, basePath, false, caller)
+		return collectSegs(splitShellSegmentsCaller(text, caller.envTaint, caller), envAs, basePath, false, caller)
 	case "xargs":
 		k := xargsTargetIndex(head)
 		if k >= len(head) {
 			return nil
 		}
 		if xargsFeedsCodeFlag(head[k:], head, effPath, caller) {
-			innerHead, innerEnv, _, innerExhausted := peelWrappersAndSbxAliases(head[k:], effPath, caller)
+			innerHead, innerEnv, innerEffPath, innerExhausted := peelWrappersAndSbxAliases(head[k:], effPath, caller)
 			envAs = envAs.merged(innerEnv)
 			if !innerExhausted && len(innerHead) > 0 {
-				if l, ok := heredocInterpLang(canonicalResolvedBase(filepath.Base(innerHead[0]))); ok {
+				// Resolve the xargs target under its own peeled env (the
+				// `env -C sub` re-anchor inside the xargs operand): a
+				// symlink alias like ./myruby -> <real ruby> must yield
+				// its language, not fall through to the POSIX-shell
+				// re-review lang:"" (R6 MF-1).
+				innerCaller := caller.seededWith(innerEnv)
+				ib := filepath.Base(innerHead[0])
+				if rb := canonicalResolvedBase(resolveHeadBase(innerHead[0], innerEffPath, innerCaller.screenCwd())); rb != "" {
+					ib = rb
+				}
+				if l, ok := heredocInterpLang(ib); ok {
 					return []stdinTarget{{lang: l, envAs: envAs}}
 				}
 			}
