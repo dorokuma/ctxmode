@@ -244,6 +244,86 @@ func TestGuard_HcReadonlyAndSubagent(t *testing.T) {
 	})
 }
 
+// TestGuard_SSHPathAliasRegressions restores the SSH/PATH regressions
+// formerly living inside the deleted sandbox-wrapper peel test: a
+// trusted-dir PATH alias ssx -> /usr/bin/ssh must still reach the ssh
+// head under xargs/find code-slot screens and piped-stdin tunnel
+// checks. Fixture plants ONLY ssx -> /usr/bin/ssh — no sandbox-wrapper
+// stand-in and no sandbox env-key logic.
+func TestGuard_SSHPathAliasRegressions(t *testing.T) {
+	localBin := mustSSXBin(t)
+	t.Setenv(auditEnvRole, "worker")
+	t.Setenv(auditEnvReadonly, "")
+	t.Setenv("PATH", t.TempDir())
+	g := currentGuardCall()
+	if !g.subagent || g.strictReadonly {
+		t.Fatal("worker must be a non-strict sub-agent")
+	}
+	for _, tc := range []struct{ code, want string }{ // "" = allowed
+		{"echo x | PATH=" + localBin + " xargs ssx dmit sh", "piped stdin to ssh"},
+		{"PATH=" + localBin + " xargs ssx dmit sh -c", "dynamic code payload"},
+		{"PATH=" + localBin + " find . -exec ssx dmit sh -c {} ;", "find -exec dynamic code payload"},
+	} {
+		r, d := g.guardCtxRunShell(tc.code)
+		checked := !strings.Contains(tc.code, "|") && !strings.HasPrefix(tc.code, "PATH=") && !strings.Contains(tc.code, "$(")
+		ra, da := "", ""
+		if checked {
+			ra, da = g.guardCtxRunArgv(strings.Fields(tc.code))
+		}
+		ok := tc.want == "" && r == "" && ra == "" || tc.want != "" && d == tc.want && (!checked || ra != "" && da == tc.want)
+		if !ok {
+			t.Errorf("%q want %q, got shell=%s/%q argv=%s/%q", tc.code, tc.want, r, d, ra, da)
+		}
+	}
+	checkSSHStdinTunnel(t, localBin)
+}
+
+// checkSSHStdinTunnel covers S-R4-1/S-R4-2: the ctx_run stdin tunnel
+// probe and stdin-head classification must seed PATH resolution with
+// the CALLER's process PATH, never the merged envAs replayed over "" —
+// a remote `PATH=` op leaking into the base drops ssx -> ssh
+// resolution (strict upgrade lost) and a `PATH=$PATH:<dir>` prefix
+// collapses to `:<dir>` (alias unresolvable, stdin screen bypassed).
+func checkSSHStdinTunnel(t *testing.T, localBin string) {
+	t.Helper()
+	t.Setenv("PATH", localBin)
+	t.Setenv(auditEnvRole, "verifier")
+	t.Setenv(auditEnvReadonly, "1")
+	vg := currentGuardCall()
+	if r, _ := vg.guardCtxRunStdinForCommand("xargs ssx dmit 'PATH=/nope sh'", "rm -rf /tmp/x"); r != ruleReadonlyWrite {
+		t.Fatalf("remote PATH= op leak: want %s strict upgrade, got %s", ruleReadonlyWrite, r)
+	}
+	t.Setenv(auditEnvReadonly, "")
+	t.Setenv(auditEnvRole, "worker")
+	if r, _ := currentGuardCall().guardCtxRunStdinForCommand("PATH=$PATH:"+localBin+" xargs ssx dmit sh", "hc kill t1"); r != ruleSubagentNestedAgent {
+		t.Fatalf("$PATH prefix collapse: want %s, got %s", ruleSubagentNestedAgent, r)
+	}
+}
+
+// mustSSXBin plants the trusted-dir PATH alias ssx -> /usr/bin/ssh
+// (S-R3-1) used by the SSH/PATH regression assertions.
+func mustSSXBin(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(withTestTrustedHome(t), ".local", "bin")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	// ssx points at a REAL system ssh: the R5 resolved-target shadow rule
+	// only blocks targets living in user/toolchain dirs, so a toolchain
+	// alias resolving into /usr/bin keeps the PATH-alias rewrite free.
+	// (A local `ssx -> .local/bin/ssh` file is a planted shadow and fails
+	// the new rule — that is exactly what the rule exists to catch.)
+	mustSymlink(t, "/usr/bin/ssh", filepath.Join(dir, "ssx"))
+	return dir
+}
+
+func mustSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestReadonlyAllowlist_Cccc pins the cccc complexity-tool policy: pure
 // query spellings (--help/-h/--version/-V, single arg) and analysis runs
 // that carry BOTH --no-cache and --no-config are admitted; cache/config
