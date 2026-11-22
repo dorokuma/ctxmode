@@ -366,8 +366,8 @@ func init() {
 	readonlyAllowlist["go"] = &cmdAllow{check: checkGoReadonly}
 	// hc reuses the sub-agent whitelist screen: only `hc send <addr> <text>`
 	// and the pure query spellings pass under strict readonly. The symlink
-	// targets (herdr-core on the host, sbx inside the reviewer sandbox) stay
-	// OUT of this table — they are admitted only as hc's resolved alias in
+	// target (herdr-core on the host) stays OUT of this table — it is
+	// admitted only as hc's resolved alias in
 	// isAllowedSystemReadonlyAlias.
 	readonlyAllowlist["hc"] = &cmdAllow{check: screenHcSubagent}
 	readonlyAllowlist["mount"] = &cmdAllow{check: checkMountReadonly}
@@ -1593,9 +1593,7 @@ func scanAllowedOpts(args []string, entry *cmdAllow) string {
 
 // readonlyPrePeelHitExempt rejects exec/eval/source/`.` / function / coproc /
 // nohup and the peelable wrapper heads before peelWrappers can strip them into
-// a benign head. `sbx` keeps the exact default-deny wording a non-peeled head
-// produces (`unknown command sbx`) so strict-readonly callers get the same
-// verdict the allowlist handed out before sbx became peelable.
+// a benign head.
 //
 // headPathExempt exempts WORD 0 only, and only for a provenance-backed
 // rewritten `<selfExe> --hc-gate …` leaf (陷阱 A): the real head contains "/"
@@ -1642,8 +1640,6 @@ func readonlyPrePeelHitExempt(argv []string, headPathExempt bool) string {
 		case "env", "command", "builtin", "nice", "timeout", "stdbuf", "busybox",
 			"ionice", "taskset", "chrt", "strace", "ltrace", "setsid", "time":
 			return canon
-		case "sbx":
-			return "unknown command sbx"
 		case "if", "then", "elif", "else", "while", "until", "do", "!",
 			"fi", "done", "for", "in", "case", "esac", "select", "[[", "]]":
 			return "control flow " + a

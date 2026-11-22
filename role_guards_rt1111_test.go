@@ -225,7 +225,6 @@ func TestRT_A10_EnvHookCtxmodeKeys(t *testing.T) {
 	block := []struct{ name, role, cmd string }{
 		{"db-verifier", "verifier", "CTXMODE_DB=/tmp/x.db ctxmode search q"},
 		{"audit-env-worker", "worker", "env CTXMODE_AUDIT_LOG=/dev/null echo ok"},
-		{"sbx-env-passthrough", "worker", "sbx --env CTXMODE_ENV_PASSTHROUGH=1 -- echo ok"},
 		{"config-worker", "worker", "env CTXMODE_CONFIG=/tmp/c.yaml echo ok"},
 	}
 	for _, c := range block {
@@ -243,10 +242,10 @@ func TestRT_A10_EnvHookCtxmodeKeys(t *testing.T) {
 	if rule, detail := g.guardCtxRunShell("CTXMODE_DB=/tmp/x.db ctxmode search q"); rule != "" {
 		t.Errorf("main agent CTXMODE_DB: got BLOCK %s: %s, want ALLOW", rule, detail)
 	}
-	// Worker non-hook sbx env stays free.
-	rule, detail := rtCmdRule("worker", "", "sbx --env A=1,B=2 -- echo ok", "")
+	// Worker non-hook env assignment stays free.
+	rule, detail := rtCmdRule("worker", "", "env A=1 B=2 echo ok", "")
 	if rule != "" {
-		t.Errorf("sbx --env A=1,B=2: got BLOCK %s: %s, want ALLOW", rule, detail)
+		t.Errorf("env A=1 B=2 echo ok: got BLOCK %s: %s, want ALLOW", rule, detail)
 	}
 }
 

@@ -384,7 +384,7 @@ var hcGateSafeWrappers = map[string]bool{
 // unrewritten and face the ordinary guard (fail-closed).
 func hcGateUnsafePeelBase(b string) bool {
 	switch b {
-	case "sbx", "exec", "builtin", "busybox", "strace", "ltrace":
+	case "exec", "builtin", "busybox", "strace", "ltrace":
 		return true
 	}
 	return false
@@ -394,11 +394,11 @@ func hcGateUnsafePeelBase(b string) bool {
 // exact head position so a Type-A rewrite always lands on a real word.
 // Provenance is surrendered (headIdx=-1) the moment the walk meets:
 // `env -S`/`--split-string` in ANY spelling (long, short cluster, glued
-// value), `env -i`/clear ops, a non-whitelisted or unsafe wrapper (sbx,
-// exec, builtin, busybox, strace, ltrace), a PATH-alias whose resolved name
+// value), `env -i`/clear ops, a non-whitelisted or unsafe wrapper (exec,
+// builtin, busybox, strace, ltrace), a PATH-alias whose resolved name
 // IS a wrapper, a dynamic word inside a wrapper's option zone, or peel
 // exhaustion. The old suffix-match shortcut ("find the peeled head back in
-// argv") is gone — `env -S "sbx --" hc …` can no longer satisfy it.
+// argv") is gone — `env -S "exec --" hc …` can no longer satisfy it.
 func peelWrappersWithIndex(argv []string, caller callerIdentity) (headArgv []string, headIdx int, wrappers []string, envAs envAssignments, exhausted bool) {
 	basePath := caller.effectivePATH()
 	effPath := envAs.effectivePATHFrom(basePath)
@@ -432,7 +432,7 @@ func peelWrappersWithIndex(argv []string, caller callerIdentity) (headArgv []str
 		if hcGateUnsafePeelBase(rb) {
 			return argv[i:], -1, nil, envAs, false
 		}
-		// A typed name resolving to a DIFFERENT wrapper (myenv -> env/sbx)
+		// A typed name resolving to a DIFFERENT wrapper (myenv -> env)
 		// is an alias-wrapped head: provenance is void either way.
 		if rb != "" && rb != base && isPeeledWrapperBase(rb) {
 			return argv[i:], -1, nil, envAs, false

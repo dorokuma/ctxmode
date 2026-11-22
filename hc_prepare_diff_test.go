@@ -7,7 +7,7 @@ package main
 //     stop peeling (headIdx < 0) on every non-provenance wrapper form:
 //     `env -S`/`--split-string` (the split payload's inner words have no
 //     1:1 argv index), `env -i`/`--ignore-environment`, and the unsafe
-//     peel bases sbx/exec/builtin/busybox/strace/ltrace.
+//     peel bases exec/builtin/busybox/strace/ltrace.
 //   - role_guards.go peelWrappers — the guard-side peeler. It MUST keep
 //     unwrapping on those same forms so the inner command is still
 //     screened.
@@ -108,7 +108,6 @@ func TestDiffPeel_ContractB_NoReverseOverPeel(t *testing.T) {
 		{"env", "--split-string=nice -n 1 ls"},
 		{"env", "-i", "ls"},
 		{"env", "--ignore-environment", "ls"},
-		{"sbx", "--preset", "reviewer", "--", "ls"},
 		{"exec", "ls"},
 		{"builtin", "echo", "ok"},
 		{"busybox", "ls"},
@@ -180,8 +179,6 @@ func TestDiffPeel_ContractC_NonProvenanceForms(t *testing.T) {
 		{"env --ignore-environment", []string{"env", "--ignore-environment", "ls"}, []string{"ls"}, "", false},
 		// Unsafe peel bases: the guard keeps unwrapping them; prepare
 		// refuses to grant cross-wrapper rewrite provenance.
-		{"sbx preset", []string{"sbx", "--preset", "reviewer", "--", "ls"}, []string{"ls"}, "", true},
-		{"sbx env", []string{"sbx", "--env", "A=1", "--", "ls"}, []string{"ls"}, "", true},
 		{"exec", []string{"exec", "ls", "-la"}, []string{"ls", "-la"}, "", true},
 		{"exec -a name", []string{"exec", "-a", "foo", "ls"}, []string{"ls"}, "", true},
 		{"builtin", []string{"builtin", "echo", "ok"}, []string{"echo", "ok"}, "", true},

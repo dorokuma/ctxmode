@@ -3953,7 +3953,7 @@ func TestGuard_DispatchReportCanonicalPath(t *testing.T) {
 			t.Fatalf("admit(0644) = %q, want empty", got)
 		}
 		// A symlink resolving to a differently-named binary is not the
-		// helper: hc may resolve to herdr-core/sbx, never to an unrelated
+		// helper: hc may resolve to herdr-core, never to an unrelated
 		// name like ls.
 		link := filepath.Join(localBin, "hc")
 		if err := os.Remove(link); err != nil {
@@ -4466,15 +4466,14 @@ func TestGuard_CompoundEnvOverride(t *testing.T) {
 }
 
 // TestGuard_EnvHookReportVars covers the DISPATCH_REPORT_PATH /
-// DISPATCH_REPORT_PARENT / CTXMODE_EXTRA_WORKDIRS / PI_SANDBOX_GO_EXEC_DIR /
-// HC_TERMINAL_ID / HC_SOCKET interception: KEY=VAL prefixes, export/declare
-// wraps, env wrappers and ctx_run args.env all block; Python/JS os.environ
-// rewrite paths block too.
+// DISPATCH_REPORT_PARENT / CTXMODE_EXTRA_WORKDIRS / HC_TERMINAL_ID /
+// HC_SOCKET interception: KEY=VAL prefixes, export/declare wraps, env
+// wrappers and ctx_run args.env all block; Python/JS os.environ rewrite
+// paths block too.
 func TestGuard_EnvHookReportVars(t *testing.T) {
 	vars := []string{
 		"DISPATCH_REPORT_PATH", "DISPATCH_REPORT_PARENT",
 		"CTXMODE_EXTRA_WORKDIRS",
-		"PI_SANDBOX_GO_EXEC_DIR",
 		"HC_TERMINAL_ID", "HC_SOCKET",
 	}
 
@@ -4533,7 +4532,6 @@ func TestGuard_EnvHookReportVars(t *testing.T) {
 		"import os,subprocess\nos.environ['DISPATCH_REPORT_PARENT']='t9'\nsubprocess.run(['ls'])",
 		"import os,subprocess\nos.environ['CTXMODE_EXTRA_WORKDIRS']='[\"/tmp\"]'\nsubprocess.run(['ls'])",
 		"import os,subprocess\nos.environ['HC_SOCKET']='/tmp/f'\nsubprocess.run(['ls'])",
-		"import os,subprocess\nos.environ['PI_SANDBOX_GO_EXEC_DIR']='/x'\nsubprocess.run(['ls'])",
 		"import os,subprocess\nos.environ['HC_TERMINAL_ID']='t9'\nsubprocess.run(['ls'])",
 		"import os,subprocess\nos.putenv('DISPATCH_REPORT_PATH','/x')\nsubprocess.run(['ls'])",
 		"import os,subprocess\nos.environ.update({'HC_SOCKET':'/x'})\nsubprocess.run(['ls'])",

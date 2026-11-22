@@ -186,7 +186,6 @@ func TestRTAudit(t *testing.T) {
 		{id: "A9-ctrl-npx-pig", role: "worker", cmd: "npx pig", wantAllow: false},
 		// A-10
 		{id: "A10a-ctxmode-db", role: "verifier", cmd: "CTXMODE_DB=/workspace/rogue.db ctxmode search test", wantAllow: false},
-		{id: "A10b-sbx-env", role: "worker", cmd: "sbx --env CTXMODE_ENV_PASSTHROUGH=1,CTXMODE_AUDIT_LOG=/tmp/fake.log -- ctxmode search x", wantAllow: false},
 		{id: "A10c-env-ctxmode-db", role: "worker", cmd: "env CTXMODE_DB=/tmp/r.db ctxmode search x", wantAllow: false},
 		{id: "A10-ctrl-role", role: "worker", cmd: "CTXMODE_ROLE= ctxmode search x", wantAllow: false},
 		// A-11

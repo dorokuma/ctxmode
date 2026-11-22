@@ -106,7 +106,7 @@ func isPreparedHcGateArgv(argv []string) bool {
 }
 
 // runHcGate implements `ctxmode --hc-gate …`: validate the hc argv, resolve
-// a trusted herdr-core/sbx via safe PATH dirs only, and exec it by fd
+// a trusted herdr-core via safe PATH dirs only, and exec it by fd
 // (/proc/self/fd/3 + ExtraFiles) with no PATH fallback.
 func runHcGate(args []string) int {
 	if runtime.GOOS != "linux" {
@@ -240,7 +240,7 @@ func validateHcGateArgs(args []string) string {
 
 // findTrustedHcExecutable walks PATH like lookPathIn but only admits
 // directories that pass isSafePathDirEntry, requires on-disk trust, and
-// insists the EvalSymlinks basename canonicalises to herdr-core or sbx.
+// insists the EvalSymlinks basename canonicalises to herdr-core.
 func findTrustedHcExecutable() (string, error) {
 	euid := os.Geteuid()
 	pathEnv := os.Getenv("PATH")
@@ -320,7 +320,7 @@ func findTrustedHcExecutable() (string, error) {
 			continue
 		}
 		base := canonicalResolvedBase(filepath.Base(resolved))
-		if base != "herdr-core" && base != "sbx" {
+		if base != "herdr-core" {
 			continue
 		}
 		return resolved, nil

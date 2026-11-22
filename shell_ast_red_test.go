@@ -526,7 +526,7 @@ func astMustAllowRound11Cases() []astRedCase {
 		{"R11_ALW_59", "for s in \"gofmt -l .\" \"go build ./...\" \"go vet ./...\" \"go test -count=1 ./...\"; do $s >/tmp/chk.log 2>&1; done", "worker", false, "for enum static multi-word commands"},
 		{"R11_ALW_60", "for f in /root/.local/bin/termosh /usr/local/bin/termosh; do \"$f\" --version; done", "worker", false, "for enum abs-path command heads"},
 		{"R11_ALW_61", "for p in '/tmp/' '整条不画' 'a:b' ''; do printf '%s\\n' \"$(grep -c -- \"$p\" report.md)\"; done", "worker", false, "for enum non-ident items graceful fallback"},
-		{"R11_ALW_62", "td=$(mktemp -d) && go build -o \"$td/sbx\" ./cmd/sbx && \"$td/sbx\" --help", "worker", false, "mktemp -d var used in built binary head"},
+		{"R11_ALW_62", "td=$(mktemp -d) && go build -o \"$td/tool\" ./cmd/tool && \"$td/tool\" --help", "worker", false, "mktemp -d var used in built binary head"},
 		{"R11_ALW_63", "echo \"=== header ===\" \\\n  && git status --short \\\n  | head -n 20", "worker", false, "normal whitespace-preceded line continuations"},
 		{"R11_ALW_64", "echo \"line 1 \\\n# still inside double quotes\"", "worker", false, "NTH-1 line continuation before # inside double quotes"},
 		{"R11_ALW_65", "git log -n 5 --oneline 2>/dev/null | head -n 5", "ro", false, "readonly git log pipeline with 2>/dev/null"},

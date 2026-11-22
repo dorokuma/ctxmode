@@ -71,13 +71,13 @@ func hcIsolationRefuse(format string, args ...any) {
 }
 
 // hcIsolationStandinTag is the fixed marker compiled into the recording
-// stand-in by scripts/ns-hc-gotest.sh. A masked hc/herdr-core/sbx path that
+// stand-in by scripts/ns-hc-gotest.sh. A masked hc/herdr-core path that
 // still serves the REAL binary (no marker) is evidence the bind mount is
 // missing — and is exactly what a bare host run looks like.
 const hcIsolationStandinTag = "CTXMODE-NS-HC-STANDIN"
 
 // hcIsolationShadowTargets enumerates the host paths a stage-B namespace
-// must have masked with the read-only stand-in: every hc / herdr-core / sbx
+// must have masked with the read-only stand-in: every hc / herdr-core
 // entry in the conventional trusted bin dirs and in the dirs of the
 // inherited PATH. Entries are kept as the ORIGINAL path — a symlink like
 // /root/.local/bin/hc -> herdr-core is listed once (the gate resolves it
@@ -100,7 +100,7 @@ func hcIsolationShadowTargets() []string {
 		}
 	}
 	var out []string
-	for _, name := range []string{"hc", "herdr-core", "sbx"} {
+	for _, name := range []string{"hc", "herdr-core"} {
 		for d := range dirs {
 			p := filepath.Join(d, name)
 			fi, err := os.Lstat(p)
@@ -204,7 +204,7 @@ func hcIsolationHasCap(status, field string, caps ...uint) bool {
 //  2. /proc/1/comm must NOT be systemd/init: the private PID namespace and
 //     its private /proc remove the /proc/1/root escape hatch.
 //  3. mountinfo: the / mount must not be propagation-shared, and every
-//     enumerated hc/herdr-core/sbx path must sit under its OWN read-only
+//     enumerated hc/herdr-core path must sit under its OWN read-only
 //     mount (mount opts contain ro), refuse O_WRONLY with EROFS, and read
 //     back the compiled-in stand-in tag — proving the host binary is
 //     masked, not merely missing.
@@ -237,7 +237,7 @@ func mustVerifyOuterTestIsolation() {
 	}
 	targets := hcIsolationShadowTargets()
 	if len(targets) == 0 {
-		hcIsolationRefuse("no hc/herdr-core/sbx shadow targets enumerated: nothing proves the namespace")
+		hcIsolationRefuse("no hc/herdr-core shadow targets enumerated: nothing proves the namespace")
 	}
 	for _, p := range targets {
 		// mount --bind follows symlinks: the mount sits on the REAL path

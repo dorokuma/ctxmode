@@ -5,6 +5,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Removed
+- **The `sbx` sandbox integration: all `sbx`-specific guard logic, env rules, test stand-ins and documentation (`role_guards.go`, `readonly_allowlist.go`, `hc_gate.go`, `hc_prepare.go`, `git_tools.go`, `scripts/ns-hc-gotest.sh`, `scripts/ns-hc-isolate.sh`, `audit_test.go`, `ns_hc_scripts_test.go`, `readonly_allowlist_test.go`, `role_guards_test.go`, `role_guards_rt1111_test.go`, `zz_rtaudit_test.go`, `zz_r2fix_test.go`, `hc_prepare_diff_test.go`, `shell_ast_red_test.go`, `AGENTS.md`).** `peelWrappers` drops the `sbx` peel branch and the `screenSbxEnvValue`/`--env` comma-split screen; `peelWrappersAndSbxAliases` is renamed `peelWrappersAndWrapperAliases` and only re-peels heads resolving to real wrapper bases (env/timeout/…). `hcGateUnsafePeelBase`, `isPeeledWrapperBase`, `isStructuralGuardHead`, `sameStructuralFamily`, `isAllowedSystemReadonlyAlias`, `readonlyCanonicalHeads`, `findTrustedHcExecutable` and `readonlyPrePeelHitExempt` all drop the `sbx` arm/name. `envHookVars`/`isEnvHookVar` no longer screen `PI_SANDBOX_INTERNAL_CHILD_SPEC`, `PI_SANDBOX_GO_EXEC_DIR` or the `PI_SANDBOX_*` prefix (the sandbox that consumed them is gone). The `ns-hc-*` isolation scripts and `TestMain` outer gate enumerate/mask only `hc`/`herdr-core`; the FIFO enumeration regression now plants `hc` instead of the deleted third name. `AGENTS.md` drops the `go/sandbox` sync invariant and the third-name stand-in description; the `TestGuard_PeelSbxWrapper`/`mustSbxBin` fixture is removed and the generic `nice -> sbx` provenance-surrender test re-targets `nice -> exec` (an unsafe peel base that still exists).
+
 ## [6.1.1] - 2026-11-22
 
 ### Fixed

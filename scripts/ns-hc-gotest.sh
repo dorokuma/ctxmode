@@ -59,7 +59,7 @@ PORCELAIN=$(git status --porcelain || true)
 # cleaned up automatically; an explicit log path is created persistently.
 WORK=$(mktemp -d /tmp/hcfix-ns-gotest-XXXXXX) || die "mktemp failed"
 # 0700, not 0755: the work dir holds the stand-in stub that gets
-# bind-mounted over trusted hc/herdr-core/sbx slots. mktemp already
+# bind-mounted over trusted hc/herdr-core slots. mktemp already
 # creates it 0700 — do NOT open it up: a 0755 /tmp dir would let any
 # local user rewrite the stub during the test window. The payload either
 # runs as root (outer path) or drops back to the CALLER_UID who owns
@@ -91,7 +91,7 @@ cat >"$WORK/stub.go" <<'STUB'
 // Recording hc stand-in: appends its argv (JSON) to HC_STUB_LOG and exits 0.
 // The fixed CTXMODE-NS-HC-STANDIN tag is what TestMain's
 // mustVerifyOuterTestIsolation greps for inside every masked
-// hc/herdr-core/sbx path: a path that serves bytes WITHOUT the tag is the
+// hc/herdr-core path: a path that serves bytes WITHOUT the tag is the
 // real host binary (mask missing) and the gate refuses to run.
 package main
 

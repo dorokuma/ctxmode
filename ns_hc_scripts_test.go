@@ -202,7 +202,7 @@ func TestNSHcScripts_ExecutableAndParse(t *testing.T) {
 		if strings.Contains(src, "/root/ctxmode-merge-jobs") {
 			t.Errorf("%s references a hardcoded host merge-jobs path", rel)
 		}
-		// Stand-in is bind-mounted over hc/herdr-core/sbx slots: world-writable is unsafe.
+		// Stand-in is bind-mounted over hc/herdr-core slots: world-writable is unsafe.
 		if strings.Contains(src, "chmod 0777") || strings.Contains(src, "chmod 777") {
 			t.Errorf("%s must not chmod a stand-in world-writable", rel)
 		}
@@ -372,12 +372,13 @@ func TestNSHcIsolate_ArgErrorsFailClosed(t *testing.T) {
 	} else if !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
-	// C-1 regression: a non-regular enumeration target (FIFO `sbx`) must kill the script.
+	// C-1 regression: a non-regular enumeration target (a FIFO shadowing
+	// the `hc` name) must kill the script.
 	if os.Geteuid() == 0 {
 		if _, err := os.Stat("/root/.local/bin/herdr-core"); err != nil {
 			t.Skip("no /root/.local/bin/herdr-core")
 		}
-		if err := syscall.Mkfifo(filepath.Join(binDir, "sbx"), 0o644); err != nil {
+		if err := syscall.Mkfifo(filepath.Join(binDir, "hc"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		run([]string{"--standin", standin, "--", "true"}, "cannot resolve enumerated target to a regular file")

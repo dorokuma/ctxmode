@@ -543,25 +543,25 @@ func TestGuard_R3_ShadowHcNoRewrite(t *testing.T) {
 	//
 	// 1. peelWrappersWithIndex replays PATH= ops over
 	//    caller.effectivePATH(): an outer caller.pathEnv carrying a
-	//    `nice -> sbx` alias makes the SAFE-LOOKING typed `nice` head
+	//    `nice -> exec` alias makes the SAFE-LOOKING typed `nice` head
 	//    resolve to an UNSAFE peel base — headIdx must surrender
 	//    (return -1). Before the fix the replay used os.Getenv("PATH")
 	//    and the alias was invisible to the slot walk.
-	t.Run("R5 MF-1 nice->sbx headIdx", func(t *testing.T) {
+	t.Run("R5 MF-1 nice->exec headIdx", func(t *testing.T) {
 		aliasDir := filepath.Join(fakeHome, "aliasbin")
 		if err := os.MkdirAll(aliasDir, 0755); err != nil {
 			t.Fatalf("mkdir aliasDir: %v", err)
 		}
 		// The symlink TARGET must exist or EvalSymlinks leaves the typed
 		// name unresolved (rb stays "", no unsafe-base hit).
-		writeTestExecutable(t, filepath.Join(aliasDir, "sbx"), 0755)
-		if err := os.Symlink(filepath.Join(aliasDir, "sbx"), filepath.Join(aliasDir, "nice")); err != nil {
-			t.Fatalf("symlink nice -> sbx: %v", err)
+		writeTestExecutable(t, filepath.Join(aliasDir, "exec"), 0755)
+		if err := os.Symlink(filepath.Join(aliasDir, "exec"), filepath.Join(aliasDir, "nice")); err != nil {
+			t.Fatalf("symlink nice -> exec: %v", err)
 		}
 		caller := callerIdentity{pathEnv: aliasDir}
 		_, headIdx, _, _, _ := peelWrappersWithIndex([]string{"nice", "-n", "5", "hc", "send", "t42", "$x"}, caller)
 		if headIdx != -1 {
-			t.Fatalf("nice -> sbx alias: headIdx = %d, want -1 (provenance surrendered)", headIdx)
+			t.Fatalf("nice -> exec alias: headIdx = %d, want -1 (provenance surrendered)", headIdx)
 		}
 	})
 	//

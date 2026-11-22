@@ -436,21 +436,16 @@ var envHookVars = map[string]bool{
 	"GIT_PROXY_COMMAND": true, "GIT_DIFF_OPTS": true,
 	"GIT_CONFIG_COUNT": true, "GIT_CONFIG_KEY_0": true, "GIT_CONFIG_VALUE_0": true,
 	"GIT_TRACE2_PARENT_SID": true, "GIT_EXEC_PATH": true,
-	// sbx internal child-process spec: a forged value makes sbx execute the
-	// injected JSON spec instead of the CLI args (S-NEW-2).
-	"PI_SANDBOX_INTERNAL_CHILD_SPEC": true,
 	// Dispatch report channel and terminal-control sockets: a sub-agent
 	// re-pointing DISPATCH_REPORT_PATH hands its report to a fake collector
 	// and a rewritten DISPATCH_REPORT_PARENT retargets the notify address
-	// the report lands on; PI_SANDBOX_GO_EXEC_DIR relocates the sbx-exec
-	// payload root; HC_TERMINAL_ID/HC_SOCKET re-target hc send to another
-	// terminal or a forged control socket, bypassing the whitelist'd
-	// report address; and CTXMODE_EXTRA_WORKDIRS widens the ctxmode
-	// workspace set at spawn, letting a role read files outside its
-	// authorized roots.
+	// the report lands on; HC_TERMINAL_ID/HC_SOCKET re-target hc send to
+	// another terminal or a forged control socket, bypassing the
+	// whitelist'd report address; and CTXMODE_EXTRA_WORKDIRS widens the
+	// ctxmode workspace set at spawn, letting a role read files outside
+	// its authorized roots.
 	"DISPATCH_REPORT_PATH": true, "DISPATCH_REPORT_PARENT": true,
-	"PI_SANDBOX_GO_EXEC_DIR": true,
-	"HC_TERMINAL_ID":         true, "HC_SOCKET": true,
+	"HC_TERMINAL_ID": true, "HC_SOCKET": true,
 	"CTXMODE_EXTRA_WORKDIRS": true,
 }
 
@@ -472,18 +467,13 @@ func isEnvHookVar(key string) bool {
 		strings.HasPrefix(key, "GIT_CONFIG") {
 		return true
 	}
-	// PI_SANDBOX_* carries sbx internal child-process state
-	// (PI_SANDBOX_INTERNAL_CHILD_SPEC); a sub-agent must never forge it.
-	if strings.HasPrefix(key, "PI_SANDBOX_") {
-		return true
-	}
 	switch key {
 	case "GIT_DIR", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE",
 		"GIT_TEMPLATE_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
 		"NODE_PATH", "PERL5LIB", "PERLLIB", "RUBYLIB",
 		// The CTXMODE_* identity/audit keys a role-carrying caller must not
 		// rewrite — kept in sync with executor.go roleIdentityEnvKeys so an
-		// env prefix / export / sbx --env hits the same wall as args.Env.
+		// env prefix / export hits the same wall as args.Env.
 		"CTXMODE_AUDIT_LOG", "CTXMODE_ENV_PASSTHROUGH", "CTXMODE_DB", "CTXMODE_CONFIG":
 		return true
 	}
@@ -516,14 +506,14 @@ var guardTaintVars = map[string]bool{
 // NAME=val assignments), command (-v/-V stay as a read-only builtin
 // query), exec, nohup, timeout (with duration and option args), nice,
 // setsid, stdbuf, busybox, ionice, taskset, chrt, time, strace/ltrace,
-// builtin, sbx (flag-style options, --env screened like env operands),
-// shell reserved/modifier words (`if`/`then`/`elif`/`else`/`while`/
-// `until`/`do`/`coproc`/`time`/`!`), and `--` terminators. watch, flock,
-// script and sudo/doas are NOT peeled here — they need stdin-context and
-// privilege semantics, so the downstream peelResolvedSegDepth /
-// stdinProgramHeadDepth helpers unwrap them. Recursion is bounded by
-// peelWrapperMaxSteps (bare KEY=VAL prefixes do not consume steps); a
-// chain that never resolves returns an index past the end.
+// builtin, shell reserved/modifier words (`if`/`then`/`elif`/`else`/
+// `while`/`until`/`do`/`coproc`/`time`/`!`), and `--` terminators.
+// watch, flock, script and sudo/doas are NOT peeled here — they need
+// stdin-context and privilege semantics, so the downstream
+// peelResolvedSegDepth / stdinProgramHeadDepth helpers unwrap them.
+// Recursion is bounded by peelWrapperMaxSteps (bare KEY=VAL prefixes
+// do not consume steps); a chain that never resolves returns an index
+// past the end.
 
 // skipExecArgs advances past bash `exec` options matching internal_getopt
 // optstring "cla:": -c/-l are boolean; -a takes a name (separate argv,
@@ -580,32 +570,6 @@ func skipExecArgs(argv []string, i int) (int, bool) {
 		}
 	}
 	return i, false
-}
-
-// screenSbxEnvValue screens one `sbx --env`/`--env=` operand and records
-// it into envAs. The real sbx stringSlice.Set splits each value on `,` and
-// trims every segment, so a single argv slot can inject several KEY=VAL
-// assignments — screening the whole word as one assignment would let
-// `A=1,PATH=/x` smuggle a PATH (or sentinel) write past the env screens.
-// Returns false when any segment must fail closed: an empty segment (the
-// real sbx silently drops it, but rejecting is simpler and safer), a
-// dynamic word, a non-KEY=VAL word, or a sentinelTrustVars key (HOME/PWD/
-// TMPDIR/IFS re-base the trusted path anchors the env screen relies on).
-func screenSbxEnvValue(val string, envAs *envAssignments) bool {
-	if val == "" {
-		return false
-	}
-	for _, rawPart := range strings.Split(val, ",") {
-		part := strings.TrimSpace(rawPart)
-		if part == "" || isDynamicArg(part) || !isAssignWord(part) {
-			return false
-		}
-		if sentinelTrustVars[part[:strings.IndexByte(part, '=')]] {
-			return false
-		}
-		envAs.addAssign(part)
-	}
-	return true
 }
 
 func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, envAs envAssignments, exhausted bool) {
@@ -777,65 +741,6 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 			if fc {
 				return argv[i:], splitPayloads, envAs, true
 			}
-		case "sbx":
-			start := i
-			i++
-			if len(argv[start:]) == 2 &&
-				(isPureQueryInvocation(argv[start:]) || argv[start+1] == "-check" ||
-					argv[start+1] == "--check" || argv[start+1] == "-version") {
-				return argv[start:], splitPayloads, envAs, false
-			}
-			for i < len(argv) {
-				a := argv[i]
-				if a == "--" {
-					i++
-					break
-				}
-				if isDynamicArg(a) {
-					return argv[i:], splitPayloads, envAs, true
-				}
-				if !strings.HasPrefix(a, "-") || a == "-" {
-					break
-				}
-				name := a
-				name = strings.TrimPrefix(name, "-")
-				name = strings.TrimPrefix(name, "-")
-				if strings.HasPrefix(name, "-") {
-					return argv[i:], splitPayloads, envAs, true
-				}
-				if strings.HasPrefix(name, "env=") {
-					if !screenSbxEnvValue(name[len("env="):], &envAs) {
-						return argv[i:], splitPayloads, envAs, true
-					}
-					i++
-					continue
-				}
-				switch name {
-				case "env":
-					if i+1 >= len(argv) || !screenSbxEnvValue(argv[i+1], &envAs) {
-						return argv[i:], splitPayloads, envAs, true
-					}
-					i += 2
-				case "preset", "workdir", "ro", "rw", "exec", "reviewer", "report-to":
-					if i+1 >= len(argv) || isDynamicArg(argv[i+1]) {
-						return argv[i:], splitPayloads, envAs, true
-					}
-					i += 2
-				case "deny-net", "best-effort":
-					i++
-				default:
-					switch {
-					case strings.HasPrefix(name, "preset="), strings.HasPrefix(name, "workdir="),
-						strings.HasPrefix(name, "ro="), strings.HasPrefix(name, "rw="),
-						strings.HasPrefix(name, "exec="), strings.HasPrefix(name, "reviewer="),
-						strings.HasPrefix(name, "report-to="),
-						strings.HasPrefix(name, "deny-net="), strings.HasPrefix(name, "best-effort="):
-						i++
-					default:
-						return argv[i:], splitPayloads, envAs, true
-					}
-				}
-			}
 		case "strace", "ltrace":
 			i++
 			var fc bool
@@ -857,17 +762,18 @@ func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, env
 	return argv[i:], splitPayloads, envAs, depth >= peelWrapperMaxSteps
 }
 
-// peelWrappersAndSbxAliases is peelWrappers plus a bounded, repeated
-// `foo -> sbx` PATH-alias rewrite: every peeled head resolving to sbx is
-// rewritten to `sbx` and peeled again (each alias level consumes one
+// peelWrappersAndWrapperAliases is peelWrappers plus a bounded,
+// repeated PATH-alias rewrite: every peeled head resolving to a wrapper
+// binary (myenv -> env, mytimeout -> timeout, ...) is rewritten to the
+// resolved wrapper name and peeled again (each alias level consumes one
 // peelWrapperMaxSteps-bounded step), so a nested
-// `foo --deny-net -- foo --deny-net -- CMD` cannot hide CMD behind a
-// second alias the caller only unwrapped once (M-REV-2). env ops
-// accumulate across all levels and the returned effPath replays them
-// over pathEnv — each alias resolves under the PATH its own level's
-// env ops install. Exhausted peels and alias chains hitting the bound
-// return exhausted (fail-closed) like peelWrappers.
-func peelWrappersAndSbxAliases(argv []string, pathEnv string, caller callerIdentity) (head []string, envAs envAssignments, effPath string, exhausted bool) {
+// `foo --opt -- foo --opt -- CMD` cannot hide CMD behind a second alias
+// the caller only unwrapped once (M-REV-2). env ops accumulate across
+// all levels and the returned effPath replays them over pathEnv — each
+// alias resolves under the PATH its own level's env ops install.
+// Exhausted peels and alias chains hitting the bound return exhausted
+// (fail-closed) like peelWrappers.
+func peelWrappersAndWrapperAliases(argv []string, pathEnv string, caller callerIdentity) (head []string, envAs envAssignments, effPath string, exhausted bool) {
 	cur := argv
 	effPath = pathEnv
 	for steps := 0; steps < peelWrapperMaxSteps; steps++ {
@@ -880,8 +786,8 @@ func peelWrappersAndSbxAliases(argv []string, pathEnv string, caller callerIdent
 		}
 		hb := filepath.Base(h[0])
 		// A PATH alias whose typed name is not a wrapper but resolves to
-		// one (foo -> sbx, myenv -> env) needs its options peeled too:
-		// rewrite the head to the resolved wrapper and loop.
+		// one (myenv -> env, mytimeout -> timeout) needs its options peeled
+		// too: rewrite the head to the resolved wrapper and loop.
 		if rb := canonicalResolvedBase(resolveHeadBase(h[0], effPath, caller.screenCwd())); rb != "" && rb != hb && isPeeledWrapperBase(rb) {
 			cur = append([]string{rb}, h[1:]...)
 			continue
@@ -2251,13 +2157,13 @@ func screenHcSubagent(headArgv []string) string {
 // caller may invoke by absolute path from their standard install locations:
 // hc, the terminal client whose `send` subcommand is the notify channel. The
 // map value is the set of resolved-basename aliases the on-disk file may
-// legitimately carry: hc is installed as a symlink to herdr-core (host) or
-// sbx (reviewer sandbox). dispatch-report is deliberately absent — it is not
-// a role-side spelling at all: ctx_report is the sole report entry and it
-// execs the helper itself, so every ctx_run spelling of dispatch-report
-// (bare, path, query or --flush) blocks for a role-guarded caller.
+// legitimately carry: hc is installed as a symlink to herdr-core on the
+// host. dispatch-report is deliberately absent — it is not a role-side
+// spelling at all: ctx_report is the sole report entry and it execs the
+// helper itself, so every ctx_run spelling of dispatch-report (bare,
+// path, query or --flush) blocks for a role-guarded caller.
 var readonlyCanonicalHeads = map[string][]string{
-	"hc": {"hc", "herdr-core", "sbx"},
+	"hc": {"hc", "herdr-core"},
 }
 
 // admittedReadonlyCanonicalHead reports whether arg0 is an absolute path
@@ -2378,13 +2284,13 @@ var transparentShimBins = map[string]bool{
 }
 
 // isPeeledWrapperBase reports whether base is one of the wrapper heads
-// peelWrappers / peelWrappersAndSbxAliases strip. A PATH symlink whose
-// typed name is not itself a wrapper but resolves to one (myenv -> env,
-// mytimeout -> timeout) must be re-peeled: the option peel ran on the
-// typed name before alias resolution rewrote head[0].
+// peelWrappers / peelWrappersAndWrapperAliases strip. A PATH symlink
+// whose typed name is not itself a wrapper but resolves to one
+// (myenv -> env, mytimeout -> timeout) must be re-peeled: the option
+// peel ran on the typed name before alias resolution rewrote head[0].
 func isPeeledWrapperBase(b string) bool {
 	switch b {
-	case "sbx", "env", "command", "builtin", "exec", "nohup", "setsid",
+	case "env", "command", "builtin", "exec", "nohup", "setsid",
 		"nice", "timeout", "stdbuf", "busybox", "ionice", "taskset", "chrt",
 		"strace", "ltrace", "time":
 		return true
@@ -2395,7 +2301,7 @@ func isPeeledWrapperBase(b string) bool {
 // sameStructuralFamily reports whether a typed structural head and its
 // resolved symlink target basename are aliases for the SAME tool — the
 // normal distro/toolchain layout (Debian /bin/sh -> dash, python3 ->
-// python3.13, awk -> mawk, gtar -> tar, hc -> herdr-core|sbx). Aliases
+// python3.13, awk -> mawk, gtar -> tar, hc -> herdr-core). Aliases
 // inside a family keep the typed base; a resolved name that crosses to a
 // different family is a conflicting alias.
 func sameStructuralFamily(a, b string) bool {
@@ -2427,7 +2333,7 @@ func sameStructuralFamily(a, b string) bool {
 	if (a == "npm" || a == "npm-cli.js") && (b == "npm" || b == "npm-cli.js") {
 		return true
 	}
-	if (a == "hc" || a == "herdr-core") && (b == "herdr-core" || b == "sbx") {
+	if (a == "hc" || a == "herdr-core") && b == "herdr-core" {
 		return true
 	}
 	return false
@@ -2447,7 +2353,7 @@ func isStructuralGuardHead(base string) bool {
 	switch base {
 	case "ssh", "xargs", "find", "eval", "watch", "flock", "script",
 		"trap", "unset", "export", "readonly", "declare", "typeset", "local",
-		"read", "getopts", "printf", "command", "ctxmode", "sbx",
+		"read", "getopts", "printf", "command", "ctxmode",
 		"awk", "gawk", "mawk", "nawk", "sed", "gsed", "tar", "gtar", "bsdtar",
 		"npx", "bunx", "pnpx", "git", "hc", "herdr-core":
 		return true
@@ -2973,7 +2879,7 @@ func isAllowedSystemReadonlyAlias(typedBase, resolvedBase, head0, pathEnv, cwd s
 			return true
 		}
 	case "hc":
-		if resolvedBase == "herdr-core" || resolvedBase == "sbx" {
+		if resolvedBase == "herdr-core" {
 			return true
 		}
 	case "which":
@@ -4090,14 +3996,14 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		}
 		return screenSSHHead(head, seg, kind, depth, caller)
 	}
-	// A symlink target promoted to a WRAPPER (PATH entry foo -> sbx/env/
+	// A symlink target promoted to a WRAPPER (PATH entry foo -> env/
 	// timeout/...) was not peeled — peelWrappers ran on the TYPED name
 	// before the alias resolution rewrote head[0]. Re-screen the promoted
-	// argv so the wrapper's own options (sbx --env/-S, env -u/-S, timeout's
-	// duration slot) and inner command head get the same treatment a
-	// directly typed invocation receives. A real wrapper head
-	// (typedHead[0] already names it) already peeled above and must not
-	// re-enter. `caller` is already envAs-seeded.
+	// argv so the wrapper's own options (env -u/-S, timeout's duration
+	// slot) and inner command head get the same treatment a directly
+	// typed invocation receives. A real wrapper head (typedHead[0]
+	// already names it) already peeled above and must not re-enter.
+	// `caller` is already envAs-seeded.
 	if isPeeledWrapperBase(base) && filepath.Base(typedHead[0]) != base {
 		return peelResolvedSegDepth(head, seg, kind, depth+1, caller)
 	}
@@ -4266,7 +4172,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			// including help/query — because no -I `xargs hc --help` still appends
 			// stdin words and breaks the two-word pure-query shape.
 			target := head[k:]
-			th, tea, teffP, tex := peelWrappersAndSbxAliases(target, caller.pathEnv, caller)
+			th, tea, teffP, tex := peelWrappersAndWrapperAliases(target, caller.pathEnv, caller)
 			if tex {
 				return "xargs " + depthExceededHit
 			}
@@ -4474,7 +4380,7 @@ func replTokenInExecSlot(innerArgv []string, token, pathEnv string, caller calle
 	if token == "" || len(innerArgv) == 0 {
 		return false
 	}
-	head, tea, effPath, exhausted := peelWrappersAndSbxAliases(innerArgv, pathEnv, caller)
+	head, tea, effPath, exhausted := peelWrappersAndWrapperAliases(innerArgv, pathEnv, caller)
 	if exhausted || len(head) == 0 {
 		return true
 	}
@@ -5988,7 +5894,7 @@ func screenFindArgsSeg(args []string, outerSeg shellSegment, kind byte, depth in
 				}
 				// Nested hc/herdr-core via find -exec* / -ok* receives path args
 				// at runtime ({} replacement / + batching). Block unconditionally.
-				th, tea, teffP, tex := peelWrappersAndSbxAliases(inner, caller.pathEnv, caller)
+				th, tea, teffP, tex := peelWrappersAndWrapperAliases(inner, caller.pathEnv, caller)
 				if tex {
 					return "find " + a + " " + depthExceededHit
 				}
@@ -12615,7 +12521,7 @@ func xargsFeedsCodeFlag(inner, full []string, pathEnv string, caller callerIdent
 	if len(inner) == 0 {
 		return false
 	}
-	head, tea, effPath, exhausted := peelWrappersAndSbxAliases(inner, pathEnv, caller)
+	head, tea, effPath, exhausted := peelWrappersAndWrapperAliases(inner, pathEnv, caller)
 	if exhausted || len(head) == 0 {
 		return false
 	}
@@ -15120,15 +15026,15 @@ func stdinProgramHeadCwd(argv []string, cwd string) (lang string, isInterp bool)
 
 // stdinProgramHeadWithEnv is stdinProgramHeadDepth carrying the env ops
 // accumulated above this recursion level: a peeled `PATH=...` prefix (or an
-// `sbx --env PATH=...` op) rewires name resolution for every wrapper the
-// command nests into, so `echo pig | PATH=dir foo -- sh` (dir/foo -> sbx)
+// `env PATH=...` op) rewires name resolution for every wrapper the
+// command nests into, so `echo pig | PATH=dir foo -- sh` (dir/foo -> sh)
 // resolves the alias under the peeled PATH instead of the process PATH.
 // The ssh remote-command branch drops it — remote heads resolve under the
 // remote login env, so only the remote ops feed their PATH replay.
 // basePath seeds the PATH the accumulated env ops replay over (the
 // caller's effective PATH — its own process PATH at depth 0): a peeled
 // `PATH=$PATH:<dir>` prefix then expands $PATH like the runtime instead
-// of collapsing to `:<dir>` ([pattern:sbx-wrapper-unwrap-asymmetry]).
+// of collapsing to `:<dir>`.
 func stdinProgramHeadWithEnv(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity) (lang string, isInterp bool, envAs envAssignments) {
 	targets := stdinProgramTargetsWithEnv(argv, depth, inherited, basePath, caller)
 	if len(targets) == 0 {
@@ -15141,7 +15047,7 @@ func stdinProgramHeadWithEnv(argv []string, depth int, inherited envAssignments,
 // wrappers (flock, watch -x, xargs) to reach an underlying ssh argv.
 // pathEnv is the effective PATH the peeled head resolves against: the
 // env ops peeled at each layer replay over it so PATH-injected aliases
-// (foo -> sbx, ssx -> ssh) resolve like the runtime would.
+// (ssx -> ssh) resolve like the runtime would.
 func peelToSSHHead(argv []string, pathEnv string, caller callerIdentity) []string {
 	cur := argv
 	effPath := pathEnv
@@ -15153,10 +15059,11 @@ func peelToSSHHead(argv []string, pathEnv string, caller callerIdentity) []strin
 			return nil
 		}
 		base := filepath.Base(head[0])
-		// A PATH alias resolving to a wrapper (foo -> sbx, myenv -> env)
-		// skipped the option peel because peelWrappers saw only the typed
-		// name — rewrite the head to the resolved wrapper and loop so its
-		// own options are peeled like a directly typed invocation.
+		// A PATH alias resolving to a wrapper (myenv -> env, mytimeout ->
+		// timeout) skipped the option peel because peelWrappers saw only
+		// the typed name — rewrite the head to the resolved wrapper and
+		// loop so its own options are peeled like a directly typed
+		// invocation.
 		if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath, caller.screenCwd())); rb != "" && rb != base && isPeeledWrapperBase(rb) {
 			cur = append([]string{rb}, head[1:]...)
 			continue
@@ -15675,7 +15582,7 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 			return nil
 		}
 		if xargsFeedsCodeFlag(head[k:], head, effPath, caller) {
-			innerHead, innerEnv, innerEffPath, innerExhausted := peelWrappersAndSbxAliases(head[k:], effPath, caller)
+			innerHead, innerEnv, innerEffPath, innerExhausted := peelWrappersAndWrapperAliases(head[k:], effPath, caller)
 			envAs = envAs.merged(innerEnv)
 			if !innerExhausted && len(innerHead) > 0 {
 				// Resolve the xargs target under its own peeled env (the

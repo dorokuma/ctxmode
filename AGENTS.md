@@ -2,7 +2,7 @@
 档位：L2
 
 ## 铁律
-1. **构建与测试**：`make check` 是唯一检查入口，覆盖 `gofmt`、`staticcheck`（本地版本与 CI 一致：`honnef.co/go/tools/cmd/staticcheck@2025.1.1`）、`go vet`、`go build` 及有 `node` / CI 环境下的 `integrations/pi/*.test.ts`；其中 `go test -race` 经 `./scripts/ns-hc-gotest.sh` 在外层 mount/PID/net 命名空间内执行（测试二进制绑定只读 hc/herdr-core/sbx stand-in、清能力并降权），裸 `go test` 会被 `TestMain` 的外层隔离门禁以 exit 125 拒绝；本机 zero-node 无 `node` 时仅跳过 Pi 扩展单测，`CI=true` 强制要求 `node`。部署由 agent 直接执行 `./deploy.sh`（编译 → initialize 验证 → 原子替换运行中二进制），**不设人工步骤**。
+1. **构建与测试**：`make check` 是唯一检查入口，覆盖 `gofmt`、`staticcheck`（本地版本与 CI 一致：`honnef.co/go/tools/cmd/staticcheck@2025.1.1`）、`go vet`、`go build` 及有 `node` / CI 环境下的 `integrations/pi/*.test.ts`；其中 `go test -race` 经 `./scripts/ns-hc-gotest.sh` 在外层 mount/PID/net 命名空间内执行（测试二进制绑定只读 hc/herdr-core stand-in、清能力并降权），裸 `go test` 会被 `TestMain` 的外层隔离门禁以 exit 125 拒绝；本机 zero-node 无 `node` 时仅跳过 Pi 扩展单测，`CI=true` 强制要求 `node`。部署由 agent 直接执行 `./deploy.sh`（编译 → initialize 验证 → 原子替换运行中二进制），**不设人工步骤**。
 2. **零 Node 依赖**：核心代码为纯 Go 实现，禁止引入 NPM/NodeJS 运行时依赖。
 3. **变更登记**：任何改动须在 `CHANGELOG.md` 的 `[Unreleased]` 段落登记。
 4. **提交与门禁**：提交、分支、门禁与收口按 `/root/.pig/agent/SYSTEM.md` §4（维护者本机由全局 `/root/.git-hooks` 执行提交扫描；仓内 `githooks/` 为可选增强、未接管 `hooksPath`）。
@@ -18,7 +18,7 @@
 - `dispatch-agent`：无 Go 模块依赖，但下列 4 项硬编码协议不变量两仓各自实现、必须锁步同步（任一变更须同批改对侧并复核本笔记）：
   1. 报告根目录 `/tmp/herdr-role-reports`
   2. 父终端地址形状 `^t[0-9a-z]+$`（本仓 `hcSendAddrOK`，对端 `config.ReportAddrRe`）
-  3. 角色侧唯一交付入口为 MCP 工具 `ctx_report`（内部委托 `dispatch-report <t-addr>` 原子写 `report.md` 与 `.meta` provenance；`ctx_run` 全角色封禁 `dispatch-report`，`--flush` 仅限派发器外层且强校验 `.meta`；`pi-extensions/go/sandbox/preset.go` 的 `DefaultReviewerTools` 保留 `dispatch-report` 仅作为沙盒内 `ctx_report` 子进程 `exec` 的 Landlock 许可）
+  3. 角色侧唯一交付入口为 MCP 工具 `ctx_report`（内部委托 `dispatch-report <t-addr>` 原子写 `report.md` 与 `.meta` provenance；`ctx_run` 全角色封禁 `dispatch-report`，`--flush` 仅限派发器外层且强校验 `.meta`；`dispatch-report` 不进入任何角色侧工具表）
   4. 回执通知格式 `报告已写入 path=<abs> bytes=<n> sha256=<hex>`；`CTXMODE_EXTRA_WORKDIRS` 空串视为未设置
 ## Release Policy / 发布规范
 

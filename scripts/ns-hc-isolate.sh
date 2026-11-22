@@ -11,7 +11,7 @@
 #   `.bash_profile` are fixture hygiene, NOT an isolation control. Any test,
 #   contract matrix, negative case or sub-shell that can produce a send must
 #   therefore run under a REAL outer OS boundary: a private mount+PID+net
-#   namespace in which every host hc/herdr-core/sbx inode IS the recording
+#   namespace in which every host hc/herdr-core inode IS the recording
 #   stand-in, capabilities are dropped, and noNewPrivs is set.
 #
 # WHAT IT DOES
@@ -20,7 +20,7 @@
 #      `sudo -n env …` with an EXPLICIT env passthrough (never sudo -E, so
 #      sudoers SETENV/secure_path cannot strip PATH/TMPDIR/GOFLAGS/etc.),
 #      carrying NS_CALLER_UID/NS_CALLER_GID for the final privilege drop.
-#   2. Outer (as root): enumerates every hc/herdr-core/sbx entry across the
+#   2. Outer (as root): enumerates every hc/herdr-core entry across the
 #      trusted bin dirs AND the caller's PATH (resolving each through
 #      readlink -f), captures dev:ino + sha256 for the primary --real
 #      target and a mounts digest. For a non-root caller working outside
@@ -67,7 +67,7 @@ note() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool missing: $1"; }
 
-# Trusted bin dirs + the caller's PATH: every hc/herdr-core/sbx entry under
+# Trusted bin dirs + the caller's PATH: every hc/herdr-core entry under
 # them must end up masked. Each entry is emitted ONLY as its readlink -f
 # canonical path (deduplicated): mount --bind follows symlinks, so feeding
 # the unresolved symlink path AND the resolved path would stack two bind
@@ -100,7 +100,7 @@ enumerate_targets() {
     seen[$d]=1
   done
   unset IFS
-  for name in hc herdr-core sbx; do
+  for name in hc herdr-core; do
     for d in "${!seen[@]}"; do
       p=$d/$name
       if [[ -e $p && ! -d $p ]]; then
@@ -186,7 +186,7 @@ if [[ ${1:-} == "--inner" ]]; then
   # helper loops over each line and dies on ANY non-private layer — the
   # check is strictly stronger, never weaker.
   # NOTE: `findmnt -T <path>` walks UP to the nearest mountpoint — a plain
-  # file target (an hc/herdr-core/sbx slot being bind-masked) resolves to
+  # file target (an hc/herdr-core slot being bind-masked) resolves to
   # the mountpoint that hosts it (e.g. `/`), which is the propagation that
   # actually decides whether our mounts leak back to the host.
   assert_private_propagation() {
@@ -229,7 +229,7 @@ if [[ ${1:-} == "--inner" ]]; then
     note "masked: $target -> stand-in (ro, private)"
   }
 
-  # Bind the read-only stand-in over EVERY enumerated hc/herdr-core/sbx
+  # Bind the read-only stand-in over EVERY enumerated hc/herdr-core
   # path (already resolved + deduplicated by the outer phase).
   while IFS= read -r target; do
     [[ -n $target ]] || continue
@@ -404,7 +404,7 @@ NS_TARGET_LIST=()
 if [[ -n $raw_targets ]]; then
   mapfile -t NS_TARGET_LIST <<< "$raw_targets"
 fi
-((${#NS_TARGET_LIST[@]} > 0)) || die "no hc/herdr-core/sbx targets enumerated on host PATH/trusted dirs"
+((${#NS_TARGET_LIST[@]} > 0)) || die "no hc/herdr-core targets enumerated on host PATH/trusted dirs"
 # The --real resolution must be in the set (it always is via the trusted
 # bin dirs, but keep the invariant explicit).
 found_real=0
