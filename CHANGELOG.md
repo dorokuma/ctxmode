@@ -5,6 +5,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Fixed
+- **`ctx_run` readonly tools description no longer implies bare `hc` access (`readonly_allowlist.go`).** The `ops:` group still lists `hc`, and a new note line spells out the actual `screenHcSubagent` boundary for strict readonly/sub-agent callers: `hc send <addr> <text>`, `hc --help`/`-h`, `hc --version`/`-V` and `hc <sub> --help`/`-h` only — `ls`/`get`/`read`/`wait`/`attach` and every other verb stay denied. Documentation only — no allowlist or guard behavior change, `TestReadonlyAllowlist_ToolsDescriptionSync` still passes (the note line carries no `:` so the sync parser skips it).
+
 ### Changed
 - **README redesigned for readability, with a new Simplified Chinese translation and light/dark logo assets (`README.md`, `README.zh-CN.md`, `assets/logo-dark.svg`, `assets/logo-light.svg`).** The English README is rewritten around a centered hero (theme-switching `<picture>` logo, badges, anchor navigation), a Mermaid data-flow diagram, a six-cell highlights table, a 30-second quick start with a copy-paste `mcpServers` JSON example, a one-line-per-tool overview, and three `<details>` sections (security model, role-scoped read-only mode, local development). The auditor-facing callout, internal dispatcher-protocol details and the hard-coded version line are removed; `README.zh-CN.md` mirrors every section 1:1 in Simplified Chinese. Documentation only — no code, version or behavior change.
 

@@ -1723,5 +1723,6 @@ text: sort uniq cut tr jq diff cmp echo printf true false
 vcs: git
 go_meta: go gofmt ctxmode cccc
 ops: ps pgrep ss journalctl systemctl which date pwd mount kill hc
+hc limited to send/--help/-h/--version/-V/sub --help|-h (no ls/get/read/wait/attach)
 `)
 }
