@@ -5,6 +5,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [6.2.1] - 2026-11-24
+
 ### Fixed
 - **`ctx_run` readonly tools description no longer implies bare `hc` access (`readonly_allowlist.go`).** The `ops:` group still lists `hc`, and a new note line spells out the actual `screenHcSubagent` boundary for strict readonly/sub-agent callers: `hc send <addr> <text>`, `hc --help`/`-h`, `hc --version`/`-V` and `hc <sub> --help`/`-h` only — `ls`/`get`/`read`/`wait`/`attach` and every other verb stay denied. Documentation only — no allowlist or guard behavior change, `TestReadonlyAllowlist_ToolsDescriptionSync` still passes (the note line carries no `:` so the sync parser skips it).
 
