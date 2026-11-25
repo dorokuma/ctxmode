@@ -1891,14 +1891,17 @@ func envClusterSplitS(argv []string, i int, st *envTokenStep, optVal string, con
 }
 
 // unwrapShellArgv reports whether argv (starting at a resolved command head)
-// is a `shell -c`/`shell -lc` shape: argv[0] a POSIX-ish shell and an option
-// bundle containing 'c' before the first non-flag argument. The code is
-// argv[i+1] when a next argument exists — for a cluster like -ce the 'c'
-// consumes the NEXT argv as the script, leaving the tail ("e") as flags; a
-// non-letter tail after 'c' (`-c"pig"` glued spelling) is prepended to that
-// script as an extra line. Only when no next argv exists does a non-empty
-// tail stand alone as the script (`["sh","-c\"pig\""]`). -o/+o option
-// values are skipped so `sh -o errexit -c 'pig'` unwraps.
+// is a `shell -c` shape: argv[0] a POSIX-ish shell and an option bundle
+// containing 'c' before the first non-flag argument. POSIX shells parse -c
+// as a BOOLEAN flag and keep scanning options AFTER it — the command string
+// is the FIRST NON-OPTION WORD (or the word right after `--`), not the word
+// immediately following the -c cluster (v6.2.2 Oracle R6 R6-MF-1: the
+// immediate-return model let `sh -co errexit -o pipefail 'pig'` and
+// `sh -co errexit -- 'pig'` slide a real code word past the unwrap). A
+// cluster tail after 'c' (`-c"pig"` glued spelling) is prepended to that
+// script as an extra line — never dropped — and letters after a bare 'c'
+// keep parsing as flags. -o/+o/-O/+O/--rcfile operands are skipped on both
+// sides of the -c letter.
 func unwrapShellArgv(argv []string) (shellText string, has bool) {
 	if len(argv) < 2 {
 		return "", false
@@ -1908,91 +1911,169 @@ func unwrapShellArgv(argv []string) (shellText string, has bool) {
 	default:
 		return "", false
 	}
+	sawC := false
+	tail := ""
 	for i := 1; i < len(argv); i++ {
-		a := argv[i]
-		if isDynamicArg(a) {
-			return "", false // let hasDynamicInterpOption / peel catch it
+		text, has, ni, done := unwrapShellWordStep(argv, i, sawC, tail)
+		if done {
+			return text, has
 		}
-		if a == "--" {
-			return "", false
-		}
-		if strings.HasPrefix(a, "--") {
-			name, val, hasVal := a[2:], "", false
-			if k := strings.IndexByte(name, '='); k >= 0 {
-				name, val, hasVal = name[:k], name[k+1:], true
-			}
-			switch name {
-			case "rcfile", "init-file":
-				if !hasVal {
-					if i+1 >= len(argv) {
-						return "", false
-					}
-					i++
-					val = argv[i]
-				}
-				if val != "/dev/null" {
-					return "", false // external rc is unreviewed code
-				}
-				continue
-			default:
-				continue
-			}
-		}
-		if a == "-o" || a == "+o" || a == "-O" || a == "+O" {
-			i++ // consumes the option NAME
+		if ni != i {
+			i = ni
 			continue
 		}
-		if (strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+")) && len(a) > 1 {
-			plus := a[0] == '+'
-			for j := 1; j < len(a); j++ {
-				ch := a[j]
-				if ch == 'c' && !plus {
-					tail := a[j+1:]
-					if isLetterOnly(tail) {
-						// Flag model (R14): letters after c are flags, not
-						// code — `sh -ce 'x'` is -c -e 'x'. A trailing -o/-O
-						// inside the tail still consumes the next argv as
-						// its option name (`sh -co vi 'x'`: vi feeds -o and
-						// 'x' is the program). The letter tail is ambiguous
-						// (ksh/zsh read -cWORD as glued code) so it is
-						// prepended to the screened text, never dropped.
-						if dyn, skipped := shellClusterOName(argv, a, j, i); dyn != "" {
-							return dyn, true
-						} else {
-							i += skipped
-						}
-						if i+1 < len(argv) {
-							return tail + "\n" + argv[i+1], true
-						}
-						return tail, true // bare -cWORD: ambiguous glued operand — screen it
-					}
-					// A non-letter tail is an ambiguous glued spelling
-					// (zsh-style -c= or -c"x"); screen it as a prepended
-					// line along with the real operand — fail closed.
-					if i+1 < len(argv) {
-						if tail != "" {
-							return tail + "\n" + argv[i+1], true
-						}
-						return argv[i+1], true
-					}
-					if tail != "" {
-						return tail, true
-					}
-					return "", false
-				}
-				if ch == 'o' || ch == 'O' {
-					// valued at end of cluster
-					if j+1 >= len(a) {
-						i++ // next argv is the option name
-					}
-					break
-				}
-			}
-			continue
+		// A cluster word the step could not settle: it may still mint the
+		// -c state, so re-run the cluster handler here.
+		skipped, newC, newTail, dyn := unwrapShellClusterWord(argv, i, sawC)
+		if dyn != "" {
+			return dyn, true
 		}
-		return "", false
+		if newC && !sawC {
+			sawC, tail = true, newTail
+		}
+		i += skipped
+	}
+	if sawC {
+		// No command-string word at all: a recorded ambiguous tail stands
+		// alone as the screened text (`["sh","-c\"pig\""]`).
+		return tail, tail != ""
 	}
 	return "", false
+}
+
+// unwrapShellWordStep settles the non-cluster words of unwrapShellArgv's
+// scan (extracted — v6.2.2 Oracle R6 R6-MF-1): dynamic words, the `--`
+// terminator, `--` long options, the bare -o/+o/-O/+O option-name pair and
+// the first non-option positional. done reports the scan ends here with
+// text/has; ni != i reports a consumed continuation index (long option or
+// -o operand).
+func unwrapShellWordStep(argv []string, i int, sawC bool, tail string) (text string, has bool, ni int, done bool) {
+	a := argv[i]
+	if isDynamicArg(a) {
+		if sawC {
+			// The command string slot itself is dynamic — hand it to the
+			// downstream dynamic-payload verdict (a peel/`$0` argv word is
+			// screened as data only when the STATIC command string passes
+			// its own screen).
+			return unwrapShellJoinTail(tail, a), true, i, true
+		}
+		return "", false, i, true // let hasDynamicInterpOption / peel catch it
+	}
+	if a == "--" {
+		if !sawC {
+			return "", false, i, true
+		}
+		// The word right after `--` is the command string when it exists
+		// (POSIX: `-c` is boolean and `--` only terminates the options).
+		if i+1 < len(argv) {
+			return unwrapShellJoinTail(tail, argv[i+1]), true, i, true
+		}
+		return tail, tail != "", i, true
+	}
+	if strings.HasPrefix(a, "--") {
+		if ni2, bail := unwrapShellLongWord(argv, i); bail {
+			return "", false, i, true
+		} else {
+			return "", false, ni2, false
+		}
+	}
+	if a == "-o" || a == "+o" || a == "-O" || a == "+O" {
+		return "", false, i + 1, false // consumes the option NAME
+	}
+	if len(a) > 1 && (a[0] == '-' || a[0] == '+') && !strings.HasPrefix(a, "--") {
+		return "", false, i, false // cluster word — the caller scans it
+	}
+	// First non-option word: with a pending -c it IS the command string;
+	// without -c the shell runs a script FILE — nothing to unwrap, and the
+	// positional ends the option zone either way.
+	if sawC {
+		return unwrapShellJoinTail(tail, a), true, i, true
+	}
+	return "", false, i, true
+}
+
+// unwrapShellJoinTail prepends the recorded cluster tail to the command
+// string (the tail is an ambiguous glued spelling, screened rather than
+// dropped — v6.2.2 Oracle R6 R6-MF-1).
+func unwrapShellJoinTail(tail, script string) string {
+	if tail == "" {
+		return script
+	}
+	if script == "" {
+		return tail
+	}
+	return tail + "\n" + script
+}
+
+// unwrapShellLongWord skips one `--` long-option word of the shell scan
+// (extracted from unwrapShellArgv — v6.2.2 Oracle R6 R6-MF-1): --rcfile/
+// --init-file consume a file operand that must name /dev/null to stay
+// reviewable; every other long word is a boolean flag. ni is the loop
+// index the scan continues from, bail reports the unwrap must give up.
+func unwrapShellLongWord(argv []string, i int) (ni int, bail bool) {
+	a := argv[i]
+	name, val, hasVal := a[2:], "", false
+	if k := strings.IndexByte(name, '='); k >= 0 {
+		name, val, hasVal = name[:k], name[k+1:], true
+	}
+	if name != "rcfile" && name != "init-file" {
+		return i, false
+	}
+	if !hasVal {
+		if i+1 >= len(argv) {
+			return i, true
+		}
+		return i + 1, val != "/dev/null" && argv[i+1] != "/dev/null"
+	}
+	return i, val != "/dev/null"
+}
+
+// unwrapShellClusterWord advances unwrapShellArgv past one short-option
+// cluster word (extracted — v6.2.2 Oracle R6 R6-MF-1): skipped counts EXTRA
+// argv operands the cluster's trailing bare -o/-O eats, newC/newTail report
+// a freshly-seen -c letter and its ambiguous tail, dyn is the dynamic
+// option-name fail-closed surface of shellClusterOName. The scan matches
+// scanShortCluster's shell grammar: letters after 'c' keep parsing as flags
+// (the recorded tail is prepended to the command text, never dropped), a
+// non-letter byte in the tail ends the flag letters, and a bare -o/-O at
+// the cluster end consumes the NEXT argv as its option name.
+func unwrapShellClusterWord(argv []string, i int, sawC bool) (skipped int, newC bool, newTail, dyn string) {
+	a := argv[i]
+	plus := a[0] == '+'
+	for j := 1; j < len(a); j++ {
+		ch := a[j]
+		if ch == 'c' && !plus && !sawC {
+			newC, newTail = true, a[j+1:]
+			// Flag model (R14): letters after c are flags, not code —
+			// `sh -ce 'x'` is -c -e 'x'. A trailing bare -o/-O inside the
+			// tail still consumes the next argv as its option name (`sh -co
+			// vi 'x'`: vi feeds -o and 'x' is the program).
+			if isLetterOnly(newTail) {
+				dyn, skipped = shellClusterOName(argv, a, j, i)
+				return skipped, true, newTail, dyn
+			}
+			// A non-letter byte in the tail is an ambiguous glued spelling
+			// (zsh-style -c= or -c"x"): it is NOT part of the flag letters,
+			// so the cluster scan ends here — the whole tail is prepended
+			// to the screened text fail-closed.
+			return 0, true, newTail, ""
+		}
+		if ch == 'o' || ch == 'O' {
+			// valued at end of cluster
+			if j+1 >= len(a) {
+				if i+1 < len(argv) {
+					if isDynamicArg(argv[i+1]) && sawC {
+						// The option name slot is dynamic AFTER a pending -c:
+						// the split re-parses it as further options (R5-MF-1).
+						return 0, newC, newTail, argv[i+1]
+					}
+					return 1, newC, newTail, ""
+				}
+			}
+			return skipped, newC, newTail, ""
+		}
+	}
+	return skipped, newC, newTail, ""
 }
 
 // shellClusterOName scans the letter tail after a cluster's 'c' for a
@@ -5332,6 +5413,14 @@ func interpOptionZoneHasToken(h []string, token, base string, findPathToken bool
 	for i := 1; i < len(h); i++ {
 		a := h[i]
 		if a == "--" {
+			if shellHeads[base] && codeDone > 0 {
+				// A pending shell -c survives `--`: the word right after it
+				// IS the command string and stays inside the zone
+				// (`xargs -a <p> -I% sh -co errexit -- %` — v6.2.2 Oracle R6
+				// R6-MF-1).
+				end = i + 2
+				break
+			}
 			end = i + 1 // the word right after -- is the script operand
 			break
 		}
@@ -5394,29 +5483,22 @@ func interpZoneWordStep(spec interpOptSpec, hasSpec bool, base string, h []strin
 	}
 	switch {
 	case strings.HasPrefix(a, "--"):
-		name := a[2:]
-		if k := strings.IndexByte(name, '='); k >= 0 {
-			name = name[:k]
-		}
-		opt := "--" + name
-		switch {
-		case spec.longCode[opt]:
-			// A long code slot: consume its operand and either stop
-			// (shell/python) or keep scanning (multi-code interps).
-			if strings.IndexByte(a, '=') < 0 && i+1 < len(h) {
-				next = i + 1
-			}
-			return next, spec.stopOnFirstCode || shellHeads[base], false, false, true
-		case spec.longValue[opt]:
-			if strings.IndexByte(a, '=') < 0 && i+1 < len(h) {
-				next = i + 1 // plain value operand
-			}
-		}
-		return next, false, false, false, false
+		return interpZoneLongWordStep(spec, base, h, i)
 	case len(a) >= 2 && (a[0] == '-' || a[0] == '+'):
-		consumed, codeHit := interpClusterZoneStep(spec, a, h, i)
+		var consumed int
+		var codeHit bool
+		if shellHeads[base] {
+			consumed, codeHit = shellClusterZoneConsume(a, h, i)
+		} else {
+			consumed, codeHit = interpClusterZoneStep(spec, a, h, i)
+		}
 		if codeHit {
-			return i + consumed, spec.stopOnFirstCode || shellHeads[base], false, false, true
+			// POSIX shells keep parsing options after a pending -c — the
+			// command string is the first NON-OPTION word — so the zone
+			// scan must continue through the remaining -/+ words instead of
+			// stopping at the -c cluster (v6.2.2 Oracle R6 R6-MF-1
+			// `sh -co errexit -o % 'echo hi'`).
+			return i + consumed, spec.stopOnFirstCode, false, false, true
 		}
 		return i + consumed, false, false, false, false
 	case !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+"):
@@ -5440,6 +5522,34 @@ func interpZoneWordStep(spec interpOptSpec, hasSpec bool, base string, h []strin
 		return i, false, false, true, false
 	}
 	return i, false, false, false, false
+}
+
+// interpZoneLongWordStep advances interpZoneWordStep past one `--` long
+// option word (extracted so interpZoneWordStep stays under the complexity
+// budget — v6.2.2 Oracle R6 R6-MF-1): long code slots consume their
+// operand and stop the zone for stopOnFirstCode interpreters and POSIX
+// shells (long forms have no boolean -c continuation), long value options
+// consume a separate value operand.
+func interpZoneLongWordStep(spec interpOptSpec, base string, h []string, i int) (next int, stopZone, stopExcl, zoneEnd, consumedCode bool) {
+	a := h[i]
+	name := a[2:]
+	if k := strings.IndexByte(name, '='); k >= 0 {
+		name = name[:k]
+	}
+	opt := "--" + name
+	next = i
+	if spec.longCode[opt] {
+		// A long code slot: consume its operand and either stop
+		// (shell/python) or keep scanning (multi-code interps).
+		if strings.IndexByte(a, '=') < 0 && i+1 < len(h) {
+			next = i + 1
+		}
+		return next, spec.stopOnFirstCode || shellHeads[base], false, false, true
+	}
+	if spec.longValue[opt] && strings.IndexByte(a, '=') < 0 && i+1 < len(h) {
+		next = i + 1 // plain value operand
+	}
+	return next, false, false, false, false
 }
 
 // interpMultiCodeBase reports whether base names a multi-code-slot
@@ -5523,6 +5633,36 @@ func interpClusterZoneStep(spec interpOptSpec, a string, h []string, i int) (con
 	return consumed, false
 }
 
+// shellClusterZoneConsume walks one short-option cluster of a POSIX shell
+// under POSIX's boolean -c model (extracted for interpZoneWordStep —
+// v6.2.2 Oracle R6 R6-MF-1): unlike the generic interpClusterZoneStep the
+// pending -c letter consumes NO operand of its own (the command string is
+// the first non-option word), while a trailing bare -o/-O still eats the
+// NEXT argv as its option name. consumed counts those EXTRA argv operands
+// and codeHit reports a bare-mode -c letter was seen.
+func shellClusterZoneConsume(a string, h []string, i int) (consumed int, codeHit bool) {
+	plus := a[0] == '+'
+	for j := 1; j < len(a); j++ {
+		ch := a[j]
+		if ch == 'c' && !plus {
+			codeHit = true
+			continue
+		}
+		if ch == 'o' || ch == 'O' {
+			if j+1 >= len(a) && i+1+consumed < len(h) {
+				consumed++ // bare valued letter: the next argv is its operand
+			}
+			return consumed, codeHit
+		}
+		if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z') {
+			// A non-letter byte ends the flag letters (ambiguous glued
+			// spelling) — no further letters parse.
+			return consumed, codeHit
+		}
+	}
+	return consumed, codeHit
+}
+
 // interpZoneConsumeNext adds one to consumed when the cluster's trailing
 // value/code letter can still reach a next argv operand (v6.2.2 R4-SF-1).
 func interpZoneConsumeNext(consumed, i int, h []string) int {
@@ -5559,7 +5699,7 @@ func replTokenInToolExecSlots(h []string, token, b string, findPathToken bool) b
 // OPTION ZONE itself is scanned too — a token inside an option word or a
 // value operand expands before awk parses it.
 func awkProgramTokenHit(h []string, token string, findPathToken bool) bool {
-	program, sawFile, hit := awkProgramFrags(h[1:])
+	program, _, hit := awkProgramFrags(h[1:])
 	if hit != "" {
 		// awkProgramFrags already flags dynamic/unsafe program sources
 		// conservatively; a token anywhere in such a shape counts as a hit.
@@ -5578,12 +5718,15 @@ func awkProgramTokenHit(h []string, token string, findPathToken bool) bool {
 		// '{}'` blocks while `awk -f parse.awk {}` stays allowed).
 		return true
 	}
-	if sawFile || program != "" {
-		// A program source was explicit: input filenames are pure data. Only
-		// the option-zone words themselves can still carry the token.
-		return awkOptZoneHasToken(h[1:], token, findPathToken)
-	}
-	return false
+	// The option zone is scanned unconditionally (v6.2.2 Oracle R6 R6-MF-3
+	// path B): an EMPTY program (`gawk -e ''` / `gawk -l '{}'` / `gawk -e ''
+	// -i '{}'`) no longer skips the zone scan — the xargs-fed word after
+	// the empty fragment can still re-arm an option spelling
+	// (`-eBEGIN{system("pig")}`) under gawk's permutation. With no program
+	// source the positional input filenames are awk's own data words,
+	// which awkOptZoneHasToken already treats as inert unless they carry
+	// the bare replace token.
+	return awkOptZoneHasToken(h[1:], token, findPathToken)
 }
 
 // awkOptZoneHasToken scans awk's option words for the token (cluster tails,
@@ -5711,6 +5854,16 @@ func awkOptWordTokenStep(args []string, i int, token string) (consume int, hit b
 			wv, _ := awkWClusterValue(args, i, j, a)
 			wName, _, _ := strings.Cut(wv, "=")
 			return wc, wh, isLongOptAbbrev(wName, "exec", 1)
+		case 'd', 'D', 'L', 'o', 'p':
+			// gawk optional_argument short options (getopt_long d::/D::/L::/
+			// o::/p::): a glued tail IS the option's argument and ends the
+			// cluster immediately without consuming the next argv — the
+			// tail's letters must never reach the 'e'/'f'/'v' cases
+			// (v6.2.2 Oracle R6 R6-MF-4 `gawk -Lfatal`/`gawk -p/dev/null`/
+			// `xargs -a <p> -I{} gawk -d/tmp/v {}`).
+			if j+1 < len(a) {
+				return 0, false, false
+			}
 		}
 	}
 	return 0, false, false
@@ -5739,13 +5892,29 @@ func awkWOperandTokenStep(args []string, i, j int, a, token string) (consume int
 	name, eqVal, hasEq := strings.Cut(v, "=")
 	isProg, _ := awkLongProgramName(name)
 	if !isProg {
+		// The OPTION NAME itself is attacker-controlled in the `-W {}` /
+		// `-W "$X"` spellings: the runtime expansion can spell a
+		// program-source option (`exec` / `source=BEGIN{system("pig")}`)
+		// that the static scan never sees (v6.2.2 Oracle R6 R6-MF-3
+		// `xargs -a <p> -I{} awk -W '{}' /dev/stdin` — mawk AND gawk).
+		// Pure-data assignments (-W assign=x={} / -W assign '{}') keep
+		// their exemption: their value is data awk never executes.
+		if strings.Contains(name, token) {
+			return consume, true
+		}
 		// Non-program value-bearing options (assign / field-separator and
 		// their GNU unique prefixes) consume their separate value operand
 		// too — otherwise the value word poses as the program and hides
 		// the REAL program text behind it (v6.2.2 Oracle R5 R5-MF-4
 		// `xargs -a <p> -I{} gawk -W assign 'x=1' '{}'`).
-		if awkLongIsDataAssign(name) && !hasEq && i+consume+1 < len(args) {
-			return consume + 1, false
+		if awkLongIsDataAssign(name) {
+			if !hasEq && i+consume+1 < len(args) {
+				return consume + 1, false
+			}
+			return consume, false
+		}
+		if strings.Contains(v, token) {
+			return consume, true
 		}
 		return consume, false
 	}
@@ -5833,8 +6002,24 @@ func awkWOperandProgram(v string, args []string, nextIdx int) (frag string, isFi
 	name, val, hasEq := strings.Cut(v, "=")
 	isProg, isF := awkLongProgramName(name)
 	if !isProg {
-		if awkLongIsDataAssign(name) && !hasEq && nextIdx < len(args) {
-			return "", false, "", "", 1
+		// The option NAME slot fails closed when it is dynamic or too
+		// short to resolve: at runtime the expansion can spell a
+		// program-source option (`exec` / `source=BEGIN{system("pig")}`)
+		// that the static scan never sees (v6.2.2 Oracle R6 R6-MF-3
+		// `X='exec'; awk -W "$X" /dev/stdin` — mawk AND gawk). Pure-data
+		// assignments (-W assign=x="$VAR" / -W assign "$VAR") stay
+		// exempt: their value is data awk never executes.
+		if isDynamicArg(name) || awkAmbiguousShortPrefix(name) {
+			return "", false, "", "dynamic code payload", 0
+		}
+		if awkLongIsDataAssign(name) {
+			if !hasEq && nextIdx < len(args) {
+				return "", false, "", "", 1
+			}
+			return "", false, "", "", 0
+		}
+		if isDynamicArg(v) {
+			return "", false, "", "dynamic code payload", 0
 		}
 		return "", false, "", "", 0
 	}
@@ -5924,6 +6109,15 @@ func awkClusterFragsEnd(args []string, i int, a string, endOut *bool) (frags []s
 				return nil, sawFile, consumedNext, wh
 			}
 			return frags, sawFile, consumedNext, ""
+		case 'd', 'D', 'L', 'o', 'p':
+			// gawk optional_argument short options (getopt_long d::/D::/L::/
+			// o::/p::): a glued tail IS the option's argument and ends the
+			// cluster immediately without consuming the next argv — the
+			// tail's letters must never reach the 'e'/'f'/'v' cases
+			// (v6.2.2 Oracle R6 R6-MF-4 `gawk -Lfatal` / `gawk -p/dev/null`).
+			if j+1 < len(a) {
+				return frags, sawFile, consumedNext, ""
+			}
 		}
 	}
 	return frags, sawFile, consumedNext, ""
@@ -5957,12 +6151,18 @@ func awkClusterWOperand(args []string, i, j int, a string, consumedNext int, end
 	}
 	frag, isFile, _, wh, wc := awkWOperandProgram(wv, args, i+consumedNext+extra+1)
 	extra += wc
-	if isFile {
+	wName, _, _ := strings.Cut(wv, "=")
+	if isFile && (isLongOptAbbrev(wName, "file", 3) || isLongOptAbbrev(wName, "exec", 1)) {
+		// Only the PROGRAM-FILE sources (-W file/-W exec) retire the
+		// positional program word; -W include/-W load (and their GNU
+		// unique prefixes -W i/-W lo) are LIBRARY loads — the positional
+		// word is still awk's main program text and must stay extractable
+		// (v6.2.2 Oracle R6 R6-MF-2 `gawk -W include=/dev/null
+		// 'BEGIN{system("pig")}'`).
 		sawFile = true
-		wName, _, _ := strings.Cut(wv, "=")
-		if isLongOptAbbrev(wName, "exec", 1) && endOut != nil {
-			*endOut = true // -W exec == --exec: ends awk's option parsing
-		}
+	}
+	if isFile && isLongOptAbbrev(wName, "exec", 1) && endOut != nil {
+		*endOut = true // -W exec == --exec: ends awk's option parsing
 	}
 	return frag, sawFile, extra, wh
 }
@@ -9081,10 +9281,15 @@ func awkProgramFrags(args []string) (string, bool, string) {
 			if !endOpts && strings.HasPrefix(a, "-") {
 				return "", sawFile, "dynamic code payload"
 			}
-			if !isSafeDynamicDataOperand(a) || isStdinDevicePath(a) {
-				return "", sawFile, "dynamic code payload"
-			}
-			if !endOpts && positional == "" && len(frags) == 0 {
+			if !sawFile && positional == "" && len(frags) == 0 {
+				// The first positional is awk's PROGRAM text — including the
+				// word right after `--` (`awk -- "$VAR"` is argv-programmed
+				// awk code, not inert data — v6.2.2 Oracle R6 R6-SF-1). The
+				// gawk -f/--file program file (sawFile) retires it instead.
+				// A dynamic data word AFTER a program source (`awk -f
+				// parse.awk -- "$FILE"` / `awk '1' -- "$FILE"`) is awk INPUT
+				// data, not code — it stays exempt (v6.2.2 Oracle R6
+				// positives).
 				return "", sawFile, "dynamic code payload"
 			}
 			if positional == "" {
@@ -9124,7 +9329,7 @@ func awkProgramFrags(args []string) (string, bool, string) {
 				}
 			}
 			i++ // consume the file operand
-		case !endOpts && (a == "-e" || a == "--source"):
+		case !endOpts && a == "-e":
 			if i+1 < len(args) {
 				frags = append(frags, args[i+1])
 				i++
@@ -15215,6 +15420,19 @@ type interpScanState struct {
 func (st *interpScanState) scanLongWord(argv []string, i int, idx *int) bool {
 	a := argv[i]
 	if a == "--" {
+		if st.pendingCode {
+			// A pending flag-model code letter of a POSIX shell survives the
+			// `--` terminator: -c is boolean there, so the word right after
+			// `--` IS the command string (`sh -co errexit -- 'pig'` —
+			// v6.2.2 Oracle R6 R6-MF-1). No word at all means the fed text
+			// lands in the open slot (xargs `-a` append mode
+			// `xargs -a <p> sh -c --`).
+			if i+1 < len(argv) {
+				st.out = append(st.out, codeSlot{flag: i + 1, text: argv[i+1], restIdx: i + 2})
+			} else {
+				st.out = append(st.out, codeSlot{flag: i, flagOnly: true, restIdx: i + 1})
+			}
+		}
 		return true // option terminator
 	}
 	if !strings.HasPrefix(a, "--") {
@@ -18077,13 +18295,21 @@ func interpDynClusterStep(head []string, i int, spec interpOptSpec, shell bool, 
 	}
 	if hasPendingCode {
 		// A flag-model code letter (node -p / sh -c) still awaits its own
-		// operand after the value slot. Shells and CPython stop at the
-		// first code slot instead, matching their own parsers (v6.2.2 R3
-		// R3-MF-5); multi-code interpreters consume one more slot so a
-		// later -r/-I operand cannot pose as the code (v6.2.2 Oracle R5
-		// R5-MF-1 `node -pC default '1' -r $X`).
-		if spec.stopOnFirstCode || shell {
+		// operand after the value slot. CPython stops at the first code
+		// slot, matching its own parser (v6.2.2 R3 R3-MF-5); multi-code
+		// interpreters consume one more slot so a later -r/-I operand
+		// cannot pose as the code (v6.2.2 Oracle R5 R5-MF-1 `node -pC
+		// default '1' -r $X`). POSIX shells are NEITHER: -c is a boolean
+		// flag there and the shell keeps parsing further -/+ options after
+		// it, so the scan must CONTINUE through the option zone (the
+		// command string is the first non-option word — v6.2.2 Oracle R6
+		// R6-MF-1 `sh -co errexit -o $X 'echo hi'` regressed to ALLOW when
+		// the R5-MF-1 repair let shells share CPython's stop).
+		if spec.stopOnFirstCode {
 			return next, true, false
+		}
+		if shell {
+			return next, false, false
 		}
 		return next + 1, false, false
 	}
@@ -18130,7 +18356,12 @@ func clusterConsumesOperand(spec interpOptSpec, a string) (consumesVal, hasPendi
 			// same continuation).
 			hasFlagCode = true
 			if tail := a[j+1:]; tail != "" && !isLetterOnly(tail) {
-				return false, false
+				// scanShortCluster sets pending BEFORE breaking on a non-letter
+				// tail (the tail is an ambiguous glued spelling, not flag
+				// letters): keep hasFlagCode through the early return so the
+				// pending code operand is not dropped (v6.2.2 Oracle R6
+				// R6-SF-2 `node -pCfoo-bar '1' -r $X`).
+				return false, hasFlagCode
 			}
 			if j+1 >= len(a) {
 				return false, true

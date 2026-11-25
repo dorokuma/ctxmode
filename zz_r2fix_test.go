@@ -2044,3 +2044,104 @@ func TestGuard_V622_OracleR5Probes(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// v6.2.2 Oracle R6 (R8 终局收口): R6-MF-1..4 / R6-SF-1..2 探针回归 —
+// POSIX shell pending -c 全链路对齐(sh -co errexit -o $X / sh -co errexit --
+// /xargs -a sh -c -- 回归与逃逸闭合);awkClusterWOperand -W include/-W load
+// 不再错置 sawFile;awkWOperandTokenStep/awkWOperandProgram 覆盖 -W '{}' /
+// -W "$X" 选项名盲区与 awkProgramTokenHit 空程序门控;gawk 可选参数短选项
+// d/D/L/o/p 粘连尾串立即结束集群;awk -- "$VAR" 与 clusterConsumesOperand
+// 非纯字母尾 hasFlagCode 锁步对齐。所有 dynamic code payload 精确断言走
+// xargs -a 无管道入口(R3-Obs-2 隔离纪律)。
+// ---------------------------------------------------------------------------
+
+func TestGuard_V622_OracleR6Probes(t *testing.T) {
+	mkPayload := func(name, content string) string {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+	payloadPig := mkPayload("r6-pig", "pig\n")
+	payloadExec := mkPayload("r6-exec", "exec\n")
+	payloadSource := mkPayload("r6-source", "source=BEGIN{system(\"pig\")}\n")
+	payloadEBegin := mkPayload("r6-ebegin", "-eBEGIN{system(\"pig\")}\n")
+	payloadEvilSo := mkPayload("r6-evilso", "/tmp/evil.so\n")
+	payloadDevStdin := mkPayload("r6-devstdin", "/dev/stdin\n")
+	payloadX := mkPayload("r6-x", "x\n")
+
+	blockCases := []struct {
+		name, cmd, want string
+	}{
+		// R6-MF-1: POSIX shell pending -c 全链路对齐 — R7 回归(sh/bash -co
+		// errexit -o $X 从 3ddc0a7 BLOCK 退化)与 -o/-- 逃逸全部恢复 BLOCK。
+		{"P-R6-MF1-a sh -co -o X", `X='errexit pig'; sh -co errexit -o $X 'echo hi'`, "dynamic code payload"},
+		{"P-R6-MF1-b bash -co -o X", `X='errexit pig'; bash -co errexit -o $X 'echo hi'`, "dynamic code payload"},
+		{"P-R6-MF1-c bash -co -o pipefail", `bash -co errexit -o pipefail 'pig'`, "pig"},
+		{"P-R6-MF1-d sh -co -- pig", `sh -co errexit -- 'pig'`, "pig"},
+		{"P-R6-MF1-e sh -ce -o X", `X='errexit pig'; sh -ce -o $X 'echo hi'`, "dynamic code payload"},
+		{"P-R6-MF1-f xargs -I% sh -co -- %", `xargs -a ` + payloadPig + ` -I% sh -co errexit -- %`, "dynamic code payload"},
+		{"P-R6-MF1-g xargs sh -c --", `xargs -a ` + payloadPig + ` sh -c --`, "dynamic code payload"},
+		// R6-MF-2: -W include/-W load 不再错置 sawFile,位置主程序正常提取。
+		{"P-R6-MF2-a -W include=", `gawk -W include=/dev/null 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R6-MF2-b -W include sep", `gawk -W include /dev/null 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R6-MF2-c -W i=", `gawk -W i=/dev/null 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R6-MF2-d -W load=time", `gawk -W load=time 'BEGIN{system("pig")}'`, "pig"},
+		// R6-MF-3: -W '{}' / -W "$X" 选项名盲区与 awkProgramTokenHit 空程序
+		// 门控跳过全部闭合。
+		{"P-R6-MF3-a xargs awk -W '{}' /dev/stdin", `xargs -a ` + payloadExec + ` -I{} awk -W '{}' /dev/stdin`, "dynamic code payload"},
+		{"P-R6-MF3-b xargs gawk -W '{}' '1'", `xargs -a ` + payloadSource + ` -I{} gawk -W '{}' '1'`, "dynamic code payload"},
+		{"P-R6-MF3-c awk -W X /dev/stdin", `X='exec'; echo 'BEGIN{system("pig")}' | awk -W "$X" /dev/stdin`, "dynamic code payload"},
+		{"P-R6-MF3-d gawk -W X 1", `X='source=BEGIN{system("pig")}'; gawk -W "$X" '1'`, "dynamic code payload"},
+		{"P-R6-MF3-e gawk -e '' {}", `xargs -a ` + payloadEBegin + ` -I{} gawk -e '' {}`, "dynamic code payload"},
+		{"P-R6-MF3-f gawk -e '' -l '{}'", `xargs -a ` + payloadEvilSo + ` -I{} gawk -e '' -l '{}'`, "dynamic code payload"},
+		{"P-R6-MF3-g gawk -e '' -i '{}'", `xargs -a ` + payloadDevStdin + ` -I{} gawk -e '' -i '{}'`, "dynamic code payload"},
+		// R6-MF-4: gawk 可选参数短选项 d/D/L/o/p 粘连尾串立即结束集群。
+		{"P-R6-MF4-a -Lfatal", `gawk -Lfatal 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R6-MF4-b -Lno-ext", `gawk -Lno-ext 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R6-MF4-c -p/dev/null", `gawk -p/dev/null 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R6-MF4-d -d/tmp/v xargs", `xargs -a ` + payloadEBegin + ` -I{} gawk -d/tmp/v {} '1'`, "dynamic code payload"},
+		// R6-SF-1: awk -- "$VAR" 在本机 mawk/gawk 直通 — !endOpts 改 !sawFile。
+		{"P-R6-SF1-a awk -- VAR", `VAR='BEGIN{system("pig")}'; awk -- "$VAR"`, "dynamic code payload"},
+		// R6-SF-2: clusterConsumesOperand 非纯字母尾保留 hasFlagCode。
+		{"P-R6-SF2-a node -pCfoo-bar", `X='a.js -e require("child_process").execSync("pig")'; node -pCfoo-bar '1' -r $X`, "dynamic code payload"},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+
+	// 放行守卫正例(R6 零假阳纪律):合法 $0/$1 数据槽、-W assign 纯数据、
+	// awk -- 后文件名、gawk -Lfatal 合法 lint 值。
+	allowCases := []struct {
+		name, cmd string
+	}{
+		{"R6-pos sh -co errexit echo", `sh -co errexit 'echo hi'`},
+		{"R6-pos sh -co errexit $1", `sh -co errexit 'echo "$1"' _ "$ARG"`},
+		{"R6-pos xargs sh -c $1", `xargs -a ` + payloadX + ` -I{} sh -c 'echo "$1"' _ {}`},
+		{"R6-pos gawk -W assign", `gawk -W assign 'x=1' 'BEGIN{print x}'`},
+		{"R6-pos xargs -W assign {}", `xargs -a ` + payloadX + ` -I{} gawk -W assign '{}' '1' /dev/null`},
+		{"R6-pos xargs -W assign=x={}", `xargs -a ` + payloadX + ` -I{} gawk -W 'assign=x={}' '1' /dev/null`},
+		{"R6-pos awk -f -- $FILE", `awk -f parse.awk -- "$FILE"`},
+		{"R6-pos awk '1' -- $FILE", `awk '1' -- "$FILE"`},
+		{"R6-pos gawk -Lfatal lint", `gawk -Lfatal 'BEGIN{print 1}'`},
+		{"R6-pos gawk -- data", `gawk 'BEGIN{print ARGV[1]}' -- -f -`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+}
