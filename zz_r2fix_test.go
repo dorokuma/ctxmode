@@ -843,3 +843,183 @@ func TestGuard_R6_MultiTargetOrderIndependent(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// v6.2.2 待办 1: Python `--` 长选项解析统一收敛 —
+// --check-hash-based-pycs 两种形态（=val / 空格分隔）在任何守卫入口都不再
+// 逃逸，未知 Python `--` 长选项保守 fail-closed，合法查询长选项保持放行。
+// ---------------------------------------------------------------------------
+
+func TestGuard_V622_PythonLongOpts(t *testing.T) {
+	blockCases := []struct {
+		name, role, ro, cmd string
+		want                string
+	}{
+		// 粘连值形态：基线误把 heck-hash-based-pycs=default 当 -c 载荷放行。
+		{"v622-1a glued -c", "worker", "", `python3 --check-hash-based-pycs=default -c 'import os; os.system("pig")'`, "python"},
+		// worker+ro=1（strict readonly verifier 模型）：基线漏审 python 写文件载荷。
+		{"v622-1b verifier write", "worker", "1", `python3 --check-hash-based-pycs default -c "open('out.txt', 'w')"`, "python"},
+		// worker 嵌套代理守卫：-c 载荷含 pig，基线借长选项逃逸。
+		{"v622-1b2 worker subagent write", "worker", "", `python3 --check-hash-based-pycs default -c "open('out.txt', 'w'); import os; os.system('pig')"`, "python"},
+		// 空格分隔形态："default" 不得提前终止选项区扫描。
+		{"v622-1c xargs -c feed", "worker", "", `echo 'import os; os.system("pig")' | xargs python3 --check-hash-based-pycs default -c`, "BLOCK"},
+		{"v622-1d find -exec -c", "worker", "", `find . -exec python3 --check-hash-based-pycs default -c '{}' \;`, "BLOCK"},
+		{"v622-1e1 -m after long", "worker", "", `python3 --check-hash-based-pycs default -m pig`, "pig"},
+		{"v622-1e2 -um glued", "worker", "", `python3 -um pig`, "pig"},
+		// 未知 Python 长选项（--jit off）：操作数 arity 不可知，fail-closed。
+		{"v622-1f unknown long", "worker", "", `python3 --jit off -c 'import os; os.system("pig")'`, "BLOCK"},
+		{"v622-1f2 missing mode", "worker", "", `python3 --check-hash-based-pycs -c 'print(1)'`, "BLOCK"},
+		{"v622-1f3 bad mode", "worker", "", `python3 --check-hash-based-pycs=bogus -c 'print(1)'`, "BLOCK"},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: tc.role, ro: tc.ro, cmd: tc.cmd}, "")
+			if tc.want == "BLOCK" {
+				if got == "ALLOW" {
+					t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+	allowCases := []struct {
+		name, role, ro, cmd string
+	}{
+		{"worker python3 --version", "worker", "", `python3 --version`},
+		{"verifier python3 --version", "verifier", "", `python3 --version`},
+		{"worker python3 --help-all", "worker", "", `python3 --help-all`},
+		{"worker pycs then --version", "worker", "", `python3 --check-hash-based-pycs=default --version`},
+		{"worker pycs benign -c", "worker", "", `python3 --check-hash-based-pycs default -c 'print(1)' "$HOME"`},
+		{"worker script custom flag", "worker", "", `python3 app.py --custom-flag val`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: tc.role, ro: tc.ro, cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// v6.2.2 待办 2: JavaScript 族拆族 — bun/ts-node/tsx 不再与 node/nodejs
+// 共享结构族；跨名软链（bun -> node）conflicting structural alias fail-
+// closed，真实 bun/tsx 自身的 -p/--print 内联代码也被拦截；node <-> nodejs
+// 同族合法软链保持放行。
+// ---------------------------------------------------------------------------
+
+func TestGuard_V622_JSFamilySplit(t *testing.T) {
+	fakeHome := withTestTrustedHome(t)
+	binDir := filepath.Join(fakeHome, ".local", "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	writeTestExecutable(t, filepath.Join(binDir, "node"), 0755)
+	for _, name := range []string{"bun", "tsx"} {
+		if err := os.Symlink(filepath.Join(binDir, "node"), filepath.Join(binDir, name)); err != nil {
+			t.Fatalf("symlink %s -> node: %v", name, err)
+		}
+	}
+	pathEnv := binDir + ":" + os.Getenv("PATH")
+	t.Setenv("PATH", pathEnv)
+	for _, tc := range []struct {
+		name, cmd string
+	}{
+		{"v622-2a bun symlink", `bun -p 'require("child_process").execSync("pig")'`},
+		{"v622-2b tsx symlink", `tsx -p 'require("child_process").execSync("pig")'`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want conflicting structural alias block", tc.cmd)
+			}
+		})
+	}
+	// Direct bun -p with no symlink at all: -p is inline code and must hit
+	// the nested-agent scan even when resolution finds nothing.
+	t.Setenv("PATH", os.Getenv("PATH"))
+	t.Run("v622-2c direct bun -p", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "v622-2c", role: "worker", cmd: `bun -p 'require("child_process").execSync("pig")'`}, "")
+		if got == "ALLOW" {
+			t.Fatalf("direct bun -p = ALLOW, want javascript inline code block")
+		}
+	})
+	// node -> nodejs is the same distro family: the inline code is
+	// screened under the shared node grammar, never a conflicting alias.
+	writeTestExecutable(t, filepath.Join(binDir, "nodejs"), 0755)
+	if err := os.Remove(filepath.Join(binDir, "node")); err != nil {
+		t.Fatalf("remove node stub: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(binDir, "nodejs"), filepath.Join(binDir, "node")); err != nil {
+		t.Fatalf("symlink node -> nodejs: %v", err)
+	}
+	t.Setenv("PATH", pathEnv)
+	t.Run("node->nodejs same family no conflict", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "v622-node-nodejs", role: "worker", argv: []string{"node", "-p", "1+1"}}, "")
+		if strings.Contains(got, "conflicting structural alias") {
+			t.Fatalf("node -> nodejs = %q, want no conflicting structural alias", got)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// v6.2.2 待办 3: replTokenInExecSlot / xargsFeedsCodeFlag 受限递归穿透 —
+// 二层 xargs / flock -c / watch -x / script -qc / find -okdir / 悬空 env
+// 包装器与 peelChainMaxDepth 深度上限全部 fail-closed；数据位 {} 保持放行。
+// ---------------------------------------------------------------------------
+
+func TestGuard_V622_MultiLayerExecSlots(t *testing.T) {
+	blockCases := []struct {
+		name, cmd string
+	}{
+		{"v622-3a xargs flock -c", `echo pig | xargs -I{} flock -x /dev/null -c '{}'`},
+		{"v622-3b find xargs sh -c", `find . -exec xargs sh -c {} \;`},
+		{"v622-3c1 xargs watch -x repl", `echo pig | xargs -I{} watch -x sh -c '{}'`},
+		{"v622-3c2 xargs watch -x open", `echo pig | xargs watch -x sh -c`},
+		{"v622-3d1 find -okdir flock cmd", `xargs -I% find . -okdir flock /tmp/lk --command='%' \;`},
+		{"v622-3d2 script -qc token", `xargs -I{} script -qc '{}' /dev/null`},
+		{"v622-3d3 dangling env", `echo pig | xargs env`},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want dynamic code payload block", tc.cmd)
+			}
+		})
+	}
+	allowCases := []struct {
+		name, cmd string
+	}{
+		{"flock data operand", `find . -exec flock /tmp/lk grep foo {} \;`},
+		{"watch -x data operand", `echo foo | xargs -I{} watch -x grep foo {}`},
+		{"find path-position token", `echo x | xargs -I{} find {} -maxdepth 1 -name '*.go'`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+	// v622-3e: 25 层 watch -x 嵌套直达 peelChainMaxDepth (24) — 两处直接
+	// 单测入口都必须 fail-closed。
+	t.Run("v622-3e depth cap", func(t *testing.T) {
+		deep := []string{"echo", "safe"}
+		for n := 0; n < 25; n++ {
+			deep = append([]string{"watch", "-x"}, deep...)
+		}
+		caller := callerIdentity{}
+		if !replTokenInExecSlot(deep, "{}", os.Getenv("PATH"), caller) {
+			t.Fatalf("replTokenInExecSlot 25-layer watch -x = false, want depth-cap fail-closed")
+		}
+		if !xargsFeedsCodeFlag(deep, nil, os.Getenv("PATH"), caller) {
+			t.Fatalf("xargsFeedsCodeFlag 25-layer watch -x = false, want depth-cap fail-closed")
+		}
+	})
+}

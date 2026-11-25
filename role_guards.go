@@ -1760,101 +1760,78 @@ func isLetterOnly(s string) bool {
 	return true
 }
 
+// isPythonInterpBase reports whether base names a Python CLI head
+// (python, python2*, python3*).
+func isPythonInterpBase(base string) bool {
+	return base == "python" || strings.HasPrefix(base, "python2") || strings.HasPrefix(base, "python3")
+}
+
+// isValidPycsMode reports whether s is a valid --check-hash-based-pycs mode.
+func isValidPycsMode(s string) bool {
+	return s == "default" || s == "always" || s == "never"
+}
+
+// inlineSlotInterpLang maps non-Python interpreter heads to their
+// guardCtxRunCode language.
+func inlineSlotInterpLang(base string) (string, bool) {
+	switch base {
+	case "node", "nodejs", "ts-node", "tsx", "bun":
+		return "javascript", true
+	case "perl":
+		return "perl", true
+	case "ruby":
+		return "ruby", true
+	case "php":
+		return "php", true
+	}
+	return "", false
+}
+
+// unwrapPythonSlots converts interpCodeSlots output on a Python head into
+// the unwrapInterpreterInline return triple. Dynamic script-path slots stay
+// in hasDynamicInterpOption / stdinProgramTargetsWithEnv rather than posing
+// as -c.
+func unwrapPythonSlots(slots []codeSlot) (string, string, bool) {
+	for _, s := range slots {
+		if s.flagOnly || s.dynOperand {
+			continue
+		}
+		if s.module {
+			return "python-module", s.text, true
+		}
+		return "python", s.text, true
+	}
+	return "", "", false
+}
+
 // unwrapInterpreterInline extracts inline code handed to a non-shell
-// interpreter: python[3[.x]] -c (after its option flags; -m pip|venv|
-// ensurepip|compileall reported as "python-module"), node/nodejs -e /
-// --eval / -p / --print, ts-node/tsx/bun -e/--eval, perl -e/-E, ruby -e,
-// php -r. Returns (language, code, true) when a spelling was found.
+// interpreter: python[2|3[.x]] -c/-m, node/nodejs/ts-node/tsx/bun
+// -e/--eval/-p/--print, perl -e/-E, ruby -e, php -r. Every interpreter shares
+// interpCodeSlots' option grammar so direct execution, find -exec and xargs
+// screens cannot drift.
 func unwrapInterpreterInline(argv []string) (lang, code string, ok bool) {
 	if len(argv) == 0 {
 		return "", "", false
 	}
 	base := filepath.Base(argv[0])
-	if base == "python" || strings.HasPrefix(base, "python2") || strings.HasPrefix(base, "python3") {
-		for i := 1; i < len(argv); i++ {
-			a := argv[i]
-			if a == "--" {
-				return "", "", false // -- terminates options; the next operand is a script file
-			}
-			if a == "-c" {
-				if i+1 < len(argv) {
-					return "python", argv[i+1], true
-				}
-				return "", "", false
-			}
-			if a == "-m" {
-				if i+1 < len(argv) {
-					return "python-module", argv[i+1], true
-				}
-				return "", "", false
-			}
-			if a == "-W" || a == "-X" {
-				i++
-				continue
-			}
-			if strings.HasPrefix(a, "-") && len(a) > 1 {
-				// Bundled short options may carry inline code or the module
-				// name: -cCODE, -ucCODE, -mMODULE, -umMODULE.
-				for j := 1; j < len(a); j++ {
-					switch a[j] {
-					case 'c':
-						if tail := a[j+1:]; tail != "" {
-							return "python", tail, true
-						}
-						if i+1 < len(argv) {
-							return "python", argv[i+1], true
-						}
-						return "", "", false
-					case 'm':
-						if tail := a[j+1:]; tail != "" {
-							return "python-module", tail, true
-						}
-						if i+1 < len(argv) {
-							return "python-module", argv[i+1], true
-						}
-						return "", "", false
-					case 'W', 'X':
-						// -W arg / -X arg take a value — glued (-Wmodule, -Xutf8)
-						// or the next argv. Either way the cluster scan must END
-						// here: continuing would misread letters inside the option
-						// value (-Wmodule's 'm' looking like -m odule) and miss a
-						// later -c.
-						if j+1 >= len(a) {
-							i++
-						}
-						j = len(a)
-					}
-				}
-				continue
-			}
-			return "", "", false
-		}
+	if isPythonInterpBase(base) {
+		return unwrapPythonSlots(interpCodeSlots(argv))
+	}
+	lang, ok = inlineSlotInterpLang(base)
+	if !ok {
 		return "", "", false
 	}
-	// The remaining interpreters share interpCodeSlots' option model so the
-	// xargs feed analysis and the inline unwrap cannot disagree: clusters
-	// (`node -pe`, `perl -eA -eB`, `ruby -e`), glued code tails, --eval /
-	// --require-style longs and dynamic operand words all behave identically.
-	switch base {
-	case "node", "nodejs", "ts-node", "tsx", "bun", "perl", "ruby", "php":
-		var frags []string
-		for _, s := range interpCodeSlots(argv) {
-			if s.flagOnly || s.text == "" {
-				continue
-			}
-			frags = append(frags, s.text)
+	var frags []string
+	for _, s := range interpCodeSlots(argv) {
+		if s.flagOnly || s.text == "" {
+			continue
 		}
-		if len(frags) == 0 {
-			return "", "", false
-		}
-		lang := map[string]string{
-			"node": "javascript", "nodejs": "javascript",
-			"ts-node": "javascript", "tsx": "javascript", "bun": "javascript",
-			"perl": "perl", "ruby": "ruby", "php": "php",
-		}[base]
-		return lang, strings.Join(frags, "\n"), true
+		frags = append(frags, s.text)
 	}
-	return "", "", false
+	if len(frags) == 0 {
+		return "", "", false
+	}
+	return lang, strings.Join(frags, "\n"), true
 }
 
 // ---------- rule 1: sub-agent nested-dispatch guard ----------
@@ -2298,45 +2275,50 @@ func isPeeledWrapperBase(b string) bool {
 	return false
 }
 
+// structuralFamilyKey maps a structural command basename to its
+// CLI-option-compatible equivalence class. Distinct runtimes whose
+// inline-code, syntax-check or subcommand flags differ (e.g. node vs
+// bun/ts-node/tsx) do NOT share a key and fail closed when symlinked across
+// names.
+func structuralFamilyKey(base string) string {
+	if shellHeads[base] {
+		return "shell"
+	}
+	if isPythonInterpBase(base) {
+		return "python"
+	}
+	switch base {
+	case "node", "nodejs":
+		return "node"
+	case "awk", "gawk", "mawk", "nawk":
+		return "awk"
+	case "sed", "gsed":
+		return "sed"
+	case "tar", "gtar", "bsdtar":
+		return "tar"
+	case "npx", "npx-cli.js":
+		return "npx"
+	case "npm", "npm-cli.js":
+		return "npm"
+	}
+	return ""
+}
+
 // sameStructuralFamily reports whether a typed structural head and its
 // resolved symlink target basename are aliases for the SAME tool — the
 // normal distro/toolchain layout (Debian /bin/sh -> dash, python3 ->
-// python3.13, awk -> mawk, gtar -> tar, hc -> herdr-core). Aliases
-// inside a family keep the typed base; a resolved name that crosses to a
-// different family is a conflicting alias.
+// python3.13, awk -> mawk, gtar -> tar, node -> nodejs, hc -> herdr-core).
+// Aliases inside a family keep the typed base; a resolved name that crosses
+// to a different family (bun -> node) is a conflicting alias.
 func sameStructuralFamily(a, b string) bool {
 	if a == b {
-		return true
-	}
-	if shellHeads[a] && shellHeads[b] {
-		return true
-	}
-	la, oka := heredocInterpLang(a)
-	lb, okb := heredocInterpLang(b)
-	if oka && okb && la == lb {
-		return true
-	}
-	if (a == "awk" || a == "gawk" || a == "mawk" || a == "nawk") &&
-		(b == "awk" || b == "gawk" || b == "mawk" || b == "nawk") {
-		return true
-	}
-	if (a == "sed" || a == "gsed") && (b == "sed" || b == "gsed") {
-		return true
-	}
-	if (a == "tar" || a == "gtar" || a == "bsdtar") &&
-		(b == "tar" || b == "gtar" || b == "bsdtar") {
-		return true
-	}
-	if (a == "npx" || a == "npx-cli.js") && (b == "npx" || b == "npx-cli.js") {
-		return true
-	}
-	if (a == "npm" || a == "npm-cli.js") && (b == "npm" || b == "npm-cli.js") {
 		return true
 	}
 	if (a == "hc" || a == "herdr-core") && b == "herdr-core" {
 		return true
 	}
-	return false
+	fa := structuralFamilyKey(a)
+	return fa != "" && fa == structuralFamilyKey(b)
 }
 
 // isStructuralGuardHead reports whether base is a command name with
@@ -4370,82 +4352,408 @@ func xargsDerivedSeg(xargsOpts, targetArgv []string, outerSeg shellSegment, path
 	return shellSegment{}
 }
 
+// peeledExecHead carries the wrapper-peeled head of an exec-slot argv plus
+// the screens' alias variants and the fail-closed facts collected while
+// peeling (exhausted peel, dangling wrapper head, unknown env options, an
+// env -S split payload naming the token).
+type peeledExecHead struct {
+	head        []string
+	variants    [][]string
+	envAs       envAssignments
+	effPath     string
+	caller      callerIdentity
+	hasSplitTok bool
+	failClosed  bool
+}
+
+// findExecSlotValueOpts are find's value-carrying predicates, mirrored from
+// screenFindArgsSeg's own table so both screens agree on which words consume
+// a value slot. A token in such a value (find . -name {}) stays a data
+// operand.
+var findExecSlotValueOpts = map[string]bool{
+	"-name": true, "-iname": true, "-path": true, "-ipath": true,
+	"-wholename": true, "-iwholename": true, "-regex": true, "-iregex": true,
+	"-type": true, "-xtype": true, "-maxdepth": true, "-mindepth": true,
+	"-newermt": true, "-newer": true, "-size": true, "-perm": true,
+	"-mtime": true, "-mmin": true, "-uid": true, "-gid": true,
+	"-user": true, "-group": true, "-printf": true, "-fprintf": true,
+	"-lname": true, "-ilname": true, "-samefile": true, "-inum": true,
+	"-links": true, "-used": true, "-fstype": true, "-anewer": true,
+	"-cnewer": true, "-newerat": true, "-newerct": true, "-regextype": true,
+	"-D": true,
+}
+
+// envHeadSplitHasToken reports whether the raw -S/--split-string payload of
+// an `env` argv head names the placeholder token. xargs -I{} env -S 'perl {}'
+// splits AFTER the substitution, so a token inside the payload can become an
+// option word (perl -e) at runtime.
+func envHeadSplitHasToken(argv []string, token string) bool {
+	if filepath.Base(argv[0]) != "env" {
+		return false
+	}
+	for i := 1; i < len(argv); i++ {
+		a := argv[i]
+		if a == "--" || !strings.HasPrefix(a, "-") || a == "-" {
+			return false // end of env's option zone
+		}
+		if isAssignWord(a) {
+			return false
+		}
+		if strings.HasPrefix(a, "--") {
+			consume, hit := envLongSplitHasToken(argv, i, token)
+			if hit {
+				return true
+			}
+			i += consume
+			continue
+		}
+		consume, hit := envClusterSplitHasToken(argv, i, token)
+		if hit {
+			return true
+		}
+		i += consume
+	}
+	return false
+}
+
+// envLongSplitHasToken screens one long-option word of env's option zone;
+// consume is how many EXTRA argv operands the option's value takes.
+func envLongSplitHasToken(argv []string, i int, token string) (consume int, hit bool) {
+	name, val, hasVal := argv[i][2:], "", false
+	if k := strings.IndexByte(name, '='); k >= 0 {
+		name, val, hasVal = name[:k], name[k+1:], true
+	}
+	switch name {
+	case "split-string":
+		if hasVal {
+			return 0, strings.Contains(val, token)
+		}
+		if i+1 < len(argv) {
+			return 1, strings.Contains(argv[i+1], token)
+		}
+	case "unset", "chdir", "argv0":
+		if !hasVal && i+1 < len(argv) {
+			return 1, false
+		}
+	}
+	return 0, false
+}
+
+// envClusterSplitHasToken scans one short-option cluster of env's option
+// zone for a token-carrying -S payload; consume is how many EXTRA argv
+// operands the cluster's trailing value letter takes.
+func envClusterSplitHasToken(argv []string, i int, token string) (consume int, hit bool) {
+	a := argv[i]
+	for j := 1; j < len(a); j++ {
+		switch a[j] {
+		case 'u', 'C', 'a':
+			if j+1 >= len(a) {
+				return 1, false // separate value operand
+			}
+			return 0, false
+		case 'S':
+			if tail := a[j+1:]; tail != "" {
+				return 0, strings.Contains(tail, token)
+			}
+			if i+1 < len(argv) {
+				return 1, strings.Contains(argv[i+1], token)
+			}
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
+// peelWrappersWithPayloads is peelWrappersAndWrapperAliases for exec-slot
+// screens: unlike the shared peel it does not drop env -S payloads or treat
+// a dangling wrapper head as safe. Exhausted peels, an empty residual head
+// (xargs env with nothing after it) and any env unknown-option/split payload
+// all fail closed, and hasSplitTok marks an env -S payload carrying the
+// token.
+func peelWrappersWithPayloads(argv []string, pathEnv string, caller callerIdentity, token string) peeledExecHead {
+	var out peeledExecHead
+	out.effPath = pathEnv
+	cur := argv
+	for steps := 0; steps < peelWrapperMaxSteps; steps++ {
+		if len(cur) > 0 && canonicalResolvedBase(filepath.Base(cur[0])) == "env" && envHeadSplitHasToken(cur, token) {
+			out.hasSplitTok = true
+		}
+		h, sp, ea, ex := peelWrappers(cur)
+		out.envAs = out.envAs.merged(ea)
+		out.effPath = ea.effectivePATHFrom(out.effPath)
+		caller = caller.seededWith(ea)
+		if ex || len(sp) > 0 || len(h) == 0 {
+			out.failClosed = true
+			out.head, out.caller = h, caller
+			return out
+		}
+		if rb := canonicalResolvedBase(resolveHeadBase(h[0], out.effPath, caller.screenCwd())); rb != "" && rb != filepath.Base(h[0]) && isPeeledWrapperBase(rb) {
+			cur = append([]string{rb}, h[1:]...)
+			continue
+		}
+		out.head, out.caller = h, caller
+		return out
+	}
+	out.failClosed = true
+	out.head, out.caller = cur, caller
+	return out
+}
+
+// peelExecSlotHead peels wrappers off an exec-slot argv and produces the
+// literal head plus its alias-resolution variants. A cross-family structural
+// re-identity (xargs -> /bin/sh, bun -> node) fails closed; a same-family
+// link only adds the canonical spelling as a second variant.
+func peelExecSlotHead(argv []string, pathEnv string, caller callerIdentity, token string) peeledExecHead {
+	p := peelWrappersWithPayloads(argv, pathEnv, caller, token)
+	if p.failClosed || len(p.head) == 0 {
+		p.failClosed = true
+		return p
+	}
+	tb := filepath.Base(p.head[0])
+	p.variants = [][]string{p.head}
+	if isDynamicArg(p.head[0]) {
+		return p
+	}
+	rb := canonicalResolvedBase(resolveHeadBase(p.head[0], p.effPath, p.caller.screenCwd()))
+	if rb == "" || rb == tb {
+		return p
+	}
+	typedStructural := isStructuralGuardHead(tb) || isPeeledWrapperBase(tb) || isBlockedAgentHead(tb)
+	resolvedStructural := isStructuralGuardHead(rb) || isPeeledWrapperBase(rb) || isBlockedAgentHead(rb)
+	if rb != p.head[0] && typedStructural && resolvedStructural && !sameStructuralFamily(tb, rb) {
+		p.failClosed = true
+		return p
+	}
+	p.variants = append(p.variants, append([]string{rb}, p.head[1:]...))
+	return p
+}
+
+// replTokenInPeeledEnv reports whether a peeled env operation list plants
+// the token into an execution-relevant variable or working directory.
+func replTokenInPeeledEnv(envAs envAssignments, token string) bool {
+	for _, op := range envAs.ops {
+		if strings.Contains(op.key, token) {
+			return true
+		}
+		if op.kind == 'd' || op.key == "PATH" || isEnvHookVar(op.key) ||
+			guardTaintVars[op.key] || sentinelTrustVars[op.key] {
+			if strings.Contains(op.value, token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // replTokenInExecSlot reports whether a placeholder token (xargs -I token or
 // find -exec "{}") sits in a command-execution slot of innerArgv: the peeled
 // command head itself, an inline shell/interpreter code slot (-c/-e), or the
 // remote command head / code slot inside an ssh invocation. Data operand
 // positions (`grep foo {}`, `git -C {} status`, `sh -c 'echo "$1"' _ {}`)
-// return false.
+// return false. Command indirection layers (xargs / flock / watch / find
+// -exec / ssh) are descended with a bounded depth.
 func replTokenInExecSlot(innerArgv []string, token, pathEnv string, caller callerIdentity) bool {
+	return replTokenInExecSlotDepth(innerArgv, token, pathEnv, caller, 0)
+}
+
+// replTokenInExecSlotDepth is the bounded-depth worker of
+// replTokenInExecSlot. Reaching peelChainMaxDepth fails closed.
+func replTokenInExecSlotDepth(innerArgv []string, token, pathEnv string, caller callerIdentity, depth int) bool {
 	if token == "" || len(innerArgv) == 0 {
 		return false
 	}
-	head, tea, effPath, exhausted := peelWrappersAndWrapperAliases(innerArgv, pathEnv, caller)
-	if exhausted || len(head) == 0 {
+	if depth >= peelChainMaxDepth {
 		return true
 	}
-	// The peeled env ops re-anchor resolution (env -C inside the peeled
-	// head moves its own cwd): resolve the ssh head under the seeded
-	// caller (R5 MF-3). The remote recursion below still crosses the ssh
-	// boundary with a bare callerIdentity (only the local cwd field) —
-	// local pathEnv/envTaint never reach remote segments.
-	tCaller := caller.seededWith(tea)
-	if strings.Contains(head[0], token) {
+	p := peelExecSlotHead(innerArgv, pathEnv, caller, token)
+	if p.failClosed || len(p.head) == 0 {
 		return true
 	}
-	// A non-ssh alias head (mysh -> /bin/sh under env -C, or a PATH alias
-	// to ssh) must face the SAME code-slot and ssh screens as the typed
-	// name: resolve the peeled head under the seeded caller and screen
-	// the canonical spelling alongside the literal one (R6 MF-1). A
-	// CROSS-FAMILY structural re-identity (one guard head resolving to a
-	// DIFFERENT structural family, `xargs -> /bin/sh`) is a conflict —
-	// fail closed; a same-family link (`hc -> herdr-core`, `sed -> gsed`)
-	// is the ordinary install spelling and only adds the variant.
-	headVariants := [][]string{head}
-	if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath, tCaller.screenCwd())); rb != "" && rb != filepath.Base(head[0]) {
-		if tb := filepath.Base(head[0]); rb != head[0] && isStructuralGuardHead(tb) && isStructuralGuardHead(rb) && !sameStructuralFamily(tb, rb) {
-			return true
-		}
-		headVariants = append(headVariants, append([]string{rb}, head[1:]...))
+	if p.hasSplitTok || replTokenInPeeledEnv(p.envAs, token) || strings.Contains(p.head[0], token) {
+		return true
 	}
-	isSSH := false
-	for _, h := range headVariants {
-		if text, has := unwrapShellArgv(h); has && strings.Contains(text, token) {
+	for _, h := range p.variants {
+		if replTokenInVariant(h, token, p.effPath, p.caller, caller, depth) {
 			return true
-		}
-		if _, code, has := unwrapInterpreterInline(h); has && strings.Contains(code, token) {
-			return true
-		}
-		for _, slot := range interpCodeSlots(h) {
-			if slot.flagOnly || strings.Contains(slot.text, token) {
-				return true
-			}
-		}
-		b := filepath.Base(h[0])
-		if b == "ssh" || resolveHeadBase(h[0], effPath, tCaller.screenCwd()) == "ssh" {
-			isSSH = true
 		}
 	}
-	if isSSH {
-		remoteCmd, hit := parseSSHInvocation(head)
-		if hit != "" {
+	return false
+}
+
+// replTokenInVariant screens one spelling of the peeled exec-slot head:
+// inline code slots first, then the command-indirection heads that need a
+// depth+1 descent.
+func replTokenInVariant(h []string, token, effPath string, tCaller, outerCaller callerIdentity, depth int) bool {
+	if text, has := unwrapShellArgv(h); has && strings.Contains(text, token) {
+		return true
+	}
+	if _, code, has := unwrapInterpreterInline(h); has && strings.Contains(code, token) {
+		return true
+	}
+	for _, slot := range interpCodeSlots(h) {
+		if slot.flagOnly || strings.Contains(slot.text, token) {
 			return true
 		}
-		for _, rseg := range splitShellSegments(remoteCmd) {
-			if len(rseg.argv) == 0 {
-				continue
-			}
-			// In POSIX sh, a lone "{}" is parsed into shellNoopWords or a
-			// command head containing the token. The remote recursion keeps
-			// ONLY the resolution base of this call (the old shared screenCwd
-			// reached remote segments too): the remote PATH base stays
-			// os.Getenv("PATH") and the remote identity/env taint stay
-			// cleared — nothing else of the local caller crosses.
-			if replTokenInExecSlot(rseg.argv, token, os.Getenv("PATH"), callerIdentity{cwd: caller.cwd}) {
+	}
+	b := filepath.Base(h[0])
+	if depth >= 1 && (b == "hc" || b == "herdr-core" || headIsCtxmodeOrSelfExe(h[0], effPath, tCaller.screenCwd())) {
+		// A nested report-channel/gate head inside a descended layer
+		// (flock ... hc, watch -x ctxmode) fails closed on the spot; at
+		// depth 0 the top-level xargs/find screens name the nested head
+		// themselves, so the exec-slot analysis stays silent there.
+		return true
+	}
+	switch b {
+	case "ssh":
+		return replTokenInSSH(h, token, outerCaller, depth)
+	case "eval":
+		return len(h) > 1 && strings.Contains(strings.Join(h[1:], " "), token)
+	case "xargs":
+		k := xargsTargetIndex(h)
+		if k < 0 {
+			return true
+		}
+		if k < len(h) {
+			return replTokenInExecSlotDepth(h[k:], token, effPath, outerCaller, depth+1)
+		}
+		return false
+	case "flock":
+		return replTokenInFlock(h, token, effPath, outerCaller, depth)
+	case "watch":
+		return replTokenInWatch(h, token, effPath, outerCaller, depth)
+	case "script":
+		payload := scriptCommandArg(h)
+		return payload != "" && (isDynamicArg(payload) || strings.Contains(payload, token))
+	case "find":
+		return replTokenInFind(h[1:], token, effPath, outerCaller, depth)
+	}
+	return false
+}
+
+// replTokenInSSH descends into the ssh remote command: a parse failure, a
+// bare-token remote command, or a token in an execution slot of any remote
+// segment all count as an exec-slot hit.
+func replTokenInSSH(h []string, token string, outerCaller callerIdentity, depth int) bool {
+	remoteCmd, hit := parseSSHInvocation(h)
+	if hit != "" {
+		return true
+	}
+	if strings.TrimSpace(remoteCmd) == token {
+		return true
+	}
+	for _, rseg := range splitShellSegments(remoteCmd) {
+		if len(rseg.argv) == 0 {
+			continue
+		}
+		if rseg.parseErr != "" || rseg.depthExceeded {
+			return true
+		}
+		if replTokenInExecSlotDepth(rseg.argv, token, os.Getenv("PATH"), callerIdentity{cwd: outerCaller.cwd}, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+// replTokenInFlock descends past flock's options: a -c/--command shell
+// string carrying the token is an exec-slot hit, as is the token in the
+// positional command argv.
+func replTokenInFlock(h []string, token, effPath string, outerCaller callerIdentity, depth int) bool {
+	innerIdx, cmdText := skipFlockArgs(h, 1)
+	if cmdText != "" {
+		return isDynamicArg(cmdText) || strings.Contains(cmdText, token)
+	}
+	if innerIdx < len(h) {
+		return replTokenInExecSlotDepth(h[innerIdx:], token, effPath, outerCaller, depth+1)
+	}
+	return false
+}
+
+// replTokenInWatch descends past watch's options: -x/--exec operands form a
+// direct exec argv, while the default mode joins operands into a `sh -c`
+// string — a token there is shell text.
+func replTokenInWatch(h []string, token, effPath string, outerCaller callerIdentity, depth int) bool {
+	k, execMode, fc := skipWatchArgs(h, 1)
+	if fc {
+		return true
+	}
+	if k >= len(h) {
+		return false
+	}
+	if execMode {
+		return replTokenInExecSlotDepth(h[k:], token, effPath, outerCaller, depth+1)
+	}
+	return strings.Contains(strings.Join(h[k:], " "), token)
+}
+
+// replTokenInFind scans find's operand list: -exec/-execdir/-ok/-okdir argv
+// descend at depth+1, value predicates skip their operand (find . -name {}
+// stays data), and a token that lands where find would parse it as a
+// predicate or path — with execution operators after it — fails closed.
+func replTokenInFind(args []string, token, effPath string, outerCaller callerIdentity, depth int) bool {
+	pathDone := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "-exec" || a == "-execdir" || a == "-ok" || a == "-okdir" {
+			end, hit := findExecTerminatorHit(args, i, token, effPath, outerCaller, depth)
+			if hit {
 				return true
 			}
+			i = end
+			pathDone = true
+			continue
 		}
-		if strings.TrimSpace(remoteCmd) == token {
+		if findExecSlotValueOpts[a] {
+			pathDone = true
+			i++ // skip the predicate's value operand
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			pathDone = true
+			if strings.Contains(a, token) {
+				return true // option-shaped word carrying the token
+			}
+			continue
+		}
+		if strings.Contains(a, token) && replTokenInFindPathWord(args, i, token, pathDone) {
+			return true
+		}
+	}
+	return false
+}
+
+// findExecTerminatorHit locates the ';'/'+' terminator of one -exec/-ok
+// family operator and descends into its command argv. A missing terminator
+// fails closed (xargs would append stdin words into the open command slot).
+func findExecTerminatorHit(args []string, i int, token, effPath string, outerCaller callerIdentity, depth int) (end int, hit bool) {
+	j := i + 1
+	for j < len(args) && args[j] != ";" && args[j] != "+" {
+		j++
+	}
+	if j >= len(args) {
+		return len(args) - 1, true
+	}
+	if j > i+1 && replTokenInExecSlotDepth(args[i+1:j], token, effPath, outerCaller, depth+1) {
+		return j, true
+	}
+	return j, false
+}
+
+// replTokenInFindPathWord reports whether a token-carrying non-option word
+// in find's operand list is dangerous: after pathDone the word is parsed as
+// an expression (fails closed unconditionally); in path position it is
+// dangerous only when execution operators follow before the next plain
+// operand (xargs -I% find . % -exec pig \;).
+func replTokenInFindPathWord(args []string, i int, token string, pathDone bool) bool {
+	if pathDone {
+		return true
+	}
+	for k := i + 1; k < len(args); k++ {
+		if !strings.HasPrefix(args[k], "-") {
+			return false // another plain operand: still the path list
+		}
+		switch args[k] {
+		case "-exec", "-execdir", "-ok", "-okdir":
 			return true
 		}
 	}
@@ -4967,6 +5275,39 @@ func parseSSHInvocation(head []string) (remoteCmd, hit string) {
 		return remote, ""
 	}
 	return "", "ssh" // no <destination> at all
+}
+
+// scriptHasOpenCommandFlag reports whether a `script` argv ends with a
+// dangling -c/--command flag whose shell-command operand has not been
+// supplied yet (so an enclosing xargs would append stdin words into -c's
+// slot).
+func scriptHasOpenCommandFlag(head []string) bool {
+	for i := 1; i < len(head); i++ {
+		a := head[i]
+		if a == "--" {
+			return false
+		}
+		if a == "-c" || a == "--command" {
+			return i+1 >= len(head)
+		}
+		if strings.HasPrefix(a, "--command=") {
+			return false
+		}
+		if a == "-O" || a == "-I" || a == "-B" || a == "-T" ||
+			a == "--log-out" || a == "--log-in" || a == "--log-timing" || a == "--timing" {
+			i++
+			continue
+		}
+		if strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && len(a) > 2 {
+			// A short cluster ending in 'c' (script -qc) consumes the NEXT argv
+			// as its command operand — an argv that ends right after the cluster
+			// leaves the slot open for an enclosing xargs feed.
+			if a[len(a)-1] == 'c' && !strings.ContainsAny(a[1:len(a)-1], "c") {
+				return i+1 >= len(head)
+			}
+		}
+	}
+	return false
 }
 
 // scriptCommandArg returns the `-c cmd` payload of a `script` argv, or "".
@@ -9177,23 +9518,21 @@ func awkProgramWrite(prog string) string {
 
 // pythonModuleArgvFrom returns the program argv `python … -m MOD [args…]`
 // actually executes ([MOD, args…]) or nil when the argv has no -m operand.
-// The glued `-mMOD` spelling is expanded back into its own word.
+// The scan shares interpCodeSlots' option grammar — -um MOD, glued -mMOD
+// and long options carrying their own values all resolve identically — so
+// the module screen and the inline-code screen cannot drift.
 func pythonModuleArgvFrom(argv []string) []string {
-	for i := 1; i < len(argv); i++ {
-		a := argv[i]
-		switch {
-		case a == "-m":
-			if i+1 < len(argv) {
-				return argv[i+1:]
-			}
-			return nil
-		case strings.HasPrefix(a, "-m") && len(a) > 2:
-			return append([]string{a[2:]}, argv[i+1:]...)
-		case a == "-W" || a == "-X":
-			i++ // value-bearing option
-		case !strings.HasPrefix(a, "-") || a == "-":
-			return nil // script-file operand ends the option run
+	for _, s := range interpCodeSlots(argv) {
+		if !s.module {
+			continue
 		}
+		if s.flagOnly || s.text == "" {
+			return nil
+		}
+		if s.restIdx < len(argv) {
+			return append([]string{s.text}, argv[s.restIdx:]...)
+		}
+		return []string{s.text}
 	}
 	return nil
 }
@@ -9208,27 +9547,22 @@ func pythonModuleArgvFrom(argv []string) []string {
 // the argv carries no `-m`, leaving the caller to the interpreter-head model.
 func pythonModuleHit(args []string) (hit string, hasModule bool) {
 	mod, rest := "", []string(nil)
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		switch {
-		case a == "-m":
-			if i+1 >= len(args) {
-				return "python -m <missing>", true
-			}
-			mod, rest = args[i+1], args[i+2:]
-			i = len(args)
-		case strings.HasPrefix(a, "-m") && len(a) > 2:
-			mod, rest = a[2:], args[i+1:]
-			i = len(args)
-		case a == "-W" || a == "-X":
-			i++ // value-bearing options
-		case strings.HasPrefix(a, "-W") || strings.HasPrefix(a, "-X"):
-			// glued value (-Wmodule, -Xutf8): no extra operand
-		case strings.HasPrefix(a, "-") && a != "-":
-			// other interpreter flags (-q, -O, -B, -u, …)
-		default:
-			return "", false // a script-file operand before -m ends the option run
+	// Screen through interpCodeSlots on a synthetic python3 head so -um
+	// MOD, glued -mMOD and value-carrying long options parse identically to
+	// the direct-execution screens.
+	full := append([]string{"python3"}, args...)
+	for _, s := range interpCodeSlots(full) {
+		if !s.module {
+			continue
 		}
+		if s.flagOnly || s.text == "" {
+			return "python -m <missing>", true
+		}
+		mod = s.text
+		if s.restIdx < len(full) {
+			rest = full[s.restIdx:]
+		}
+		break
 	}
 	if mod == "" {
 		return "", false // no -m on this invocation
@@ -9346,6 +9680,66 @@ var interpSyntaxCheckFlags = map[string][]string{
 	"perl": {"-c"}, "ruby": {"-c"}, "php": {"-l"},
 }
 
+// interpFileRunStep advances screenInterpFileRun's option scan by one word
+// and reports the verdict for it: allow (a pure query / syntax-check
+// spelling), stop (end of the option run — the scan falls through to the
+// block), or neither. Python heads additionally consume -W/-X values and
+// validate --check-hash-based-pycs, and reject unknown long options: a
+// `--jit off` style spelling leaves the scanner unable to tell whether the
+// next word is its operand or the script file.
+func interpFileRunStep(args []string, i int, base string, syntaxFlags []string) (nextIdx int, allow, stop bool) {
+	a := args[i]
+	if isPythonInterpBase(base) {
+		if a == "-W" || a == "-X" {
+			return i + 1, false, false // consumes a separate value operand
+		}
+		if strings.HasPrefix(a, "--") && a != "--" {
+			next, allow, stop, handled := pyLongInterpFileRunStep(args, i)
+			if handled {
+				return next, allow, stop
+			}
+		}
+	}
+	switch a {
+	case "-", "--version", "-V", "-VV", "--help", "-h":
+		return i, true, false
+	}
+	for _, f := range syntaxFlags {
+		if a == f {
+			return i, true, false
+		}
+	}
+	if a == "--" || !strings.HasPrefix(a, "-") {
+		return i, false, true // script operand reached
+	}
+	return i, false, false
+}
+
+// pyLongInterpFileRunStep screens one `--` word of a Python head in
+// screenInterpFileRun's option run: query spellings allow, a valid
+// --check-hash-based-pycs mode is consumed, and every unknown or
+// malformed long option stops the scan (fail closed).
+func pyLongInterpFileRunStep(args []string, i int) (nextIdx int, allow, stop, handled bool) {
+	name, val, hasVal := args[i][2:], "", false
+	if k := strings.IndexByte(name, '='); k >= 0 {
+		name, val, hasVal = name[:k], name[k+1:], true
+	}
+	switch name {
+	case "help", "help-env", "help-xoptions", "help-all", "version":
+		if !hasVal {
+			return i, true, false, true
+		}
+	case "check-hash-based-pycs":
+		if hasVal {
+			return i, false, !isValidPycsMode(val), true
+		}
+		if i+1 < len(args) && isValidPycsMode(args[i+1]) && !isDynamicArg(args[i+1]) {
+			return i + 1, false, false, true
+		}
+	}
+	return i, false, true, true // unknown/malformed Python long option
+}
+
 // screenInterpFileRun decides a bare interpreter invocation with no inline
 // code: --version/-V/--help/-h spellings and the `-` stdin marker (whose
 // program stream is screened via the heredoc/stdin payload paths) stay
@@ -9356,19 +9750,15 @@ var interpSyntaxCheckFlags = map[string][]string{
 // runs a script file and blocks for strict read-only.
 func screenInterpFileRun(args []string, base string) string {
 	syntaxFlags := interpSyntaxCheckFlags[base]
-	for _, a := range args {
-		switch a {
-		case "-", "--version", "-V", "-VV", "--help", "-h":
+	for i := 0; i < len(args); i++ {
+		next, allow, stop := interpFileRunStep(args, i, base, syntaxFlags)
+		if allow {
 			return ""
 		}
-		for _, f := range syntaxFlags {
-			if a == f {
-				return ""
-			}
+		if stop {
+			break
 		}
-		if a == "--" || !strings.HasPrefix(a, "-") {
-			break // script operand reached: later flags belong to the script
-		}
+		i = next
 	}
 	return base
 }
@@ -12310,41 +12700,65 @@ func splitTopLevelItems(s string, open, close byte) []string {
 // in addition to the pending argv operand — never silently ignored. A "--" or the first static non-option operand ends the
 // zone; a bare "-" is the stdin-script operand, not a cluster.
 type codeSlot struct {
-	flag     int
-	text     string
-	flagOnly bool
+	flag       int
+	text       string
+	flagOnly   bool
+	module     bool // the slot is a python -m module operand, not inline code
+	dynOperand bool // the slot text is a dynamic script-operand word, not literal code
+	restIdx    int  // argv index where the operands AFTER this slot begin
 }
 
-func interpCodeSlots(argv []string) []codeSlot {
-	if len(argv) < 2 {
-		return nil
-	}
-	base := filepath.Base(argv[0])
-	gluedCodes := ""               // cluster letters whose TAIL (or next argv) is code
-	flagCodes := ""                // code flags: operand is the next argv AFTER the cluster scan
-	valShort := ""                 // letters REQUIRING a value: glued tail, else the next argv
-	optShort := ""                 // letters with an OPTIONAL glued value of ARBITRARY bytes: glued tail ends the cluster, a bare letter is a flag and consumes nothing
-	optNumShort := ""              // letters with an OPTIONAL restricted NUMERIC glued value: after its legal tail the cluster keeps scanning — perl -0e is -0 -e, not -0 with value 'e'
-	longCode := map[string]bool{}  // --name / --name=code
-	longValue := map[string]bool{} // --name consumes a separate value
-	dynScriptOperand := false      // a dynamic first operand is inline code (xargs feed / $X eval)
+// interpOptSpec is one interpreter's CLI option grammar.
+type interpOptSpec struct {
+	gluedCodes       string
+	flagCodes        string
+	valShort         string
+	optShort         string
+	optNumShort      string
+	longCode         map[string]bool
+	longBool         map[string]bool
+	longValue        map[string]bool
+	dynScriptOperand bool
+	stopOnFirstCode  bool
+	strictLong       bool
+}
+
+// lookupInterpOptSpec returns the CLI option grammar for an interpreter or
+// shell head, or false when the head has no inline-code surface.
+func lookupInterpOptSpec(base string) (interpOptSpec, bool) {
+	spec := interpOptSpec{}
 	switch {
-	case base == "python" || strings.HasPrefix(base, "python2") || strings.HasPrefix(base, "python3"):
-		gluedCodes, valShort = "cm", "WX"
-		dynScriptOperand = true
+	case isPythonInterpBase(base):
+		// CPython: glued -c/-m, valued -W/-X; the legal long options are the
+		// zero-arg queries plus --check-hash-based-pycs (PEP 552). Every other
+		// `--` word fails closed — its arity is unknowable statically. CPython
+		// stops parsing its own options at the first -c/-m.
+		spec.gluedCodes, spec.valShort = "cm", "WX"
+		spec.longBool = map[string]bool{"--help": true, "--help-env": true, "--help-xoptions": true, "--help-all": true, "--version": true}
+		spec.longValue = map[string]bool{"--check-hash-based-pycs": true}
+		spec.dynScriptOperand, spec.stopOnFirstCode, spec.strictLong = true, true, true
 	case base == "node" || base == "nodejs":
 		// node clusters are flag-parsed: -pe is -p -e and the code operand
 		// is the next argv; -e/-p never glue their operand. -r takes a
 		// module operand (tail or next argv).
-		flagCodes, valShort = "ep", "r"
-		longCode = map[string]bool{"--eval": true, "--print": true}
-		longValue = map[string]bool{"--require": true, "--loader": true, "--import": true, "--experimental-loader": true, "--conditions": true}
-		dynScriptOperand = true
-	case base == "ts-node" || base == "tsx" || base == "bun":
-		gluedCodes = "e"
-		longCode = map[string]bool{"--eval": true}
-		longValue = map[string]bool{"--require": true, "--loader": true, "--import": true}
-		dynScriptOperand = true
+		spec.flagCodes, spec.valShort = "ep", "r"
+		spec.longCode = map[string]bool{"--eval": true, "--print": true}
+		spec.longValue = map[string]bool{"--require": true, "--loader": true, "--import": true, "--experimental-loader": true, "--conditions": true}
+		spec.dynScriptOperand = true
+	case base == "bun":
+		// bun -e/--eval/-p/--print carry inline code; -r preloads a module and
+		// -c names a bunfig file, so neither is a shell-style code flag.
+		spec.flagCodes, spec.valShort = "ep", "rc"
+		spec.longCode = map[string]bool{"--eval": true, "--print": true}
+		spec.longValue = map[string]bool{"--require": true, "--preload": true, "--import": true, "--loader": true, "--cwd": true, "--config": true, "--env-file": true}
+		spec.dynScriptOperand = true
+	case base == "ts-node" || base == "tsx":
+		// ts-node/tsx support node's -e/-p inline-code spellings; -r/-P/-O
+		// consume module/project/compilerOptions operands.
+		spec.flagCodes, spec.valShort = "ep", "rPO"
+		spec.longCode = map[string]bool{"--eval": true, "--print": true}
+		spec.longValue = map[string]bool{"--require": true, "--loader": true, "--import": true, "--project": true, "--compiler-options": true, "--tsconfig": true}
+		spec.dynScriptOperand = true
 	case base == "perl":
 		// -M/-m/-I REQUIRE a module/dir operand (glued or next argv). The
 		// optional-glued letters split in two: -i/-F/-x take an ARBITRARY
@@ -12355,140 +12769,296 @@ func interpCodeSlots(argv []string) []codeSlot {
 		// bare-letter form; R16 covers the glued tail). -7 is not a real
 		// perl option but stays optional-glued so a glued tail is consumed
 		// conservatively.
-		gluedCodes, valShort, optShort, optNumShort = "eE", "MmI", "iF7x", "l0"
-		dynScriptOperand = true
+		spec.gluedCodes, spec.valShort, spec.optShort, spec.optNumShort = "eE", "MmI", "iF7x", "l0"
+		spec.dynScriptOperand = true
 	case base == "ruby":
 		// Same split for ruby: -F/-K/-C/-X/-r/-I require operands (K eats
 		// its single coding char); -i/-x take arbitrary optional-glued
 		// tails while -0 is the restricted numeric kind (`ruby -0e CODE`
 		// still reaches -e).
-		gluedCodes, valShort, optShort, optNumShort = "e", "FKCXrI", "ix", "0"
-		dynScriptOperand = true
+		spec.gluedCodes, spec.valShort, spec.optShort, spec.optNumShort = "e", "FKCXrI", "ix", "0"
+		spec.dynScriptOperand = true
 	case base == "php":
-		gluedCodes, valShort = "r", "cdz"
-		dynScriptOperand = true
+		spec.gluedCodes, spec.valShort = "r", "cdz"
+		spec.dynScriptOperand = true
 	case shellHeads[base]:
 		// dash/bash/zsh/ksh flag-model -c; -o/-O consume an option-name
 		// operand (cluster tail or next argv).
-		flagCodes, valShort = "c", "oO"
+		spec.flagCodes, spec.valShort = "c", "oO"
 	default:
+		return spec, false
+	}
+	if spec.longCode == nil {
+		spec.longCode = map[string]bool{}
+	}
+	if spec.longValue == nil {
+		spec.longValue = map[string]bool{}
+	}
+	if spec.longBool == nil {
+		spec.longBool = map[string]bool{}
+	}
+	return spec, true
+}
+
+// scanLongOpt screens one `--` word of the option zone and returns the
+// index of the LAST argv word the option consumes (the loop advances past
+// it). stop reports that the option scan must end here: either because a
+// strict-arity long option failed validation (an open code slot is emitted
+// fail-closed) or because a pending flag-model code letter cannot take an
+// option word as its operand.
+func (spec interpOptSpec) scanLongOpt(argv []string, i int, pendingCode bool) (slot codeSlot, hasSlot bool, nextIdx int, stop bool) {
+	if pendingCode {
+		return codeSlot{}, false, i, true // an option still cannot be -c's operand
+	}
+	a := argv[i]
+	name, val, hasVal := a[2:], "", false
+	if k := strings.IndexByte(name, '='); k >= 0 {
+		name, val, hasVal = name[:k], name[k+1:], true
+	}
+	opt := "--" + name
+	if spec.longCode[opt] {
+		slot.flag = i
+		switch {
+		case hasVal:
+			slot.text, slot.restIdx = val, i+1
+		case i+1 < len(argv):
+			slot.text, slot.restIdx, nextIdx = argv[i+1], i+2, i+1
+		default:
+			slot.flagOnly, slot.restIdx = true, i+1
+		}
+		return slot, true, nextIdx, false
+	}
+	if spec.longValue[opt] {
+		if opt == "--check-hash-based-pycs" {
+			valid := false
+			if hasVal {
+				valid = isValidPycsMode(val)
+			} else if i+1 < len(argv) && !isDynamicArg(argv[i+1]) && isValidPycsMode(argv[i+1]) {
+				nextIdx = i + 1
+				valid = true
+			}
+			if !valid {
+				// A missing/dynamic/illegal mode means the scanner cannot tell
+				// how many operands the option consumes — fail closed with an
+				// open code slot and end the scan.
+				return codeSlot{flag: i, flagOnly: true}, true, i, true
+			}
+			return codeSlot{}, false, nextIdx, false
+		}
+		if !hasVal && i+1 < len(argv) {
+			nextIdx = i + 1 // consumes the separate value operand
+		}
+		return codeSlot{}, false, nextIdx, false
+	}
+	if spec.strictLong {
+		if spec.longBool[opt] && !hasVal {
+			return codeSlot{}, false, i, false
+		}
+		// Unknown long option (or a glued value on a zero-arg query): its
+		// operand arity is unknowable — fail closed, end the scan.
+		return codeSlot{flag: i, flagOnly: true}, true, i, true
+	}
+	return codeSlot{}, false, i, false // boolean or unknown long option
+}
+
+// scanShortCluster scans one short-option cluster word and returns the code
+// slots it exposes. pending reports a flag-model code letter whose operand
+// is the next argv word after the whole cluster scan finishes.
+func (spec interpOptSpec) scanShortCluster(argv []string, i int) (slots []codeSlot, nextIdx int, pending bool) {
+	a := argv[i]
+	nextIdx = i
+	plus := a[0] == '+'
+	isPy := isPythonInterpBase(filepath.Base(argv[0]))
+	for j := 1; j < len(a); j++ {
+		ch := a[j]
+		if !plus && strings.IndexByte(spec.gluedCodes, ch) >= 0 {
+			slot := codeSlot{flag: i, module: isPy && ch == 'm'}
+			if tail := a[j+1:]; tail != "" {
+				slot.text, slot.restIdx = tail, i+1
+			} else if i+1 < len(argv) {
+				slot.text, slot.restIdx, nextIdx = argv[i+1], i+2, i+1
+			} else {
+				slot.flagOnly, slot.restIdx = true, i+1
+			}
+			slots = append(slots, slot)
+			break
+		}
+		if !plus && strings.IndexByte(spec.flagCodes, ch) >= 0 {
+			// Flag-model code letter: the operand is the next argv word
+			// after the cluster scan. A non-empty tail is an ambiguous
+			// glued spelling (ksh/zsh may read it as the operand —
+			// `-cpig`) so it is ALSO screened as code while its letters
+			// keep being parsed as flags (`-ce` needs the next argv too).
+			pending = true
+			if tail := a[j+1:]; tail != "" {
+				slots = append(slots, codeSlot{flag: i, text: tail, restIdx: i + 1})
+				if !isLetterOnly(tail) {
+					break // ambiguous glued operand — not flag letters
+				}
+			}
+			continue
+		}
+		if strings.IndexByte(spec.valShort, ch) >= 0 {
+			if j+1 >= len(a) {
+				nextIdx = i + 1 // value is the next argv
+			}
+			break // value letters end the cluster either way
+		}
+		if strings.IndexByte(spec.optNumShort, ch) >= 0 {
+			// Restricted numeric tail: consume its legal bytes, then RESUME
+			// the cluster — `perl -0e` is -0 -e, so the e must not be eaten
+			// as a value.
+			j += consumeNumOptTail(a, j, ch)
+			continue
+		}
+		if strings.IndexByte(spec.optShort, ch) >= 0 {
+			if j+1 >= len(a) {
+				continue // bare optional-value flag — consumes no argv
+			}
+			break // glued value ends the cluster
+		}
+	}
+	return slots, nextIdx, pending
+}
+
+// isDynScriptCodeOperand reports whether a dynamic word in first-operand
+// position is inline code (true) or a split-safe path-shaped script-file
+// operand (false — the option scan ends there, Q1-C).
+func isDynScriptCodeOperand(a string) bool {
+	if isSafeDynamicDataOperand(a) &&
+		(strings.Contains(a, "/") || strings.HasPrefix(a, "/") ||
+			strings.HasPrefix(a, cmdSubPlaceholderAbsDq) || hasInterpScriptExt(a)) {
+		return false
+	}
+	return true
+}
+
+func interpCodeSlots(argv []string) []codeSlot {
+	if len(argv) < 2 {
 		return nil
 	}
-	var out []codeSlot
-	pendingCode := false // flag-model code letter seen; operand resolves after the cluster
+	spec, ok := lookupInterpOptSpec(filepath.Base(argv[0]))
+	if !ok {
+		return nil
+	}
+	st := interpScanState{spec: spec}
 	for i := 1; i < len(argv); i++ {
 		a := argv[i]
-		if a == "--" {
-			break // option terminator
-		}
 		if strings.HasPrefix(a, "--") {
-			if pendingCode {
-				break // an option still cannot be -c's operand
+			if st.scanLongWord(argv, i, &i) {
+				return st.out
 			}
-			name, val, hasVal := a[2:], "", false
-			if k := strings.IndexByte(name, '='); k >= 0 {
-				name, val, hasVal = name[:k], name[k+1:], true
-			}
-			if longCode["--"+name] {
-				if hasVal {
-					out = append(out, codeSlot{flag: i, text: val})
-				} else if i+1 < len(argv) {
-					out = append(out, codeSlot{flag: i, text: argv[i+1]})
-					i++
-				} else {
-					out = append(out, codeSlot{flag: i, flagOnly: true})
-				}
-				continue
-			}
-			if longValue["--"+name] {
-				if !hasVal {
-					i++ // consumes the separate value operand
-				}
-			}
-			continue // boolean or unknown long option
+			continue
 		}
-		// A bare "-" is the stdin-script operand, not an option cluster.
 		if !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+") || a == "-" || a == "+" {
-			if pendingCode {
-				// The pending flag-model code operand IS this word
-				// (`sh -c code`, `node -pe code`): argv0/positional-name
-				// words that follow are already covered — a second
-				// non-option operand ends the zone.
-				out = append(out, codeSlot{flag: i, text: a})
-				pendingCode = false
-				continue
+			if st.scanOperandWord(argv, i) {
+				return st.out
 			}
-			if dynScriptOperand && isDynamicArg(a) {
-				// SH11 MF-2: a split-safe path-shaped word is the script-file
-				// operand, not inline code — end the option scan (Q1-C). Any
-				// other dynamic word in operand position may BE the code text
-				// (xargs replace-token / $X eval) — screen it.
-				if isSafeDynamicDataOperand(a) &&
-					(strings.Contains(a, "/") || strings.HasPrefix(a, "/") ||
-						strings.HasPrefix(a, cmdSubPlaceholderAbsDq) || hasInterpScriptExt(a)) {
-					break
-				}
-				out = append(out, codeSlot{flag: i, text: a})
-				break
-			}
-			break // first non-option operand: the script file
+			continue
 		}
-		plus := a[0] == '+'
-		for j := 1; j < len(a); j++ {
-			ch := a[j]
-			if !plus && strings.IndexByte(gluedCodes, ch) >= 0 {
-				if tail := a[j+1:]; tail != "" {
-					out = append(out, codeSlot{flag: i, text: tail})
-				} else if i+1 < len(argv) {
-					out = append(out, codeSlot{flag: i, text: argv[i+1]})
-					i++
-				} else {
-					out = append(out, codeSlot{flag: i, flagOnly: true})
-				}
-				break
-			}
-			if !plus && strings.IndexByte(flagCodes, ch) >= 0 {
-				// Flag-model code letter: the operand is the next argv word
-				// after the cluster scan. A non-empty tail is an ambiguous
-				// glued spelling (ksh/zsh may read it as the operand —
-				// `-cpig`) so it is ALSO screened as code while its letters
-				// keep being parsed as flags (`-ce` needs the next argv too).
-				pendingCode = true
-				if tail := a[j+1:]; tail != "" {
-					out = append(out, codeSlot{flag: i, text: tail})
-					if !isLetterOnly(tail) {
-						break // ambiguous glued operand — not flag letters
-					}
-				}
-				continue
-			}
-			if strings.IndexByte(valShort, ch) >= 0 {
-				if j+1 >= len(a) {
-					i++ // value is the next argv
-				}
-				break // value letters end the cluster either way
-			}
-			if strings.IndexByte(optNumShort, ch) >= 0 {
-				// Restricted numeric tail: consume its legal bytes, then RESUME
-				// the cluster — `perl -0e` is -0 -e, so the e must not be eaten
-				// as a value.
-				j += consumeNumOptTail(a, j, ch)
-				continue
-			}
-			if strings.IndexByte(optShort, ch) >= 0 {
-				if j+1 >= len(a) {
-					continue // bare optional-value flag — consumes no argv
-				}
-				break // glued value ends the cluster
-			}
+		if st.scanClusterWord(argv, i, &i) {
+			return st.out
 		}
 	}
-	if pendingCode {
+	if st.pendingCode {
 		// A trailing flag-model code letter with no operand word: the fed
 		// text lands here (xargs model) — mark the open slot.
-		out = append(out, codeSlot{flag: len(argv) - 1, flagOnly: true})
+		st.out = append(st.out, codeSlot{flag: len(argv) - 1, flagOnly: true, restIdx: len(argv)})
 	}
-	return out
+	return st.out
+}
+
+// interpScanState carries interpCodeSlots' scan registers so the per-word
+// handlers stay small enough to review independently.
+type interpScanState struct {
+	spec        interpOptSpec
+	out         []codeSlot
+	pendingCode bool
+}
+
+// scanLongWord handles one `--` word (and the `--` terminator); done reports
+// the scan must end — either the option terminator, an early stopOnFirstCode
+// return, or a strict-long validation failure. Words that are not long
+// options leave the loop index untouched.
+func (st *interpScanState) scanLongWord(argv []string, i int, idx *int) bool {
+	a := argv[i]
+	if a == "--" {
+		return true // option terminator
+	}
+	if !strings.HasPrefix(a, "--") {
+		return false
+	}
+	slot, hasSlot, nextIdx, stop := st.spec.scanLongOpt(argv, i, st.pendingCode)
+	if hasSlot {
+		st.out = append(st.out, slot)
+	}
+	if nextIdx > i {
+		*idx = nextIdx // consumed a separate value operand
+	}
+	// stopOnFirstCode must not drop a LATER -c/-m still inside argv — a
+	// strict-long validation failure is not CPython's own -c/-m either, so
+	// the scan only ends early when the slot's operand reaches the argv
+	// tail (the xargs open-slot model).
+	if stop {
+		return true
+	}
+	return hasSlot && st.spec.stopOnFirstCode && slot.restIdx >= len(argv)
+}
+
+// scanOperandWord handles a non-option operand word (including a bare "-"
+// stdin marker); done reports the scan must end — operands always terminate
+// the option zone except for the pending flag-model code operand itself.
+func (st *interpScanState) scanOperandWord(argv []string, i int) bool {
+	a := argv[i]
+	if strings.HasPrefix(a, "-") && a != "-" || strings.HasPrefix(a, "+") && a != "+" {
+		return false
+	}
+	if st.pendingCode {
+		// The pending flag-model code operand IS this word
+		// (`sh -c code`, `node -pe code`): argv0/positional-name
+		// words that follow are already covered — a second
+		// non-option operand ends the zone.
+		st.out = append(st.out, codeSlot{flag: i, text: a, restIdx: i + 1})
+		if st.spec.stopOnFirstCode {
+			return true
+		}
+		st.pendingCode = false
+		return false
+	}
+	if st.spec.dynScriptOperand && isDynamicArg(a) {
+		// SH11 MF-2: a split-safe path-shaped word is the script-file
+		// operand, not inline code — end the option scan (Q1-C). Any
+		// other dynamic word in operand position may BE the code text
+		// (xargs replace-token / $X eval) — screen it.
+		if isDynScriptCodeOperand(a) {
+			st.out = append(st.out, codeSlot{flag: i, text: a, dynOperand: true, restIdx: i + 1})
+		}
+	}
+	return true // first non-option operand: the script file ends the zone
+}
+
+// scanClusterWord handles one short-option cluster word; done reports an
+// early stopOnFirstCode return.
+func (st *interpScanState) scanClusterWord(argv []string, i int, idx *int) bool {
+	a := argv[i]
+	if !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+") || a == "-" || a == "+" {
+		return false
+	}
+	if strings.HasPrefix(a, "--") {
+		return false
+	}
+	slots, nextIdx, pending := st.spec.scanShortCluster(argv, i)
+	*idx = nextIdx
+	if len(slots) > 0 {
+		st.out = append(st.out, slots...)
+		if st.spec.stopOnFirstCode {
+			return true
+		}
+	}
+	if pending {
+		st.pendingCode = true
+	}
+	return false
 }
 
 // consumeNumOptTail returns how many bytes after a[j] form the legal
@@ -12517,73 +13087,183 @@ func consumeNumOptTail(a string, j int, ch byte) int {
 func isHexDigit(b byte) bool {
 	return b >= '0' && b <= '9' || b >= 'a' && b <= 'f' || b >= 'A' && b <= 'F'
 }
+
+// xargsFeedsCodeFlag reports whether the stdin words an xargs invocation
+// feeds its target command can land in an open inline-code slot (-c/-e
+// whose operand has not been supplied yet) or in a replace-token exec slot.
+// Command indirection layers (xargs / flock / watch -x / ssh / find -exec)
+// are descended with a bounded depth; exceeding it fails closed.
 func xargsFeedsCodeFlag(inner, full []string, pathEnv string, caller callerIdentity) bool {
+	return xargsFeedsCodeFlagDepth(inner, full, pathEnv, caller, 0)
+}
+
+// xargsFeedsCodeFlagDepth is the bounded-depth worker of
+// xargsFeedsCodeFlag. The repl-token screen is shared with
+// replTokenInExecSlotDepth so the two feeds cannot drift, and a dangling
+// wrapper or wrapper-only target (xargs env) fails closed — the stdin words
+// would become the command head itself.
+func xargsFeedsCodeFlagDepth(inner, outerXargs []string, pathEnv string, caller callerIdentity, depth int) bool {
 	if len(inner) == 0 {
 		return false
 	}
-	head, tea, effPath, exhausted := peelWrappersAndWrapperAliases(inner, pathEnv, caller)
-	if exhausted || len(head) == 0 {
-		return false
-	}
-	// Same env-op re-anchor as replTokenInExecSlot: the ssh head resolves
-	// under the caller seeded with the peeled ops (R5 MF-3); the remote
-	// recursion keeps the bare remote identity.
-	tCaller := caller.seededWith(tea)
-	repl := xargsReplToken(full)
-	if repl != "" && strings.Contains(head[0], repl) {
+	if depth >= peelChainMaxDepth {
 		return true
 	}
-	// Same alias resolution as replTokenInExecSlot: a non-ssh alias head
-	// (mysh -> /bin/sh under env -C, a PATH alias to ssh) must face the
-	// code-slot and ssh screens under BOTH spellings (R6 MF-1). A
-	// CROSS-FAMILY structural re-identity is a conflict — fail closed;
-	// a same-family link (`hc -> herdr-core`) only adds the variant.
-	headVariants := [][]string{head}
-	if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath, tCaller.screenCwd())); rb != "" && rb != filepath.Base(head[0]) {
-		if tb := filepath.Base(head[0]); rb != head[0] && isStructuralGuardHead(tb) && isStructuralGuardHead(rb) && !sameStructuralFamily(tb, rb) {
+	repl := xargsReplToken(outerXargs)
+	if repl != "" && replTokenInExecSlotDepth(inner, repl, pathEnv, caller, depth) {
+		return true
+	}
+	p := peelExecSlotHead(inner, pathEnv, caller, repl)
+	if p.failClosed || len(p.head) == 0 {
+		return true
+	}
+	for _, h := range p.variants {
+		if xargsVariantFeedsCodeSlot(h, repl, outerXargs, p.effPath, caller, p.caller, depth) {
 			return true
 		}
-		headVariants = append(headVariants, append([]string{rb}, head[1:]...))
 	}
-	// If the inner target is ssh, inspect the remote command for an open
-	// code flag (`xargs ssh dmit sh -c`) or a replace-token in the remote
-	// command head / code slot (`xargs -I{} ssh dmit {}`).
-	for _, h := range headVariants {
-		b := filepath.Base(h[0])
-		if b == "ssh" || resolveHeadBase(h[0], effPath, tCaller.screenCwd()) == "ssh" {
-			remoteCmd, hit := parseSSHInvocation(h)
-			if hit != "" {
-				return false
-			}
-			if repl != "" && strings.TrimSpace(remoteCmd) == repl {
-				return true
-			}
-			for _, rseg := range splitShellSegments(remoteCmd) {
-				if len(rseg.argv) == 0 {
-					continue
-				}
-				if xargsFeedsCodeFlag(rseg.argv, full, os.Getenv("PATH"), callerIdentity{cwd: caller.cwd}) {
-					return true
-				}
-			}
-			return false
-		}
-	}
-	for _, h := range headVariants {
-		if len(h) < 2 {
-			continue
-		}
-		slots := interpCodeSlots(h)
-		if len(slots) == 0 {
-			continue
-		}
-		for _, s := range slots {
+	return false
+}
+
+// xargsVariantFeedsCodeSlot screens one spelling of the xargs target head:
+// interpreter inline-code slots first, then the command indirection heads.
+func xargsVariantFeedsCodeSlot(h []string, repl string, outerXargs []string, effPath string, outerCaller, tCaller callerIdentity, depth int) bool {
+	b := filepath.Base(h[0])
+	if len(h) >= 2 {
+		for _, s := range interpCodeSlots(h) {
 			if s.flagOnly {
 				return true
 			}
-			if repl != "" && strings.Contains(s.text, repl) {
-				return true
+		}
+	}
+	if depth >= 1 && (b == "hc" || b == "herdr-core" || headIsCtxmodeOrSelfExe(h[0], effPath, tCaller.screenCwd())) {
+		return true
+	}
+	switch b {
+	case "ssh":
+		return xargsSSHFeedsCodeSlot(h, repl, outerXargs, outerCaller, depth)
+	case "xargs":
+		return xargsNestedFeedsCodeSlot(h, outerXargs, effPath, outerCaller, depth)
+	case "flock":
+		return xargsFlockFeedsCodeSlot(h, outerXargs, effPath, outerCaller, depth)
+	case "watch":
+		return xargsWatchFeedsCodeSlot(h, outerXargs, effPath, outerCaller, depth)
+	case "script":
+		if scriptHasOpenCommandFlag(h) {
+			return true
+		}
+		return isDynamicArg(scriptCommandArg(h))
+	case "eval":
+		return repl == ""
+	case "find":
+		return xargsFindFeedsCodeSlot(h[1:], repl)
+	}
+	return false
+}
+
+// xargsSSHFeedsCodeSlot screens the remote command an ssh target runs: a
+// parse failure or a missing remote command fails closed, and every remote
+// segment is descended as an xargs target in its own right.
+func xargsSSHFeedsCodeSlot(h []string, repl string, outerXargs []string, outerCaller callerIdentity, depth int) bool {
+	remoteCmd, hit := parseSSHInvocation(h)
+	if hit != "" {
+		return true
+	}
+	for _, rseg := range splitShellSegments(remoteCmd) {
+		if len(rseg.argv) == 0 {
+			continue
+		}
+		if rseg.parseErr != "" || rseg.depthExceeded {
+			return true
+		}
+		if xargsFeedsCodeFlagDepth(rseg.argv, outerXargs, os.Getenv("PATH"), callerIdentity{cwd: outerCaller.cwd}, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+// xargsNestedFeedsCodeSlot descends into a nested xargs target: the inner
+// xargs consumes its OWN stdin words, and the outer feed reaches its target
+// only when the outer xargs appends operands (no -I token).
+func xargsNestedFeedsCodeSlot(h, outerXargs []string, effPath string, outerCaller callerIdentity, depth int) bool {
+	repl := xargsReplToken(outerXargs)
+	k := xargsTargetIndex(h)
+	if k < 0 {
+		return true
+	}
+	if k >= len(h) {
+		// No inner target at all (xargs xargs): the inner xargs runs its
+		// default echo — outer appended words only matter without -I.
+		return repl == ""
+	}
+	if xargsFeedsCodeFlagDepth(h[k:], h, effPath, outerCaller, depth+1) {
+		return true
+	}
+	if repl == "" {
+		return xargsFeedsCodeFlagDepth(h[k:], outerXargs, effPath, outerCaller, depth+1)
+	}
+	return false
+}
+
+// xargsFlockFeedsCodeSlot descends past flock's options: a -c/--command
+// shell string fed by xargs is shell text the outer stream lands in; a
+// positional command argv feeds the same way the direct target does.
+func xargsFlockFeedsCodeSlot(h, outerXargs []string, effPath string, outerCaller callerIdentity, depth int) bool {
+	repl := xargsReplToken(outerXargs)
+	innerIdx, cmdText := skipFlockArgs(h, 1)
+	if cmdText != "" {
+		return isDynamicArg(cmdText)
+	}
+	if innerIdx >= len(h) {
+		// Dangling flock (xargs flock -x / xargs flock /tmp/lk): the fed
+		// words become the command flock runs — open only without -I.
+		return repl == ""
+	}
+	return xargsFeedsCodeFlagDepth(h[innerIdx:], outerXargs, effPath, outerCaller, depth+1)
+}
+
+// xargsWatchFeedsCodeSlot descends past watch's options: -x/--exec operands
+// form a direct exec argv fed like the direct target; the default mode
+// joins operands into a `sh -c` string, so fed words land in shell text
+// only when the outer xargs appends them (no -I).
+func xargsWatchFeedsCodeSlot(h, outerXargs []string, effPath string, outerCaller callerIdentity, depth int) bool {
+	repl := xargsReplToken(outerXargs)
+	if len(h) < 2 {
+		return repl == ""
+	}
+	k, execMode, fc := skipWatchArgs(h, 1)
+	if fc {
+		return true
+	}
+	if k >= len(h) {
+		return repl == ""
+	}
+	if !execMode {
+		return repl == ""
+	}
+	return xargsFeedsCodeFlagDepth(h[k:], outerXargs, effPath, outerCaller, depth+1)
+}
+
+// xargsFindFeedsCodeSlot reports whether a find target carries an unclosed
+// -exec/-execdir/-ok/-okdir operator: the fed words would land inside its
+// command argv — open only when the outer xargs appends operands (no -I).
+func xargsFindFeedsCodeSlot(args []string, repl string) bool {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "-exec" || a == "-execdir" || a == "-ok" || a == "-okdir" {
+			j := i + 1
+			for j < len(args) && args[j] != ";" && args[j] != "+" {
+				j++
 			}
+			if j >= len(args) {
+				return repl == ""
+			}
+			i = j
+			continue
+		}
+		if findExecSlotValueOpts[a] {
+			i++
 		}
 	}
 	return false
@@ -14937,6 +15617,46 @@ func (g guardCall) guardCtxRunShellEnv(code string, envAs envAssignments) (rule,
 // "sh"]` forwards the caller's stdin to a remote shell reading its PROGRAM
 // from that stream, so the stdin payload is remote code, not data.
 
+// checkPythonLongInterpOpt screens one `--` word in a Python head's option
+// zone: the zero-arg query spellings pass, --check-hash-based-pycs must
+// carry a statically valid mode (glued or the next argv), and every other
+// long option — its operand arity unknowable — is bad (fail closed).
+func checkPythonLongInterpOpt(head []string, i int) (nextIdx int, bad bool) {
+	a := head[i]
+	name, val, hasVal := a[2:], "", false
+	if k := strings.IndexByte(name, '='); k >= 0 {
+		name, val, hasVal = name[:k], name[k+1:], true
+	}
+	switch name {
+	case "help", "help-env", "help-xoptions", "help-all", "version":
+		if hasVal {
+			return i, true
+		}
+		return i, false
+	case "check-hash-based-pycs":
+		if hasVal {
+			return i, !isValidPycsMode(val)
+		}
+		if i+1 >= len(head) || isDynamicArg(head[i+1]) || !isValidPycsMode(head[i+1]) {
+			return i, true
+		}
+		return i + 1, false // consumes the separate mode operand
+	}
+	return i, true // unknown Python long option
+}
+
+// isSafeDynamicScriptPath reports whether a dynamic word in the interpreter
+// option zone ends the zone as the script-file operand: split-safe, never
+// option-shaped at runtime, and path-shaped (absolute, glob containing '/',
+// abs-dq placeholder, or a known interpreter script extension).
+func isSafeDynamicScriptPath(a string) bool {
+	if !isSafeDynamicDataOperand(a) {
+		return false
+	}
+	return strings.Contains(a, "/") || strings.HasPrefix(a, "/") ||
+		strings.HasPrefix(a, cmdSubPlaceholderAbsDq) || hasInterpScriptExt(a)
+}
+
 // hasDynamicInterpOption reports a dynamic word in the shell/interpreter
 // option zone (before -- or the first static script operand).
 func hasDynamicInterpOption(head []string, base string) bool {
@@ -14954,6 +15674,7 @@ func hasDynamicInterpOption(head []string, base string) bool {
 		"--loader": true, "--import": true, "--experimental-loader": true,
 		"--conditions": true, "-I": true, "-M": true, "-m": true,
 		"-d": true, "-z": true, "--rcfile": true, "--init-file": true,
+		"--check-hash-based-pycs": true,
 		// Code-carrying flags: still consume the next argv so a following
 		// dynamic -e is not mistaken for the script file (MF-2 multi -e).
 		"-c": true, "+c": true, "-e": true, "-E": true, "-p": true,
@@ -14963,6 +15684,7 @@ func hasDynamicInterpOption(head []string, base string) bool {
 		"-c": true, "+c": true, "-e": true, "-E": true, "-p": true,
 		"--eval": true, "--print": true, "-r": true,
 	}
+	pyHead := isPythonInterpBase(base)
 	for i := 1; i < len(head); i++ {
 		a := head[i]
 		if a == "--" {
@@ -14971,6 +15693,14 @@ func hasDynamicInterpOption(head []string, base string) bool {
 		// "-" means stdin script source; remaining args are script argv (W-Fix-6).
 		if a == "-" {
 			return false
+		}
+		if pyHead && strings.HasPrefix(a, "--") && !isDynamicArg(a) {
+			next, bad := checkPythonLongInterpOpt(head, i)
+			if bad {
+				return true
+			}
+			i = next
+			continue
 		}
 		if isDynamicArg(a) {
 			// Shell option zone: any dynamic word may expand to -c/-s etc.
@@ -14982,9 +15712,7 @@ func hasDynamicInterpOption(head []string, base string) bool {
 			// the option zone as the script-file operand (MF-2/Q1-C). A
 			// word-start __ctx_dq_sub__ may begin with '-' at runtime and is
 			// NOT a safe script operand.
-			if isSafeDynamicDataOperand(a) &&
-				(strings.Contains(a, "/") || strings.HasPrefix(a, "/") ||
-					strings.HasPrefix(a, cmdSubPlaceholderAbsDq) || hasInterpScriptExt(a)) {
+			if isSafeDynamicScriptPath(a) {
 				return false
 			}
 			return true
