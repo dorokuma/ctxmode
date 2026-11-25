@@ -1367,6 +1367,21 @@ func TestGuard_V622_OracleR3Probes(t *testing.T) {
 	if err := os.WriteFile(payloadCPig, []byte("-c\npig\n"), 0644); err != nil {
 		t.Fatalf("write payload-cpig: %v", err)
 	}
+	// R3/R5 探针的 xargs -a 无管道 payload(Oracle R4 精确 verdict 纪律:
+	// 管道 echo 会被上游 piped code 规则掩盖目标 verdict,改用 -a 文件喂入)。
+	mkPayload := func(name, content string) string {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+	payloadFooExec := mkPayload("payload-fooexec", "foo -exec pig ;\n")
+	payloadCkpt := mkPayload("payload-ckpt", "a --checkpoint=1 --checkpoint-action=exec=pig\n")
+	payloadDashE := mkPayload("payload-dashe", "-e\n")
+	payloadBegin := mkPayload("payload-begin", "BEGIN{system(\"pig\")}\n")
+	payloadCorePager := mkPayload("payload-cp", "core.pager\n")
+	payloadPig := mkPayload("payload-pig", "pig\n")
 
 	blockCases := []struct {
 		name, cmd, want string
@@ -1377,11 +1392,11 @@ func TestGuard_V622_OracleR3Probes(t *testing.T) {
 		{"P-R3-MF1-c tar fstab nonfirst", `tar -cf /dev/null /etc/fstab --use-compress-program=pig`, "pig"},
 		{"P-R3-MF1-d tar BSD cIf", `tar cIf pig /dev/null /dev/null`, "pig"},
 		// R3-MF-2: 单步剥离包装链,nice/timeout/嵌套 env 不再跃过 env -S。
-		{"P-R3-MF2-a nice env -S find", `echo "foo -exec pig ;" | xargs -I{} nice env -S "find . -name {}"`, ""},
-		{"P-R3-MF2-b timeout env -S", `echo "foo -exec pig ;" | xargs -I{} timeout 10 env -S "find . -name {}"`, ""},
-		{"P-R3-MF2-c env -- env -S", `echo "foo -exec pig ;" | xargs -I{} env -- env -S "find . -name {}"`, ""},
-		{"P-R3-MF2-d env -i env -S", `echo "foo -exec pig ;" | xargs -I{} env -i env -S "find . -name {}"`, ""},
-		{"P-R3-MF2-e nice env -S tar", `echo "a --checkpoint=1 --checkpoint-action=exec=pig" | xargs -I{} nice env -S "tar -cf /dev/null {}"`, ""},
+		{"P-R3-MF2-a nice env -S find", `xargs -a ` + payloadFooExec + ` -I{} nice env -S "find . -name {}"`, "dynamic code payload"},
+		{"P-R3-MF2-b timeout env -S", `xargs -a ` + payloadFooExec + ` -I{} timeout 10 env -S "find . -name {}"`, "dynamic code payload"},
+		{"P-R3-MF2-c env -- env -S", `xargs -a ` + payloadFooExec + ` -I{} env -- env -S "find . -name {}"`, "dynamic code payload"},
+		{"P-R3-MF2-d env -i env -S", `xargs -a ` + payloadFooExec + ` -I{} env -i env -S "find . -name {}"`, "dynamic code payload"},
+		{"P-R3-MF2-e nice env -S tar", `xargs -a ` + payloadCkpt + ` -I{} nice env -S "tar -cf /dev/null {}"`, "dynamic code payload"},
 		// R3-MF-3: flock 真实长选项表 + 未知长选项 fail-closed。
 		{"P-R3-MF3-a flock --no-fork", `flock --no-fork /dev/null pig`, "pig"},
 		{"P-R3-MF3-c flock --f fcntl", `flock --f /dev/null pig`, "pig"},
@@ -1393,17 +1408,17 @@ func TestGuard_V622_OracleR3Probes(t *testing.T) {
 		{"P-R3-MF5-d node -pe -r", `X='a.js -e require("child_process").execSync("pig")'; node -pe '1' -r $X`, "dynamic code payload"},
 		{"P-R3-MF5-e bun -pe -c", `X='a.toml -e require("child_process").execSync("pig")'; bun -pe '1' -c $X`, "dynamic code payload"},
 		// R3-MF-5 攻击面补充: 代码槽后选项位占位符仍拦截。
-		{"P-R3-MF5-f perl -e xargs %", `echo -e | xargs -I% perl -e '1' % 'system("pig")'`, ""},
-		{"P-R3-MF5-g perl -e dash-%", `echo -e | xargs -I% perl -e '1' -%`, ""},
+		{"P-R3-MF5-f perl -e xargs %", `xargs -a ` + payloadDashE + ` -I% perl -e '1' % 'system("pig")'`, "dynamic code payload"},
+		{"P-R3-MF5-g perl -e dash-%", `xargs -a ` + payloadDashE + ` -I% perl -e '1' -%`, "dynamic code payload"},
 		// v6.2.2 R5 加固: 自定义/默认替换 token 位于非末尾位置时,其后方参数
 		// 仍可被扩展武装成 -e/-r 代码操作数,不再依赖硬编码拼写名单。
-		{"P-R5-a xargs -I{} perl trailing", `echo -e | xargs -I{} perl -e '1' {} 'system("pig")'`, ""},
-		{"P-R5-b xargs -IFOO custom token", `echo -e | xargs -IFOO perl -e '1' FOO 'system("pig")'`, ""},
+		{"P-R5-a xargs -I{} perl trailing", `xargs -a ` + payloadDashE + ` -I{} perl -e '1' {} 'system("pig")'`, "dynamic code payload"},
+		{"P-R5-b xargs -IFOO custom token", `xargs -a ` + payloadDashE + ` -IFOO perl -e '1' FOO 'system("pig")'`, "dynamic code payload"},
 		// R3-MF-6: git/awk/xargs 三路残余绕过。
-		{"P-R3-MF6-a git -c key-side", `echo 'core.pager' | xargs -I{} git -c '{}=pig' log`, ""},
-		{"P-R3-MF6-a2 git --config-env", `echo pig | xargs -I{} git --config-env 'core.pager={}' log`, ""},
-		{"P-R3-MF6-b gawk -f masks -e", `echo 'BEGIN{system("pig")}' | xargs -I{} gawk -f /dev/null /dev/null -e '{}'`, ""},
-		{"P-R3-MF6-c gawk -W source", `echo 'BEGIN{system("pig")}' | xargs -I{} gawk -e '1' -W 'source={}' /dev/null`, ""},
+		{"P-R3-MF6-a git -c key-side", `xargs -a ` + payloadCorePager + ` -I{} git -c '{}=pig' log`, "dynamic code payload"},
+		{"P-R3-MF6-a2 git --config-env", `xargs -a ` + payloadPig + ` -I{} git --config-env 'core.pager={}' log`, "dynamic code payload"},
+		{"P-R3-MF6-b gawk -f masks -e", `xargs -a ` + payloadBegin + ` -I{} gawk -f /dev/null /dev/null -e '{}'`, "dynamic code payload"},
+		{"P-R3-MF6-c gawk -W source", `xargs -a ` + payloadBegin + ` -I{} gawk -e '1' -W 'source={}' /dev/null`, "dynamic code payload"},
 		// R3-SF-1: node spec 单源收口(-C / 长值选项)。
 		{"P-R3-SF1-a node --title", `node --title x -e 'require("child_process").execSync("pig")'`, "javascript inline code"},
 		{"P-R3-SF1-b node --env-file", `node --env-file /dev/null -e 'require("child_process").execSync("pig")'`, "javascript inline code"},
@@ -1492,7 +1507,9 @@ func TestGuard_V622_OracleR3Probes(t *testing.T) {
 		{"R2-6-e xargs awk -v", `echo x | xargs -I{} awk -v k={} 'BEGIN{print k}' /dev/null`},
 		{"R2-6-f git --git-dir separate", `echo /tmp/repo | xargs -I{} git --git-dir {} log -1`},
 		{"R2-6-g perl -we legit -I", `perl -we 'print qq(ok)' -I /tmp`},
-		{"R5-a xargs -I{} perl -pe data", `echo a.txt | xargs -I{} perl -pe 's/a/b/' {}`},
+		{"R5-a xargs -I{} perl -pe data", `echo a.txt | xargs -I{} perl -pe 's/a/b/' -- {}`},
+		{"R5-b xargs -I{} perl -pe dot-slash", `echo a.txt | xargs -I{} perl -pe 's/a/b/' ./{}`},
+		{"R5-c find perl -pe trailing", `find . -exec perl -pe 's/a/b/' {} other.txt \;`},
 	}
 	for _, tc := range allowCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1587,6 +1604,242 @@ func TestGuard_V622_OracleR3Probes(t *testing.T) {
 		}
 		if got := skipFlockLong([]string{"flock", "--no-fork-x", "/dev/null", "pig"}, 1); got != -1 {
 			t.Errorf("skipFlockLong unknown long = %d, want -1 fail-closed", got)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// v6.2.2 Oracle R4 (R6 闭环): R4-MF-1..4 / R4-SF-1..4 / R4-Obs-1 探针回归 —
+// tar 布尔 -h 不再吞并后续 exec 选项;xargs 替换 token 的单词粘连/=` 代码
+// 选项 RCE(-esystem pig / --eval=...)在末词也不豁免;env -S 嵌套重拆链
+// 不再被 len(rest)>=len(cur) 截断;gawk -W 按 GNU getopt_long "W;" 解析
+// 且 -E/--exec 接通 stdin/动态校验,awk 位置参数不再终止选项区扫描。
+// 管道 echo 形态受上游 piped code 规则掩盖(verdict 为 piped code to shell/
+// perl/javascript),精确 dynamic code payload 断言一律走 xargs -a 无管道
+// 入口(R3-Obs-2 隔离纪律);stdin 程序源断言走 echo 管道与 argv+stdin 双通道。
+// ---------------------------------------------------------------------------
+
+func TestGuard_V622_OracleR4Probes(t *testing.T) {
+	mkPayload := func(name, content string) string {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+	payloadEsys := mkPayload("r4-esys", "-esystem(\"pig\")\n")
+	payloadEval := mkPayload("r4-eval", "--eval=require(\"child_process\").execSync(\"pig\")\n")
+	payloadDash := mkPayload("r4-dash", "-\n")
+	payloadFooExec := mkPayload("r4-fooexec", "foo -exec pig ;\n")
+	payloadCkpt := mkPayload("r4-ckpt", "a --checkpoint=1 --checkpoint-action=exec=pig\n")
+	payloadBegin := mkPayload("r4-begin", "BEGIN{system(\"pig\")}\n")
+	payloadEvilAwk := mkPayload("r4-evilawk", "/tmp/evil.awk\n")
+
+	blockCases := []struct {
+		name, cmd, want string
+	}{
+		// R4-MF-1: tar 布尔 -h(--dereference)不再当带值字母吞并后续 exec 选项。
+		{"P-R4-MF1-a tar -h use-compress", `tar -h --use-compress-program=pig -cf /dev/null /dev/null`, "pig"},
+		{"P-R4-MF1-b tar -ch use-compress", `tar -ch --use-compress-program=pig -cf /dev/null /dev/null`, "pig"},
+		{"P-R4-MF1-c tar -xh to-command", `tar -xh --to-command=pig -f /dev/null`, "pig"},
+		{"P-R4-MF1-d tar -chI pig", `tar -chI pig -cf /dev/null /dev/null`, "pig"},
+		{"P-R4-MF1-e tar -h ckpt-exec", `tar -h --checkpoint-action=exec=pig --checkpoint=1 -cf /dev/null /dev/null`, "pig"},
+		// R4-MF-2: 单词粘连/=` 代码选项 RCE —— 末词也不豁免(xargs -a 无管道
+		// 入口断言 dynamic code payload;stdin 管道形态的上游 verdict 另行验证)。
+		{"P-R4-MF2-a perl glued -e", `xargs -a ` + payloadEsys + ` -I{} perl -e '1' {}`, "dynamic code payload"},
+		{"P-R4-MF2-b perl -pe glued", `xargs -a ` + payloadEsys + ` -I{} perl -pe 's/a/b/' {}`, "dynamic code payload"},
+		{"P-R4-MF2-c custom token FOO", `xargs -a ` + payloadEsys + ` -IFOO perl -e '1' FOO`, "dynamic code payload"},
+		{"P-R4-MF2-d ruby glued -e", `xargs -a ` + payloadEsys + ` -I{} ruby -e '1' {}`, "dynamic code payload"},
+		{"P-R4-MF2-e node --eval=", `xargs -a ` + payloadEval + ` -I{} node -e '1' {}`, "dynamic code payload"},
+		{"P-R4-MF2-f bun --eval=", `xargs -a ` + payloadEval + ` -I{} bun -e '1' {}`, "dynamic code payload"},
+		{"P-R4-MF2-g xargs -a perl", `xargs -a ` + payloadEsys + ` -I{} perl -e '1' {}`, "dynamic code payload"},
+		{"P-R4-MF2-h xargs -a node", `xargs -a ` + payloadEval + ` -I{} node -e '1' {}`, "dynamic code payload"},
+		// R4-MF-3: env -S 拆词重拼嵌套链不再被 len(rest)>=len(cur) 截断。
+		{"P-R4-MF3-a env -Senv -S find", `xargs -a ` + payloadFooExec + ` -I{} env "-Senv -S" "find . -name {}"`, "dynamic code payload"},
+		{"P-R4-MF3-b env -S nice chain", `xargs -a ` + payloadFooExec + ` -I{} env -S "nice nice nice" env -S "find . -name {}"`, "dynamic code payload"},
+		{"P-R4-MF3-c env -S nested env", `xargs -a ` + payloadFooExec + ` -I{} env -S "nice nice env -S" "find . -name {}"`, "dynamic code payload"},
+		{"P-R4-MF3-d env -Senv -S tar", `xargs -a ` + payloadCkpt + ` -I{} env "-Senv -S" "tar -cf /dev/null {}"`, "dynamic code payload"},
+		// R4-MF-4: gawk -W GNU "W;" 语义 / -E/--exec / 位置参数后置选项。
+		{"P-R4-MF4-c -W source PROG", `gawk -e '1' -W source 'BEGIN{system("pig")}' /dev/null`, "pig"},
+		{"P-R4-MF4-d -W source xargs", `xargs -a ` + payloadBegin + ` -I{} gawk -e '1' -W source '{}' /dev/null`, "dynamic code payload"},
+		{"P-R4-MF4-e -W so= prefix", `gawk -e '1' -W 'so=BEGIN{system("pig")}' /dev/null`, "pig"},
+		{"P-R4-MF4-f -W exec xargs", `xargs -a ` + payloadBegin + ` -I{} gawk -e '1' -W exec '{}' /dev/null`, "dynamic code payload"},
+		{"P-R4-MF4-g positional -f", `xargs -a ` + payloadDash + ` -I{} gawk -e '1' /dev/null -f '{}'`, "dynamic code payload"},
+		{"P-R4-MF4-x1 --file= positional", `xargs -a ` + payloadEvilAwk + ` -I{} gawk -e '1' /dev/null --file='{}'`, "dynamic code payload"},
+		{"P-R4-MF4-x2 -f mask -f", `xargs -a ` + payloadEvilAwk + ` -I{} gawk -f /dev/null /dev/null -f '{}'`, "dynamic code payload"},
+		{"P-R4-MF4-x3 positional -i", `xargs -a ` + payloadEvilAwk + ` -I{} gawk -e '1' /dev/null -i '{}'`, "dynamic code payload"},
+		{"P-R4-MF4-x4 -W file= token", `xargs -a ` + payloadEvilAwk + ` -I{} gawk -e '1' /dev/null -W 'file={}'`, "dynamic code payload"},
+		// R4-SF-1: flagCodes 后接非代码字母不再丢失 hasFlagCode。
+		{"P-R4-SF1 node -pi pending", `xargs -a ` + payloadDash + ` -I% node -pi '1' %`, "dynamic code payload"},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+
+	// R4-MF-2 管道路径:stdin 是任意字节的 xargs 馈入,整块管线必 BLOCK
+	// (上游 piped code verdict 与精确 exec-slot verdict 任一都算闭合)。
+	for _, tc := range []struct{ name, cmd string }{
+		{"P-R4-MF2-a-pipe perl glued", `echo '-esystem("pig")' | xargs -I{} perl -e '1' {}`},
+		{"P-R4-MF2-b-pipe perl -pe glued", `echo '-eBEGIN{system("pig")}' | xargs -I{} perl -pe 's/a/b/' {}`},
+		{"P-R4-MF2-c-pipe custom FOO", `echo '-esystem("pig")' | xargs -IFOO perl -e '1' FOO`},
+		{"P-R4-MF2-d-pipe ruby glued", `echo '-esystem("pig")' | xargs -I{} ruby -e '1' {}`},
+		{"P-R4-MF2-e-pipe node --eval=", `echo '--eval=require("child_process").execSync("pig")' | xargs -I{} node -e '1' {}`},
+		{"P-R4-MF2-f-pipe bun --eval=", `echo '--eval=require("child_process").execSync("pig")' | xargs -I{} bun -e '1' {}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+		})
+	}
+
+	// R4-MF-4 awk stdin 程序源:echo 管道 + guardCtxRunArgv argv+stdin 双通道
+	// 均须拦截(Reviewer R3 #3 argv+stdin 独立性)。
+	for _, tc := range []struct {
+		name, cmd, want string
+	}{
+		{"P-R4-MF4-a -W file=-", `echo 'BEGIN{system("pig")}' | gawk -W file=-`, "awk script from stdin"},
+		{"P-R4-MF4-b -W file=/dev/stdin", `echo 'BEGIN{system("pig")}' | gawk -W file=/dev/stdin`, "awk script from stdin"},
+		{"P-R4-MF4-h gawk -E stdin", `echo 'BEGIN{system("pig")}' | gawk -E /dev/stdin`, "awk script from stdin"},
+		{"P-R4-MF4-i --exec=stdin", `echo 'BEGIN{system("pig")}' | gawk --exec=/dev/stdin`, "awk script from stdin"},
+		{"P-R4-MF4-j --exec stdin sep", `echo 'BEGIN{system("pig")}' | gawk --exec /dev/stdin`, "awk script from stdin"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{"P-R4-MF4-a-argvstdin", []string{"gawk", "-W", "file=-"}, "awk script from stdin"},
+		{"P-R4-MF4-b-argvstdin", []string{"gawk", "-W", "file=/dev/stdin"}, "awk script from stdin"},
+		{"P-R4-MF4-h-argvstdin", []string{"gawk", "-E", "/dev/stdin"}, "awk script from stdin"},
+		{"P-R4-MF4-i-argvstdin", []string{"gawk", "--exec=/dev/stdin"}, "awk script from stdin"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{
+				id: tc.name, role: "worker",
+				argv:  tc.argv,
+				stdin: "BEGIN{system(\"pig\")}",
+			}, "")
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("guardCtxRunArgv %v + stdin = %q, want verdict substring %q", tc.argv, got, tc.want)
+			}
+		})
+	}
+	t.Run("P-R4-MF4-k -W file heredoc", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "P-R4-MF4-k", role: "worker", cmd: "gawk -W file=- <<'EOF'\nBEGIN{system(\"pig\")}\nEOF"}, "")
+		if got == "ALLOW" {
+			t.Fatalf("gawk -W file=- heredoc = ALLOW, want a guard block")
+		}
+	})
+
+	// 放行守卫正例(R4 零假阳纪律):find 自身 {}、xargs -- 分隔/./{} 前缀、
+	// awk/git 合法数据、script 以值字母结尾的位置文件名不再吞 --。
+	allowCases := []struct {
+		name, cmd string
+	}{
+		{"R4-pos find perl -pe", `find . -exec perl -pe 's/a/b/' {} \;`},
+		{"R4-pos find perl trailing", `find . -exec perl -pe 's/a/b/' {} other.txt \;`},
+		{"R4-pos xargs perl -- token", `echo a.txt | xargs -I{} perl -pe 's/a/b/' -- {}`},
+		{"R4-pos xargs perl dot-slash", `echo a.txt | xargs -I{} perl -pe 's/a/b/' ./{}`},
+		{"R4-pos find awk -f -v", `find . -exec awk -f parse.awk -v fname={} {} \;`},
+		{"R4-pos find git --git-dir", `find . -name .git -exec git --git-dir={} log -1 \;`},
+		{"R4-pos find rg env -S", `find . -name '*.go' -exec rg env -S {} \;`},
+		{"R4-pos git -c user.name", `xargs -a ` + payloadEvilAwk + ` -I{} git -cuser.name={} log`},
+		{"R4-pos git -C glued", `find . -exec git -C{} status \;`},
+		{"R4-pos awk glued -vf", `xargs -a ` + payloadEvilAwk + ` -I{} awk -vf={} 'END{print f}' /dev/null`},
+		{"R4-pos awk glued -F", `xargs -a ` + payloadEvilAwk + ` -I{} awk -F{} 'END{print f}' /dev/null`},
+		{"R4-pos awk --assign glued", `xargs -a ` + payloadEvilAwk + ` -I{} awk --assign=f={} 'END{print f}' /dev/null`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+
+	// R4-SF-3: script 以值字母结尾的位置文件名不再吞掉 --(xargs -a 无管道
+	// 入口,避免上游 piped code verdict 掩盖)。
+	t.Run("R4-pos script positional .o", func(t *testing.T) {
+		payloadX := mkPayload("r4-x", "x\n")
+		got := rtGuardCwd(t, rtCase{id: "R4-pos-script-o", role: "worker", cmd: `xargs -a ` + payloadX + ` -I% script /tmp/out.o -- %`}, "")
+		if got != "ALLOW" {
+			t.Fatalf("xargs script /tmp/out.o -- %% = %q, want ALLOW", got)
+		}
+	})
+
+	// 目标层直断断言:R4 修复点的单元 verdict 不依赖外层规则兜出 BLOCK。
+	t.Run("R4-unit env-split re-split chain", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			argv []string
+			want bool
+		}{
+			{"env -Senv -S", []string{"env", "-Senv -S", "find . -name {}"}, true},
+			{"env -S nice nice env -S", []string{"env", "-S", "nice nice env -S", "find . -name {}"}, true},
+			{"env -S nice nice nice env -S", []string{"env", "-S", "nice nice nice", "env", "-S", "find . -name {}"}, true},
+		} {
+			if got := wrapperChainEnvSplitHasToken(tc.argv, os.Getenv("PATH"), callerIdentity{}, "{}"); got != tc.want {
+				t.Errorf("wrapperChainEnvSplitHasToken(%v) = %v, want %v", tc.argv, got, tc.want)
+			}
+		}
+	})
+	t.Run("R4-unit awk -W shapes direct", func(t *testing.T) {
+		if _, _, hit := awkProgramFrags([]string{"-W", "file=-"}); hit != "awk script from stdin" {
+			t.Errorf("awkProgramFrags(-W file=-) hit = %q, want awk script from stdin", hit)
+		}
+		if _, _, hit := awkProgramFrags([]string{"-W", "file=/dev/stdin"}); hit != "awk script from stdin" {
+			t.Errorf("awkProgramFrags(-W file=/dev/stdin) hit = %q, want awk script from stdin", hit)
+		}
+		if _, _, hit := awkProgramFrags([]string{"-Wfile=-"}); hit != "awk script from stdin" {
+			t.Errorf("awkProgramFrags(-Wfile=-) hit = %q, want awk script from stdin", hit)
+		}
+		if _, _, hit := awkProgramFrags([]string{"-E", "/dev/stdin"}); hit != "awk script from stdin" {
+			t.Errorf("awkProgramFrags(-E /dev/stdin) hit = %q, want awk script from stdin", hit)
+		}
+		if _, _, hit := awkProgramFrags([]string{"--exec=/dev/stdin"}); hit != "awk script from stdin" {
+			t.Errorf("awkProgramFrags(--exec=/dev/stdin) hit = %q, want awk script from stdin", hit)
+		}
+		prog, _, hit := awkProgramFrags([]string{"-e", "1", "-W", "source", "BEGIN{1}", "/dev/null"})
+		if hit != "" || !strings.Contains(prog, "BEGIN{1}") {
+			t.Errorf("awkProgramFrags(-W source PROG) = %q hit %q, want program containing BEGIN{1}", prog, hit)
+		}
+		prog2, _, hit2 := awkProgramFrags([]string{"-e", "1", "-W", "so=BEGIN{2}", "/dev/null"})
+		if hit2 != "" || !strings.Contains(prog2, "BEGIN{2}") {
+			t.Errorf("awkProgramFrags(-W so=PROG) = %q hit %q, want program containing BEGIN{2}", prog2, hit2)
+		}
+	})
+	t.Run("R4-unit awkOptZone positional scan", func(t *testing.T) {
+		if !awkOptZoneHasToken([]string{"-e", "1", "/dev/null", "-f", "{}"}, "{}") {
+			t.Errorf("awkOptZoneHasToken(positional then -f {}) = false, want true")
+		}
+		if !awkOptZoneHasToken([]string{"-e", "1", "/dev/null", "--file={}"}, "{}") {
+			t.Errorf("awkOptZoneHasToken(positional then --file={}) = false, want true")
+		}
+		if awkOptZoneHasToken([]string{"-vf={}", "/dev/null"}, "{}") {
+			t.Errorf("awkOptZoneHasToken(-vf={}) = true, want false (glued data assignment)")
+		}
+	})
+	t.Run("R4-unit scriptOptWord positional", func(t *testing.T) {
+		if consume, hit := scriptOptWordTokenStep([]string{"script", "/tmp/out.o", "--", "%"}, 1, "%"); consume != 0 || hit {
+			t.Errorf("scriptOptWordTokenStep(positional /tmp/out.o) = %d,%v want 0,false", consume, hit)
 		}
 	})
 }

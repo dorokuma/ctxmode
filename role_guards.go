@@ -4809,9 +4809,14 @@ func wrapperChainEnvSplitHasToken(argv []string, pathEnv string, caller callerId
 				return true
 			}
 			rest, payloads, ea := skipEnvOperands(cur, 1, envAssignments{})
-			if len(payloads) > 0 || len(rest) == 0 || len(rest) >= len(cur) {
+			if len(payloads) > 0 || len(rest) == 0 {
 				return false // unknown/dangling env options fail closed, not open
 			}
+			// No length-shrink requirement: an outer env -S's split can RE-SPELL
+			// env heads and keep len(rest) == len(cur) or longer (`env "-Senv -S"
+			// "find . -name {}"` -> `env -S "find . -name {}"`), which must NOT
+			// end the walk — the outer depth budget already bounds it, and a
+			// non-converging chain fails CLOSED below (v6.2.2 Oracle R4 R4-MF-3).
 			pathEnv = ea.effectivePATHFrom(pathEnv)
 			caller = caller.seededWith(ea)
 			cur = rest
@@ -4823,39 +4828,23 @@ func wrapperChainEnvSplitHasToken(argv []string, pathEnv string, caller callerId
 		// Step past THIS wrapper layer ONLY (never the whole chain — a
 		// full-chain peel would leapfrog an intermediate env -S position,
 		// the R3 regression that re-opened nice env -S "find . -name {}").
-		rest, ok := peelSingleWrapper(cur)
-		if !ok || len(rest) == 0 || len(rest) >= len(cur) {
+		// peelSingleWrapperArgs is called with the RESOLVED base directly so
+		// a PATH-alias wrapper (./mynice) still peels under its canonical
+		// arity (v6.2.2 Oracle R4 R4-MF-3).
+		wi, ok := peelSingleWrapperArgs(cur, base)
+		if !ok || wi > len(cur) {
+			return false
+		}
+		rest := cur[wi:]
+		if len(rest) == 0 || len(rest) >= len(cur) {
 			return false
 		}
 		cur = rest
 	}
-	return false
-}
-
-// peelSingleWrapper strips exactly ONE wrapper layer off argv — the head
-// word plus its own options/operands — and reports whether the head was a
-// peelable wrapper. It NEVER loops: callers that walk a chain drive the
-// iteration so intermediate env positions cannot be skipped (v6.2.2 R3
-// R3-MF-2). env itself is not handled here (skipEnvOperands owns its
-// richer operand model); the remaining wrappers mirror peelWrappers'
-// one-step arities, delegated to small per-family skippers so this
-// function stays reviewable.
-func peelSingleWrapper(argv []string) (rest []string, ok bool) {
-	if len(argv) == 0 {
-		return argv, false
-	}
-	base := filepath.Base(argv[0])
-	if cb := canonicalResolvedBase(base); cb != "" {
-		base = cb
-	}
-	i, ok := peelSingleWrapperArgs(argv, base)
-	if !ok {
-		return argv, false
-	}
-	if i > len(argv) {
-		i = len(argv)
-	}
-	return argv[i:], true
+	// Depth exhausted without reaching a real command head: the chain's
+	// shape is unprovable — fail CLOSED (peelWrappers' exhausted parity,
+	// v6.2.2 Oracle R4 R4-MF-3).
+	return true
 }
 
 // peelSingleWrapperArgs consumes the option words of ONE wrapper head and
@@ -5024,12 +5013,24 @@ func replTokenInPeeledEnv(envAs envAssignments, token string) bool {
 // return false. Command indirection layers (xargs / flock / watch / find
 // -exec / ssh) are descended with a bounded depth.
 func replTokenInExecSlot(innerArgv []string, token, pathEnv string, caller callerIdentity) bool {
-	return replTokenInExecSlotDepth(innerArgv, token, pathEnv, caller, 0)
+	return replTokenInExecSlotDepth(innerArgv, token, pathEnv, caller, 0, false)
+}
+
+// replTokenInExecSlotFind is replTokenInExecSlot for find's OWN -exec/-ok
+// family: find expands "{}" onto its scan-root file paths, which never
+// start with '-', so a bare find "{}" is provably option-inert — unlike
+// the xargs replacement token, which expands onto arbitrary stdin bytes
+// (v6.2.2 Oracle R4 R4-MF-2).
+func replTokenInExecSlotFind(innerArgv []string, token, pathEnv string, caller callerIdentity) bool {
+	return replTokenInExecSlotDepth(innerArgv, token, pathEnv, caller, 0, true)
 }
 
 // replTokenInExecSlotDepth is the bounded-depth worker of
 // replTokenInExecSlot. Reaching peelChainMaxDepth fails closed.
-func replTokenInExecSlotDepth(innerArgv []string, token, pathEnv string, caller callerIdentity, depth int) bool {
+// findPathToken is true only when token is find's OWN "{}" placeholder
+// (the screenFindExecInner entry): xargs replace tokens and every further
+// descent pass false (v6.2.2 Oracle R4 R4-MF-2).
+func replTokenInExecSlotDepth(innerArgv []string, token, pathEnv string, caller callerIdentity, depth int, findPathToken bool) bool {
 	if token == "" || len(innerArgv) == 0 {
 		return false
 	}
@@ -5044,7 +5045,7 @@ func replTokenInExecSlotDepth(innerArgv []string, token, pathEnv string, caller 
 		return true
 	}
 	for _, h := range p.variants {
-		if replTokenInVariant(h, token, p.effPath, p.caller, caller, depth) {
+		if replTokenInVariant(h, token, p.effPath, p.caller, caller, depth, findPathToken) {
 			return true
 		}
 	}
@@ -5054,7 +5055,7 @@ func replTokenInExecSlotDepth(innerArgv []string, token, pathEnv string, caller 
 // replTokenInVariant screens one spelling of the peeled exec-slot head:
 // inline code slots first, then the command-indirection heads that need a
 // depth+1 descent.
-func replTokenInVariant(h []string, token, effPath string, tCaller, outerCaller callerIdentity, depth int) bool {
+func replTokenInVariant(h []string, token, effPath string, tCaller, outerCaller callerIdentity, depth int, findPathToken bool) bool {
 	if text, has := unwrapShellArgv(h); has && strings.Contains(text, token) {
 		return true
 	}
@@ -5080,7 +5081,7 @@ func replTokenInVariant(h []string, token, effPath string, tCaller, outerCaller 
 	// word runs as code. Words AFTER the first code slot or static script
 	// operand are script argv and stay free (v6.2.2 MF-8).
 	if shellHeads[b] || isPythonInterpBase(b) || inlineSlotInterpBase(b) {
-		if interpOptionZoneHasToken(h, token, b) {
+		if interpOptionZoneHasToken(h, token, b, findPathToken) {
 			return true
 		}
 	}
@@ -5113,8 +5114,10 @@ func replTokenInVariant(h []string, token, effPath string, tCaller, outerCaller 
 			// Recursion descends under the env -C-re-anchored caller: an
 			// outer `env -C sub` moves the resolution base into sub, and
 			// dropping it here would lose the ./mysh -> /bin/sh re-anchor
-			// (v6.2.2 MF-6).
-			return replTokenInExecSlotDepth(h[k:], token, effPath, tCaller, depth+1)
+			// (v6.2.2 MF-6). findPathToken does NOT propagate: even when the
+			// outer scan was find's own {}, an xargs descent re-exposes the
+			// token to arbitrary stdin bytes (v6.2.2 Oracle R4 R4-MF-2).
+			return replTokenInExecSlotDepth(h[k:], token, effPath, tCaller, depth+1, false)
 		}
 		return false
 	case "flock":
@@ -5166,7 +5169,7 @@ func replTokenInSSH(h []string, token string, outerCaller callerIdentity, depth 
 		if len(rseg.argv) == 0 {
 			continue
 		}
-		if replTokenInExecSlotDepth(rseg.argv, token, os.Getenv("PATH"), callerIdentity{cwd: outerCaller.cwd}, depth+1) {
+		if replTokenInExecSlotDepth(rseg.argv, token, os.Getenv("PATH"), callerIdentity{cwd: outerCaller.cwd}, depth+1, false) {
 			return true
 		}
 	}
@@ -5190,7 +5193,7 @@ func inlineSlotInterpBase(b string) bool {
 // while multi-code interpreters (perl/ruby/node/bun/tsx/php) may carry a
 // SECOND -e/-r after the first whose slot the runtime expansion can still
 // arm. The zone ends at -- or the first static non-option script operand.
-func interpOptionZoneHasToken(h []string, token, base string) bool {
+func interpOptionZoneHasToken(h []string, token, base string, findPathToken bool) bool {
 	spec, hasSpec := lookupInterpOptSpec(base)
 	end := len(h)
 	codeDone := 0
@@ -5200,7 +5203,7 @@ func interpOptionZoneHasToken(h []string, token, base string) bool {
 			end = i + 1 // the word right after -- is the script operand
 			break
 		}
-		ni, stopZone, stopExcl, zoneEnd, consumedCode := interpZoneWordStep(spec, hasSpec, base, h, i, codeDone, token)
+		ni, stopZone, stopExcl, zoneEnd, consumedCode := interpZoneWordStep(spec, hasSpec, base, h, i, codeDone, token, findPathToken)
 		if consumedCode {
 			codeDone++
 		}
@@ -5239,11 +5242,16 @@ func interpOptionZoneHasToken(h []string, token, base string) bool {
 // non-option word AFTER a code slot is input-DATA (the script file or
 // stdin data — v6.2.2 R3 R3-MF-5/Reviewer R2-6 `find -exec perl -pe
 // 's/a/b/' {}`), so it ends the zone for REAL instead of posing as the
-// script operand. token is the replacement token xargs/find expands
-// (v6.2.2 R5): a token-carrying post-code positional only stays data
-// when it sits at the LAST argv index (no trailing words its expansion
-// can arm into a second -e/-r code operand).
-func interpZoneWordStep(spec interpOptSpec, hasSpec bool, base string, h []string, i, codeDone int, token string) (next int, stopZone, stopExcl, zoneEnd, consumedCode bool) {
+// script operand. token is the replacement token xargs/find expands and
+// findPathToken is true ONLY for find's own "{}" (whose expansion onto
+// scan-root file paths never starts with '-'): a token-carrying post-code
+// positional stays data only when it is provably option-inert — the token
+// is absent, a non-empty static prefix precedes it (`./{}`/`dir/{}` — the
+// expansion can never begin with '-'), or it is find's own bare "{}"
+// (v6.2.2 Oracle R4 R4-MF-2: the R5 last-word exemption let a single
+// xargs-fed word arm a GLUED second code option — `-esystem("pig")` —
+// with no trailing operand at all).
+func interpZoneWordStep(spec interpOptSpec, hasSpec bool, base string, h []string, i, codeDone int, token string, findPathToken bool) (next int, stopZone, stopExcl, zoneEnd, consumedCode bool) {
 	a := h[i]
 	next = i
 	if !hasSpec {
@@ -5293,7 +5301,7 @@ func interpZoneWordStep(spec interpOptSpec, hasSpec bool, base string, h []strin
 			// Everything else ends the zone EXCLUDED — a static data file
 			// never counts as a zone hit (v6.2.2 R3 R3-MF-5 / Reviewer
 			// R2-6 `find -exec perl -pe 's/a/b/' {}` stays allowed).
-			if !isDynamicArg(a) && (!strings.Contains(a, token) || i == len(h)-1) {
+			if !isDynamicArg(a) && (!strings.Contains(a, token) || strings.Index(a, token) > 0 || (findPathToken && a == "{}")) {
 				return i, true, true, false, false
 			}
 		}
@@ -5322,6 +5330,7 @@ func interpClusterZoneStep(spec interpOptSpec, a string, h []string, i int) (con
 		return 0, false
 	}
 	plus := a[0] == '+'
+	hasFlagCode := false
 	for j := 1; j < len(a); j++ {
 		ch := a[j]
 		if !plus && strings.IndexByte(spec.gluedCodes, ch) >= 0 {
@@ -5331,23 +5340,25 @@ func interpClusterZoneStep(spec interpOptSpec, a string, h []string, i int) (con
 			return consumed, true
 		}
 		if !plus && strings.IndexByte(spec.flagCodes, ch) >= 0 {
+			hasFlagCode = true
 			if j+1 >= len(a) {
-				if i+1+consumed < len(h) {
-					consumed++
-				}
-				return consumed, true
+				return interpZoneConsumeNext(consumed, i, h), true
 			}
 			// A letter-only tail keeps parsing as cluster flags — the
 			// pending flag-code letter only settles its operand when the
 			// scan reaches the end of the word (v6.2.2 R3 R3-MF-5: `node
 			// -pe 1 {}` must expose exactly ONE code operand, not two).
+			// hasFlagCode carries it across the continuation so a later
+			// non-flag letter cannot drop it (v6.2.2 Oracle R4 R4-SF-1).
 			continue
 		}
 		if strings.IndexByte(spec.valShort, ch) >= 0 {
-			if j+1 >= len(a) && i+1+consumed < len(h) {
-				consumed++
+			if j+1 >= len(a) {
+				consumed = interpZoneConsumeNext(consumed, i, h)
 			}
-			return consumed, false
+			// A pending flag-code letter whose operand is the same next
+			// argv: the operand remains the CODE slot (v6.2.2 R4-SF-1).
+			return consumed, hasFlagCode
 		}
 		if strings.IndexByte(spec.optNumShort, ch) >= 0 {
 			j += consumeNumOptTail(a, j, ch)
@@ -5357,7 +5368,22 @@ func interpClusterZoneStep(spec interpOptSpec, a string, h []string, i int) (con
 			return consumed, false
 		}
 	}
+	if hasFlagCode {
+		// The cluster ended on non-settling letters after a flag-code
+		// letter (`node -pi`): the next argv is the pending CODE operand
+		// (v6.2.2 Oracle R4 R4-SF-1, scanShortCluster pending parity).
+		return interpZoneConsumeNext(consumed, i, h), true
+	}
 	return consumed, false
+}
+
+// interpZoneConsumeNext adds one to consumed when the cluster's trailing
+// value/code letter can still reach a next argv operand (v6.2.2 R4-SF-1).
+func interpZoneConsumeNext(consumed, i int, h []string) int {
+	if i+1+consumed < len(h) {
+		return consumed + 1
+	}
+	return consumed
 }
 
 // replTokenInToolExecSlots covers the awk/sed/tar/git execution slots a
@@ -5425,8 +5451,23 @@ func awkOptZoneHasToken(args []string, token string) bool {
 			endOpts = true
 			continue
 		}
-		if endOpts || !strings.HasPrefix(a, "-") || a == "-" {
-			return false // first positional begins program/data operands
+		if endOpts {
+			return false // words after -- / gawk -E are awk's argv data
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			// Positional program/input-file operands do NOT end the scan:
+			// GNU gawk's getopt_long permutes options after operands, so a
+			// trailing -f/--file/-i/-W still parses (v6.2.2 Oracle R4
+			// R4-MF-4 `gawk -e '1' /dev/null -f '{}'`).
+			continue
+		}
+		if awkGluedDataAssign(a) {
+			// Glued pure-data assignments (-vf={} / -F{} / --assign=f={} /
+			// --field-separator={}) carry their value inside the word: the
+			// token there is DATA awk never executes as program text, in
+			// parity with the separate-operand spelling (v6.2.2 Oracle R4
+			// R4-SF-3 `awk -v f={}` stays allowed).
+			continue
 		}
 		if strings.Contains(a, token) {
 			return true
@@ -5438,6 +5479,22 @@ func awkOptZoneHasToken(args []string, token string) bool {
 		i += consume
 	}
 	return false
+}
+
+// awkGluedDataAssign reports whether a is a GLUED pure-data awk assignment
+// word (-v<kv> / -F<fs> / --assign=<kv> / --field-separator=<fs>): the
+// value lives inside the word itself, so the separate-operand data
+// exemption applies to the whole word (v6.2.2 Oracle R4 R4-SF-3). Only
+// cluster shapes whose FIRST letter is the value letter count — in
+// `-ev{}` the tail is program text, not an assignment.
+func awkGluedDataAssign(a string) bool {
+	if strings.HasPrefix(a, "--assign=") || strings.HasPrefix(a, "--field-separator=") {
+		return true
+	}
+	if strings.HasPrefix(a, "--") || len(a) < 3 {
+		return false
+	}
+	return a[0] == '-' && (a[1] == 'v' || a[1] == 'F')
 }
 
 // awkOptWordTokenStep advances awkOptZoneHasToken past the option word at
@@ -5466,7 +5523,7 @@ func awkOptWordTokenStep(args []string, i int, token string) (consume int, hit b
 	}
 	for j := 1; j < len(a); j++ {
 		switch a[j] {
-		case 'e', 'f', 'i':
+		case 'e', 'f', 'i', 'E':
 			// Program-bearing options: the operand IS awk source (or names
 			// the source file/library), so a token inside it is a hit.
 			if j+1 >= len(a) && i+1 < len(args) {
@@ -5490,20 +5547,45 @@ func awkOptWordTokenStep(args []string, i int, token string) (consume int, hit b
 	return 0, false
 }
 
+// (awkWValueIsProgram is superseded by awkLongProgramName's GNU-prefix
+// resolution — v6.2.2 Oracle R4 R4-MF-4.)
+
 // awkWOperandTokenStep handles one gawk -W compatibility letter inside a
-// short cluster: -W source=PROG supplies program text inline, -W file=FILE
-// and -W exec[=FILE] name the program file (v6.2.2 R3 R3-MF-6 — the
-// letter was dropped in R3 and -W 'source={}' slipped past).
+// short cluster under GNU getopt_long's "W;" translation (`-W x=y` ==
+// `--x=y`, `-W x` == `--x`, `-W x y` == `--x y` — v6.2.2 Oracle R4
+// R4-MF-4): the bare-word spellings consume the operand word AND the
+// value word after it, and the token check lands on the real VALUE slot
+// (`-W exec '{}'` hits on args[i+2], not on the bare word `exec`).
 func awkWOperandTokenStep(args []string, i, j int, a, token string) (consume int, hit bool) {
+	v := ""
+	consume = 0
 	if j+1 < len(a) {
-		v := a[j+1:]
-		return 0, awkWValueIsProgram(v) && strings.Contains(v, token)
+		v = a[j+1:]
+	} else if i+1 < len(args) {
+		v, consume = args[i+1], 1
+	} else {
+		return 0, false
 	}
-	if i+1 < len(args) {
-		v := args[i+1]
-		return 1, awkWValueIsProgram(v) && strings.Contains(v, token)
+	// Inline x=y spelling: the value is inside v itself.
+	name, eqVal, hasEq := strings.Cut(v, "=")
+	isProg, _ := awkLongProgramName(name)
+	if !isProg {
+		return consume, false
 	}
-	return 0, false
+	if hasEq {
+		return consume, strings.Contains(eqVal, token)
+	}
+	// Bare -W word spelling: the value is the NEXT argv after the operand
+	// word — that slot is what carries the token (`-W exec '{}'`). Both
+	// file-valued (exec/file) and inline-text (source) operands hit on it:
+	// either way the word names awk program material.
+	if i+consume+1 < len(args) {
+		if strings.Contains(args[i+consume+1], token) {
+			return consume + 1, true
+		}
+		return consume + 1, false
+	}
+	return consume, false
 }
 
 // awkWClusterValue extracts the -W operand of one awk short cluster:
@@ -5518,14 +5600,83 @@ func awkWClusterValue(args []string, i, j int, a string) (v string, consumedNext
 	return "", false
 }
 
-// awkClusterFrags scans one short-option cluster of awk's argv (extracted
-// from awkProgramFrags so the main walk stays under the complexity budget
-// — v6.2.2 R3 R3-MF-6): 'e' collects program fragments, 'f' names a
-// program FILE (stdin devices and unsafe dynamic paths fail closed), the
-// data letters 'F'/'v'/'i' consume their operands, and the gawk
-// compatibility letter 'W' re-plays source=/file=/exec program shapes.
-// consumedNext counts how many EXTRA argv operands the cluster eats.
-func awkClusterFrags(args []string, i int, a string) (frags []string, sawFile bool, consumedNext int, hit string) {
+// awkProgramFileHit applies the `-f` program-FILE source validation to one
+// operand value v: `-`/stdin devices read the PROGRAM from stdin (unvetted),
+// an unsafe dynamic path fails closed.
+func awkProgramFileHit(v string) string {
+	if v == "-" || isStdinDevicePath(v) {
+		return "awk script from stdin"
+	}
+	if isDynamicArg(v) && !isSafeDynamicDataOperand(v) {
+		return "dynamic code payload"
+	}
+	return ""
+}
+
+// awkLongProgramName reports whether name GNU-prefix-resolves to one of
+// gawk's program-source long options (file/source/include/load/exec).
+// source/include are the inline-text/library pair, file/exec/load name
+// files. isLongOptAbbrev's minPrefixLen is 1 for the unambiguous pair and
+// 3/2 for the ambiguous ones, matching GNU's unique-prefix rule
+// (v6.2.2 Oracle R4 R4-MF-4 `-W 'so=...'`).
+func awkLongProgramName(name string) (isProgram bool, isFile bool) {
+	switch {
+	case isLongOptAbbrev(name, "source", 2):
+		return true, false
+	case isLongOptAbbrev(name, "file", 3):
+		return true, true
+	case isLongOptAbbrev(name, "exec", 2):
+		return true, true
+	case isLongOptAbbrev(name, "include", 3):
+		return true, true
+	case isLongOptAbbrev(name, "load", 3):
+		return true, true
+	}
+	return false, false
+}
+
+// awkWOperandProgram parses one gawk `-W` compatibility operand value under
+// GNU getopt_long's "W;" translation (`-W x=y` == `--x=y`, `-W x` == `--x`,
+// `-W x y` == `--x y` — v6.2.2 Oracle R4 R4-MF-4): frags/appended program
+// text is reported through frag (empty when not a source operand), isFile
+// marks a program-FILE source and fileVal carries its value (which for the
+// bare-word `-W exec FILE` / `-W file FILE` spellings lives in the NEXT
+// argv — the caller consumes it). consumedNext reports the operand needed
+// one additional argv beyond the -W word itself (bare `-W` + operand word
+// already counts one).
+func awkWOperandProgram(v string, args []string, nextIdx int) (frag string, isFile bool, fileVal string, hit string, extraConsumed int) {
+	name, val, hasEq := strings.Cut(v, "=")
+	isProg, isF := awkLongProgramName(name)
+	if !isProg {
+		return "", false, "", "", 0
+	}
+	if !hasEq {
+		// Bare -W word spelling (`-W source PROG` / `-W exec FILE`): the value
+		// is the NEXT argv after the operand word.
+		if nextIdx < len(args) {
+			val, extraConsumed = args[nextIdx], 1
+		} else {
+			val = ""
+		}
+	}
+	if !isF {
+		return val, false, "", "", extraConsumed
+	}
+	return "", true, val, awkProgramFileHit(val), extraConsumed
+}
+
+// awkClusterFragsEnd scans one short-option cluster of awk's argv
+// (extracted from awkProgramFrags so the main walk stays under the
+// complexity budget — v6.2.2 R3 R3-MF-6): 'e' collects program fragments,
+// 'f'/'E' name a program FILE (stdin devices and unsafe dynamic paths fail
+// closed, 'E' additionally ends the option scan like gawk's own --exec),
+// the data letters 'F'/'v'/'i' consume their operands, and the gawk
+// compatibility letter 'W' re-plays source=/file=/exec program shapes
+// under GNU getopt_long "W;" semantics. consumedNext counts how many
+// EXTRA argv operands the cluster eats; endOut (when non-nil) is set true
+// after gawk's -E/--exec shape terminates awk's own option parsing
+// (v6.2.2 Oracle R4 R4-MF-4).
+func awkClusterFragsEnd(args []string, i int, a string, endOut *bool) (frags []string, sawFile bool, consumedNext int, hit string) {
 	for j := 1; j < len(a); j++ {
 		switch a[j] {
 		case 'e':
@@ -5536,20 +5687,12 @@ func awkClusterFrags(args []string, i int, a string) (frags []string, sawFile bo
 				consumedNext++
 			}
 			return frags, sawFile, consumedNext, ""
-		case 'f':
+		case 'f', 'E':
 			sawFile = true
-			v := a[j+1:]
-			if v == "" {
-				if i+1+consumedNext < len(args) {
-					v = args[i+1+consumedNext]
-					consumedNext++
-				}
-			}
-			if v == "-" || isStdinDevicePath(v) {
-				return nil, sawFile, consumedNext, "awk script from stdin"
-			}
-			if isDynamicArg(v) && !isSafeDynamicDataOperand(v) {
-				return nil, sawFile, consumedNext, "dynamic code payload"
+			_, extra, fh := awkClusterFileOperand(args, i, j, a, consumedNext, a[j] == 'E', endOut)
+			consumedNext += extra
+			if fh != "" {
+				return nil, sawFile, consumedNext, fh
 			}
 			return frags, sawFile, consumedNext, ""
 		case 'F', 'v', 'i':
@@ -5558,14 +5701,14 @@ func awkClusterFrags(args []string, i int, a string) (frags []string, sawFile bo
 			}
 			return frags, sawFile, consumedNext, ""
 		case 'W':
-			wv, wConsumed := awkWClusterValue(args, i+consumedNext, j, a)
-			if wConsumed {
-				consumedNext++
+			wFrag, wSawFile, wExtra, wh := awkClusterWOperand(args, i, j, a, consumedNext, endOut)
+			consumedNext += wExtra
+			if wFrag != "" {
+				frags = append(frags, wFrag)
 			}
-			if strings.HasPrefix(wv, "source=") {
-				frags = append(frags, wv[len("source="):])
-			} else if awkWValueIsProgram(wv) {
-				sawFile = true
+			sawFile = sawFile || wSawFile
+			if wh != "" {
+				return nil, sawFile, consumedNext, wh
 			}
 			return frags, sawFile, consumedNext, ""
 		}
@@ -5573,12 +5716,42 @@ func awkClusterFrags(args []string, i int, a string) (frags []string, sawFile bo
 	return frags, sawFile, consumedNext, ""
 }
 
-// awkWValueIsProgram reports whether one gawk -W compatibility operand
-// arms awk program text: -W source=PROG supplies program source inline,
-// -W file=FILE and -W exec[=FILE] name the program file.
-func awkWValueIsProgram(v string) bool {
-	return strings.HasPrefix(v, "source=") || strings.HasPrefix(v, "file=") ||
-		v == "exec" || strings.HasPrefix(v, "exec=")
+// awkClusterFileOperand resolves the program-file operand of one -f/-E
+// cluster letter (glued tail or next argv), reporting the EXTRA argv count
+// and any stdin/dynamic hit; -E additionally marks endOpts through endOut
+// (v6.2.2 Oracle R4 R4-MF-4).
+func awkClusterFileOperand(args []string, i, j int, a string, consumedNext int, isE bool, endOut *bool) (v string, extra int, hit string) {
+	if isE && endOut != nil {
+		// gawk -E/--exec terminates option parsing: words after its
+		// operand are the program's argv data.
+		*endOut = true
+	}
+	v = a[j+1:]
+	if v == "" && i+1+consumedNext < len(args) {
+		v, extra = args[i+1+consumedNext], 1
+	}
+	return v, extra, awkProgramFileHit(v)
+}
+
+// awkClusterWOperand resolves one gawk -W compatibility letter inside a
+// short cluster (glued tail or operand word), reporting the program
+// fragment / file-source / extra argv count / hit under GNU getopt_long's
+// "W;" translation (v6.2.2 Oracle R4 R4-MF-4).
+func awkClusterWOperand(args []string, i, j int, a string, consumedNext int, endOut *bool) (frag string, sawFile bool, extra int, hit string) {
+	wv, wConsumed := awkWClusterValue(args, i+consumedNext, j, a)
+	if wConsumed {
+		extra++
+	}
+	frag, isFile, _, wh, wc := awkWOperandProgram(wv, args, i+consumedNext+extra+1)
+	extra += wc
+	if isFile {
+		sawFile = true
+		wName, _, _ := strings.Cut(wv, "=")
+		if isLongOptAbbrev(wName, "exec", 2) && endOut != nil {
+			*endOut = true // -W exec == --exec: ends awk's option parsing
+		}
+	}
+	return frag, sawFile, extra, wh
 }
 
 // awkLongValueIsProgram reports whether a gawk long option's value operand
@@ -5864,9 +6037,33 @@ func gitGlobalOptTokenStep(h []string, i int, token string) (consume int, hit, c
 	// Pure-data glued long forms are exempted from the blanket token hit
 	// below: their value is a path the git binary consumes itself, never a
 	// shell-bound string (v6.2.2 R3 R3-MF-6 / Reviewer R2-6 parity with
-	// the separate-operand spelling).
+	// the separate-operand spelling). --exec-path is NOT here: it redirects
+	// git's subprogram lookup directory, which screenGitGlobalArgs blocks
+	// unconditionally, so a token there must hit (v6.2.2 Oracle R4 R4-SF-2).
 	gluedData := strings.HasPrefix(a, "--git-dir=") || strings.HasPrefix(a, "--work-tree=") ||
-		strings.HasPrefix(a, "--namespace=") || strings.HasPrefix(a, "--exec-path=")
+		strings.HasPrefix(a, "--namespace=")
+	// Key=value-bearing shapes are screened BEFORE the blanket token hit
+	// (v6.2.2 Oracle R4 R4-SF-2 — the blanket hit used to precede them,
+	// making this code unreachable and false-hitting `git -cuser.name={}`
+	// while the separate `-c user.name={}` spelling stayed allowed).
+	if len(a) > 2 && strings.HasPrefix(a, "-c") && !strings.HasPrefix(a, "--") {
+		if gitExecConfigValueHasToken(a[2:], token) {
+			return 0, true, false
+		}
+		return 0, false, true
+	}
+	if strings.HasPrefix(a, "--config-env=") {
+		if gitExecConfigValueHasToken(a[len("--config-env="):], token) {
+			return 0, true, false
+		}
+		return 0, false, true
+	}
+	if len(a) > 2 && strings.HasPrefix(a, "-C") && !strings.HasPrefix(a, "--") {
+		// Glued -C<dir>: a plain path value exactly like the separate
+		// operand — never a hit on its own (v6.2.2 Oracle R4 R4-SF-2
+		// `find . -exec git -C{} status \;` parity).
+		return 0, false, true
+	}
 	if strings.Contains(a, token) && !isBareDashC && !gluedData {
 		return 0, true, false
 	}
@@ -5879,19 +6076,22 @@ func gitGlobalOptTokenStep(h []string, i int, token string) (consume int, hit, c
 		}
 		return 0, false, true
 	}
-	if len(a) > 2 && strings.HasPrefix(a, "-c") && !strings.HasPrefix(a, "--") {
-		if gitExecConfigValueHasToken(a[2:], token) {
-			return 0, true, false
-		}
-		return 0, false, true
-	}
-	if a == "-C" || a == "--git-dir" || a == "--work-tree" || a == "--namespace" ||
-		a == "--exec-path" {
+	if a == "-C" || a == "--git-dir" || a == "--work-tree" || a == "--namespace" {
 		// Plain path value operand — pure DATA (git -C {} status): the word
 		// is consumed so it cannot pose as the subcommand, but a token
 		// inside it never reaches a shell (v6.2.2 R3).
 		if i+1 < len(h) {
 			return 1, false, true
+		}
+		return 0, false, true
+	}
+	if a == "--exec-path" || strings.HasPrefix(a, "--exec-path=") {
+		// --exec-path redirects git's subprogram lookup directory — NOT pure
+		// data (screenGitGlobalArgs blocks it unconditionally). A token in
+		// the value already hit above; the plain form still consumes its
+		// operand so it cannot pose as the subcommand (v6.2.2 R4-SF-2).
+		if a == "--exec-path" && i+1 < len(h) {
+			return 1, strings.Contains(h[i+1], token), true
 		}
 		return 0, false, true
 	}
@@ -5910,12 +6110,6 @@ func gitGlobalOptTokenStep(h []string, i int, token string) (consume int, hit, c
 				return 1, true, false
 			}
 			return 1, false, true
-		}
-		return 0, false, true
-	}
-	if strings.HasPrefix(a, "--config-env=") {
-		if gitExecConfigValueHasToken(a[len("--config-env="):], token) {
-			return 0, true, false
 		}
 		return 0, false, true
 	}
@@ -6016,7 +6210,7 @@ func replTokenInFlock(h []string, token, effPath string, outerCaller callerIdent
 		}
 	}
 	if innerIdx < len(h) {
-		return replTokenInExecSlotDepth(h[innerIdx:], token, effPath, outerCaller, depth+1)
+		return replTokenInExecSlotDepth(h[innerIdx:], token, effPath, outerCaller, depth+1, false)
 	}
 	return false
 }
@@ -6033,7 +6227,7 @@ func replTokenInWatch(h []string, token, effPath string, outerCaller callerIdent
 		return false
 	}
 	if execMode {
-		return replTokenInExecSlotDepth(h[k:], token, effPath, outerCaller, depth+1)
+		return replTokenInExecSlotDepth(h[k:], token, effPath, outerCaller, depth+1, false)
 	}
 	return strings.Contains(strings.Join(h[k:], " "), token)
 }
@@ -6094,7 +6288,11 @@ func findExecTerminatorHit(args []string, i int, token, effPath string, outerCal
 	if j >= len(args) {
 		return len(args) - 1, true
 	}
-	if j > i+1 && replTokenInExecSlotDepth(args[i+1:j], token, effPath, outerCaller, depth+1) {
+	// A NESTED find descent passes false: even when the outermost scan was
+	// find's own {}, this inner command is reached through an xargs/flock/
+	// ssh layer where the token already re-exposes to arbitrary bytes
+	// (v6.2.2 Oracle R4 R4-MF-2).
+	if j > i+1 && replTokenInExecSlotDepth(args[i+1:j], token, effPath, outerCaller, depth+1, false) {
 		return j, true
 	}
 	return j, false
@@ -6808,6 +7006,13 @@ func scriptOptZoneHasToken(h []string, token string) bool {
 // inside a value operand.
 func scriptOptWordTokenStep(h []string, i int, token string) (consume int, hit bool) {
 	a := h[i]
+	if !strings.HasPrefix(a, "-") || len(a) <= 1 {
+		// Positional operands are not option words — treating them as short
+		// clusters would let a filename ending in c/O/I/... swallow the
+		// following `--` terminator (v6.2.2 Oracle R4 R4-SF-3
+		// `script /tmp/out.o -- %`).
+		return 0, false
+	}
 	if strings.HasPrefix(a, "--") {
 		name := a[2:]
 		hasEq := strings.IndexByte(name, '=') >= 0
@@ -7908,7 +8113,7 @@ func screenFindExecInner(args []string, i, j int, op string, outerSeg shellSegme
 		return ""
 	}
 	inner := args[i+1 : j]
-	if replTokenInExecSlot(inner, "{}", caller.pathEnv, caller) {
+	if replTokenInExecSlotFind(inner, "{}", caller.pathEnv, caller) {
 		return "find " + op + " dynamic code payload"
 	}
 	// Nested hc/herdr-core via find -exec* / -ok* receives path args
@@ -8574,6 +8779,61 @@ func isStdinDevicePath(p string) bool {
 	return false
 }
 
+// awkProgramLongStep handles one `--` word of awkProgramFrags' walk
+// (extracted so the main loop stays under the complexity budget — v6.2.2
+// Oracle R4 R4-MF-4): frag carries an inline program fragment (--source),
+// sawFile marks a program-FILE source, consumed counts EXTRA argv operands
+// eaten, endOpts reports gawk --exec's end-of-options, hit is the
+// stdin/dynamic verdict.
+func awkProgramLongStep(args []string, i int, a string) (frag string, sawFile bool, consumed int, endOpts bool, hit string) {
+	name, val, hasEq := strings.Cut(a[2:], "=")
+	if isLongOptAbbrev(name, "exec", 2) {
+		// gawk --exec == --file plus end-of-options.
+		endOpts = true
+	}
+	switch {
+	case isLongOptAbbrev(name, "file", 3) || isLongOptAbbrev(name, "exec", 2):
+		sawFile = true
+		if !hasEq {
+			if i+1 < len(args) {
+				val = args[i+1]
+			}
+			consumed = 1
+		}
+		return "", sawFile, consumed, endOpts, awkProgramFileHit(val)
+	case isLongOptAbbrev(name, "source", 2):
+		if hasEq {
+			return val, false, 0, false, ""
+		}
+		if i+1 < len(args) {
+			return args[i+1], false, 1, false, ""
+		}
+		return "", false, 0, false, ""
+	case name == "assign" || name == "field-separator":
+		if !hasEq {
+			consumed = 1
+		}
+		return "", false, consumed, false, ""
+	case isLongOptAbbrev(name, "include", 3) || isLongOptAbbrev(name, "load", 3):
+		// --include/--load supply library text/compiled files: consume the
+		// operand and apply the program-file validation to it (a stdin device
+		// would smuggle unvetted awk text — v6.2.2 Oracle R4 R4-MF-4).
+		if !hasEq {
+			if i+1 < len(args) {
+				val = args[i+1]
+			}
+			consumed = 1
+		}
+		if isLongOptAbbrev(name, "load", 3) {
+			return "", false, consumed, endOpts, awkProgramFileHit(val)
+		}
+		return "", false, consumed, endOpts, ""
+	case strings.HasPrefix("file", name) || strings.HasPrefix("include", name):
+		return "", false, 0, false, "dynamic code payload"
+	}
+	return "", false, 0, false, ""
+}
+
 func awkProgramFrags(args []string) (string, bool, string) {
 	var frags []string
 	var positional string
@@ -8597,67 +8857,42 @@ func awkProgramFrags(args []string) (string, bool, string) {
 			continue
 		}
 		if !endOpts && strings.HasPrefix(a, "--") && a != "--" {
-			name, val, hasEq := strings.Cut(a[2:], "=")
-			switch {
-			case isLongOptAbbrev(name, "file", 3):
-				sawFile = true
-				if !hasEq {
-					if i+1 < len(args) {
-						val = args[i+1]
-					}
-					i++
-				}
-				if val == "-" || isStdinDevicePath(val) {
-					return "", sawFile, "awk script from stdin"
-				}
-				if isDynamicArg(val) && !isSafeDynamicDataOperand(val) {
-					return "", sawFile, "dynamic code payload"
-				}
-				continue
-			case isLongOptAbbrev(name, "source", 2):
-				if hasEq {
-					frags = append(frags, val)
-				} else if i+1 < len(args) {
-					frags = append(frags, args[i+1])
-					i++
-				}
-				continue
-			case name == "assign" || name == "field-separator" || isLongOptAbbrev(name, "include", 3):
-				if !hasEq {
-					i++
-				}
-				continue
-			case strings.HasPrefix("file", name) || strings.HasPrefix("include", name):
-				return "", sawFile, "dynamic code payload"
-			default:
-				continue
+			lFrag, lSawFile, consumed, lEnd, lHit := awkProgramLongStep(args, i, a)
+			if lHit != "" {
+				return "", sawFile || lSawFile, lHit
 			}
+			if lEnd {
+				endOpts = true
+			}
+			sawFile = sawFile || lSawFile
+			if lFrag != "" {
+				frags = append(frags, lFrag)
+			}
+			i += consumed
+			continue
 		}
 		switch {
 		case a == "--" && !endOpts:
 			endOpts = true
-		case a == "-f":
+		case a == "-f" || a == "-E":
 			sawFile = true
+			if a == "-E" {
+				endOpts = true // gawk -E == --exec: ends option parsing (R4-MF-4)
+			}
 			if i+1 < len(args) {
 				v := args[i+1]
 				// S3: `awk -f -` (and the /dev/stdin family) reads the
 				// PROGRAM from stdin — unvetted.
-				if v == "-" || isStdinDevicePath(v) {
-					return "", sawFile, "awk script from stdin"
-				}
-				if isDynamicArg(v) && !isSafeDynamicDataOperand(v) {
-					return "", sawFile, "dynamic code payload"
+				if fh := awkProgramFileHit(v); fh != "" {
+					return "", sawFile, fh
 				}
 			}
 			i++ // consume the file operand
-		case strings.HasPrefix(a, "--file="):
+		case strings.HasPrefix(a, "--file=") || strings.HasPrefix(a, "--exec="):
 			sawFile = true
-			v := a[len("--file="):]
-			if v == "-" || isStdinDevicePath(v) {
-				return "", sawFile, "awk script from stdin"
-			}
-			if isDynamicArg(v) && !isSafeDynamicDataOperand(v) {
-				return "", sawFile, "dynamic code payload"
+			v := a[strings.IndexByte(a, '=')+1:]
+			if fh := awkProgramFileHit(v); fh != "" {
+				return "", sawFile, fh
 			}
 		case a == "-e" || a == "--source":
 			if i+1 < len(args) {
@@ -8671,7 +8906,11 @@ func awkProgramFrags(args []string) (string, bool, string) {
 			var cSawFile bool
 			var cHit string
 			var consumedNext int
-			cFrag, cSawFile, consumedNext, cHit = awkClusterFrags(args, i, a)
+			var cEnd bool
+			cFrag, cSawFile, consumedNext, cHit = awkClusterFragsEnd(args, i, a, &cEnd)
+			if cEnd {
+				endOpts = true
+			}
 			if cHit != "" {
 				return "", sawFile || cSawFile, cHit
 			}
@@ -9573,7 +9812,7 @@ func tarSubagentClusterStep(args []string, i int) (consume int, cmd string) {
 				return 1, args[i+1]
 			}
 			return 0, ""
-		case 'f', 'C', 'T', 'X', 'b', 'L', 'H', 'h':
+		case 'f', 'C', 'T', 'X', 'b', 'L', 'H':
 			if j+1 >= len(a) && i+1 < len(args) {
 				return 1, "" // value operand is the next argv
 			}
@@ -14859,7 +15098,7 @@ func xargsFeedsCodeFlagDepth(inner, outerXargs []string, pathEnv string, caller 
 		return true
 	}
 	repl := xargsReplToken(outerXargs)
-	if repl != "" && replTokenInExecSlotDepth(inner, repl, pathEnv, caller, depth) {
+	if repl != "" && replTokenInExecSlotDepth(inner, repl, pathEnv, caller, depth, false) {
 		return true
 	}
 	p := peelExecSlotHead(inner, pathEnv, caller, repl)
@@ -14901,7 +15140,14 @@ func xargsVariantFeedsCodeSlot(h []string, repl string, outerXargs []string, eff
 		if scriptHasOpenCommandFlag(h) {
 			return true
 		}
-		return isDynamicArg(scriptCommandArg(h))
+		if isDynamicArg(scriptCommandArg(h)) {
+			return true
+		}
+		// Append mode: util-linux script never batch-consumes multiple
+		// typescript files, so fed stdin words land where getopt can
+		// permute them into -c/--command (v6.2.2 Oracle R4 R4-Obs-1
+		// `xargs -a <payload> script /dev/null`).
+		return repl == ""
 	case "eval":
 		return repl == ""
 	case "find":
@@ -15005,37 +15251,15 @@ func xargsWatchFeedsCodeSlot(h, outerXargs []string, effPath string, outerCaller
 	return xargsFeedsCodeFlagDepth(h[k:], outerXargs, effPath, outerCaller, depth+1)
 }
 
-// xargsFindFeedsCodeSlot reports whether a find target carries an unclosed
-// -exec/-execdir/-ok/-okdir operator: the fed words would land inside its
-// command argv — open only when the outer xargs appends operands (no -I).
+// xargsFindFeedsCodeSlot reports whether fed words can land inside a
+// find target's -exec/-execdir/-ok/-okdir command argv. With a replace
+// token the scan can never prove it (replTokenInFind owns the token
+// analysis — the loop that used to walk the operand list here returned
+// false on every path, dead code since v6.2.2 R3 — v6.2.2 Oracle R4
+// R4-SF-4); in append mode the stdin words always land in find's
+// expression tail (`xargs find .` feeding `-exec pig ;`).
 func xargsFindFeedsCodeSlot(args []string, repl string) bool {
-	if repl == "" {
-		// Appended stdin words always land in find's expression/action tail:
-		// `xargs find .` feeding `-exec pig ;` is parsed as the operator
-		// sequence outright (v6.2.2 MF-7), open or not.
-		return true
-	}
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if a == "-exec" || a == "-execdir" || a == "-ok" || a == "-okdir" {
-			j := i + 1
-			for j < len(args) && args[j] != ";" && args[j] != "+" {
-				j++
-			}
-			if j >= len(args) {
-				return false // closed by the replace token's own expansion
-			}
-			i = j
-			continue
-		}
-		if isFindValueOpt(a) {
-			i++
-			if a == "-fprintf" {
-				i++ // -fprintf FILE FORMAT — two operands (v6.2.2 MF-7)
-			}
-		}
-	}
-	return false
+	return repl == ""
 }
 
 // langHasBacktickSpawn reports whether the language's code can spawn a
@@ -17628,6 +17852,7 @@ func clusterConsumesOperand(spec interpOptSpec, a string) (consumes, isCode bool
 		return false, false
 	}
 	plus := a[0] == '+'
+	hasFlagCode := false
 	for j := 1; j < len(a); j++ {
 		ch := a[j]
 		if !plus && strings.IndexByte(spec.gluedCodes, ch) >= 0 {
@@ -17639,8 +17864,12 @@ func clusterConsumesOperand(spec interpOptSpec, a string) (consumes, isCode bool
 		if !plus && strings.IndexByte(spec.flagCodes, ch) >= 0 {
 			// Flag-model code letter (node -pe / sh -c): its operand is the
 			// next argv and it is CODE. Letters after a letter-only tail keep
-			// parsing as flags, so the scan only settles once the letter
-			// ends the cluster.
+			// parsing as flags — remember the pending code letter through
+			// hasFlagCode even when the scan continues, so a later NON-flag
+			// letter settling the cluster cannot drop it (v6.2.2 Oracle R4
+			// R4-SF-1: scanShortCluster keeps `pending` across exactly the
+			// same continuation).
+			hasFlagCode = true
 			if tail := a[j+1:]; tail != "" && !isLetterOnly(tail) {
 				return false, false
 			}
@@ -17651,6 +17880,13 @@ func clusterConsumesOperand(spec interpOptSpec, a string) (consumes, isCode bool
 		}
 		if strings.IndexByte(spec.valShort, ch) >= 0 {
 			if j+1 >= len(a) {
+				if hasFlagCode {
+					// A pending flag-code letter followed by a bare value letter:
+					// BOTH consume the next argv in scanShortCluster's pending
+					// model — the value letter loses (only one operand exists),
+					// so the operand remains the CODE slot (v6.2.2 R4-SF-1).
+					return true, true
+				}
 				return true, false // bare value letter: the operand is the next argv
 			}
 			return false, false // glued tail IS the value — the cluster ends
@@ -17662,6 +17898,12 @@ func clusterConsumesOperand(spec interpOptSpec, a string) (consumes, isCode bool
 		if strings.IndexByte(spec.optShort, ch) >= 0 {
 			return false, false // optional-glued tail absorbs the rest
 		}
+	}
+	if hasFlagCode {
+		// The cluster ended on non-settling flag letters after a flag-code
+		// letter (`node -pi` where 'i' is not in any table): the next argv
+		// is still the pending CODE operand (v6.2.2 Oracle R4 R4-SF-1).
+		return true, true
 	}
 	return false, false
 }
