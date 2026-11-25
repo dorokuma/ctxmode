@@ -9070,85 +9070,9 @@ func screenTarSubagent(args []string, depth int, caller callerIdentity) string {
 			return "dynamic code payload"
 		}
 		var cmd string
-		switch {
-		case strings.HasPrefix(a, "--") && strings.IndexByte(a, '=') >= 0:
-			lname, lval, _ := strings.Cut(a[2:], "=")
-			switch {
-			case tarExecLongMatch(lname, "checkpoint-action"):
-				if strings.HasPrefix(lval, "exec=") {
-					cmd = lval[len("exec="):]
-				} else if lval == "exec" {
-					cmd = "true" // bare exec still arms the hook
-				}
-			case tarExecLongMatch(lname, "to-command") || tarExecLongMatch(lname, "use-compress-program"):
-				cmd = lval
-			}
-		case strings.HasPrefix(a, "--"):
-			lname := a[2:]
-			switch {
-			case tarExecLongMatch(lname, "checkpoint-action"):
-				if i+1 < len(args) {
-					v := args[i+1]
-					if strings.HasPrefix(v, "exec=") {
-						cmd = v[len("exec="):]
-					}
-					i++
-				}
-			case tarExecLongMatch(lname, "to-command") || tarExecLongMatch(lname, "use-compress-program"):
-				if i+1 < len(args) {
-					cmd = args[i+1]
-					i++
-				}
-			}
-		case a == "-I":
-			if i+1 < len(args) {
-				cmd = args[i+1]
-				i++
-			}
-		case strings.HasPrefix(a, "-I") && len(a) > 2:
-			cmd = a[2:]
-		case a == "-f" || a == "--file" || a == "-C" || a == "--directory" ||
-			a == "-T" || a == "--files-from" || a == "-X" || a == "--exclude-from" ||
-			a == "--exclude" || a == "--owner" || a == "--group" || a == "--mode" ||
-			a == "--mtime" || a == "--strip-components" || a == "--transform" ||
-			a == "--format" || a == "--index-file" || a == "--occurrence":
-			// Data value slot: the next argv is a filename/dir/pattern, not
-			// an option — a dynamic value is already screened above.
-			i++
-		case strings.HasPrefix(a, "--"):
-			// Other long options (--numeric-owner, --exclude=pat, ...).
-		case strings.HasPrefix(a, "-") && len(a) > 1:
-			// Short-option cluster: f/C/T/X take a value operand — the
-			// cluster tail or the next argv — and end the cluster. 'I' inside
-			// a cluster is --use-compress-program's short form whose operand
-			// arms an exec hook (v6.2.2 R3 R2-SF-3).
-			for j := 1; j < len(a); j++ {
-				switch a[j] {
-				case 'I':
-					if j+1 < len(a) {
-						cmd = a[j+1:]
-					} else if i+1 < len(args) {
-						cmd = args[i+1]
-						i++
-					}
-					j = len(a)
-				case 'f', 'C', 'T', 'X', 'b', 'L', 'H', 'h':
-					if j+1 >= len(a) {
-						i++ // value operand is the next argv
-					}
-					j = len(a)
-				}
-			}
-		default:
-			// BSD first-operand action word (tar cf / tar xf / tar tzf):
-			// when it contains 'f' the NEXT operand is the archive value.
-			if !bsdAction {
-				bsdAction = true
-				if strings.Contains(a, "f") {
-					i++
-				}
-			}
-		}
+		consume, cmdText := tarSubagentWordStep(args, i, &bsdAction)
+		i += consume
+		cmd = cmdText
 		if cmd == "" {
 			continue
 		}
@@ -9158,6 +9082,118 @@ func screenTarSubagent(args []string, depth int, caller callerIdentity) string {
 		return "tar exec hook" // any non-blocked hook command still executes
 	}
 	return ""
+}
+
+// tarSubagentWordStep advances screenTarSubagent past the word at index i
+// (extracted so the scan loop stays reviewable — v6.2.2 R3): consume counts
+// EXTRA argv operands the word eats, cmd carries an exec-hook command text
+// the word arms ("" when the word is plain data or a boolean flag).
+func tarSubagentWordStep(args []string, i int, bsdAction *bool) (consume int, cmd string) {
+	a := args[i]
+	if strings.HasPrefix(a, "--") {
+		return tarSubagentLongStep(args, i)
+	}
+	if a == "-I" {
+		if i+1 < len(args) {
+			return 1, args[i+1]
+		}
+		return 0, ""
+	}
+	if strings.HasPrefix(a, "-I") && len(a) > 2 {
+		return 0, a[2:]
+	}
+	if tarShortDataOpt(a) {
+		return 1, "" // plain data value operand
+	}
+	if strings.HasPrefix(a, "-") && len(a) > 1 {
+		return tarSubagentClusterStep(args, i)
+	}
+	// BSD first-operand action word (tar cf / tar xf / tar tzf): when it
+	// contains 'f' the NEXT operand is the archive value.
+	if !*bsdAction {
+		*bsdAction = true
+		if strings.Contains(a, "f") {
+			return 1, ""
+		}
+	}
+	return 0, ""
+}
+
+// tarShortDataOpt reports whether a is one of tar's plain-data value
+// options consuming a separate operand.
+func tarShortDataOpt(a string) bool {
+	switch a {
+	case "-f", "--file", "-C", "--directory", "-T", "--files-from", "-X",
+		"--exclude-from", "--exclude", "--owner", "--group", "--mode",
+		"--mtime", "--strip-components", "--transform", "--format",
+		"--index-file", "--occurrence":
+		return true
+	}
+	return false
+}
+
+// tarSubagentLongStep handles one `--` word of screenTarSubagent's scan.
+func tarSubagentLongStep(args []string, i int) (consume int, cmd string) {
+	a := args[i]
+	lname, lval, hasEq := a[2:], "", false
+	if k := strings.IndexByte(lname, '='); k >= 0 {
+		lname, lval, hasEq = lname[:k], lname[k+1:], true
+	}
+	isCheckpoint := tarExecLongMatch(lname, "checkpoint-action")
+	isExecValue := tarExecLongMatch(lname, "to-command") || tarExecLongMatch(lname, "use-compress-program")
+	if !isCheckpoint && !isExecValue {
+		return 0, "" // other long options (--numeric-owner, --exclude=pat, ...)
+	}
+	if hasEq {
+		if isCheckpoint {
+			if strings.HasPrefix(lval, "exec=") {
+				return 0, lval[len("exec="):]
+			}
+			if lval == "exec" {
+				return 0, "true" // bare exec still arms the hook
+			}
+			return 0, ""
+		}
+		return 0, lval
+	}
+	if i+1 < len(args) {
+		v := args[i+1]
+		if isCheckpoint {
+			if strings.HasPrefix(v, "exec=") {
+				return 1, v[len("exec="):]
+			}
+			return 1, ""
+		}
+		return 1, v
+	}
+	return 0, ""
+}
+
+// tarSubagentClusterStep handles one short-option cluster of
+// screenTarSubagent's scan: f/C/T/X take a value operand — the cluster
+// tail or the next argv — and end the cluster. 'I' inside a cluster is
+// --use-compress-program's short form whose operand arms an exec hook
+// (v6.2.2 R3 R2-SF-3).
+func tarSubagentClusterStep(args []string, i int) (consume int, cmd string) {
+	a := args[i]
+	for j := 1; j < len(a); j++ {
+		switch a[j] {
+		case 'I':
+			if j+1 < len(a) {
+				return 0, a[j+1:]
+			}
+			if i+1 < len(args) {
+				return 1, args[i+1]
+			}
+			return 0, ""
+		case 'f', 'C', 'T', 'X', 'b', 'L', 'H', 'h':
+			if j+1 >= len(a) && i+1 < len(args) {
+				return 1, "" // value operand is the next argv
+			}
+			return 0, ""
+		}
+	}
+	return 0, ""
 }
 
 // -i inplace / -iINCL / --include inplace. Ordinary `awk '{print $1}'` passes.
