@@ -5200,7 +5200,7 @@ func interpOptionZoneHasToken(h []string, token, base string) bool {
 			end = i + 1 // the word right after -- is the script operand
 			break
 		}
-		ni, stopZone, stopExcl, zoneEnd, consumedCode := interpZoneWordStep(spec, hasSpec, base, h, i, codeDone)
+		ni, stopZone, stopExcl, zoneEnd, consumedCode := interpZoneWordStep(spec, hasSpec, base, h, i, codeDone, token)
 		if consumedCode {
 			codeDone++
 		}
@@ -5239,8 +5239,11 @@ func interpOptionZoneHasToken(h []string, token, base string) bool {
 // non-option word AFTER a code slot is input-DATA (the script file or
 // stdin data — v6.2.2 R3 R3-MF-5/Reviewer R2-6 `find -exec perl -pe
 // 's/a/b/' {}`), so it ends the zone for REAL instead of posing as the
-// script operand.
-func interpZoneWordStep(spec interpOptSpec, hasSpec bool, base string, h []string, i, codeDone int) (next int, stopZone, stopExcl, zoneEnd, consumedCode bool) {
+// script operand. token is the replacement token xargs/find expands
+// (v6.2.2 R5): a token-carrying post-code positional only stays data
+// when it sits at the LAST argv index (no trailing words its expansion
+// can arm into a second -e/-r code operand).
+func interpZoneWordStep(spec interpOptSpec, hasSpec bool, base string, h []string, i, codeDone int, token string) (next int, stopZone, stopExcl, zoneEnd, consumedCode bool) {
 	a := h[i]
 	next = i
 	if !hasSpec {
@@ -5290,23 +5293,13 @@ func interpZoneWordStep(spec interpOptSpec, hasSpec bool, base string, h []strin
 			// Everything else ends the zone EXCLUDED — a static data file
 			// never counts as a zone hit (v6.2.2 R3 R3-MF-5 / Reviewer
 			// R2-6 `find -exec perl -pe 's/a/b/' {}` stays allowed).
-			if !isDynamicArg(a) && (a == "{}" || !isBareReplToken(a)) {
+			if !isDynamicArg(a) && (!strings.Contains(a, token) || i == len(h)-1) {
 				return i, true, true, false, false
 			}
 		}
 		return i, false, false, true, false
 	}
 	return i, false, false, false, false
-}
-
-// isBareReplToken reports whether a word is exactly the replacement-token
-// spelling of the feed that carries it — xargs' -I TOKEN (default `{}`)
-// or find's `{}`: the post-expansion landing zone of that word is
-// unprovable, so it keeps the conservative zone-end treatment (v6.2.2 R3
-// R3-MF-5). Arbitrary non-option data words (file.txt, input.log) never
-// match — they are unambiguous stream-data operands.
-func isBareReplToken(a string) bool {
-	return a == "{}" || a == "%" || a == cmdSubPlaceholder
 }
 
 // interpMultiCodeBase reports whether base names a multi-code-slot

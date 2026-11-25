@@ -5,6 +5,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Fixed
+- **Role guards: close the v6.2.2 R5 xargs replacement-token blind spot (`role_guards.go`, `zz_r2fix_test.go`).** `interpZoneWordStep` gains a `token` parameter and replaces the hard-coded `isBareReplToken` spelling list (`{}`/`%`/cmdsub) with a positional rule: a non-option word carrying the token after a consumed code slot of a multi-code interpreter is still treated as input data ONLY when it is the LAST argv word (`i == len(h)-1`) — a trailing word behind it can still be armed into a second `-e`/`-r` code operand by the runtime expansion. `echo -e | xargs -I{} perl -e '1' {} 'system("pig")'` and the custom-token `xargs -IFOO perl -e '1' FOO 'system("pig")'` now block, while the legitimate last-position forms `find . -exec perl -pe 's/a/b/' {} \;` and `echo a.txt | xargs -I{} perl -pe 's/a/b/' {}` stay `ALLOW`. The now-unused `isBareReplToken` helper is deleted. Regression coverage: `TestGuard_V622_OracleR3Probes` gains the two `P-R5-*` BLOCK probes and the `R5-a` ALLOW row; `interpZoneWordStep` measures cognitive 32 under `cccc --no-config --no-cache`.
+
 ## [6.2.2] - 2026-11-25
 
 ### Fixed

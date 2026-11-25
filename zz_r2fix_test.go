@@ -1395,6 +1395,10 @@ func TestGuard_V622_OracleR3Probes(t *testing.T) {
 		// R3-MF-5 攻击面补充: 代码槽后选项位占位符仍拦截。
 		{"P-R3-MF5-f perl -e xargs %", `echo -e | xargs -I% perl -e '1' % 'system("pig")'`, ""},
 		{"P-R3-MF5-g perl -e dash-%", `echo -e | xargs -I% perl -e '1' -%`, ""},
+		// v6.2.2 R5 加固: 自定义/默认替换 token 位于非末尾位置时,其后方参数
+		// 仍可被扩展武装成 -e/-r 代码操作数,不再依赖硬编码拼写名单。
+		{"P-R5-a xargs -I{} perl trailing", `echo -e | xargs -I{} perl -e '1' {} 'system("pig")'`, ""},
+		{"P-R5-b xargs -IFOO custom token", `echo -e | xargs -IFOO perl -e '1' FOO 'system("pig")'`, ""},
 		// R3-MF-6: git/awk/xargs 三路残余绕过。
 		{"P-R3-MF6-a git -c key-side", `echo 'core.pager' | xargs -I{} git -c '{}=pig' log`, ""},
 		{"P-R3-MF6-a2 git --config-env", `echo pig | xargs -I{} git --config-env 'core.pager={}' log`, ""},
@@ -1488,6 +1492,7 @@ func TestGuard_V622_OracleR3Probes(t *testing.T) {
 		{"R2-6-e xargs awk -v", `echo x | xargs -I{} awk -v k={} 'BEGIN{print k}' /dev/null`},
 		{"R2-6-f git --git-dir separate", `echo /tmp/repo | xargs -I{} git --git-dir {} log -1`},
 		{"R2-6-g perl -we legit -I", `perl -we 'print qq(ok)' -I /tmp`},
+		{"R5-a xargs -I{} perl -pe data", `echo a.txt | xargs -I{} perl -pe 's/a/b/' {}`},
 	}
 	for _, tc := range allowCases {
 		t.Run(tc.name, func(t *testing.T) {
