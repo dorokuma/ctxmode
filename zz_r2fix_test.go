@@ -925,6 +925,7 @@ func TestGuard_V622_JSFamilySplit(t *testing.T) {
 		}
 	}
 	pathEnv := binDir + ":" + os.Getenv("PATH")
+	origPath := os.Getenv("PATH")
 	t.Setenv("PATH", pathEnv)
 	for _, tc := range []struct {
 		name, cmd string
@@ -940,12 +941,15 @@ func TestGuard_V622_JSFamilySplit(t *testing.T) {
 		})
 	}
 	// Direct bun -p with no symlink at all: -p is inline code and must hit
-	// the nested-agent scan even when resolution finds nothing.
-	t.Setenv("PATH", os.Getenv("PATH"))
+	// the nested-agent scan even when resolution finds nothing. The PATH
+	// restore must re-bind the ORIGINAL PATH — re-reading os.Getenv after
+	// t.Setenv would hand back the already-modified value and keep the
+	// bun -> node symlink visible (v6.2.2 Oracle R1 Obs-2).
+	t.Setenv("PATH", origPath)
 	t.Run("v622-2c direct bun -p", func(t *testing.T) {
 		got := rtGuardCwd(t, rtCase{id: "v622-2c", role: "worker", cmd: `bun -p 'require("child_process").execSync("pig")'`}, "")
-		if got == "ALLOW" {
-			t.Fatalf("direct bun -p = ALLOW, want javascript inline code block")
+		if !strings.Contains(got, "javascript inline code") {
+			t.Fatalf("direct bun -p = %q, want javascript inline code block", got)
 		}
 	})
 	// node -> nodejs is the same distro family: the inline code is
@@ -1022,4 +1026,147 @@ func TestGuard_V622_MultiLayerExecSlots(t *testing.T) {
 			t.Fatalf("xargsFeedsCodeFlag 25-layer watch -x = false, want depth-cap fail-closed")
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// v6.2.2 Oracle R1: MF-1〜MF-9 / SF-1〜SF-5 / Obs-1〜Obs-2 探针回归 —
+// Python -c/-m 后选项区终止与 -uW/-uX 短簇四处同构、bun -c/node -r/php -c
+// 值槽动态拦截、npm 族结构头与 shell --rcfile、env -S 包装链扫描、递归
+// caller 重锚、find 谓词/尾部追加/-fprintf 二元 arity、占位符非首词注入、
+// script/flock 选项状态机、xargs --r* 缩写、awk/sed/tar/git -c 执行槽、
+// find -H/-L/-P 前置标志豁免。
+// ---------------------------------------------------------------------------
+
+func TestGuard_V622_OracleR1Probes(t *testing.T) {
+	blockCases := []struct {
+		name, cmd string
+	}{
+		// MF-2: -uW/-uX 短簇消费下一 argv 后，$OPT 动态词与非法长选项均 fail-closed。
+		{"P-MF2-a -uW dynOPT", `OPT=-c; python3 -uW ignore "$OPT" 'import os; os.system("pig")'`},
+		{"P-MF2-b -uW unknown long", `python3 -uW ignore --jit off -c 'import os; os.system("pig")'`},
+		{"P-MF2-c -uW bad pycs", `python3 -uW ignore --check-hash-based-pycs=bogus -c 'import os; os.system("pig")'`},
+		{"P-MF2-f xargs -0 feed", `printf '%s\0' -c 'import os; os.system("pig")' | xargs -0 python3 -uW ignore`},
+		// MF-3: bun -c 是 bunfig 值槽而非代码标志——动态操作数 fail-closed。
+		{"P-MF3-a bun -c $X", `X='a.toml -e require("child_process").execSync("pig")'; bun -c $X`},
+		// MF-4b: shell --rcfile/--init-file 值槽消费与非 /dev/null fail-closed。
+		{"P-MF4b-1 bash rcfile -c", `bash --rcfile /etc/profile -c 'pig'`},
+		{"P-MF4b-2 xargs rcfile open -c", `echo pig | xargs bash --rcfile /dev/null -c`},
+		{"P-MF4b-3 find rcfile -c", `find . -exec bash --rcfile /etc/profile -c '{}' \;`},
+		{"P-MF4b-4 pipe rcfile stdin", `echo pig | bash --rcfile /dev/null`},
+		// MF-5: env -S 分词注入——前导包装器/赋值/裸 '-'/GNU 缩写全线拦截。
+		{"P-MF5-a nice env -S", `echo "-e system('pig')" | xargs -I{} nice env -S 'perl {}'`},
+		{"P-MF5-b FOO=1 env -S", `echo "-e system('pig')" | xargs -I{} FOO=1 env -S 'perl {}'`},
+		{"P-MF5-c env - -S", `echo "-e system('pig')" | xargs -I{} env - -S 'perl {}'`},
+		{"P-MF5-d env --split abbrev", `echo "-e system('pig')" | xargs -I{} env --split 'perl {}'`},
+		// MF-7: find 路径位占位符全后缀扫描、尾部追加、-fprintf 二元 arity。
+		{"P-MF7-a pathword exec suffix", `echo -exec | xargs -I% find . % pig ';'`},
+		{"P-MF7-b append mode", `printf -- '-exec\npig\n;\n' | xargs find .`},
+		{"P-MF7-c fprintf shift", `echo pig | xargs -I{} find . -fprintf /dev/null -exec -exec sh -c '{}' ';'`},
+		// MF-8: shell/解释器选项区占位符、内层 xargs 选项位、flock 锁文件位、ssh 本地与远端注入。
+		{"P-MF8-a sh opt zone", `echo -c | xargs -I% sh % 'pig'`},
+		{"P-MF8-b python opt zone", `echo -c | xargs -I% python3 % 'import os; os.system("pig")'`},
+		{"P-MF8-c inner xargs zone", `echo pig > /tmp/p && echo 'I{}' | xargs -I% xargs -a /tmp/p -% sh -c '{}'`},
+		{"P-MF8-d flock lockfile zone", `echo -c | xargs -I% flock % 'sh -c pig' /dev/null`},
+		{"P-MF8-e ssh dest zone", `echo '-oProxyCommand=pig' | xargs -I{} ssh {} dmit ls`},
+		{"P-MF8-f1 ssh remote repl", `echo '; pig' | xargs -I{} ssh dmit 'echo {}'`},
+		{"P-MF8-f2 ssh remote append", `echo '; pig' | xargs ssh dmit echo hi`},
+		// MF-9: script -T 文件名字母 c 不再误判、flock 短簇/--/--fcntl 修正。
+		{"P-MF9-a script -T open -c", `echo pig | xargs script -T/tmp/xc -c`},
+		{"P-MF9-b script -T token -c", `echo pig | xargs -I{} script -T/tmp/c.log -c '{}' /dev/null`},
+		{"P-MF9-c flock -xc cluster", `echo pig | xargs -I{} flock -xc '{}' /dev/null`},
+		{"P-MF9-d flock -- then -c", `echo pig | xargs -I{} flock -- /dev/null -c '{}'`},
+		{"P-MF9-e flock --fcntl boolean", `echo pig | xargs -I{} flock --fcntl /dev/null sh -c '{}'`},
+		// SF-3: GNU xargs --r* 唯一前缀缩写。
+		{"SF3 xargs --repl", `echo pig | xargs --repl sh -c '{}'`},
+		// SF-4: awk/sed/tar/git -c 执行槽。
+		{"SF4 awk program", `echo 'BEGIN{system("pig")}' | xargs -I{} awk '{}' /dev/null`},
+		{"SF4 sed script", `echo '1e pig' | xargs -I{} sed '{}' /dev/null`},
+		{"SF4 tar checkpoint-action", `echo 'pig' | xargs -I{} tar --checkpoint=1 --checkpoint-action=exec='{}' -cf /dev/null /dev/null`},
+		{"SF4 git -c pager", `echo 'pig' | xargs -I{} git -c core.pager='{}' log`},
+		// SF-5: node --input-type 入 longValue 后动态/静态错位不再逃逸。
+		{"SF5 node --input-type", `node --input-type commonjs -e 'require("child_process").execSync("pig")'`},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+		})
+	}
+	// MF-1 功能回归与 Obs-1 假阳性豁免：以下合法调用必须放行。
+	allowCases := []struct {
+		name, cmd string
+	}{
+		{"P-MF1-a pytest module", `python3 -m pytest --cov=x`},
+		{"P-MF1-b json.tool module", `python3 -m json.tool --sort-keys`},
+		{"P-MF1-c -c then script args", `python3 -c 'import sys; print(sys.argv)' --foo`},
+		{"P-OBS1 find -L path token", `echo src | xargs -I{} find -L {} -name '*.go'`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+	// P-MF2-d: screenReadonlyWrite 对 -uX 携带值与粘连 -c 的只读文件运行拦截。
+	t.Run("P-MF2-d readonly -uX", func(t *testing.T) {
+		if got := screenReadonlyWrite([]string{"python3", "-uX", "--version", "evil.py"}); got == "" {
+			t.Fatalf("screenReadonlyWrite python3 -uX --version evil.py = empty, want python3 block")
+		}
+	})
+	t.Run("P-MF2-d2 readonly glued -c", func(t *testing.T) {
+		if got := screenReadonlyWrite([]string{"python3", "-c__import__('os').system('touch /tmp/pwn')", "--version"}); got == "" {
+			t.Fatalf("screenReadonlyWrite glued -c --version = empty, want python3 block")
+		}
+	})
+}
+
+// TestGuard_V622_OracleR1EnvCwd 覆盖 MF-4a 结构别名与 MF-6 env -C 重锚
+// 递归 caller 修复（依赖文件系统软链布置，单独成组）。
+func TestGuard_V622_OracleR1EnvCwd(t *testing.T) {
+	fakeHome := withTestTrustedHome(t)
+	binDir := filepath.Join(fakeHome, ".local", "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	writeTestExecutable(t, filepath.Join(binDir, "npm-cli.js"), 0755)
+	if err := os.Symlink(filepath.Join(binDir, "npm-cli.js"), filepath.Join(binDir, "bun")); err != nil {
+		t.Fatalf("symlink bun -> npm-cli.js: %v", err)
+	}
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	t.Run("P-MF4a bun->npm-cli.js conflict", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "P-MF4a", role: "worker", cmd: `bun exec -- pig`}, "")
+		if !strings.Contains(got, "conflicting structural alias") {
+			t.Fatalf("bun exec -- pig = %q, want conflicting structural alias", got)
+		}
+	})
+
+	cwd := filepath.Join(fakeHome, "proj")
+	sub := filepath.Join(cwd, "sub")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	if err := os.Symlink("/bin/sh", filepath.Join(sub, "mysh")); err != nil {
+		t.Fatalf("symlink mysh -> /bin/sh: %v", err)
+	}
+	mf6 := []struct {
+		name, cmd string
+	}{
+		{"P-MF6-a env -C watch -x", `echo pig | xargs -I{} env -C sub watch -x ./mysh -c '{}'`},
+		{"P-MF6-b env -C watch open", `echo pig | xargs env -C sub watch -x ./mysh -c`},
+		{"P-MF6-c env -C flock", `echo pig | xargs -I{} env -C sub flock /dev/null ./mysh -c '{}'`},
+		{"P-MF6-d env -C find -exec", `echo pig | xargs -I{} env -C sub find . -exec ./mysh -c '{}' ';'`},
+		{"P-MF6-e env -C flock open", `echo pig | xargs env -C sub flock /dev/null ./mysh -c`},
+	}
+	for _, tc := range mf6 {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, cwd)
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+		})
+	}
 }
