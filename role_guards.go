@@ -1034,14 +1034,10 @@ func skipFlockArgs(argv []string, i int) (int, string) {
 				i++
 			}
 			return flockAfterLock(argv, i)
-		case a == "-c" || a == "--command":
-			if i+1 < len(argv) {
-				return len(argv), argv[i+1]
+		case strings.HasPrefix(a, "--") || a == "-c":
+			if txt, hit := flockCommandWordHit(a, argv, i); hit {
+				return len(argv), txt
 			}
-			return len(argv), ""
-		case strings.HasPrefix(a, "--command="):
-			return len(argv), a[len("--command="):]
-		case strings.HasPrefix(a, "--"):
 			i = skipFlockLong(argv, i)
 			if i < 0 {
 				return len(argv), cmdSubPlaceholder
@@ -1078,16 +1074,104 @@ func flockShortTakesValue(a string) bool {
 	return a == "-w" || a == "-E" || a == "-d"
 }
 
+// flockMatchLong resolves one long-option name (no leading dashes, no
+// =value) against util-linux flock's real getopt_long table with GNU
+// unique-prefix abbreviation (v6.2.2 R3 R2-MF-4): --com abbreviates
+// --command, --time abbreviates --timeout, --con abbreviates
+// --conflict-exit-code. The second return value is false when the name
+// matches no option or is ambiguous (getopt_long rejects ambiguities
+// with an error, so the caller treats them conservatively).
+func flockMatchLong(name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	// util-linux flock longopts: command, conflict-exit-code, close, debug,
+	// fd, fcntl, help, lock-file, nofork, nonblocking, shared, exclusive,
+	// timeout, unlock, verbose, version, wait (the util-linux 2.39 table).
+	candidates := []string{
+		"command", "conflict-exit-code", "close", "debug", "fd", "fcntl",
+		"help", "lock-file", "nofork", "nonblocking", "shared", "exclusive",
+		"timeout", "unlock", "verbose", "version", "wait",
+	}
+	match := ""
+	hits := 0
+	for _, c := range candidates {
+		if c == name {
+			return c, true
+		}
+		if strings.HasPrefix(c, name) {
+			hits++
+			match = c
+		}
+	}
+	if hits == 1 {
+		return match, true
+	}
+	return "", false
+}
+
+// flockLongTakesValue reports whether a resolved flock long option consumes
+// a separate value operand when spelled without =glue.
+func flockLongTakesValue(full string) bool {
+	return full == "timeout" || full == "conflict-exit-code" || full == "fd" || full == "wait" || full == "lock-file"
+}
+
+// flockCommandWordHit screens one `--` word of flock's option zone for the
+// --command flag under GNU unique-prefix abbreviation: the glued or
+// separate command text is returned with hit=true. This is shared by
+// skipFlockArgs' option zone and flockAfterLock's post-lock zone so the
+// two positions cannot drift (v6.2.2 R3 R2-MF-4).
+func flockCommandWordHit(a string, argv []string, i int) (cmdText string, hit bool) {
+	if a == "-c" {
+		if i+1 < len(argv) {
+			return argv[i+1], true
+		}
+		return "", true
+	}
+	if !strings.HasPrefix(a, "--") {
+		return "", false
+	}
+	name, val, hasVal := a[2:], "", false
+	if k := strings.IndexByte(name, '='); k >= 0 {
+		name, val, hasVal = name[:k], name[k+1:], true
+	}
+	full, ok := flockMatchLong(name)
+	if !ok || full != "command" {
+		return "", false
+	}
+	if hasVal {
+		return val, true
+	}
+	if i+1 < len(argv) {
+		return argv[i+1], true
+	}
+	return "", true
+}
+
 // skipFlockLong consumes one `--` long-option word of flock's option zone
 // and returns the index to continue from, or -1 when a dynamic operand
 // fails closed. -F/--fcntl are BOOLEAN flags in util-linux flock (never
-// valued — v6.2.2 MF-9), so they consume only their own word.
+// valued — v6.2.2 MF-9), so they consume only their own word; GNU
+// unique-prefix abbreviations resolve through flockMatchLong (v6.2.2 R3).
 func skipFlockLong(argv []string, i int) int {
-	switch argv[i] {
-	case "--timeout", "--conflict-exit-code", "--fd":
+	a := argv[i]
+	name := a[2:]
+	if k := strings.IndexByte(name, '='); k >= 0 {
+		// Glued values consume only their own word whatever the arity.
+		return i + 1
+	}
+	full, ok := flockMatchLong(name)
+	if ok && flockLongTakesValue(full) {
 		if i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
 			return -1
 		}
+		return i + 2
+	}
+	if !ok && i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
+		// An unknown/ambiguous long option whose arity is unknowable: when
+		// the next word is a plain operand, conservatively consume it as
+		// the option's value so it cannot pose as the lock file or the
+		// command head (fail closed on shape, not on the word itself).
 		return i + 2
 	}
 	return i + 1 // boolean or glued-value long option
@@ -1126,17 +1210,13 @@ func flockClusterScan(argv []string, i int) (idx int, txt string, done bool) {
 }
 
 // flockAfterLock checks what follows flock's lock file/fd operand: a
-// -c/--command flag (or --command= form) yields the shell string, anything
-// else is the command argv start.
+// -c/--command flag (glued, separate or GNU-abbreviated) yields the shell
+// string, anything else is the command argv start.
 func flockAfterLock(argv []string, i int) (int, string) {
-	if i < len(argv) && (argv[i] == "-c" || argv[i] == "--command") {
-		if i+1 < len(argv) {
-			return len(argv), argv[i+1]
+	if i < len(argv) {
+		if txt, hit := flockCommandWordHit(argv[i], argv, i); hit {
+			return len(argv), txt
 		}
-		return len(argv), ""
-	}
-	if i < len(argv) && strings.HasPrefix(argv[i], "--command=") {
-		return len(argv), argv[i][len("--command="):]
 	}
 	return i, ""
 }
@@ -4445,14 +4525,26 @@ func stdinOnlySeg(s shellSegment) shellSegment {
 // (`echo code | xargs ssh dmit sh`), where OpenSSH joins xargs-appended
 // words into the remote login shell command string.
 func xargsDerivedSeg(xargsOpts, targetArgv []string, outerSeg shellSegment, pathEnv string, caller callerIdentity) shellSegment {
-	if xargsHasArgFile(xargsOpts) {
-		// The child inherits the outer stdin stream — but only the stdin
-		// facts, never the outer words or their provenance.
-		return stdinOnlySeg(outerSeg)
-	}
 	hasOuterInput := outerSeg.pipedStdin || outerSeg.stdinRedir ||
 		outerSeg.hereString != "" || len(outerSeg.heredocText) > 0
-	if hasOuterInput && sshTunnelsStdinProgram(targetArgv, pathEnv, caller) {
+	if xargsHasArgFile(xargsOpts) {
+		// The child inherits the outer stdin stream — but only the stdin
+		// facts, never the outer words or their provenance. When NO outer
+		// stdin stream exists, xargs builds the trailing argv from the
+		// -a FILE instead: those words append after the ssh invocation
+		// exactly like a pipe feed (v6.2.2 R3 R2-MF-5), so a remote
+		// stdin-program target still receives them.
+		if !hasOuterInput && sshTunnelsStdinProgram(targetArgv, pathEnv, caller) {
+			return shellSegment{pipedStdin: true}
+		}
+		return stdinOnlySeg(outerSeg)
+	}
+	if sshTunnelsStdinProgram(targetArgv, pathEnv, caller) {
+		// Without -I the appended words ALWAYS come from xargs' stdin —
+		// piped, redirected, or the ctx_run stdin parameter (argv mode,
+		// where outerSeg carries no facts at all). A remote stdin-program
+		// target (ssh dmit sh) reads them as program text (v6.2.2 R3
+		// R2-MF-5); the precise downstream verdict names the transport.
 		return shellSegment{pipedStdin: true}
 	}
 	return shellSegment{}
@@ -4490,6 +4582,28 @@ var findExecSlotValueOpts = map[string]bool{
 	// One-operand file-output predicates (v6.2.2 MF-7): leaving them out
 	// shifts the operand walk so a following -exec misaligns.
 	"-fprint": true, "-fprint0": true, "-fls": true, "-files0-from": true,
+}
+
+// isFindValueOpt reports whether a find operand word is a value-carrying
+// predicate whose operand must be skipped as DATA: the explicit
+// findExecSlotValueOpts table plus GNU find's time predicates
+// (-amin/-atime/-cmin/-ctime/-context) and the -newerXY family
+// (-newermm etc — 8 chars, XY in aBcmt) (v6.2.2 R3 R2-SF-2).
+func isFindValueOpt(a string) bool {
+	if findExecSlotValueOpts[a] {
+		return true
+	}
+	switch a {
+	case "-amin", "-atime", "-cmin", "-ctime", "-context":
+		return true
+	}
+	if len(a) == 8 && strings.HasPrefix(a, "-newer") {
+		x, y := a[6], a[7]
+		okX := x == 'a' || x == 'B' || x == 'c' || x == 'm' || x == 't'
+		okY := y == 'a' || y == 'B' || y == 'c' || y == 'm' || y == 't'
+		return okX && okY
+	}
+	return false
 }
 
 // envHeadSplitHasToken reports whether the raw -S/--split-string payload of
@@ -4588,18 +4702,18 @@ func envClusterSplitHasToken(argv []string, i int, token string) (consume int, h
 func peelWrappersWithPayloads(argv []string, pathEnv string, caller callerIdentity, token string) peeledExecHead {
 	var out peeledExecHead
 	out.effPath = pathEnv
-	// Scan EVERY wrapper-chain position for an env head whose raw -S payload
-	// carries the token: leading nice/timeout/FOO=1 prefixes or a nested
-	// `env -- env` must not hide the split injection, because peelWrappers
-	// consumes those wrappers (and the inner env's own options) in one pass
-	// before this screen could ever look at cur[0] (v6.2.2 MF-5).
-	for pos := 0; pos < len(argv) && !out.hasSplitTok; pos++ {
-		if canonicalResolvedBase(filepath.Base(argv[pos])) == "env" && envHeadSplitHasToken(argv[pos:], token) {
-			out.hasSplitTok = true
-		}
-	}
 	cur := argv
 	for steps := 0; steps < peelWrapperMaxSteps; steps++ {
+		// Scan the CURRENT chain's wrapper positions for an env head whose
+		// raw -S payload carries the token — BEFORE peeling rewrites or
+		// drops the payload (v6.2.2 R3 R2-MF-7). The scan is constrained
+		// to wrapper positions only: a non-wrapper command head (rg, echo)
+		// ends the walk, so `rg env -S {}` never false-hits on the
+		// smart-case flag, while alias-rewritten chains re-scan after each
+		// rewrite so ./myenv -> env still exposes its -S payload.
+		if !out.hasSplitTok && wrapperChainEnvSplitHasToken(cur, out.effPath, caller, token) {
+			out.hasSplitTok = true
+		}
 		h, sp, ea, ex := peelWrappers(cur)
 		out.envAs = out.envAs.merged(ea)
 		out.effPath = ea.effectivePATHFrom(out.effPath)
@@ -4621,6 +4735,60 @@ func peelWrappersWithPayloads(argv []string, pathEnv string, caller callerIdenti
 	return out
 }
 
+// wrapperChainEnvSplitHasToken walks the leading wrapper chain of argv and
+// reports whether any ENV head inside that chain carries a -S/--split-string
+// payload naming the token. The walk is constrained to wrapper positions:
+// assignment words and shell no-op prefixes step free; a wrapper head
+// (resolved through PATH aliases so ./myenv -> env counts) hands its OWN
+// argv to envHeadSplitHasToken when it is env, then the walk steps past
+// the wrapper with peelWrappers' exact operand arities. The FIRST
+// non-wrapper command head ends the zone — operand positions of real
+// commands (rg env -S {}) are never scanned (v6.2.2 R3 R2-MF-7).
+func wrapperChainEnvSplitHasToken(argv []string, pathEnv string, caller callerIdentity, token string) bool {
+	cur := argv
+	for depth := 0; depth < peelWrapperMaxSteps; depth++ {
+		if len(cur) == 0 {
+			return false
+		}
+		a := cur[0]
+		if isAssignWord(a) || shellNoopWords[a] {
+			cur = cur[1:]
+			depth-- // assignments/no-ops are free prefixes, not wrappers
+			continue
+		}
+		if isDynamicArg(a) {
+			return false
+		}
+		base := filepath.Base(a)
+		isEnv := canonicalResolvedBase(base) == "env"
+		if !isEnv {
+			if rb := canonicalResolvedBase(resolveHeadBase(a, pathEnv, caller.screenCwd())); rb != "" {
+				isEnv = rb == "env"
+				base = rb
+			}
+		}
+		if isEnv {
+			// An env position: scan its own option zone for the -S token.
+			// Whatever follows env's options is a COMMAND (or a nested
+			// wrapper chain INSIDE the -S payload, which the payload split
+			// screening owns) — the outer chain ends here.
+			return envHeadSplitHasToken(cur, token)
+		}
+		if !isPeeledWrapperBase(base) && base != "command" && base != "builtin" && base != "exec" && base != "nohup" && base != "setsid" && base != "busybox" {
+			return false // first real command head ends the wrapper zone
+		}
+		// Step past this wrapper with peelWrappers' own arities: probe the
+		// one-head chain and measure how many words it consumed.
+		rest, _, _, _ := peelWrappers(cur)
+		consumed := len(cur) - len(rest)
+		if consumed <= 0 || len(rest) == 0 {
+			return false
+		}
+		cur = rest
+	}
+	return false
+}
+
 // peelExecSlotHead peels wrappers off an exec-slot argv and produces the
 // literal head plus its alias-resolution variants. A cross-family structural
 // re-identity (xargs -> /bin/sh, bun -> node) fails closed; a same-family
@@ -4634,6 +4802,13 @@ func peelExecSlotHead(argv []string, pathEnv string, caller callerIdentity, toke
 	typed := filepath.Base(p.head[0])
 	tb := canonicalResolvedBase(typed) // normalize g-prefixed/npm-cli spellings first (v6.2.2 SF-2)
 	p.variants = [][]string{p.head}
+	if tb != "" && tb != typed {
+		// Write the canonical spelling back as a variant (v6.2.2 R3 R2-SF-1):
+		// gfind/gxargs/genv spellings must face the SAME find/xargs/env
+		// screens as their canonical bases even when nothing resolves on
+		// disk (peelResolvedSegDepth L4010-style normalization).
+		p.variants = append(p.variants, append([]string{tb}, p.head[1:]...))
+	}
 	if isDynamicArg(p.head[0]) {
 		return p
 	}
@@ -4775,7 +4950,15 @@ func replTokenInVariant(h []string, token, effPath string, tCaller, outerCaller 
 		return replTokenInWatch(h, token, effPath, tCaller, depth)
 	case "script":
 		payload := scriptCommandArg(h)
-		return payload != "" && (isDynamicArg(payload) || strings.Contains(payload, token))
+		if payload != "" && (isDynamicArg(payload) || strings.Contains(payload, token)) {
+			return true
+		}
+		// A token in script's own option zone (`script % 'pig' /dev/null`)
+		// expands before util-linux script permutes and parses its options:
+		// at runtime % can become -c and arm the following word as the
+		// command (v6.2.2 R3 R2-MF-6). Words AFTER the first static
+		// typescript operand with no -c anywhere stay inert data.
+		return scriptOptZoneHasToken(h, token)
 	case "find":
 		return replTokenInFind(h[1:], token, effPath, tCaller, depth)
 	}
@@ -4825,13 +5008,17 @@ func inlineSlotInterpBase(b string) bool {
 }
 
 // interpOptionZoneHasToken reports whether the token sits in the option
-// zone (or first operand slot) of a shell/interpreter argv — every word up
-// to the first `-c`/`-m`/`-e`-style code slot (whose operand is already
-// screened by the code-slot logic) or the first STATIC non-option operand
-// (the script file — tokens after it are script argv, not options). Words
-// that ARE the code operand were already caught by interpCodeSlots; here
-// only the parse-shape-changing positions count (v6.2.2 MF-8).
+// zone (or first operand slot) of a shell/interpreter argv. The scan is
+// driven by the head's own interpOptSpec (v6.2.2 R3 R2-MF-6): value options
+// consume their operands (the operand word itself is still token-checked),
+// code slots consume their operands too but do NOT end the scan unless the
+// spec stops on first code (CPython) or the head is a POSIX shell — shells
+// positional $0/$1 after -c are data slots (`sh -c 'echo "$1"' _ {}`),
+// while multi-code interpreters (perl/ruby/node/bun/tsx/php) may carry a
+// SECOND -e/-r after the first whose slot the runtime expansion can still
+// arm. The zone ends at -- or the first static non-option script operand.
 func interpOptionZoneHasToken(h []string, token, base string) bool {
+	spec, hasSpec := lookupInterpOptSpec(base)
 	end := len(h)
 	for i := 1; i < len(h); i++ {
 		a := h[i]
@@ -4839,27 +5026,15 @@ func interpOptionZoneHasToken(h []string, token, base string) bool {
 			end = i + 1 // the word right after -- is the script operand
 			break
 		}
-		if a == "-c" || a == "-e" || a == "-E" || a == "-m" || a == "-p" ||
-			a == "--eval" || a == "--print" {
-			end = i + 1 // include the slot word itself; its operand was screened
-			break
-		}
-		if !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+") {
+		ni, stopZone, zoneEnd := interpZoneWordStep(spec, hasSpec, base, h, i)
+		if zoneEnd {
 			end = i + 1 // first static script operand — include it, stop after
 			break
 		}
-		if len(a) > 2 && !strings.HasPrefix(a, "--") && shellHeads[base] {
-			// shell short cluster reaching 'c' (sh -xc 'pig'): the operand is
-			// the next argv — the zone ends after the cluster word itself.
-			for j := 1; j < len(a); j++ {
-				if a[j] == 'c' {
-					end = i + 1
-					break
-				}
-			}
-			if end != len(h) {
-				break
-			}
+		i = ni
+		if stopZone {
+			end = i + 1
+			break
 		}
 	}
 	if end > len(h) {
@@ -4871,6 +5046,102 @@ func interpOptionZoneHasToken(h []string, token, base string) bool {
 		}
 	}
 	return false
+}
+
+// interpZoneWordStep advances interpOptionZoneHasToken's scan past the
+// word at index i (extracted so the scan loop stays reviewable — v6.2.2
+// R3). next is the index the loop continues from; stopZone reports the
+// zone ends AFTER this word (first code slot of a stop-on-first-code
+// interpreter or a shell); zoneEnd reports the first static non-option
+// script operand was reached.
+func interpZoneWordStep(spec interpOptSpec, hasSpec bool, base string, h []string, i int) (next int, stopZone, zoneEnd bool) {
+	a := h[i]
+	next = i
+	if !hasSpec {
+		if !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+") {
+			return i, false, true
+		}
+		return i, false, false
+	}
+	switch {
+	case strings.HasPrefix(a, "--"):
+		name := a[2:]
+		if k := strings.IndexByte(name, '='); k >= 0 {
+			name = name[:k]
+		}
+		opt := "--" + name
+		switch {
+		case spec.longCode[opt]:
+			// A long code slot: consume its operand and either stop
+			// (shell/python) or keep scanning (multi-code interps).
+			if strings.IndexByte(a, '=') < 0 && i+1 < len(h) {
+				next = i + 1
+			}
+			return next, spec.stopOnFirstCode || shellHeads[base], false
+		case spec.longValue[opt]:
+			if strings.IndexByte(a, '=') < 0 && i+1 < len(h) {
+				next = i + 1 // plain value operand
+			}
+		}
+		return next, false, false
+	case len(a) >= 2 && (a[0] == '-' || a[0] == '+'):
+		consumed, codeHit := interpClusterZoneStep(spec, a, h, i)
+		if codeHit {
+			return i + consumed, spec.stopOnFirstCode || shellHeads[base], false
+		}
+		return i + consumed, false, false
+	case !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+"):
+		return i, false, true
+	}
+	return i, false, false
+}
+
+// interpClusterZoneStep walks one short-option cluster in
+// interpOptionZoneHasToken's spec-driven scan: consumed counts EXTRA argv
+// operands the cluster's trailing value/code letter eats, and codeHit
+// reports the cluster names a code slot letter (glued or flag model).
+func interpClusterZoneStep(spec interpOptSpec, a string, h []string, i int) (consumed int, codeHit bool) {
+	if strings.HasPrefix(a, "--") {
+		return 0, false
+	}
+	plus := a[0] == '+'
+	for j := 1; j < len(a); j++ {
+		ch := a[j]
+		if !plus && strings.IndexByte(spec.gluedCodes, ch) >= 0 {
+			if j+1 >= len(a) && i+1+consumed < len(h) {
+				consumed++ // separate code operand
+			}
+			return consumed, true
+		}
+		if !plus && strings.IndexByte(spec.flagCodes, ch) >= 0 {
+			if j+1 >= len(a) || isLetterOnly(a[j+1:]) {
+				if i+1+consumed < len(h) {
+					consumed++
+				}
+				if j+1 >= len(a) {
+					return consumed, true
+				}
+				// letter-only tail keeps parsing as flags but the code flag
+				// is pending — conservative: treat as a code hit now.
+				return consumed, true
+			}
+			return consumed, true
+		}
+		if strings.IndexByte(spec.valShort, ch) >= 0 {
+			if j+1 >= len(a) && i+1+consumed < len(h) {
+				consumed++
+			}
+			return consumed, false
+		}
+		if strings.IndexByte(spec.optNumShort, ch) >= 0 {
+			j += consumeNumOptTail(a, j, ch)
+			continue
+		}
+		if strings.IndexByte(spec.optShort, ch) >= 0 {
+			return consumed, false
+		}
+	}
+	return consumed, false
 }
 
 // replTokenInToolExecSlots covers the awk/sed/tar/git execution slots a
@@ -4892,146 +5163,417 @@ func replTokenInToolExecSlots(h []string, token, b string) bool {
 	return false
 }
 
-// awkProgramTokenHit reports the token inside awk's program-text operand:
-// the first non-option word after the option zone (skipping -f/-v/-F...
-// value operands). `awk '{}' /dev/null` runs the token as awk code at
-// runtime (system() reaches a shell).
+// awkProgramTokenHit reports the token inside awk's program-text operands.
+// It reuses awkProgramFrags' full option grammar (v6.2.2 R3 R2-MF-3): a -f
+// program FILE leaves the input operands as DATA (no false hit on
+// `awk -f parse.awk {}`), while GNU gawk's -e/--source texts, cluster-glued
+// -e and the bare program word are all matched against the token. The awk
+// OPTION ZONE itself is scanned too — a token inside an option word or a
+// value operand expands before awk parses it.
 func awkProgramTokenHit(h []string, token string) bool {
-	for i := 1; i < len(h); i++ {
-		a := h[i]
-		if a == "--" {
-			if i+1 < len(h) {
-				return strings.Contains(h[i+1], token)
-			}
-			return false
-		}
-		if strings.HasPrefix(a, "-") && len(a) > 1 {
-			// -f/-v/-F/-W consume a value (glued or next argv): skip it. -e
-			// is not an awk option but keep conservative single-letter value
-			// skipping to the letters awk documents.
-			if a == "-f" || a == "-v" || a == "-F" || a == "-W" {
-				i++
-			}
-			continue
-		}
-		return strings.Contains(a, token)
-	}
-	return false
-}
-
-// sedScriptTokenHit reports the token inside sed's script operands: the
-// -e/-f values (glued or separate) or the first bare non-option word.
-func sedScriptTokenHit(h []string, token string) bool {
-	for i := 1; i < len(h); i++ {
-		a := h[i]
-		if a == "--" {
-			if i+1 < len(h) {
-				return strings.Contains(h[i+1], token)
-			}
-			return false
-		}
-		if strings.HasPrefix(a, "-") && len(a) > 1 {
-			consume, hit := sedOptTokenStep(h, i, token)
-			if hit {
+	program, sawFile, hit := awkProgramFrags(h[1:])
+	if hit != "" {
+		// awkProgramFrags already flags dynamic/unsafe program sources
+		// conservatively; a token anywhere in such a shape counts as a hit.
+		for _, a := range h[1:] {
+			if strings.Contains(a, token) {
 				return true
 			}
-			i += consume
-			continue
 		}
-		return strings.Contains(a, token)
+	}
+	if !sawFile && strings.Contains(program, token) {
+		// No -f program FILE: the program text is what awk executes, and a
+		// token inside it is awk code (system() reaches a shell). When a -f
+		// file supplies the program, awkProgramFrags' positional fallback
+		// may still fold the first INPUT filename into `program` — those
+		// operands are pure data (v6.2.2 R3 R2-MF-3 `awk -f parse.awk {}`).
+		return true
+	}
+	if sawFile || program != "" {
+		// A program source was explicit: input filenames are pure data. Only
+		// the option-zone words themselves can still carry the token.
+		return awkOptZoneHasToken(h[1:], token)
 	}
 	return false
 }
 
-// sedOptTokenStep handles one option word of sed's argv; consume is how
-// many EXTRA argv operands the option's value takes.
-func sedOptTokenStep(h []string, i int, token string) (consume int, hit bool) {
-	a := h[i]
-	if a == "-e" || a == "-f" || a == "--expression" || a == "--file" {
-		if i+1 < len(h) {
-			return 1, strings.Contains(h[i+1], token)
+// awkOptZoneHasToken scans awk's option words for the token (cluster tails,
+// -f/-v/-F/--assign/--include values): expansion there re-shapes the parse
+// before awk reads its operands (v6.2.2 R3 R2-MF-3 --assign/'{}' rows).
+func awkOptZoneHasToken(args []string, token string) bool {
+	endOpts := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" && !endOpts {
+			endOpts = true
+			continue
+		}
+		if endOpts || !strings.HasPrefix(a, "-") || a == "-" {
+			return false // first positional begins program/data operands
+		}
+		if strings.Contains(a, token) {
+			return true
+		}
+		consume, hit := awkOptWordTokenStep(args, i, token)
+		if hit {
+			return true
+		}
+		i += consume
+	}
+	return false
+}
+
+// awkOptWordTokenStep advances awkOptZoneHasToken past the option word at
+// index i: consume counts EXTRA argv operands the word's trailing value
+// letter eats, hit reports the token inside a value operand.
+func awkOptWordTokenStep(args []string, i int, token string) (consume int, hit bool) {
+	a := args[i]
+	if strings.HasPrefix(a, "--") {
+		name := a[2:]
+		hasEq := strings.IndexByte(name, '=') >= 0
+		if k := strings.IndexByte(name, '='); k >= 0 {
+			name = name[:k]
+		}
+		if !hasEq && awkLongTakesValue(name) && i+1 < len(args) {
+			if strings.Contains(args[i+1], token) {
+				return 1, true
+			}
+			return 1, false
 		}
 		return 0, false
 	}
-	if strings.HasPrefix(a, "-e") || strings.HasPrefix(a, "-f") {
-		if len(a) > 2 && !strings.HasPrefix(a, "--") {
-			return 0, strings.Contains(a[2:], token)
+	for j := 1; j < len(a); j++ {
+		switch a[j] {
+		case 'e', 'f', 'F', 'v', 'i':
+			if j+1 >= len(a) && i+1 < len(args) {
+				if strings.Contains(args[i+1], token) {
+					return 1, true
+				}
+				return 1, false
+			}
+			return 0, false // glued tail IS the value — the cluster ends
 		}
-		return 0, false
-	}
-	if strings.HasPrefix(a, "--expression=") || strings.HasPrefix(a, "--file=") {
-		return 0, strings.Contains(a[strings.IndexByte(a, '=')+1:], token)
 	}
 	return 0, false
 }
 
-// tarExecOptTokenHit reports the token inside tar's command-exec option
-// values: --checkpoint-action=exec*/-exec/… glued or separate, --to-command
-// and --use-compress-program.
-func tarExecOptTokenHit(h []string, token string) bool {
-	for i := 1; i < len(h); i++ {
-		a := h[i]
-		if strings.HasPrefix(a, "--checkpoint-action=") || strings.HasPrefix(a, "--to-command=") ||
-			strings.HasPrefix(a, "--use-compress-program=") {
-			if strings.Contains(a[strings.IndexByte(a, '=')+1:], token) {
-				return true
-			}
-			continue
-		}
-		if a == "--checkpoint-action" || a == "--to-command" || a == "--use-compress-program" {
-			if i+1 < len(h) {
-				if strings.Contains(h[i+1], token) {
-					return true
-				}
-				i++
-			}
-			continue
+// awkLongTakesValue reports whether a GNU awk long option consumes a
+// separate value operand (the value-bearing subset of gawk's longopts).
+func awkLongTakesValue(name string) bool {
+	for _, full := range []string{"file", "source", "assign", "field-separator", "include", "load", "exec"} {
+		if isLongOptAbbrev(name, full, 1) {
+			return true
 		}
 	}
 	return false
+}
+
+// sedScriptTokenHit reports the token inside sed's script operands. It
+// reuses sedScripts' full option grammar (v6.2.2 R3 R2-MF-3): once any
+// -e/-f/--expression/--file script source appeared, remaining positional
+// words are INPUT FILES — data, never scripts (restores
+// `find -exec sed -e 's/foo/bar/' {} \;`), while the -e/-f values
+// themselves, cluster-glued -ne'{}' tails, --expr GNU abbreviations and
+// option-zone words are all matched against the token.
+func sedScriptTokenHit(h []string, token string) bool {
+	scripts, _ := sedScripts(h[1:])
+	for _, s := range scripts {
+		if strings.Contains(s, token) {
+			return true
+		}
+	}
+	if len(scripts) > 0 {
+		return sedOptZoneHasToken(h[1:], token)
+	}
+	// No explicit script at all: sedScripts treats the first bare positional
+	// as the script, so scripts is non-empty whenever a candidate existed.
+	// Reaching here means operands were dynamic or absent — scan the raw
+	// words conservatively.
+	return sedOptZoneHasToken(h[1:], token)
+}
+
+// sedOptZoneHasToken scans sed's option zone for the token: option words,
+// cluster tails and value operands all expand before sed parses them
+// (v6.2.2 R3 R2-MF-3 --expr='{}' rows). Positional input files never count.
+func sedOptZoneHasToken(args []string, token string) bool {
+	endOpts := false
+	sawScript := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" && !endOpts {
+			endOpts = true
+			continue
+		}
+		if endOpts || !strings.HasPrefix(a, "-") || a == "-" {
+			if sawScript {
+				return false // input files are data
+			}
+			// first positional IS the script when nothing explicit appeared
+			if strings.Contains(a, token) {
+				return true
+			}
+			sawScript = true
+			continue
+		}
+		isDanglingBareE := a == "-e" && i+1 >= len(args)
+		if strings.Contains(a, token) && !isDanglingBareE {
+			return true
+		}
+		consume, hit, scripted := sedOptWordTokenStep(args, i, token)
+		if hit {
+			return true
+		}
+		if scripted {
+			sawScript = true
+		}
+		i += consume
+	}
+	return false
+}
+
+// sedOptWordTokenStep advances sedOptZoneHasToken past the option word at
+// index i (extracted so the scan loop stays reviewable — v6.2.2 R3):
+// consume counts EXTRA argv operands the word's value eats, hit reports
+// the token inside a value operand, scripted reports the word carries an
+// explicit script source (-e/-f/--expression/--file or their clusters).
+func sedOptWordTokenStep(args []string, i int, token string) (consume int, hit, scripted bool) {
+	a := args[i]
+	if strings.HasPrefix(a, "--") {
+		return sedLongOptTokenStep(args, i, token)
+	}
+	for j := 1; j < len(a); j++ {
+		switch a[j] {
+		case 'e', 'f', 'l':
+			if a[j] != 'l' {
+				scripted = true
+			}
+			if j+1 >= len(a) && i+1 < len(args) {
+				if strings.Contains(args[i+1], token) {
+					return 1, true, scripted
+				}
+				return 1, false, scripted
+			}
+			return 0, false, scripted // glued tail IS the value
+		}
+	}
+	return 0, false, false
+}
+
+// sedLongOptTokenStep handles one `--` word of sedOptZoneHasToken's scan.
+func sedLongOptTokenStep(args []string, i int, token string) (consume int, hit, scripted bool) {
+	name := args[i][2:]
+	hasEq := strings.IndexByte(name, '=') >= 0
+	if k := strings.IndexByte(name, '='); k >= 0 {
+		name = name[:k]
+	}
+	isExpr := isLongOptAbbrev(name, "expression", 1)
+	isFile := !isExpr && isLongOptAbbrev(name, "file", 2)
+	isLineLen := !isExpr && !isFile && isLongOptAbbrev(name, "line-length", 1)
+	if !isExpr && !isFile && !isLineLen {
+		return 0, false, false
+	}
+	scripted = isExpr || isFile
+	if !hasEq && i+1 < len(args) {
+		if strings.Contains(args[i+1], token) {
+			return 1, true, scripted
+		}
+		return 1, false, scripted
+	}
+	return 0, false, scripted
+}
+
+// tarExecOptTokenHit reports the token inside tar's command-exec option
+// values: --checkpoint-action=exec*/-exec/… glued or separate, --to-command,
+// --use-compress-program and the -I short form (glued or separate). GNU
+// tar resolves unique-prefix abbreviations of its long options, so the
+// scan matches prefixes (--checkpoint-act=, --use-compress=) against the
+// real long names (v6.2.2 R3 R2-SF-3).
+func tarExecOptTokenHit(h []string, token string) bool {
+	for i := 1; i < len(h); i++ {
+		consume, hit := tarExecWordTokenStep(h, i, token)
+		if hit {
+			return true
+		}
+		i += consume
+	}
+	return false
+}
+
+// tarExecWordTokenStep advances tarExecOptTokenHit past the word at index
+// i (extracted so the scan loop stays reviewable — v6.2.2 R3): consume
+// counts EXTRA argv operands consumed, hit reports a token inside an
+// exec-arming value.
+func tarExecWordTokenStep(h []string, i int, token string) (consume int, hit bool) {
+	a := h[i]
+	if strings.HasPrefix(a, "--") {
+		return tarLongExecTokenStep(h, i, token)
+	}
+	if !strings.HasPrefix(a, "-") || len(a) <= 1 || a == "-" {
+		return 0, false
+	}
+	// Short cluster: 'I' is --use-compress-program's short form — its
+	// operand is the glued tail or the next argv (v6.2.2 R3 R2-SF-3).
+	for j := 1; j < len(a); j++ {
+		switch a[j] {
+		case 'I':
+			if tail := a[j+1:]; tail != "" {
+				return 0, strings.Contains(tail, token)
+			}
+			if i+1 < len(h) {
+				return 1, strings.Contains(h[i+1], token)
+			}
+			return 0, false
+		case 'f', 'C', 'T', 'X', 'b', 'L', 'H':
+			if j+1 >= len(a) && i+1 < len(h) {
+				return 1, false // plain value operand — data, but consumed
+			}
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
+// tarLongExecTokenStep handles one `--` word of tarExecOptTokenHit's scan.
+func tarLongExecTokenStep(h []string, i int, token string) (consume int, hit bool) {
+	name, val, hasEq := h[i][2:], "", false
+	if k := strings.IndexByte(name, '='); k >= 0 {
+		name, val, hasEq = name[:k], name[k+1:], true
+	}
+	if !tarExecLongMatch(name, "checkpoint-action") && !tarExecLongMatch(name, "to-command") &&
+		!tarExecLongMatch(name, "use-compress-program") {
+		return 0, false
+	}
+	if hasEq {
+		return 0, strings.Contains(val, token)
+	}
+	if i+1 < len(h) {
+		return 1, strings.Contains(h[i+1], token)
+	}
+	return 0, false
+}
+
+// tarExecLongMatch reports whether name is a unique-prefix abbreviation of
+// the full long option among tar's own exec-relevant and common value long
+// options. Ambiguity against the other tar longs resolves conservatively
+// to NO match (getopt_long would reject it at runtime).
+func tarExecLongMatch(name, full string) bool {
+	if name == "" {
+		return false
+	}
+	if name == full {
+		return true
+	}
+	if !strings.HasPrefix(full, name) {
+		return false
+	}
+	// Candidate competitor long options sharing the prefix space; an equal
+	// or longer common prefix on a competitor makes the abbreviation
+	// ambiguous at runtime, so it does not resolve.
+	competitors := []string{
+		"checkpoint", "checkpoint-action", "to-command", "use-compress-program",
+		"file", "directory", "files-from", "exclude", "include", "transform",
+		"format", "newer", "after-date", "occurrence", "index-file", "owner",
+		"group", "mode", "mtime", "sort", "quoting-style", "totals",
+	}
+	for _, c := range competitors {
+		if c == full {
+			continue
+		}
+		if strings.HasPrefix(c, name) {
+			return false // ambiguous prefix — getopt_long rejects at runtime
+		}
+	}
+	return true
 }
 
 // gitConfigExecTokenHit reports the token inside `git -c key=val` config
-// overrides whose keys run external commands (core.pager, core.sshCommand,
-// diff/grep/ssh agents): `git -c core.pager='{}' log` feeds the token to a
-// shell at runtime.
+// overrides whose keys run external commands, or anywhere in git's GLOBAL
+// OPTION ZONE itself: an option word carrying the token expands before git
+// parses it (v6.2.2 R3 R2-MF-3 `git % 'core.pager=pig' log`), so it can
+// become a `-c` arming an exec-capable key. Global value options
+// (-C/--git-dir/--work-tree/--namespace/--exec-path/--config-env) consume
+// their operands before the -c scan (their operand word is still checked).
 func gitConfigExecTokenHit(h []string, token string) bool {
 	for i := 1; i < len(h); i++ {
 		a := h[i]
-		if strings.HasPrefix(a, "-") && len(a) > 1 {
-			if a == "-c" {
-				if i+1 < len(h) {
-					if gitExecConfigValueHasToken(h[i+1], token) {
-						return true
-					}
-					i++
-				}
-				continue
+		if !strings.HasPrefix(a, "-") || len(a) <= 1 {
+			if strings.Contains(a, token) {
+				// A non-option word carrying the token sits where git expects
+				// the SUBCOMMAND: at runtime the expansion can spell `-c` and
+				// arm the following static key=val word (v6.2.2 R3 R2-MF-3
+				// `git % 'core.pager=pig' log`).
+				return true
 			}
-			if len(a) > 2 && strings.HasPrefix(a, "-c") {
-				if gitExecConfigValueHasToken(a[2:], token) {
-					return true
-				}
-				continue
-			}
-			continue
+			return false // the -c zone ended at the subcommand
 		}
-		return false // first non-option word is the subcommand — the -c zone ended
+		consume, hit, cont := gitGlobalOptTokenStep(h, i, token)
+		if hit {
+			return true
+		}
+		i += consume
+		if !cont {
+			return false
+		}
 	}
 	return false
 }
 
+// gitGlobalOptTokenStep advances gitConfigExecTokenHit past the global
+// option word at index i (extracted so the scan loop stays reviewable —
+// v6.2.2 R3): consume counts EXTRA argv operands consumed, hit reports a
+// token in an exec-arming position, cont reports the scan continues.
+func gitGlobalOptTokenStep(h []string, i int, token string) (consume int, hit, cont bool) {
+	a := h[i]
+	isBareDashC := a == "-c"
+	if strings.Contains(a, token) && !isBareDashC {
+		return 0, true, false
+	}
+	if isBareDashC {
+		if i+1 < len(h) {
+			if gitExecConfigValueHasToken(h[i+1], token) {
+				return 1, true, false
+			}
+			return 1, false, true
+		}
+		return 0, false, true
+	}
+	if len(a) > 2 && strings.HasPrefix(a, "-c") && !strings.HasPrefix(a, "--") {
+		if gitExecConfigValueHasToken(a[2:], token) {
+			return 0, true, false
+		}
+		return 0, false, true
+	}
+	if a == "-C" || a == "--git-dir" || a == "--work-tree" || a == "--namespace" ||
+		a == "--exec-path" || a == "--config-env" {
+		// Plain path/config value operand — pure DATA (git -C {} status):
+		// the word is consumed so it cannot pose as the subcommand, but a
+		// token inside it never reaches a shell (v6.2.2 R3).
+		if i+1 < len(h) {
+			return 1, false, true
+		}
+		return 0, false, true
+	}
+	return 0, false, true
+}
+
 // gitExecConfigValueHasToken reports whether one `git -c` key=val word both
-// names a command-exec config key and carries the token in its value.
+// names a command-exec config key and carries the token in its value. A
+// bare token word with NO '=' at all counts as a hit: at runtime the word
+// IS the placeholder expansion, and a config value positioned after the
+// expansion cannot be shape-proven (v6.2.2 R3 R2-MF-3 `git -c '{}'`). Key
+// capability flows through gitKeyIsExecCapable — the same predicate
+// screenGitGlobalArgs uses — so merge.foo.driver / diff.foo.command /
+// credential.<url>.helper cannot drift (v6.2.2 R3 R2-MF-3).
 func gitExecConfigValueHasToken(kv, token string) bool {
 	eq := strings.IndexByte(kv, '=')
 	if eq < 0 {
-		return false
+		return strings.Contains(kv, token)
 	}
 	if !strings.Contains(kv[eq+1:], token) {
 		return false
 	}
-	return gitExecConfigKeys[strings.ToLower(kv[:eq])]
+	key := strings.ToLower(kv[:eq])
+	return gitKeyIsExecCapable(key) || strings.HasPrefix(kv[eq+1:], "!")
 }
 
 // sshLocalZoneHasToken reports whether the token sits in ssh's LOCAL parse
@@ -5054,8 +5596,19 @@ func sshLocalZoneHasToken(h []string, token string) bool {
 				return true
 			}
 			// Skip the operands of value-taking letters so they are not
-			// mistaken for <destination>; the operand word itself is still
-			// scanned below.
+			// mistaken for <destination>: a value letter at the cluster
+			// tail consumes the NEXT argv word (v6.2.2 R3 R2-MF-5).
+			for j := 1; j < len(a); j++ {
+				if sshShortTakesValue(a[j]) {
+					if j+1 >= len(a) && i+1 < len(h) {
+						if strings.Contains(h[i+1], token) {
+							return true
+						}
+						i++
+					}
+					break // a glued tail IS the value — the cluster ends
+				}
+			}
 			continue
 		}
 		if !sawDest {
@@ -5130,7 +5683,7 @@ func replTokenInFind(args []string, token, effPath string, outerCaller callerIde
 			pathDone = true
 			continue
 		}
-		if findExecSlotValueOpts[a] {
+		if isFindValueOpt(a) {
 			pathDone = true
 			i++ // skip the predicate's value operand
 			if a == "-fprintf" {
@@ -5758,14 +6311,21 @@ func scanScriptOpts(head []string) scriptOptScan {
 			}
 			continue
 		}
-		return sc // first non-option operand (the typescript file) ends the zone
+		// Positional typescript file: util-linux script's getopt_long has NO
+		// leading '+' — options are PERMUTED after positional operands, so a
+		// -c following the file still arms the command. Skip the operand and
+		// keep scanning (v6.2.2 R3 R2-MF-4 / Reviewer MF-3).
+		continue
 	}
 	return sc
 }
 
 // scanScriptLong handles one `--` word of script's option zone and returns
 // the loop index to continue from. GNU getopt_long unique abbreviations of
-// --command count; the valued long options consume their operands.
+// --command count; the valued long options consume their operands. util-linux
+// script's --timing is an OPTIONAL argument (t:: / --timing[=FILE]) — only
+// the glued =FILE form carries a value, a bare --timing NEVER consumes the
+// next argv (v6.2.2 R3 R2-MF-4).
 func scanScriptLong(head []string, i int, sc *scriptOptScan) int {
 	a := head[i]
 	name, val, hasVal := a[2:], "", false
@@ -5784,14 +6344,22 @@ func scanScriptLong(head []string, i int, sc *scriptOptScan) int {
 		}
 		return i
 	}
-	switch name {
-	case "log-out", "log-in", "log-timing", "timing":
-		if !hasVal && i+1 < len(head) {
-			if isDynamicArg(head[i+1]) && !isSplitSafeDynamicWord(head[i+1]) {
-				sc.cmdText, sc.cmdFlagIdx = cmdSubPlaceholder, i
-				return i
+	if name == "timing" || strings.HasPrefix("timing", name) && len(name) >= 2 {
+		// optional_argument: only the =glued form carries a value.
+		return i
+	}
+	// util-linux script value long options: log-in/log-out/log-timing
+	// (-I/-O/-T), log-io (-B), output-limit (-o), logging-format (-m).
+	for _, full := range []string{"log-out", "log-in", "log-timing", "log-io", "output-limit", "logging-format"} {
+		if strings.HasPrefix(full, name) && name != "" {
+			if !hasVal && i+1 < len(head) {
+				if isDynamicArg(head[i+1]) && !isSplitSafeDynamicWord(head[i+1]) {
+					sc.cmdText, sc.cmdFlagIdx = cmdSubPlaceholder, i
+					return i
+				}
+				return i + 1
 			}
-			return i + 1
+			return i
 		}
 	}
 	return i
@@ -5816,7 +6384,7 @@ func scanScriptCluster(head []string, i int, sc *scriptOptScan) int {
 				sc.cmdOpen = true
 			}
 			return i
-		case 'O', 'I', 'B', 'T', 't', 'o', 'm':
+		case 'O', 'I', 'B', 'T', 'o', 'm':
 			if j+1 >= len(a) && i+1 < len(head) {
 				if isDynamicArg(head[i+1]) && !isSplitSafeDynamicWord(head[i+1]) {
 					sc.cmdText, sc.cmdFlagIdx = cmdSubPlaceholder, i
@@ -5825,9 +6393,74 @@ func scanScriptCluster(head []string, i int, sc *scriptOptScan) int {
 				return i + 1 // bare valued letter: the next argv is its operand
 			}
 			return i // glued value ends the cluster
+		case 't':
+			// optional_argument (t::): only a glued tail is the timing file —
+			// a bare -t NEVER consumes the next argv, so the cluster scan
+			// simply ends here (v6.2.2 R3 R2-MF-4).
+			return i
 		}
 	}
 	return i
+}
+
+// scriptOptZoneHasToken reports whether the token sits in script's option
+// zone — the words BEFORE the first positional operand or a -- terminator,
+// plus script's value-option operands. Positional typescript files and
+// everything after them are inert data (v6.2.2 R3 R2-MF-6).
+func scriptOptZoneHasToken(h []string, token string) bool {
+	for i := 1; i < len(h); i++ {
+		a := h[i]
+		if a == "--" {
+			return false
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			return false // first positional operand ends the scannable zone
+		}
+		if strings.Contains(a, token) {
+			return true
+		}
+		consume, hit := scriptOptWordTokenStep(h, i, token)
+		if hit {
+			return true
+		}
+		i += consume
+	}
+	return false
+}
+
+// scriptOptWordTokenStep advances scriptOptZoneHasToken past the option
+// word at index i (extracted so the scan loop stays reviewable — v6.2.2
+// R3): consume counts EXTRA argv operands consumed, hit reports the token
+// inside a value operand.
+func scriptOptWordTokenStep(h []string, i int, token string) (consume int, hit bool) {
+	a := h[i]
+	if strings.HasPrefix(a, "--") {
+		name := a[2:]
+		hasEq := strings.IndexByte(name, '=') >= 0
+		if k := strings.IndexByte(name, '='); k >= 0 {
+			name = name[:k]
+		}
+		for _, full := range []string{"log-out", "log-in", "log-timing", "log-io", "output-limit", "logging-format", "command"} {
+			if strings.HasPrefix(full, name) && name != "" && !hasEq && i+1 < len(h) {
+				return 1, strings.Contains(h[i+1], token)
+			}
+		}
+		return 0, false
+	}
+	// Short cluster: O/I/B/T/o/m take values, c takes the command.
+	for j := 1; j < len(a); j++ {
+		ch := a[j]
+		if ch == 'c' || ch == 'O' || ch == 'I' || ch == 'B' || ch == 'T' || ch == 'o' || ch == 'm' {
+			if j+1 >= len(a) && i+1 < len(h) {
+				return 1, strings.Contains(h[i+1], token)
+			}
+			return 0, false
+		}
+		if ch == 't' {
+			return 0, false // optional-glued only
+		}
+	}
+	return 0, false
 }
 
 // scriptHasOpenCommandFlag reports whether a `script` argv ends with a
@@ -6550,6 +7183,44 @@ func screenUnsetArgs(args []string, kind byte) string {
 	return ""
 }
 
+// xargsValueLongs are GNU xargs long options that consume a value operand
+// (separate argv, or glued with =). The table feeds GNU unique-prefix
+// resolution in xargsMatchValueLong (v6.2.2 R3 R2-SF-3): findutils xargs
+// longopts are arg-file(-a), delimiter(-d), eof, replace(-i/-I), verbose,
+// interactive, no-run-if-empty, max-lines(-L/-l), max-args(-n), max-chars(-s),
+// max-procs(-P), process-slot-var, show-limits, exit, null, open-tty,
+// version, help. --eof and --replace take OPTIONAL glued-only values and
+// never consume a separate argv, so they stay OUT of this table.
+var xargsValueLongs = []string{
+	"arg-file", "delimiter", "max-args", "max-lines", "max-procs",
+	"max-chars", "process-slot-var",
+}
+
+// xargsMatchValueLong resolves one long-option name against xargs'
+// separate-value long options with GNU unique-prefix abbreviation
+// (--max-a -> max-args, --arg-f -> arg-file). The empty string means no
+// value option matched (boolean, optional-value or ambiguous prefix).
+func xargsMatchValueLong(name string) string {
+	if name == "" {
+		return ""
+	}
+	match := ""
+	hits := 0
+	for _, c := range xargsValueLongs {
+		if c == name {
+			return c
+		}
+		if strings.HasPrefix(c, name) {
+			hits++
+			match = c
+		}
+	}
+	if hits == 1 {
+		return match
+	}
+	return ""
+}
+
 // xargsLongWithValue are GNU xargs long options that consume a SEPARATE
 // value operand. GNU --eof and --replace take an optional value only via
 // =glue: bare --eof/--replace must NOT consume the next argv (that word is
@@ -6558,6 +7229,23 @@ var xargsLongWithValue = map[string]bool{
 	"--arg-file": true, "--delimiter": true,
 	"--max-args": true, "--max-lines": true, "--max-procs": true,
 	"--max-chars": true, "--process-slot-var": true,
+}
+
+// xargsLongConsumesNext reports whether one `--` word of xargs' option zone
+// consumes the NEXT argv as its value: exact or GNU-abbreviated value long
+// options without a glued =value (v6.2.2 R3 R2-SF-3).
+func xargsLongConsumesNext(a string) bool {
+	if !strings.HasPrefix(a, "--") {
+		return false
+	}
+	name := a[2:]
+	if strings.IndexByte(name, '=') >= 0 {
+		return false // glued value never consumes the next argv
+	}
+	if xargsLongWithValue[a] {
+		return true
+	}
+	return xargsMatchValueLong(name) != ""
 }
 
 // xargsShortWithValue are short-option letters that consume a value (the
@@ -6585,29 +7273,15 @@ func xargsTargetIndex(argv []string) int {
 			return i
 		}
 		if strings.HasPrefix(a, "--") {
-			if j := strings.IndexByte(a, '='); j > 0 {
-				i++
-			} else if xargsLongWithValue[a] {
-				if i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
-					return i + 1
-				}
-				i += 2
-			} else {
-				i++
+			ni, at := xargsLongTargetStep(argv, i)
+			if at >= 0 {
+				return at
 			}
+			i = ni
 			continue
 		}
 		if strings.HasPrefix(a, "-") && len(a) > 1 {
-			consumedNext := false
-			for j := 1; j < len(a); j++ {
-				if a[j] == 'e' || a[j] == 'i' {
-					break
-				}
-				if xargsShortWithValue[a[j]] {
-					consumedNext = j+1 >= len(a)
-					break
-				}
-			}
+			consumedNext := xargsClusterConsumesNext(a)
 			if consumedNext && i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
 				return i + 1
 			}
@@ -6620,6 +7294,37 @@ func xargsTargetIndex(argv []string) int {
 		return i
 	}
 	return i
+}
+
+// xargsLongTargetStep advances xargsTargetIndex past one `--` word: next is
+// the index to continue from, at is the command-index answer when a dynamic
+// value operand decides it (-1 while the scan continues).
+func xargsLongTargetStep(argv []string, i int) (next, at int) {
+	a := argv[i]
+	if strings.IndexByte(a, '=') > 0 {
+		return i + 1, -1
+	}
+	if xargsLongConsumesNext(a) {
+		if i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
+			return i, i + 1
+		}
+		return i + 2, -1
+	}
+	return i + 1, -1
+}
+
+// xargsClusterConsumesNext reports whether xargs' short cluster word a
+// ends in a value letter whose operand is the NEXT argv word.
+func xargsClusterConsumesNext(a string) bool {
+	for j := 1; j < len(a); j++ {
+		if a[j] == 'e' || a[j] == 'i' {
+			return false
+		}
+		if xargsShortWithValue[a[j]] {
+			return j+1 >= len(a)
+		}
+	}
+	return false
 }
 
 // xargsReplToken returns the LAST -I/-i/--replace replacement token the
@@ -6636,17 +7341,11 @@ func xargsReplToken(argv []string) string {
 			break
 		}
 		if strings.HasPrefix(a, "--") {
-			if j := strings.IndexByte(a, '='); j > 0 {
-				if xargsIsReplaceLong(a[:j]) {
-					repl = a[j+1:]
-				}
-				continue
+			tok, hasTok, consumed := xargsReplLongToken(a)
+			if hasTok {
+				repl = tok
 			}
-			if xargsIsReplaceLong(a) {
-				repl = "{}" // GNU: bare --replace == -I{}
-			} else if xargsLongWithValue[a] {
-				i++
-			}
+			i += consumed
 			continue
 		}
 		if strings.HasPrefix(a, "-") && len(a) > 1 {
@@ -6664,6 +7363,32 @@ func xargsReplToken(argv []string) string {
 		break // first non-option operand is the command
 	}
 	return repl
+}
+
+// xargsReplLongToken handles one `--` word in xargsReplToken's scan
+// (extracted so the scan loop stays reviewable — v6.2.2 R3): tok/hasTok
+// carry a replacement token the word names, consumed counts EXTRA argv
+// operands the word eats as a value option. GNU `--replace=` with an
+// empty value still defaults to "{}" (v6.2.2 R3 R2-SF-3), bare
+// --replace abbreviations default to "{}" without consuming the next
+// argv, and GNU-abbreviated value long options consume one operand.
+func xargsReplLongToken(a string) (tok string, hasTok bool, consumed int) {
+	if j := strings.IndexByte(a, '='); j > 0 {
+		if xargsIsReplaceLong(a[:j]) {
+			if a[j+1:] == "" {
+				return "{}", true, 0 // GNU --replace= (empty) still defaults to {}
+			}
+			return a[j+1:], true, 0
+		}
+		return "", false, 0
+	}
+	if xargsIsReplaceLong(a) {
+		return "{}", true, 0 // GNU: bare --replace == -I{}
+	}
+	if xargsLongConsumesNext(a) {
+		return "", false, 1
+	}
+	return "", false, 0
 }
 
 // xargsReplClusterToken scans one short-option cluster word of xargs'
@@ -6744,7 +7469,6 @@ func screenFindArgsSeg(args []string, outerSeg shellSegment, kind byte, depth in
 	expectValue := false
 	skipNextAlso := false // -fprintf consumed TWO operands: this slot is its FORMAT
 	pathDone := false
-	valueOpts := findExecSlotValueOpts
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if skipNextAlso {
@@ -6774,7 +7498,7 @@ func screenFindArgsSeg(args []string, outerSeg shellSegment, kind byte, depth in
 			pathDone = true
 			continue
 		}
-		if valueOpts[a] {
+		if isFindValueOpt(a) {
 			pathDone = true
 			expectValue = true
 			if a == "-fprintf" {
@@ -8347,31 +9071,41 @@ func screenTarSubagent(args []string, depth int, caller callerIdentity) string {
 		}
 		var cmd string
 		switch {
-		case strings.HasPrefix(a, "--checkpoint-action="):
-			v := a[len("--checkpoint-action="):]
-			if strings.HasPrefix(v, "exec=") {
-				cmd = v[len("exec="):]
-			} else if v == "exec" {
-				cmd = "true" // bare exec still arms the hook
-			}
-		case a == "--checkpoint-action":
-			if i+1 < len(args) {
-				v := args[i+1]
-				if strings.HasPrefix(v, "exec=") {
-					cmd = v[len("exec="):]
+		case strings.HasPrefix(a, "--") && strings.IndexByte(a, '=') >= 0:
+			lname, lval, _ := strings.Cut(a[2:], "=")
+			switch {
+			case tarExecLongMatch(lname, "checkpoint-action"):
+				if strings.HasPrefix(lval, "exec=") {
+					cmd = lval[len("exec="):]
+				} else if lval == "exec" {
+					cmd = "true" // bare exec still arms the hook
 				}
-				i++
+			case tarExecLongMatch(lname, "to-command") || tarExecLongMatch(lname, "use-compress-program"):
+				cmd = lval
 			}
-		case a == "--to-command" || a == "--use-compress-program" || a == "-I":
+		case strings.HasPrefix(a, "--"):
+			lname := a[2:]
+			switch {
+			case tarExecLongMatch(lname, "checkpoint-action"):
+				if i+1 < len(args) {
+					v := args[i+1]
+					if strings.HasPrefix(v, "exec=") {
+						cmd = v[len("exec="):]
+					}
+					i++
+				}
+			case tarExecLongMatch(lname, "to-command") || tarExecLongMatch(lname, "use-compress-program"):
+				if i+1 < len(args) {
+					cmd = args[i+1]
+					i++
+				}
+			}
+		case a == "-I":
 			if i+1 < len(args) {
 				cmd = args[i+1]
 				i++
 			}
-		case strings.HasPrefix(a, "--to-command="):
-			cmd = a[len("--to-command="):]
-		case strings.HasPrefix(a, "--use-compress-program="):
-			cmd = a[len("--use-compress-program="):]
-		case strings.HasPrefix(a, "-I") && len(a) > 2 && !strings.HasPrefix(a, "--"):
+		case strings.HasPrefix(a, "-I") && len(a) > 2:
 			cmd = a[2:]
 		case a == "-f" || a == "--file" || a == "-C" || a == "--directory" ||
 			a == "-T" || a == "--files-from" || a == "-X" || a == "--exclude-from" ||
@@ -8385,9 +9119,19 @@ func screenTarSubagent(args []string, depth int, caller callerIdentity) string {
 			// Other long options (--numeric-owner, --exclude=pat, ...).
 		case strings.HasPrefix(a, "-") && len(a) > 1:
 			// Short-option cluster: f/C/T/X take a value operand — the
-			// cluster tail or the next argv — and end the cluster.
+			// cluster tail or the next argv — and end the cluster. 'I' inside
+			// a cluster is --use-compress-program's short form whose operand
+			// arms an exec hook (v6.2.2 R3 R2-SF-3).
 			for j := 1; j < len(a); j++ {
 				switch a[j] {
+				case 'I':
+					if j+1 < len(a) {
+						cmd = a[j+1:]
+					} else if i+1 < len(args) {
+						cmd = args[i+1]
+						i++
+					}
+					j = len(a)
 				case 'f', 'C', 'T', 'X', 'b', 'L', 'H', 'h':
 					if j+1 >= len(a) {
 						i++ // value operand is the next argv
@@ -10267,7 +11011,7 @@ func interpFileRunStep(args []string, i int, base string, syntaxFlags []string) 
 		// those out, but the option run must still stop here (never screen
 		// the operand as a query flag); -uW/-uX-style clusters consume the
 		// next argv as their W/X operand (v6.2.2 MF-2), never allow it.
-		if !strings.HasPrefix(a, "--") && len(a) > 2 && strings.HasPrefix(a, "-") {
+		if !strings.HasPrefix(a, "--") && len(a) >= 2 && strings.HasPrefix(a, "-") {
 			isCode, cons := pyShortClusterEnd(a)
 			if isCode {
 				return i, false, true
@@ -16286,9 +17030,6 @@ func interpDynValueOpts(spec interpOptSpec) (valueExact, codeFlags map[string]bo
 	}
 	for k := range spec.longValue {
 		valueExact[k] = true
-		if spec.longValueRe[k] {
-			codeFlags[k] = true
-		}
 	}
 	for k := range spec.longCode {
 		valueExact[k], codeFlags[k] = true, true
@@ -16304,6 +17045,47 @@ func interpDynValueOpts(spec interpOptSpec) (valueExact, codeFlags map[string]bo
 // (the only heads whose option zone also spells +o/+O/+c).
 func shellOptSpecHasPlus(spec interpOptSpec) bool {
 	return spec.flagCodes == "c" && strings.Contains(spec.valShort, "o")
+}
+
+// interpDynLongStep handles one `--` word in hasDynamicInterpOption's scan
+// (extracted so the main scan loop stays reviewable — v6.2.2 R3): end/dyn
+// carry the final verdict when the word decides the outcome, next is the
+// loop index to continue from. Python's strict long arity table owns the
+// Python verdict; non-Python long VALUE options consume their operand
+// through the spec-derived valueExact table and a dynamic operand fails
+// closed unless the slot is itself inline code (v6.2.2 R3 R2-MF-1).
+func interpDynLongStep(head []string, i int, spec interpOptSpec, valueExact, codeFlags map[string]bool, pyHead, shell bool) (next int, end, dyn bool) {
+	if pyHead {
+		n, bad := checkPythonLongInterpOpt(head, i)
+		if bad {
+			return i, true, true
+		}
+		return n, false, false
+	}
+	a := head[i]
+	name := a[2:]
+	hasEq := false
+	if k := strings.IndexByte(name, '='); k >= 0 {
+		name, hasEq = name[:k], true
+	}
+	if shell && (name == "rcfile" || name == "init-file") && shellRcfileDynamicHit(head, i) {
+		return i, true, true
+	}
+	if !valueExact["--"+name] {
+		return i, false, false // unknown or boolean long option consumes only its own word
+	}
+	if hasEq {
+		return i, false, false // glued value consumes only its own word
+	}
+	// A separate value operand follows: dynamic operands fail closed unless
+	// the slot itself is inline code (its own screen judges those downstream).
+	if i+1 < len(head) && isDynamicArg(head[i+1]) && !codeFlags["--"+name] {
+		return i, true, true
+	}
+	if i+1 < len(head) {
+		return i + 1, false, false // consume the separate value operand
+	}
+	return i, false, false
 }
 
 // hasDynamicInterpOption reports a dynamic word in the shell/interpreter
@@ -16327,57 +17109,121 @@ func hasDynamicInterpOption(head []string, base string) bool {
 	valueExact, codeFlags := interpDynValueOpts(spec)
 	pyHead := isPythonInterpBase(base)
 	for i := 1; i < len(head); i++ {
-		a := head[i]
-		if a == "--" || a == "-" {
-			// "--" ends the option zone; "-" means stdin script source and
-			// the remaining args are script argv (W-Fix-6).
-			return false
+		ni, end, dyn := interpDynWordStep(head, i, spec, valueExact, codeFlags, pyHead, shell)
+		if end {
+			return dyn
 		}
-		if isDynamicArg(a) {
-			return dynInterpWordHit(a, shell)
-		}
-		if strings.HasPrefix(a, "--") {
-			next, end, dyn := dynLongOptStep(head, i, pyHead, shell)
-			if end {
-				return dyn
-			}
-			i = next
-			continue
-		}
-		if pyHead {
-			if end, dyn := pyInterpScanStep(head, i); end {
-				return dyn
-			}
-		}
-		if valueExact[a] {
-			if i+1 < len(head) && isDynamicArg(head[i+1]) && !codeFlags[a] {
-				return true
-			}
-			i++ // consume value / code slot
-			continue
-		}
-		if strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+") {
-			i += pyClusterValueSkip(a, pyHead)
-			continue
-		}
-		// first static non-option operand = script file → option zone ends
-		return false
+		i = ni
 	}
 	return false
 }
 
-// pyClusterValueSkip reports how many EXTRA argv words a Python short
-// cluster's trailing W/X value consumes: -uW/-uX-style clusters carry the
-// operand in the NEXT argv (v6.2.2 MF-2), and skipping it here keeps the
-// operand from posing as the first script word and ending the scan early.
-func pyClusterValueSkip(a string, pyHead bool) int {
-	if !pyHead || strings.HasPrefix(a, "--") || len(a) <= 2 {
-		return 0
+// interpDynWordStep advances hasDynamicInterpOption's scan past the word at
+// index i (extracted so the scan loop stays reviewable — v6.2.2 R3): next
+// is the loop index to continue from, end/dyn carry the final verdict when
+// the word decides the outcome (including the zone-ending first static
+// script operand, reported as end=true, dyn=false).
+func interpDynWordStep(head []string, i int, spec interpOptSpec, valueExact, codeFlags map[string]bool, pyHead, shell bool) (next int, end, dyn bool) {
+	a := head[i]
+	if a == "--" || a == "-" {
+		// "--" ends the option zone; "-" means stdin script source and
+		// the remaining args are script argv (W-Fix-6).
+		return i, true, false
 	}
-	if _, cons := pyShortClusterEnd(a); cons {
-		return 1
+	if isDynamicArg(a) {
+		return i, true, dynInterpWordHit(a, shell)
 	}
-	return 0
+	if strings.HasPrefix(a, "--") {
+		return interpDynLongStep(head, i, spec, valueExact, codeFlags, pyHead, shell)
+	}
+	if pyHead {
+		if pyEnd, pyDyn := pyInterpScanStep(head, i); pyEnd {
+			return i, true, pyDyn
+		}
+	}
+	if valueExact[a] {
+		if i+1 < len(head) && isDynamicArg(head[i+1]) && !codeFlags[a] {
+			return i, true, true
+		}
+		return i + 1, false, false // consume value / code slot
+	}
+	if strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+") {
+		// Spec-derived cluster value consumption (v6.2.2 R3 R2-MF-2):
+		// a cluster ending in a bare value letter consumes the NEXT
+		// argv — the operand is checked for dynamic words BEFORE it is
+		// skipped, so python3 -uW $X / sh -o errexit "$OPT" / perl -wI
+		// /tmp -I $X can no longer launder a dynamic word through the
+		// value slot. Python's own -uW/-uX table agrees with the spec.
+		if clusterValueConsumesNext(spec, a) {
+			if i+1 < len(head) && isDynamicArg(head[i+1]) {
+				return i, true, true
+			}
+			return i + 1, false, false
+		}
+		return i, false, false
+	}
+	// first static non-option operand = script file → option zone ends
+	return i, true, false
+}
+
+// clusterConsumesNext is the spec-derived single source for short-cluster
+// value consumption shared by hasDynamicInterpOption and
+// stdinInterpTargetsScan (v6.2.2 R3 R2-MF-2): it reports whether the cluster
+// word a ends in a spec value letter (valShort) whose operand is the NEXT
+// argv word, or names a bare/glued code letter. Cluster parsing mirrors
+// interpOptSpec.scanShortCluster: glued code letters end the cluster, glued
+// or flag value letters end at the value letter, optional-glued letters
+// absorb their tails.
+func clusterConsumesNext(spec interpOptSpec, a string) (consumes bool) {
+	if strings.HasPrefix(a, "--") || len(a) < 2 {
+		return false
+	}
+	plus := a[0] == '+'
+	for j := 1; j < len(a); j++ {
+		ch := a[j]
+		if !plus && strings.IndexByte(spec.gluedCodes, ch) >= 0 {
+			return false // glued code: tail-or-next is a code slot, not a value
+		}
+		if !plus && strings.IndexByte(spec.flagCodes, ch) >= 0 {
+			// Flag-model code letter: its operand is the next argv — but that
+			// operand is CODE, screened by the code-slot logic, so it never
+			// counts as a skip-worthy value here. Letters after a letter-only
+			// tail keep parsing as flags.
+			if tail := a[j+1:]; tail != "" && !isLetterOnly(tail) {
+				return false
+			}
+			continue
+		}
+		if strings.IndexByte(spec.valShort, ch) >= 0 {
+			if j+1 >= len(a) {
+				return true // bare value letter: the operand is the next argv
+			}
+			return false // glued tail IS the value — the cluster ends
+		}
+		if strings.IndexByte(spec.optNumShort, ch) >= 0 {
+			j += consumeNumOptTail(a, j, ch)
+			continue
+		}
+		if strings.IndexByte(spec.optShort, ch) >= 0 {
+			return false // optional-glued tail absorbs the rest
+		}
+	}
+	return false
+}
+
+// clusterValueConsumesNext reports whether the short cluster a consumes the
+// NEXT argv as a plain value operand under spec — the shared skip rule for
+// the option-zone scanners (v6.2.2 R3 R2-MF-2).
+func clusterValueConsumesNext(spec interpOptSpec, a string) bool {
+	if strings.HasPrefix(a, "--") || len(a) <= 2 && len(a) != 2 {
+		return false
+	}
+	if len(a) == 2 {
+		// A bare two-letter option: value letters consume the next argv.
+		ch := a[1]
+		return strings.IndexByte(spec.valShort, ch) >= 0
+	}
+	return clusterConsumesNext(spec, a)
 }
 
 // dynInterpWordHit decides a dynamic word inside the shell/interpreter
@@ -16392,23 +17238,6 @@ func dynInterpWordHit(a string, shell bool) bool {
 		return false // script-file operand ends the option zone
 	}
 	return true
-}
-
-// dynLongOptStep handles one `--` word in hasDynamicInterpOption's scan:
-// end/dyn carry the final verdict when the word decides the outcome, next
-// is the loop index to continue from (a consumed separate operand).
-func dynLongOptStep(head []string, i int, pyHead, shell bool) (next int, end, dyn bool) {
-	if pyHead {
-		n, bad := checkPythonLongInterpOpt(head, i)
-		if bad {
-			return i, true, true
-		}
-		return n, false, false
-	}
-	if shell && shellRcfileDynamicHit(head, i) {
-		return i, true, true
-	}
-	return i, false, false
 }
 
 // pyInterpScanStep applies CPython's stop-at-first-code-slot rule to argv
@@ -16431,10 +17260,17 @@ func pyInterpScanStep(head []string, i int) (end, dyn bool) {
 			return false, false
 		}
 	} else {
-		var isCode bool
-		isCode, _ = pyShortClusterEnd(a)
+		var isCode, consumesNext bool
+		isCode, consumesNext = pyShortClusterEnd(a)
 		if !isCode {
 			return false, false
+		}
+		if !consumesNext {
+			// The module/code text is glued INSIDE the cluster (-mjson.tool):
+			// the next argv is a script/module argument, never the module
+			// name — the scan ends here with no dynamic verdict (v6.2.2 R3
+			// R2-MF-2 restores python3 -mjson.tool "$HOME/a.json").
+			return true, false
 		}
 		isModule = clusterEndsInM(a)
 	}
@@ -17217,19 +18053,26 @@ func stdinShellClusterVerdict(a string, i int) (verdict, next int, force bool) {
 
 // stdinInterpTargetsScan is the interpreter-head tail of
 // stdinProgramTargetsWithEnv, extracted so the caller stays reviewable
-// (v6.2.2 Oracle R1). Value options consume their operands; a Python
-// -uW/-uX-style cluster carries its W/X operand in the NEXT argv and must
-// never let that operand pose as the script file (v6.2.2 MF-2).
+// (v6.2.2 Oracle R1). Value options consume their operands; the value table
+// derives from the interpreter's own spec so bun/tsx/node/shell/perl/ruby
+// value options can never drift apart from hasDynamicInterpOption (v6.2.2
+// R3 R2-MF-2/R2-SF-4), and a spec-driven cluster trailing a bare value
+// letter consumes the NEXT argv instead of letting it pose as the script
+// file.
 func stdinInterpTargetsScan(head []string, base, lang string, envAs envAssignments) []stdinTarget {
 	sawDashDash := false
-	valueOpts := map[string]bool{
-		"-W": true, "-X": true, "-r": true, "--require": true,
-		"--loader": true, "--import": true, "--experimental-loader": true,
-		"--conditions": true, "-C": true, "-I": true, "-M": true, "-m": true,
-		"-c": true, "-d": true, "-z": true, "-F": true, "-K": true,
-		"--input-type": true, "--check-hash-based-pycs": true, "--title": true,
-		"--env-file": true, "--env-file-if-exists": true, "--redirect-warnings": true,
-		"--diagnostic-dir": true, "--watch-path": true,
+	spec, hasSpec := lookupInterpOptSpec(base)
+	var valueExact map[string]bool
+	if hasSpec {
+		valueExact, _ = interpDynValueOpts(spec)
+	} else {
+		valueExact = map[string]bool{}
+	}
+	// stdin-channel value options with no inline-code surface (node/bun
+	// readonly plumbing): always consume a separate operand even when the
+	// spec table does not model them for code slots.
+	for _, extra := range []string{"--title", "--env-file", "--env-file-if-exists", "--redirect-warnings", "--diagnostic-dir", "--watch-path"} {
+		valueExact[extra] = true
 	}
 	for i := 1; i < len(head); {
 		a := head[i]
@@ -17247,11 +18090,24 @@ func stdinInterpTargetsScan(head []string, base, lang string, envAs envAssignmen
 		if sawDashDash || !strings.HasPrefix(a, "-") {
 			return nil
 		}
-		if isPythonInterpBase(base) && pyClusterValueSkip(a, true) > 0 {
-			i += 2 // cluster word plus the separate W/X operand it consumes
+		if strings.HasPrefix(a, "--") {
+			name := a[2:]
+			hasEq := strings.IndexByte(name, '=') >= 0
+			if k := strings.IndexByte(name, '='); k >= 0 {
+				name = name[:k]
+			}
+			if valueExact["--"+name] && !hasEq {
+				i += 2 // consume the separate value operand
+				continue
+			}
+			i++
 			continue
 		}
-		if valueOpts[a] {
+		if hasSpec && clusterValueConsumesNext(spec, a) {
+			i += 2 // cluster word plus the separate value operand it consumes
+			continue
+		}
+		if valueExact[a] {
 			i += 2
 			continue
 		}

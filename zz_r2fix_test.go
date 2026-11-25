@@ -1124,8 +1124,184 @@ func TestGuard_V622_OracleR1Probes(t *testing.T) {
 	})
 }
 
+// ---------------------------------------------------------------------------
+// v6.2.2 Oracle R2 (R3 闭环): R2-MF-1..7 / R2-SF-1..4 / R2-Obs-1..2 探针回归 —
+// 长值选项 valueExact 统一消费与动态校验、pyInterpScanStep consumesNext 恢复
+// 粘连 -m、sed/awk/git 复用仓内单源解析器、script -t optional_argument 与
+// 位置参数置换、flock/xargs/tar GNU 唯一前缀缩写、ssh 短簇值操作数、xargs -a
+// 与 argv+stdin 闭合、peelExecSlotHead canonical 变体写回、find 谓词表补齐、
+// env -S 包装链约束扫描。每条 block 探针在修复前均为 ALLOW（或回归BLOCK），
+// 每条 allow 探针钉住不得误伤的合法调用。
+// ---------------------------------------------------------------------------
+
+func TestGuard_V622_OracleR2Probes(t *testing.T) {
+	blockCases := []struct {
+		name, cmd string
+	}{
+		// R2-MF-1: 非 Python 长值选项经 valueExact 统一消费并校验动态操作数。
+		{"P-R2-MF1-a bash rcfile /dev/null $OPT", `OPT=-c; bash --rcfile /dev/null "$OPT" 'pig'`},
+		{"P-R2-MF1-b bash double rcfile", `bash --rcfile /dev/null --rcfile /etc/profile -c 'pig'`},
+		{"P-R2-MF1-c node --conditions --import", `X='a.js -e require("child_process").execSync("pig")'; node --conditions default --import $X`},
+		{"P-R2-MF1-d bun --cwd -c", `X='a.toml -e require("child_process").execSync("pig")'; bun --cwd . -c $X`},
+		{"P-R2-MF1-e node --input-type -r", `X='a.js -e require("child_process").execSync("pig")'; node --input-type commonjs -r $X`},
+		{"P-R2-MF1-f node --require no reverse polarity", `X='a.js -e require("child_process").execSync("pig")'; node --require $X`},
+		// R2-MF-2: spec 驱动短簇带值消费先查动态词再 i++。
+		{"P-R2-MF2-c python3 -uW dyn", `X='ignore -c __import__("os").system("pig")'; python3 -uW $X`},
+		{"P-R2-MF2-d bash -xo cluster", `bash -xo errexit --rcfile /etc/profile -c 'pig'`},
+		{"P-R2-MF2-e sh -xo dynOPT", `OPT=-c; sh -xo errexit "$OPT" 'pig'`},
+		{"P-R2-MF2-f perl -wI dyn", `X='/tmp -e system("pig")'; perl -wI /tmp -I $X`},
+		{"P-R2-MF2-g perl -wI heredoc", "perl -wI /tmp <<'EOF'\nsystem(\"pig\")\nEOF"},
+		// R2-MF-3: sed/awk/git 复用单源解析器后的绕过面。
+		{"P-R2-MF3-d sed -ne glued", `echo '1e pig' | xargs -I{} sed -ne'{}' /etc/hosts`},
+		{"P-R2-MF3-e sed --expr abbrev", `echo '1e pig' | xargs -I{} sed --expr='{}' /etc/hosts`},
+		{"P-R2-MF3-f gawk -e glued", `echo 'BEGIN{system("pig")}' | xargs -I{} gawk -e'{}' /dev/null`},
+		{"P-R2-MF3-g gawk --assign then token", `echo 'BEGIN{system("pig")}' | xargs -I{} gawk --assign x=1 '{}' /dev/null`},
+		{"P-R2-MF3-h git -c bare token", `echo 'core.pager=pig' | xargs -I{} git -c '{}' log`},
+		{"P-R2-MF3-i git optzone token", `echo '-c' | xargs -I% git % 'core.pager=pig' log`},
+		{"P-R2-MF3-j git merge driver key", `echo 'pig' | xargs -I{} git -c 'merge.foo.driver={}' merge`},
+		// R2-MF-4: script -t optional_argument / 长选项补全 / 位置参数置换;
+		// flock GNU 唯一前缀缩写。
+		{"P-R2-MF4-a script -t bare", `script -t -c 'pig' /dev/null`},
+		{"P-R2-MF4-b xargs script -t", `echo pig | xargs -I{} script -t -c '{}' /dev/null`},
+		{"P-R2-MF4-c script --timing bare", `script --timing -c 'pig' /dev/null`},
+		{"P-R2-MF4-d script --log-io", `script --log-io /dev/null -c 'pig'`},
+		{"P-R2-MF4-e script positional then -c", `script /dev/null -c 'pig'`},
+		{"P-R2-MF4-f flock --com glued", `flock --com='pig' /dev/null`},
+		{"P-R2-MF4-g flock --time separate", `flock --time 5 /dev/null -c 'pig'`},
+		// R2-MF-5: ssh 短簇带值操作数不再冒充 destination。
+		{"P-R2-MF5-a ssh -p operand", `echo '-oProxyCommand=pig' | xargs -I{} ssh -p 22 {} dmit ls`},
+		// R2-MF-6: interpOptionZoneHasToken spec 驱动跳值、多 -e 继续扫描。
+		{"P-R2-MF6-a python3 -W operand", `echo -c | xargs -I% python3 -W ignore % 'import os; os.system("pig")'`},
+		{"P-R2-MF6-b sh -o operand", `echo -c | xargs -I% sh -o errexit % 'pig'`},
+		{"P-R2-MF6-c bun -c value then token", `echo -e | xargs -I% bun -c a.toml % 'require("child_process").execSync("pig")'`},
+		{"P-R2-MF6-d perl multi -e", `echo -e | xargs -I% perl -e '1' % 'system("pig")'`},
+		{"P-R2-MF6-e php -r then token", `echo -r | xargs -I% php -r '1;' % 'system("pig");'`},
+		{"P-R2-MF6-f script optzone token", `echo -c | xargs -I% script % 'pig' /dev/null`},
+		// R2-SF-1..4: canonical 变体、find 谓词、xargs/tar GNU 缩写、stdin spec 派生。
+		{"P-R2-SF1-a gfind canonical", `echo pig | xargs -I% gfind . -exec sh -c '%' ';'`},
+		{"P-R2-SF2-a find -newermm shift", `find . -newermm -exec -exec pig ';'`},
+		{"P-R2-SF3-a xargs --replace= empty", `echo pig | xargs --replace= sh -c '{}'`},
+		{"P-R2-SF3-b xargs --max-a abbrev", `echo pig | xargs --max-a 1 -I{} sh -c '{}'`},
+		{"P-R2-SF3-c tar -cI cluster", `echo 'pig' | xargs -I{} tar -cI '{}' -f /dev/null /dev/null`},
+		{"P-R2-SF4-a bun --cwd stdin", `echo 'require("child_process").execSync("pig")' | bun --cwd . -`},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+		})
+	}
+	allowCases := []struct {
+		name, cmd string
+	}{
+		// R2-MF-2 功能回归恢复:粘连 -m 后动态/通配参数是模块参数而非模块名。
+		{"P-R2-MF2-a python3 -mjson.tool", `python3 -mjson.tool "$HOME/a.json"`},
+		{"P-R2-MF2-b python3 -mpytest glob", `python3 -mpytest tests/*.py`},
+		// R2-MF-3 功能回归恢复:-e/-f 之后输入文件名是数据。
+		{"P-R2-MF3-a find sed -e", `find . -name '*.txt' -exec sed -e 's/foo/bar/' {} \;`},
+		{"P-R2-MF3-b xargs sed -e", `echo foo.txt | xargs -I{} sed -e 's/foo/bar/' {}`},
+		{"P-R2-MF3-c find awk -f", `find . -name '*.log' -exec awk -f parse.awk {} \;`},
+		{"P-R2-MF3-a2 find sed -n -e", `find . -name '*.txt' -exec sed -n -e '1,5p' {} \;`},
+		{"P-R2-MF3-a3 find sed -f", `find . -name '*.txt' -exec sed -f rules.sed {} \;`},
+		// R2-MF-7 功能回归恢复:rg 参数位的 env -S 不触发包装链扫描。
+		{"P-R2-MF7-b rg env -S operand", `find . -name '*.go' -exec rg env -S {} \;`},
+		{"P-R2-MF7-b2 echo env -S operand", `echo foo | xargs -I{} echo env -S {}`},
+		// R2-SF-2 假阳性恢复:-ctime 等时间谓词的值是数据。
+		{"P-R2-SF2-b find -ctime value", `echo 5 | xargs -I{} find . -ctime {}`},
+		// flock 正例:-xw 粘连簇与分离 -x -w 都正确解析到命令头 true。
+		{"flock -xw 0 positive", `flock -xw 0 /dev/null true`},
+		{"flock -x -w 30 positive", `flock -x -w 30 /dev/null true`},
+		// script/typescript 合法调用不受选项区扫描误伤。
+		{"script benign -c no token", `script -c 'echo hi' /tmp/out`},
+		// R12 数据位保持:sh -c positional $1 与 git -C 路径值。
+		{"R12 sh positional", `find . -exec sh -c 'echo "$1"' _ {} +`},
+		{"R12 git -C data", `echo /tmp/repo | xargs -I{} git -C {} status`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+
+	// P-R2-MF5-b/c: xargs -a 文件喂词与 argv+stdin 两路闭合。文件用
+	// t.TempDir() 预建——`printf ... > /tmp/p` 前置重定向会独立命中写拦截
+	// 掩盖目标路径 (Reviewer should-fix),且断言精确 verdict 子串。
+	t.Run("P-R2-MF5-b xargs -a file feed", func(t *testing.T) {
+		payload := filepath.Join(t.TempDir(), "payload")
+		if err := os.WriteFile(payload, []byte("-c\npig\n"), 0644); err != nil {
+			t.Fatalf("write payload: %v", err)
+		}
+		got := rtGuardCwd(t, rtCase{id: "P-R2-MF5-b", role: "worker", cmd: `xargs -a ` + payload + ` ssh dmit sh`}, "")
+		if !strings.Contains(got, "ssh") {
+			t.Fatalf("xargs -a payload ssh dmit sh = %q, want an ssh verdict block", got)
+		}
+	})
+	t.Run("P-R2-MF5-c argv+stdin feed", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{
+			id: "P-R2-MF5-c", role: "worker",
+			argv:  []string{"xargs", "ssh", "dmit", "sh"},
+			stdin: "-c pig",
+		}, "")
+		if !strings.Contains(got, "ssh") {
+			t.Fatalf("argv xargs ssh dmit sh + stdin '-c pig' = %q, want an ssh verdict block", got)
+		}
+	})
+	// R12 精确 verdict 不破坏:pipe 与 file-redir 两种传输必须各归其名。
+	t.Run("R12 piped verdict exact", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "R12-a", role: "worker", cmd: `echo code | xargs ssh dmit sh`}, "")
+		if !strings.Contains(got, "piped stdin to ssh") {
+			t.Fatalf("echo code | xargs ssh dmit sh = %q, want piped stdin to ssh", got)
+		}
+	})
+	t.Run("R12 file-redir verdict exact", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "R12-b", role: "worker", cmd: `xargs -a /tmp/items ssh dmit sh < /tmp/script.sh`}, "")
+		if !strings.Contains(got, "file stdin to ssh stdin-program") {
+			t.Fatalf("xargs -a file ssh dmit sh < redir = %q, want file stdin to ssh stdin-program", got)
+		}
+	})
+}
+
+// TestGuard_V622_OracleR2EnvCwd 覆盖 R2-MF-7 软链别名 env -S 注入
+// (依赖文件系统软链布置,单独成组)。
+func TestGuard_V622_OracleR2EnvCwd(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.Symlink("/usr/bin/env", filepath.Join(cwd, "myenv")); err != nil {
+		t.Fatalf("symlink myenv -> /usr/bin/env: %v", err)
+	}
+	t.Run("P-R2-MF7-a symlink alias env -S", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{
+			id: "P-R2-MF7-a", role: "worker",
+			cmd: `echo "-e system('pig')" | xargs -I{} ./myenv -S "perl -e '1' {}"`,
+		}, cwd)
+		if got == "ALLOW" {
+			t.Fatalf("./myenv -S split injection = ALLOW, want a guard block")
+		}
+	})
+	// P-MF2-e 补齐 (R2-Obs-1):-uW 后 heredoc 代码流同样拦截。
+	t.Run("P-MF2-e python3 -uW heredoc", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{
+			id: "P-MF2-e", role: "worker",
+			cmd: "python3 -uW ignore <<'EOF'\nimport os; os.system(\"pig\")\nEOF",
+		}, "")
+		if got == "ALLOW" {
+			t.Fatalf("python3 -uW ignore heredoc = ALLOW, want a guard block")
+		}
+	})
+	// R2-Obs-1: 独立两字符 -c 后查询标志不得放行脚本文件运行。
+	t.Run("P-R2-Obs1 readonly bare -c then --version", func(t *testing.T) {
+		if got := screenReadonlyWrite([]string{"python3", "-c", "-1; open('/var/a','w').write('x')", "--version"}); got == "" {
+			t.Fatalf("screenReadonlyWrite python3 -c <code> --version = empty, want python3 block")
+		}
+	})
+}
+
 // TestGuard_V622_OracleR1EnvCwd 覆盖 MF-4a 结构别名与 MF-6 env -C 重锚
-// 递归 caller 修复（依赖文件系统软链布置，单独成组）。
+// 递归 caller 修复(依赖文件系统软链布置,单独成组)。
 func TestGuard_V622_OracleR1EnvCwd(t *testing.T) {
 	fakeHome := withTestTrustedHome(t)
 	binDir := filepath.Join(fakeHome, ".local", "bin")
