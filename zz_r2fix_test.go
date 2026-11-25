@@ -1465,27 +1465,29 @@ func TestGuard_V622_OracleR3Probes(t *testing.T) {
 	// R3-MF-3-b: flock --no-fork 后 python3 不再被错当锁文件。
 	t.Run("P-R3-MF3-b flock --no-fork python3", func(t *testing.T) {
 		got := rtGuardCwd(t, rtCase{id: "P-R3-MF3-b", role: "worker", cmd: `flock --no-fork /dev/null python3 -c 'import os; os.system("pig")'`}, "")
-		if got == "ALLOW" {
-			t.Fatalf("flock --no-fork python3 -c = ALLOW, want a guard block")
+		if !strings.Contains(got, "python inline code") {
+			t.Fatalf("flock --no-fork python3 -c = %q, want python inline code", got)
 		}
 	})
 
 	// R3-MF-6-d/e: xargs -a 配良性 here-string/heredoc 不再绕过 ssh stdin
 	// 追加审查;f: GNU --arg-f 缩写接入 xargsMatchValueLong(verifier 外泄)。
-	t.Run("P-R3-MF6-d xargs -a here-string", func(t *testing.T) {
+	t.Run("P-R3-MF6-d xargs -a argv+stdin", func(t *testing.T) {
+		// <<< here-string 是 bash-only 语法(/bin/sh dash 拒收),stdin 流通道
+		// 经 argv+stdin 入口钉精确 verdict;heredoc 的 POSIX 拼写见 MF6-e。
 		got := rtGuardCwd(t, rtCase{
 			id: "P-R3-MF6-d", role: "worker",
 			argv:  []string{"xargs", "-a", payloadCPig, "ssh", "dmit", "sh"},
-			stdin: "echo hi", // argv+stdin 通道等价于外层 stdin 流存在但 -a 仍追加
+			stdin: "echo hi",
 		}, "")
-		if !strings.Contains(got, "ssh") {
-			t.Fatalf("xargs -a payload ssh dmit sh + stdin = %q, want an ssh verdict block", got)
+		if !strings.Contains(got, "piped stdin to ssh") {
+			t.Fatalf("xargs -a payload ssh dmit sh + stdin = %q, want piped stdin to ssh", got)
 		}
 	})
 	t.Run("P-R3-MF6-e xargs -a heredoc", func(t *testing.T) {
 		got := rtGuardCwd(t, rtCase{id: "P-R3-MF6-e", role: "worker", cmd: "xargs -a " + payloadCPig + " ssh dmit sh <<'EOF'\necho hi\nEOF"}, "")
-		if !strings.Contains(got, "ssh") {
-			t.Fatalf("xargs -a payload ssh dmit sh heredoc = %q, want an ssh verdict block", got)
+		if !strings.Contains(got, "piped stdin to ssh") {
+			t.Fatalf("xargs -a payload ssh dmit sh heredoc = %q, want piped stdin to ssh", got)
 		}
 	})
 	t.Run("P-R3-MF6-f xargs --arg-f verifier", func(t *testing.T) {
@@ -1652,8 +1654,8 @@ func TestGuard_V622_OracleR4Probes(t *testing.T) {
 		{"P-R4-MF2-d ruby glued -e", `xargs -a ` + payloadEsys + ` -I{} ruby -e '1' {}`, "dynamic code payload"},
 		{"P-R4-MF2-e node --eval=", `xargs -a ` + payloadEval + ` -I{} node -e '1' {}`, "dynamic code payload"},
 		{"P-R4-MF2-f bun --eval=", `xargs -a ` + payloadEval + ` -I{} bun -e '1' {}`, "dynamic code payload"},
-		{"P-R4-MF2-g xargs -a perl", `xargs -a ` + payloadEsys + ` -I{} perl -e '1' {}`, "dynamic code payload"},
-		{"P-R4-MF2-h xargs -a node", `xargs -a ` + payloadEval + ` -I{} node -e '1' {}`, "dynamic code payload"},
+		{"P-R4-MF2-g php glued -r", `xargs -a ` + mkPayload("r4-phpr", "-rsystem(\"pig\");\n") + ` -I{} php -r '1;' {}`, "dynamic code payload"},
+		{"P-R4-MF2-h tsx --eval=", `xargs -a ` + payloadEval + ` -I{} tsx -e '1' {}`, "dynamic code payload"},
 		// R4-MF-3: env -S 拆词重拼嵌套链不再被 len(rest)>=len(cur) 截断。
 		{"P-R4-MF3-a env -Senv -S find", `xargs -a ` + payloadFooExec + ` -I{} env "-Senv -S" "find . -name {}"`, "dynamic code payload"},
 		{"P-R4-MF3-b env -S nice chain", `xargs -a ` + payloadFooExec + ` -I{} env -S "nice nice nice" env -S "find . -name {}"`, "dynamic code payload"},
@@ -1743,8 +1745,8 @@ func TestGuard_V622_OracleR4Probes(t *testing.T) {
 	}
 	t.Run("P-R4-MF4-k -W file heredoc", func(t *testing.T) {
 		got := rtGuardCwd(t, rtCase{id: "P-R4-MF4-k", role: "worker", cmd: "gawk -W file=- <<'EOF'\nBEGIN{system(\"pig\")}\nEOF"}, "")
-		if got == "ALLOW" {
-			t.Fatalf("gawk -W file=- heredoc = ALLOW, want a guard block")
+		if !strings.Contains(got, "awk script from stdin") {
+			t.Fatalf("gawk -W file=- heredoc = %q, want awk script from stdin", got)
 		}
 	})
 
@@ -1827,19 +1829,218 @@ func TestGuard_V622_OracleR4Probes(t *testing.T) {
 		}
 	})
 	t.Run("R4-unit awkOptZone positional scan", func(t *testing.T) {
-		if !awkOptZoneHasToken([]string{"-e", "1", "/dev/null", "-f", "{}"}, "{}") {
+		if !awkOptZoneHasToken([]string{"-e", "1", "/dev/null", "-f", "{}"}, "{}", false) {
 			t.Errorf("awkOptZoneHasToken(positional then -f {}) = false, want true")
 		}
-		if !awkOptZoneHasToken([]string{"-e", "1", "/dev/null", "--file={}"}, "{}") {
+		if !awkOptZoneHasToken([]string{"-e", "1", "/dev/null", "--file={}"}, "{}", false) {
 			t.Errorf("awkOptZoneHasToken(positional then --file={}) = false, want true")
 		}
-		if awkOptZoneHasToken([]string{"-vf={}", "/dev/null"}, "{}") {
+		if awkOptZoneHasToken([]string{"-vf={}", "/dev/null"}, "{}", false) {
 			t.Errorf("awkOptZoneHasToken(-vf={}) = true, want false (glued data assignment)")
 		}
 	})
 	t.Run("R4-unit scriptOptWord positional", func(t *testing.T) {
 		if consume, hit := scriptOptWordTokenStep([]string{"script", "/tmp/out.o", "--", "%"}, 1, "%"); consume != 0 || hit {
 			t.Errorf("scriptOptWordTokenStep(positional /tmp/out.o) = %d,%v want 0,false", consume, hit)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// v6.2.2 Oracle R5 (R7 闭环): R5-MF-1..4 / R5-SF-1..3 探针回归 —
+// flagCodes+valShort 双槽消费恢复 sh -co/bash -co/node -pr/bun -pc 的 BLOCK;
+// env -S 同层递归拆出内层 -S 载荷沿 token 传播闭合;awk 选项区裸 token
+// 按 findPathToken 语义命中;gawk GNU 唯一前缀与 -W assign/--as 操作数消费
+// 闭合。所有 dynamic code payload 精确断言走 xargs -a 无管道入口,stdin
+// 程序源断言走 echo 管道与 argv+stdin 双通道(R3-Obs-2 隔离纪律)。
+// ---------------------------------------------------------------------------
+
+func TestGuard_V622_OracleR5Probes(t *testing.T) {
+	mkPayload := func(name, content string) string {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+	payloadEval := mkPayload("r5-eval", "--eval=require(\"child_process\").execSync(\"pig\")\n")
+	payloadFooExec := mkPayload("r5-fooexec", "foo -exec pig ;\n")
+	payloadCkpt := mkPayload("r5-ckpt", "a --checkpoint=1 --checkpoint-action=exec=pig\n")
+	payloadEBegin := mkPayload("r5-ebegin", "-eBEGIN{system(\"pig\")}\n")
+	payloadFstdin := mkPayload("r5-fstdin", "-f/dev/stdin\n")
+	payloadEvilSo := mkPayload("r5-evilso", "/tmp/evil.so\n")
+
+	blockCases := []struct {
+		name, cmd, want string
+	}{
+		// R5-MF-1: R6 回归修复 — flagCodes+valShort 集群的值槽先查动态词,
+		// 待定代码槽再消费一个操作数(sh/bash/node/bun 全部恢复 BLOCK)。
+		{"P-R5-MF1-a sh -co", `X='errexit pig'; sh -co $X 'echo hi'`, "dynamic code payload"},
+		{"P-R5-MF1-b bash -co", `X='errexit pig'; bash -co $X 'echo hi'`, "dynamic code payload"},
+		{"P-R5-MF1-c node -pr", `X='a.js -e require("child_process").execSync("pig")'; node -pr $X '1'`, "dynamic code payload"},
+		{"P-R5-MF1-d bun -pc", `X='a.toml -e require("child_process").execSync("pig")'; bun -pc $X '1'`, "dynamic code payload"},
+		{"P-R5-MF1-e node -pC separate", `X='a.js -e require("child_process").execSync("pig")'; node -pC default '1' -r $X`, "dynamic code payload"},
+		{"P-R5-MF1-f node -pC glued", `X='a.js -e require("child_process").execSync("pig")'; node -pCdefault '1' -r $X`, "dynamic code payload"},
+		{"P-R5-MF1-g xargs node -pC", `xargs -a ` + payloadEval + ` -I% node -pC default '1' %`, "dynamic code payload"},
+		{"P-R5-MF1-h xargs node -pC glued", `xargs -a ` + payloadEval + ` -I% node -pCdefault '1' %`, "dynamic code payload"},
+		// R5-MF-2: env -S 同层递归拆出内层 -S 载荷沿 token 传播。
+		{"P-R5-MF2-a env -S -S find", `xargs -a ` + payloadFooExec + ` -I{} env -S "-S" "find . -name {}"`, "dynamic code payload"},
+		{"P-R5-MF2-b env -S-S find", `xargs -a ` + payloadFooExec + ` -I{} env "-S-S" "find . -name {}"`, "dynamic code payload"},
+		{"P-R5-MF2-c env -S split-string", `xargs -a ` + payloadFooExec + ` -I{} env -S "--split-string" "find . -name {}"`, "dynamic code payload"},
+		{"P-R5-MF2-d env -S -i -S tar", `xargs -a ` + payloadCkpt + ` -I{} env -S "-i -S" "tar -cf /dev/null {}"`, "dynamic code payload"},
+		// R5-MF-3: awk 选项区裸 token 按 findPathToken 语义命中(单词粘连
+		// 选项注入 — mawk/gawk 均可触发)。
+		{"P-R5-MF3-a gawk -e glued", `xargs -a ` + payloadEBegin + ` -I{} gawk -e '1' {}`, "dynamic code payload"},
+		{"P-R5-MF3-b gawk -e /dev/null", `xargs -a ` + payloadEBegin + ` -I{} gawk -e '1' /dev/null {}`, "dynamic code payload"},
+		{"P-R5-MF3-c awk -f devstdin", `xargs -a ` + payloadFstdin + ` -I{} awk -f /dev/null {}`, "dynamic code payload"},
+		// R5-MF-4: gawk GNU 唯一前缀 / -i 库验证 / -W assign 操作数消费。
+		{"P-R5-MF4-f -W assign program", `gawk -W assign 'x=1' 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R5-MF4-f2 -W field-separator", `gawk -W field-separator : 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R5-MF4-g --as program", `gawk --as 'x=1' 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R5-MF4-g2 --fie program", `gawk --fie : 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R5-MF4-h -l load xargs", `xargs -a ` + payloadEvilSo + ` -I{} gawk -e '1' -l '{}'`, "dynamic code payload"},
+		{"P-R5-MF4-h2 -W lo xargs", `xargs -a ` + payloadEvilSo + ` -I{} gawk -e '1' -W lo '{}'`, "dynamic code payload"},
+		{"P-R5-MF4-h3 -W e xargs", `xargs -a ` + payloadEvilSo + ` -I{} gawk -e '1' -W e '{}'`, "dynamic code payload"},
+		{"P-R5-MF4-x1 --as xargs", `xargs -a ` + mkPayload("r5-begin2", "BEGIN{system(\"pig\")}\n") + ` -I{} gawk --as 'x=1' '{}'`, "dynamic code payload"},
+		// R4-Obs-1: script 追加模式回归用例(补 R4 缺口)。
+		{"P-R4-Obs1 script append", `xargs -a ` + mkPayload("r5-cflag", "-c pig\n") + ` script /dev/null`, "dynamic code payload"},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+
+	// R5-MF-4 stdin 程序源管道:--include/-i/--e/-W e 各形态均须命中
+	// awk script from stdin(echo 管道 + argv+stdin 双通道)。
+	for _, tc := range []struct {
+		name, cmd, want string
+	}{
+		{"P-R5-MF4-a --include=stdin pipe", `echo 'BEGIN{system("pig")}' | gawk --include=/dev/stdin '1'`, "awk script from stdin"},
+		{"P-R5-MF4-a2 --include sep pipe", `echo 'BEGIN{system("pig")}' | gawk --include /dev/stdin '1'`, "awk script from stdin"},
+		{"P-R5-MF4-b -i stdin pipe", `echo 'BEGIN{system("pig")}' | gawk -i /dev/stdin '1'`, "awk script from stdin"},
+		{"P-R5-MF4-b2 -i glued pipe", `echo 'BEGIN{system("pig")}' | gawk -i/dev/stdin '1'`, "awk script from stdin"},
+		{"P-R5-MF4-d --e=stdin pipe", `echo 'BEGIN{system("pig")}' | gawk --e=/dev/stdin`, "awk script from stdin"},
+		{"P-R5-MF4-d2 --e sep pipe", `echo 'BEGIN{system("pig")}' | gawk --e /dev/stdin`, "awk script from stdin"},
+		{"P-R5-MF4-e -W e=stdin pipe", `echo 'BEGIN{system("pig")}' | gawk -W e=/dev/stdin`, "awk script from stdin"},
+		{"P-R5-MF4-e2 -W e sep pipe", `echo 'BEGIN{system("pig")}' | gawk -W e /dev/stdin`, "awk script from stdin"},
+		{"P-R5-MF4-e3 -W in=stdin pipe", `echo 'BEGIN{system("pig")}' | gawk -W in=/dev/stdin '1'`, "awk script from stdin"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{"P-R5-MF4-c argvstdin --include=", []string{"gawk", "--include=/dev/stdin", "1"}, "awk script from stdin"},
+		{"P-R5-MF4-c2 argvstdin -i sep", []string{"gawk", "-i", "/dev/stdin", "1"}, "awk script from stdin"},
+		{"P-R5-MF4-c3 argvstdin --e=", []string{"gawk", "--e=/dev/stdin"}, "awk script from stdin"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{
+				id: tc.name, role: "worker",
+				argv:  tc.argv,
+				stdin: "BEGIN{system(\"pig\")}",
+			}, "")
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("guardCtxRunArgv %v + stdin = %q, want verdict substring %q", tc.argv, got, tc.want)
+			}
+		})
+	}
+
+	// 放行守卫正例(R5 零假阳纪律):find 自身 {}、xargs --/./{} 拼写、
+	// awk -v 纯数据、静态 sh -co、-- 后的 awk argv 数据。
+	allowCases := []struct {
+		name, cmd string
+	}{
+		{"R5-pos find perl -pe", `find . -exec perl -pe 's/a/b/' {} \;`},
+		{"R5-pos find perl trailing", `find . -exec perl -pe 's/a/b/' {} other.txt \;`},
+		{"R5-pos xargs perl -- token", `echo a.txt | xargs -I{} perl -pe 's/a/b/' -- {}`},
+		{"R5-pos xargs perl dot-slash", `echo a.txt | xargs -I{} perl -pe 's/a/b/' ./{}`},
+		{"R5-pos find awk -f -v", `find . -exec awk -f parse.awk -v fname={} {} \;`},
+		{"R5-pos find awk -v data", `find . -exec awk -v f={} 'END {print f}' {} \;`},
+		{"R5-pos xargs awk -vf glued", `echo x | xargs -I{} awk -vf={} 'END{print f}' /dev/null`},
+		{"R5-pos xargs awk -- token", `echo x | xargs -I{} awk -f parse.awk -- {}`},
+		{"R5-pos xargs awk dot-slash", `echo x | xargs -I{} awk -f parse.awk ./{}`},
+		{"R5-pos sh -co static", `sh -co errexit 'echo hi'`},
+		{"R5-pos gawk -- data", `gawk 'BEGIN{print ARGV[1]}' -- -f -`},
+		{"R5-pos find rg env -S", `find . -name '*.go' -exec rg env -S {} \;`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+
+	// 目标层直断断言(R5-Obs 防掩盖纪律):skipEnvOperandsToken /
+	// awkOptZoneHasToken findPathToken / awkWOperandProgram 的单元 verdict
+	// 不依赖外层管道或外围规则兜出 BLOCK。
+	t.Run("R5-unit env re-split token propagation", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			argv []string
+			want bool
+		}{
+			{"env -S -S", []string{"env", "-S", "-S", "find . -name {}"}, true},
+			{"env -S-S", []string{"env", "-S-S", "find . -name {}"}, true},
+			{"env -S -i -S", []string{"env", "-S", "-i -S", "find . -name {}"}, true},
+			{"env -S benign", []string{"env", "-S", "echo hi"}, false},
+			{"rg env -S operand", []string{"rg", "env", "-S", "{}"}, false},
+		} {
+			if got := wrapperChainEnvSplitHasToken(tc.argv, os.Getenv("PATH"), callerIdentity{}, "{}"); got != tc.want {
+				t.Errorf("wrapperChainEnvSplitHasToken(%v) = %v, want %v", tc.argv, got, tc.want)
+			}
+		}
+	})
+	t.Run("R5-unit awkOptZone bare token find-vs-xargs", func(t *testing.T) {
+		if !awkOptZoneHasToken([]string{"-e", "1", "{}"}, "{}", false) {
+			t.Errorf("awkOptZoneHasToken xargs bare token = false, want true")
+		}
+		if awkOptZoneHasToken([]string{"-e", "1", "{}"}, "{}", true) {
+			t.Errorf("awkOptZoneHasToken find own {} = true, want false")
+		}
+		if awkOptZoneHasToken([]string{"-e", "1", "./{}"}, "{}", false) {
+			t.Errorf("awkOptZoneHasToken ./{} = true, want false")
+		}
+		if awkOptZoneHasToken([]string{"-e", "1", "--", "{}"}, "{}", false) {
+			t.Errorf("awkOptZoneHasToken -- {} = true, want false (post-terminator data)")
+		}
+	})
+	t.Run("R5-unit awk -W assign consumption", func(t *testing.T) {
+		prog, _, hit := awkProgramFrags([]string{"-W", "assign", "x=1", "BEGIN{1}"})
+		if hit != "" || !strings.Contains(prog, "BEGIN{1}") {
+			t.Errorf("awkProgramFrags(-W assign x=1 PROG) = %q hit %q, want program BEGIN{1}", prog, hit)
+		}
+		prog2, _, hit2 := awkProgramFrags([]string{"--as", "x=1", "BEGIN{2}"})
+		if hit2 != "" || !strings.Contains(prog2, "BEGIN{2}") {
+			t.Errorf("awkProgramFrags(--as x=1 PROG) = %q hit %q, want program BEGIN{2}", prog2, hit2)
+		}
+		if _, _, hit3 := awkProgramFrags([]string{"--include=/dev/stdin", "1"}); hit3 != "awk script from stdin" {
+			t.Errorf("awkProgramFrags(--include=/dev/stdin) hit = %q, want awk script from stdin", hit3)
+		}
+		if _, _, hit4 := awkProgramFrags([]string{"-i", "/dev/stdin", "1"}); hit4 != "awk script from stdin" {
+			t.Errorf("awkProgramFrags(-i /dev/stdin) hit = %q, want awk script from stdin", hit4)
+		}
+		if _, _, hit5 := awkProgramFrags([]string{"--e=/dev/stdin"}); hit5 != "awk script from stdin" {
+			t.Errorf("awkProgramFrags(--e=/dev/stdin) hit = %q, want awk script from stdin", hit5)
+		}
+		if _, _, hit6 := awkProgramFrags([]string{"-l", "/dev/stdin"}); hit6 != "awk script from stdin" {
+			t.Errorf("awkProgramFrags(-l /dev/stdin) hit = %q, want awk script from stdin", hit6)
 		}
 	})
 }
