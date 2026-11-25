@@ -1346,3 +1346,242 @@ func TestGuard_V622_OracleR1EnvCwd(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// v6.2.2 Oracle R3 (R4 闭环): R3-MF-1..6 / R3-SF-1..2 / R3-Obs-1 探针回归 —
+// tar 长数据选项与 BSD 首词、wrapperChainEnvSplitHasToken 单步剥离、flock
+// 真实长选项表 fail-closed、script 置换扫描与 -E/--echo、多代码槽短簇操作数
+// 消费与合法数据文件名恢复、git/awk/xargs -a ssh 三路残余绕过、node spec
+// 单源收口。BLOCK 探针均断言目标 verdict 子串(不被上游管道/重定向规则掩盖),
+// ALLOW 探针钉住 Reviewer R2-6 的合法数据语义。
+// ---------------------------------------------------------------------------
+
+func TestGuard_V622_OracleR3Probes(t *testing.T) {
+	// xargs -a / heredoc 用例的预建 payload(t.TempDir 避免前导重定向命中写
+	// 拦截掩盖目标 verdict —— R3-Obs-2 测试隔离纪律)。
+	payloadC := filepath.Join(t.TempDir(), "payload-c")
+	if err := os.WriteFile(payloadC, []byte("-c\n"), 0644); err != nil {
+		t.Fatalf("write payload-c: %v", err)
+	}
+	payloadCPig := filepath.Join(t.TempDir(), "payload-cpig")
+	if err := os.WriteFile(payloadCPig, []byte("-c\npig\n"), 0644); err != nil {
+		t.Fatalf("write payload-cpig: %v", err)
+	}
+
+	blockCases := []struct {
+		name, cmd, want string
+	}{
+		// R3-MF-1: tar 长数据选项消费操作数 + BSD 首词严格限定 argv[0]。
+		{"P-R3-MF1-a tar --file swallow", `tar -c --file foo.tar --use-compress-program=pig /dev/null`, "pig"},
+		{"P-R3-MF1-b tar --directory ckpt", `tar --directory /tmp/f --checkpoint=1 --checkpoint-action=exec=pig -cf /dev/null /dev/null`, "pig"},
+		{"P-R3-MF1-c tar fstab nonfirst", `tar -cf /dev/null /etc/fstab --use-compress-program=pig`, "pig"},
+		{"P-R3-MF1-d tar BSD cIf", `tar cIf pig /dev/null /dev/null`, "pig"},
+		// R3-MF-2: 单步剥离包装链,nice/timeout/嵌套 env 不再跃过 env -S。
+		{"P-R3-MF2-a nice env -S find", `echo "foo -exec pig ;" | xargs -I{} nice env -S "find . -name {}"`, ""},
+		{"P-R3-MF2-b timeout env -S", `echo "foo -exec pig ;" | xargs -I{} timeout 10 env -S "find . -name {}"`, ""},
+		{"P-R3-MF2-c env -- env -S", `echo "foo -exec pig ;" | xargs -I{} env -- env -S "find . -name {}"`, ""},
+		{"P-R3-MF2-d env -i env -S", `echo "foo -exec pig ;" | xargs -I{} env -i env -S "find . -name {}"`, ""},
+		{"P-R3-MF2-e nice env -S tar", `echo "a --checkpoint=1 --checkpoint-action=exec=pig" | xargs -I{} nice env -S "tar -cf /dev/null {}"`, ""},
+		// R3-MF-3: flock 真实长选项表 + 未知长选项 fail-closed。
+		{"P-R3-MF3-a flock --no-fork", `flock --no-fork /dev/null pig`, "pig"},
+		{"P-R3-MF3-c flock --f fcntl", `flock --f /dev/null pig`, "pig"},
+		{"P-R3-MF3-d flock --nb", `flock --nb /dev/null pig`, "pig"},
+		// R3-MF-5: 多代码槽短簇操作数消费后继续扫选项区。
+		{"P-R3-MF5-a perl -we -I", `X='/tmp -e system("pig")'; perl -we '1' -I $X`, "dynamic code payload"},
+		{"P-R3-MF5-b ruby -we -I", `X='/tmp -e system("pig")'; ruby -we '1' -I $X`, "dynamic code payload"},
+		{"P-R3-MF5-c php -nr -c", `X='a.ini -r system("pig");'; php -nr '1;' -c $X`, "dynamic code payload"},
+		{"P-R3-MF5-d node -pe -r", `X='a.js -e require("child_process").execSync("pig")'; node -pe '1' -r $X`, "dynamic code payload"},
+		{"P-R3-MF5-e bun -pe -c", `X='a.toml -e require("child_process").execSync("pig")'; bun -pe '1' -c $X`, "dynamic code payload"},
+		// R3-MF-5 攻击面补充: 代码槽后选项位占位符仍拦截。
+		{"P-R3-MF5-f perl -e xargs %", `echo -e | xargs -I% perl -e '1' % 'system("pig")'`, ""},
+		{"P-R3-MF5-g perl -e dash-%", `echo -e | xargs -I% perl -e '1' -%`, ""},
+		// R3-MF-6: git/awk/xargs 三路残余绕过。
+		{"P-R3-MF6-a git -c key-side", `echo 'core.pager' | xargs -I{} git -c '{}=pig' log`, ""},
+		{"P-R3-MF6-a2 git --config-env", `echo pig | xargs -I{} git --config-env 'core.pager={}' log`, ""},
+		{"P-R3-MF6-b gawk -f masks -e", `echo 'BEGIN{system("pig")}' | xargs -I{} gawk -f /dev/null /dev/null -e '{}'`, ""},
+		{"P-R3-MF6-c gawk -W source", `echo 'BEGIN{system("pig")}' | xargs -I{} gawk -e '1' -W 'source={}' /dev/null`, ""},
+		// R3-SF-1: node spec 单源收口(-C / 长值选项)。
+		{"P-R3-SF1-a node --title", `node --title x -e 'require("child_process").execSync("pig")'`, "javascript inline code"},
+		{"P-R3-SF1-b node --env-file", `node --env-file /dev/null -e 'require("child_process").execSync("pig")'`, "javascript inline code"},
+		{"P-R3-SF1-c node -C", `node -C default -e 'require("child_process").execSync("pig")'`, "javascript inline code"},
+		{"P-R3-SF1-d node -C stdin", `echo 'require("child_process").execSync("pig")' | node -C default -`, "piped code to javascript"},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+
+	// R3-MF-4: script 置换扫描(xargs -a 无管道入口,断言 dynamic code payload
+	// 精确 verdict —— 修复前仅靠 echo 管道误触 piped code to shell 掩盖)。
+	for _, tc := range []struct{ name, cmd string }{
+		{"P-R3-MF4-a script xargs -a pre", `xargs -a ` + payloadC + ` -I% script % 'pig' /dev/null`},
+		{"P-R3-MF4-b script xargs -a post", `xargs -a ` + payloadC + ` -I% script /dev/null % 'pig'`},
+		{"P-R3-MF4-d find -exec script", `find . -name '-c' -exec script {} 'pig' /dev/null \;`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if !strings.Contains(got, "dynamic code payload") {
+				t.Fatalf("rtGuardCwd(%q) = %q, want dynamic code payload", tc.cmd, got)
+			}
+		})
+	}
+	t.Run("P-R3-MF4-c script argv+stdin", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{
+			id: "P-R3-MF4-c", role: "worker",
+			argv:  []string{"xargs", "-I%", "script", "%", "pig", "/dev/null"},
+			stdin: "-c",
+		}, "")
+		if !strings.Contains(got, "dynamic code payload") {
+			t.Fatalf("argv script %% pig + stdin '-c' = %q, want dynamic code payload", got)
+		}
+	})
+
+	// R3-MF-3-b: flock --no-fork 后 python3 不再被错当锁文件。
+	t.Run("P-R3-MF3-b flock --no-fork python3", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "P-R3-MF3-b", role: "worker", cmd: `flock --no-fork /dev/null python3 -c 'import os; os.system("pig")'`}, "")
+		if got == "ALLOW" {
+			t.Fatalf("flock --no-fork python3 -c = ALLOW, want a guard block")
+		}
+	})
+
+	// R3-MF-6-d/e: xargs -a 配良性 here-string/heredoc 不再绕过 ssh stdin
+	// 追加审查;f: GNU --arg-f 缩写接入 xargsMatchValueLong(verifier 外泄)。
+	t.Run("P-R3-MF6-d xargs -a here-string", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{
+			id: "P-R3-MF6-d", role: "worker",
+			argv:  []string{"xargs", "-a", payloadCPig, "ssh", "dmit", "sh"},
+			stdin: "echo hi", // argv+stdin 通道等价于外层 stdin 流存在但 -a 仍追加
+		}, "")
+		if !strings.Contains(got, "ssh") {
+			t.Fatalf("xargs -a payload ssh dmit sh + stdin = %q, want an ssh verdict block", got)
+		}
+	})
+	t.Run("P-R3-MF6-e xargs -a heredoc", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "P-R3-MF6-e", role: "worker", cmd: "xargs -a " + payloadCPig + " ssh dmit sh <<'EOF'\necho hi\nEOF"}, "")
+		if !strings.Contains(got, "ssh") {
+			t.Fatalf("xargs -a payload ssh dmit sh heredoc = %q, want an ssh verdict block", got)
+		}
+	})
+	t.Run("P-R3-MF6-f xargs --arg-f verifier", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "P-R3-MF6-f", role: "verifier", cmd: `xargs --arg-f=/tmp/items -I{} ssh dmit cat < /etc/passwd`}, "")
+		if !strings.Contains(got, "ssh remote write") {
+			t.Fatalf("xargs --arg-f ssh cat exfil = %q, want ssh remote write", got)
+		}
+	})
+
+	// Reviewer R2-6 合法数据 ALLOW 行: 解释器输入文件名 / awk -v 纯数据赋
+	// 值 / git 纯数据路径值(glued 与分离双形态)。
+	allowCases := []struct {
+		name, cmd string
+	}{
+		{"R2-6-a find perl -pe data", `find . -exec perl -pe 's/a/b/' {} \;`},
+		{"R2-6-b find awk -v data", `find . -exec awk -v f={} 'END {print f}' {} \;`},
+		{"R2-6-c find awk -f -v data", `find . -exec awk -f parse.awk -v fname={} {} \;`},
+		{"R2-6-d find git --git-dir glued", `find . -name .git -exec git --git-dir={} log -1 \;`},
+		{"R2-6-e xargs awk -v", `echo x | xargs -I{} awk -v k={} 'BEGIN{print k}' /dev/null`},
+		{"R2-6-f git --git-dir separate", `echo /tmp/repo | xargs -I{} git --git-dir {} log -1`},
+		{"R2-6-g perl -we legit -I", `perl -we 'print qq(ok)' -I /tmp`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+
+	// R12 精确 verdict 不受 xargsDerivedSeg 收紧影响: 真管道与文件重定向
+	// 各归其名。
+	t.Run("R12 piped verdict unchanged", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "R12-a-r3", role: "worker", cmd: `echo code | xargs ssh dmit sh`}, "")
+		if !strings.Contains(got, "piped stdin to ssh") {
+			t.Fatalf("echo code | xargs ssh dmit sh = %q, want piped stdin to ssh", got)
+		}
+	})
+	t.Run("R12 file-redir verdict unchanged", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "R12-b-r3", role: "worker", cmd: `xargs -a /tmp/items ssh dmit sh < /tmp/script.sh`}, "")
+		if !strings.Contains(got, "file stdin to ssh stdin-program") {
+			t.Fatalf("xargs -a file ssh dmit sh < redir = %q, want file stdin to ssh stdin-program", got)
+		}
+	})
+
+	// 目标层直断断言(R3-Obs-2 防掩盖纪律): wrapperChainEnvSplitHasToken /
+	// scriptOptZoneHasToken / gitExecConfigValueHasToken / flockMatchLong 的
+	// 单元 verdict 不依赖上层管道或外围规则兜出 BLOCK。
+	t.Run("R3-unit env-split chain direct", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			argv []string
+			want bool
+		}{
+			{"nice env -S find", []string{"nice", "env", "-S", "find . -name {}"}, true},
+			{"timeout env -S find", []string{"timeout", "10", "env", "-S", "find . -name {}"}, true},
+			{"env -- env -S find", []string{"env", "--", "env", "-S", "find . -name {}"}, true},
+			{"env -i env -S find", []string{"env", "-i", "env", "-S", "find . -name {}"}, true},
+			{"nice env -S tar", []string{"nice", "env", "-S", "tar -cf /dev/null {}"}, true},
+			{"rg env -S operand", []string{"rg", "env", "-S", "{}"}, false},
+			{"echo env -S operand", []string{"echo", "env", "-S", "{}"}, false},
+		} {
+			if got := wrapperChainEnvSplitHasToken(tc.argv, os.Getenv("PATH"), callerIdentity{}, "{}"); got != tc.want {
+				t.Errorf("wrapperChainEnvSplitHasToken(%v) = %v, want %v", tc.argv, got, tc.want)
+			}
+		}
+	})
+	t.Run("R3-unit script zone direct", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			h    []string
+			want bool
+		}{
+			{"script % pig", []string{"script", "%", "pig", "/dev/null"}, true},
+			{"script positional then %", []string{"script", "/dev/null", "%", "pig"}, true},
+			{"script -q % pig", []string{"script", "-q", "%", "pig", "/dev/null"}, true},
+			{"script -c benign", []string{"script", "-c", "echo hi", "/tmp/out"}, false},
+			{"script -- terminator", []string{"script", "--", "%"}, false},
+		} {
+			if got := scriptOptZoneHasToken(tc.h, "%"); got != tc.want {
+				t.Errorf("scriptOptZoneHasToken(%v) = %v, want %v", tc.h, got, tc.want)
+			}
+		}
+	})
+	t.Run("R3-unit git -c key-side direct", func(t *testing.T) {
+		if !gitExecConfigValueHasToken("{}=pig", "{}") {
+			t.Errorf("gitExecConfigValueHasToken({}=pig) = false, want true")
+		}
+		if !gitExecConfigValueHasToken("core.pager={}", "{}") {
+			t.Errorf("gitExecConfigValueHasToken(core.pager={}) = false, want true")
+		}
+		if gitExecConfigValueHasToken("user.name={}", "{}") {
+			t.Errorf("gitExecConfigValueHasToken(user.name={}) = true, want false for a non-exec key")
+		}
+	})
+	t.Run("R3-unit flock long table direct", func(t *testing.T) {
+		for _, tc := range []struct {
+			in, want string
+			ok       bool
+		}{
+			{"no-fork", "no-fork", true},
+			{"nb", "nb", true},
+			{"f", "fcntl", true},
+			{"fd", "", false},
+			{"nofork", "", false},
+			{"com", "command", true},
+			{"c", "", false},
+		} {
+			if full, ok := flockMatchLong(tc.in); full != tc.want || ok != tc.ok {
+				t.Errorf("flockMatchLong(%q) = %q,%v want %q,%v", tc.in, full, ok, tc.want, tc.ok)
+			}
+		}
+		if got := skipFlockLong([]string{"flock", "--no-fork-x", "/dev/null", "pig"}, 1); got != -1 {
+			t.Errorf("skipFlockLong unknown long = %d, want -1 fail-closed", got)
+		}
+	})
+}
