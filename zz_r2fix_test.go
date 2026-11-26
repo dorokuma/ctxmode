@@ -2261,3 +2261,97 @@ EOF`, "pig"},
 		})
 	}
 }
+
+func TestGuard_V622_OracleR8Probes(t *testing.T) {
+	mkPayload := func(name, content string) string {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+	payloadPigProg := mkPayload("r8-prog", "BEGIN{system(\"pig\")}\n")
+	payloadPig := mkPayload("r8-pig", "pig\n")
+	payloadX := mkPayload("r8-x", "x\n")
+
+	blockCases := []struct {
+		name, cmd, want string
+	}{
+		// R8-MF-1: -Wi/-W in 碰撞值经独立 aux 通道,不再压死位置主程序
+		// 与 -- 后动态程序提取(R9 引入的 gawk 直通回归)。
+		{"P-R8-MF1-a gawk -W i devnull pig", `gawk -W i /dev/null 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R8-MF1-b gawk -Wi devnull pig", `gawk -Wi /dev/null 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R8-MF1-c gawk -W in devnull pig", `gawk -W in /dev/null 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R8-MF1-d gawk -W i devnull -- VAR", `VAR='BEGIN{system("pig")}'; gawk -W i /dev/null -- "$VAR"`, "dynamic code payload"},
+		{"P-R8-MF1-e xargs gawk -W i devnull -- tok", `xargs -a ` + payloadPigProg + ` -I{} gawk -W i /dev/null -- '{}'`, "dynamic code payload"},
+		{"P-R8-MF1-f xargs gawk -W i devnull tok prog", `xargs -a ` + payloadPig + ` -I{} gawk -W i /dev/null 'BEGIN{system("{}")}'`, "dynamic code payload"},
+		// R8-MF-2: awkProgramLongStep 接入 --assign/--field-separator
+		// 分离值的 awkDataValSplitHit(无引号词拆分重新武装选项解析)。
+		{"P-R8-MF2-a gawk --as VAR", `VAR='x=1 -e BEGIN{system("pig")}'; gawk --as $VAR '1'`, "dynamic code payload"},
+		{"P-R8-MF2-b gawk --assign VAR", `VAR='x=1 -e BEGIN{system("pig")}'; gawk --assign $VAR '1'`, "dynamic code payload"},
+		{"P-R8-MF2-c gawk --field-separator VAR", `VAR=', -e BEGIN{system("pig")}'; gawk --field-separator $VAR '1'`, "dynamic code payload"},
+		{"P-R8-MF2-d gawk --fie VAR", `VAR=', -e BEGIN{system("pig")}'; gawk --fie $VAR '1'`, "dynamic code payload"},
+		// R8-MF-3: MAWK_LONG_OPTIONS 纳入 envHookVars(KEY=VAL 前缀/export/env 通路)。
+		{"P-R8-MF3-a MAWK ignore --file", `MAWK_LONG_OPTIONS=ignore awk --file=/dev/null 'BEGIN{system("pig")}'`, "MAWK_LONG_OPTIONS"},
+		{"P-R8-MF3-b MAWK ignore --assign", `MAWK_LONG_OPTIONS=ignore awk --assign 'BEGIN{system("pig")}'`, "MAWK_LONG_OPTIONS"},
+		{"P-R8-MF3-c MAWK warn --file", `MAWK_LONG_OPTIONS=warn awk --file=/dev/null 'BEGIN{system("pig")}'`, "MAWK_LONG_OPTIONS"},
+		{"P-R8-MF3-d MAWK allow --i", `MAWK_LONG_OPTIONS=allow awk --i 'BEGIN{system("pig")}'`, "MAWK_LONG_OPTIONS"},
+		// 附加反例守卫:引号毒化 / 末项非 exec 的逗号链 / R8-Obs-1 穿透 here-string。
+		{"R8-neg gawk -W i quote poison", `gawk -W i "a'b" 'BEGIN{system("pig")}'`, "pig"},
+		{"R8-neg awk -W i,interactive pig", `awk -W i,interactive 'BEGIN{system("pig")}'`, "pig"},
+		{"R8-neg bash -c nested restricted herestring", `bash -c "bash --restricted <<< 'pig'"`, "pig"},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+
+	// P-R8-MF3-e: ctx_run env 通道的 MAWK_LONG_OPTIONS 覆盖拦截。
+	t.Run("P-R8-MF3-e guardCtxRunEnv MAWK", func(t *testing.T) {
+		rule, detail := guardCall{subagent: true}.guardCtxRunEnv(map[string]string{"MAWK_LONG_OPTIONS": "ignore"})
+		if rule != "subagent_nested_agent" || detail != "env MAWK_LONG_OPTIONS" {
+			t.Fatalf("guardCtxRunEnv(MAWK_LONG_OPTIONS=ignore) = (%q, %q), want (%q, %q)", rule, detail, "subagent_nested_agent", "env MAWK_LONG_OPTIONS")
+		}
+	})
+
+	// P-R8-SF1-c: 逗号末项名契约 — -W interactive,exec FILE 标记 sawFile。
+	t.Run("P-R8-SF1-c awkProgramFrags sawFile contract", func(t *testing.T) {
+		_, sawFile, hit := awkProgramFrags([]string{"-W", "interactive,exec", "/tmp/evil.awk"})
+		if hit != "" {
+			t.Fatalf("awkProgramFrags hit = %q, want empty", hit)
+		}
+		if !sawFile {
+			t.Fatalf("awkProgramFrags(-W interactive,exec FILE) sawFile = false, want true")
+		}
+	})
+
+	// 放行守卫正例(R8 零假阳纪律)。
+	allowCases := []struct {
+		name, cmd string
+	}{
+		{"P-R8-SF1-a awk -W interactive,exec parse", `awk -W interactive,exec parse.awk "$FILE"`},
+		{"P-R8-SF1-b xargs awk -W interactive,exec parse", `xargs -a ` + payloadX + ` -I{} awk -W interactive,exec parse.awk {}`},
+		{"R8-pos awk -Winteractive,exec parse", `awk -Winteractive,exec parse.awk "$FILE"`},
+		{"R8-pos gawk --assign quoted", `VAR='x=1'; gawk --assign "$VAR" '1'`},
+		{"R8-pos gawk --as quoted", `VAR='x=1'; gawk --as "$VAR" '1'`},
+		{"R8-pos gawk --field-separator quoted", `SEP=','; gawk --field-separator "$SEP" '1'`},
+		{"R8-pos awk -Wi benign", `awk -Wi 'BEGIN{print 1}'`},
+		{"R8-pos gawk -W i devnull benign", `gawk -W i /dev/null 'BEGIN{print 1}'`},
+		{"R8-pos gawk -W i devnull benign -- FILE", `gawk -W i /dev/null 'BEGIN{print 1}' -- "$FILE"`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+}

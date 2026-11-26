@@ -427,6 +427,12 @@ var envHookVars = map[string]bool{
 	"NODE_OPTIONS": true, "PYTHONSTARTUP": true, "PYTHONINSPECT": true,
 	"PYTHONPATH": true,
 	"PERL5OPT":   true, "PERL5DB": true, "RUBYOPT": true,
+	// mawk(1) MAWK_LONG_OPTIONS rewrites how mawk treats GNU --long
+	// options at runtime (ignore/warn/allow), desynchronizing the guard's
+	// gawk-shaped long-option parse from what the interpreter actually
+	// consumes — the positional program escapes review (v6.2.2 Oracle R8
+	// R8-MF-3).
+	"MAWK_LONG_OPTIONS": true,
 	"JAVA_TOOL_OPTIONS": true, "JDK_JAVA_OPTIONS": true, "_JAVA_OPTIONS": true,
 	// S2: bash -x prompt expansion and startup option vars can re-arm
 	// execution (PS4='$(pig)' bash -x -c, SHELLOPTS=braceexpand,
@@ -5873,7 +5879,10 @@ func awkOptWordTokenStep(args []string, i int, token string) (consume int, hit b
 		case 'W':
 			wc, wh := awkWOperandTokenStep(args, i, j, a, token)
 			wv, _ := awkWClusterValue(args, i, j, a)
-			wName, _, _ := strings.Cut(wv, "=")
+			// v6.2.2 Oracle R8 R8-SF-1: the item name is the LAST comma
+			// item's name — `-W interactive,exec` ends awk's option parse
+			// exactly like `-W exec`.
+			wName := awkWLastItemName(wv)
 			return wc, wh, isLongOptAbbrev(wName, "exec", 1)
 		case 'd', 'D', 'L', 'o', 'p':
 			// gawk optional_argument short options (getopt_long d::/D::/L::/
@@ -6014,6 +6023,21 @@ func awkWCommaTokenHit(v string, args []string, i, consume int, token string) (c
 
 // awkWClusterValue extracts the -W operand of one awk short cluster:
 // the glued tail when present, otherwise the NEXT argv (consumedNext).
+// awkWLastItemName extracts the option NAME of the LAST comma item of
+// a (possibly comma-chained) mawk -W operand — `-W interactive,exec`
+// reports `exec`, `-W i,e` reports `e`, and a comma-free operand simply
+// reports its own name cut at `=` (v6.2.2 Oracle R8 R8-SF-1): mawk
+// parses the chain item by item, so the trailing item alone decides
+// whether the positional program word is retired (file/exec) and
+// whether awk's own option parsing ends (exec).
+func awkWLastItemName(wv string) string {
+	if idx := strings.LastIndexByte(wv, ','); idx >= 0 {
+		wv = wv[idx+1:]
+	}
+	name, _, _ := strings.Cut(wv, "=")
+	return name
+}
+
 func awkWClusterValue(args []string, i, j int, a string) (v string, consumedNext bool) {
 	if j+1 < len(a) {
 		return a[j+1:], false
@@ -6076,16 +6100,16 @@ func awkLongProgramName(name string) (isProgram bool, isFile bool) {
 // operand WITHOUT posing as the program (v6.2.2 Oracle R5 R5-MF-4:
 // `gawk -W assign 'x=1' 'BEGIN{...}'` — the x=1 value can no longer usurp
 // the positional program slot and hide the real program text behind it).
-func awkWOperandProgram(v string, args []string, nextIdx int) (frag string, isFile bool, fileVal string, hit string, extraConsumed int) {
+func awkWOperandProgram(v string, args []string, nextIdx int, aux *[]string) (frag string, isFile bool, fileVal string, hit string, extraConsumed int) {
 	if strings.Contains(v, ",") {
 		// mawk chains several -W operands with commas (`-W interactive,exec
 		// FILE` / `-W i,e FILE`) where gawk would reject the composite as a
 		// single unknown option — fail-closed must track the MAWK parse, so
 		// each comma item is re-validated by the leaf grammar (v6.2.2 Oracle
 		// R7 R7-MF-4 path B).
-		return awkWCommaProgram(v, args, nextIdx)
+		return awkWCommaProgram(v, args, nextIdx, aux)
 	}
-	return awkWOperandProgramLeaf(v, args, nextIdx)
+	return awkWOperandProgramLeaf(v, args, nextIdx, aux)
 }
 
 // awkWCommaProgram validates one comma-chained mawk -W operand (v6.2.2
@@ -6095,7 +6119,7 @@ func awkWOperandProgram(v string, args []string, nextIdx int) (frag string, isFi
 // through the leaf's isFile channel. awk never executes a concatenated
 // composite as ONE option name, so the whole-word dynamic/ambiguous
 // fallback of the leaf cannot model it.
-func awkWCommaProgram(v string, args []string, nextIdx int) (frag string, isFile bool, fileVal string, hit string, extraConsumed int) {
+func awkWCommaProgram(v string, args []string, nextIdx int, aux *[]string) (frag string, isFile bool, fileVal string, hit string, extraConsumed int) {
 	parts := strings.Split(v, ",")
 	var frags []string
 	for k, part := range parts {
@@ -6120,7 +6144,7 @@ func awkWCommaProgram(v string, args []string, nextIdx int) (frag string, isFile
 				}
 			}
 		}
-		f, fFile, fv, h, extra := awkWOperandProgramLeaf(part, args, itemNext)
+		f, fFile, fv, h, extra := awkWOperandProgramLeaf(part, args, itemNext, aux)
 		if h != "" {
 			return "", isFile || fFile, "", h, extraConsumed
 		}
@@ -6139,8 +6163,11 @@ func awkWCommaProgram(v string, args []string, nextIdx int) (frag string, isFile
 
 // awkWOperandProgramLeaf validates one comma-free -W operand item (the
 // pre-R7 grammar plus the -Wi/-W in collision handling of Oracle R7
-// R7-MF-4 and the unquoted-split data-value verdict of R7-SF-1).
-func awkWOperandProgramLeaf(v string, args []string, nextIdx int) (frag string, isFile bool, fileVal string, hit string, extraConsumed int) {
+// R7-MF-4 and the unquoted-split data-value verdict of R7-SF-1). aux
+// (when non-nil) carries the -Wi/-W in collision operand value OUT of
+// band so it never enters the caller's ordinary fragment list (v6.2.2
+// Oracle R8 R8-MF-1).
+func awkWOperandProgramLeaf(v string, args []string, nextIdx int, aux *[]string) (frag string, isFile bool, fileVal string, hit string, extraConsumed int) {
 	name, val, hasEq := strings.Cut(v, "=")
 	isProg, isF := awkLongProgramName(name)
 	if !isProg {
@@ -6171,7 +6198,7 @@ func awkWOperandProgramLeaf(v string, args []string, nextIdx int) (frag string, 
 			val = ""
 		}
 		if extraConsumed == 1 && (name == "i" || name == "in") && val != "" {
-			return awkWIncludeCollisionLeaf(val, extraConsumed)
+			return awkWIncludeCollisionLeaf(val, extraConsumed, aux)
 		}
 	}
 	if !isF {
@@ -6214,8 +6241,21 @@ func awkWDataAssignLeaf(v string, args []string, nextIdx int, hasEq bool) (frag 
 // positional program word still extracts on the gawk interpretation too
 // (`gawk -W i /dev/null 'BEGIN{system("pig")}'` blocks through BOTH
 // channels).
-func awkWIncludeCollisionLeaf(val string, extraConsumed int) (frag string, isFile bool, fileVal string, hit string, extraConsumedOut int) {
-	return val, true, val, awkProgramFileHit(val), extraConsumed
+//
+// v6.2.2 Oracle R8 R8-MF-1: the collision value must NOT enter the
+// ordinary frag return — a non-empty frags list suppresses
+// awkProgramFrags' positional-program extraction (`len(frags) == 0`
+// gates), which regressed `gawk -W i /dev/null 'BEGIN{system("pig")}'`
+// (and the `--`/xargs twins) from BLOCK to ALLOW. It travels out of
+// band through aux instead: awkProgramFrags appends it AFTER the
+// positional settlement so a library file name carrying an unclosed
+// quote (`gawk -W i "a'b" ...`) can never poison the REAL program text
+// that precedes it in the joined program.
+func awkWIncludeCollisionLeaf(val string, extraConsumed int, aux *[]string) (frag string, isFile bool, fileVal string, hit string, extraConsumedOut int) {
+	if aux != nil {
+		*aux = append(*aux, val)
+	}
+	return "", true, val, awkProgramFileHit(val), extraConsumed
 }
 
 // awkDataValSplitHit reports a pure-data assignment VALUE (-v/-F/--assign/
@@ -6251,7 +6291,7 @@ func awkLongIsDataAssign(name string) bool {
 // EXTRA argv operands the cluster eats; endOut (when non-nil) is set true
 // after gawk's -E/--exec shape terminates awk's own option parsing
 // (v6.2.2 Oracle R4 R4-MF-4).
-func awkClusterFragsEnd(args []string, i int, a string, endOut *bool) (frags []string, sawFile bool, consumedNext int, hit string) {
+func awkClusterFragsEnd(args []string, i int, a string, endOut *bool, aux *[]string) (frags []string, sawFile bool, consumedNext int, hit string) {
 	for j := 1; j < len(a); j++ {
 		switch a[j] {
 		case 'e':
@@ -6299,7 +6339,7 @@ func awkClusterFragsEnd(args []string, i int, a string, endOut *bool) (frags []s
 			}
 			return frags, sawFile, consumedNext, ""
 		case 'W':
-			wFrag, wSawFile, wExtra, wh := awkClusterWOperand(args, i, j, a, consumedNext, endOut)
+			wFrag, wSawFile, wExtra, wh := awkClusterWOperand(args, i, j, a, consumedNext, endOut, aux)
 			consumedNext += wExtra
 			if wFrag != "" {
 				frags = append(frags, wFrag)
@@ -6361,14 +6401,17 @@ func awkClusterFileOperand(args []string, i, j int, a string, consumedNext int, 
 // short cluster (glued tail or operand word), reporting the program
 // fragment / file-source / extra argv count / hit under GNU getopt_long's
 // "W;" translation (v6.2.2 Oracle R4 R4-MF-4).
-func awkClusterWOperand(args []string, i, j int, a string, consumedNext int, endOut *bool) (frag string, sawFile bool, extra int, hit string) {
+func awkClusterWOperand(args []string, i, j int, a string, consumedNext int, endOut *bool, aux *[]string) (frag string, sawFile bool, extra int, hit string) {
 	wv, wConsumed := awkWClusterValue(args, i+consumedNext, j, a)
 	if wConsumed {
 		extra++
 	}
-	frag, isFile, _, wh, wc := awkWOperandProgram(wv, args, i+consumedNext+extra+1)
+	frag, isFile, _, wh, wc := awkWOperandProgram(wv, args, i+consumedNext+extra+1, aux)
 	extra += wc
-	wName, _, _ := strings.Cut(wv, "=")
+	// v6.2.2 Oracle R8 R8-SF-1: the item name is the LAST comma item's
+	// name — `-W interactive,exec` / `-W i,e` retire the positional
+	// program exactly like `-W exec`.
+	wName := awkWLastItemName(wv)
 	if isFile && (isLongOptAbbrev(wName, "file", 3) || isLongOptAbbrev(wName, "exec", 1)) {
 		// Only the PROGRAM-FILE sources (-W file/-W exec) retire the
 		// positional program word; -W include/-W load (and their GNU
@@ -9446,8 +9489,16 @@ func awkProgramLongStep(args []string, i int, a string) (frag string, sawFile bo
 		// --as/--fie) consume their separate value operand so it cannot
 		// usurp the positional program slot and hide the REAL program
 		// text behind it (v6.2.2 Oracle R5 R5-MF-4
-		// `gawk --as 'x=1' 'BEGIN{system("pig")}'`).
+		// `gawk --as 'x=1' 'BEGIN{system("pig")}'`). An UNQUOTED dynamic
+		// value operand word-splits at runtime and re-arms awk's own
+		// option parse the same way -v/-F/-W assign do (v6.2.2 Oracle R8
+		// R8-MF-2 `gawk --as $VAR '1'`).
 		if !hasEq {
+			if i+1 < len(args) {
+				if sh := awkDataValSplitHit(args[i+1]); sh != "" {
+					return "", false, 0, false, sh
+				}
+			}
 			consumed = 1
 		}
 		return "", false, consumed, false, ""
@@ -9487,34 +9538,61 @@ func awkAmbiguousShortPrefix(name string) bool {
 	return false
 }
 
+// awkDataAssignOptStep validates the separate value operand of one
+// awk -F/-v pure-data assignment option (extracted so awkProgramFrags
+// stays under the complexity budget — v6.2.2 Oracle R8 R8-Obs-2): an
+// UNQUOTED dynamic operand word-splits at runtime and the fragments
+// re-arm awk's own option parse (v6.2.2 Oracle R7 R7-SF-1).
+func awkDataAssignOptStep(args []string, i int) (hit string) {
+	if i+1 < len(args) {
+		return awkDataValSplitHit(args[i+1])
+	}
+	return ""
+}
+
+// awkDynWordStep settles one dynamic word of awkProgramFrags' walk
+// (extracted so the main loop stays under the complexity budget —
+// v6.2.2 Oracle R8 R8-Obs-2): hit reports the pre-terminator re-arm
+// verdict or the argv-programmed positional-program verdict; setPos
+// reports the word must be recorded as the positional candidate when
+// none is set yet (input data after a program source).
+func awkDynWordStep(a string, sawFile, endOpts bool, positional string, nFrags int) (hit string, setPos bool) {
+	if !endOpts && (strings.HasPrefix(a, "-") || !isSafeDynamicDataOperand(a)) {
+		// Dynamic words BEFORE the option terminator: awk's own parser
+		// (mawk/nawk positional scan, gawk getopt_long permutation) can
+		// re-read the expansion as further options — even after a -f
+		// program file or a positional program (v6.2.2 Oracle R7
+		// R7-MF-1 `awk -f /dev/null "$X"` / `gawk '1' "$X"` regression).
+		return "dynamic code payload", false
+	}
+	if !sawFile && positional == "" && nFrags == 0 {
+		// The first positional is awk's PROGRAM text — including the
+		// word right after `--` (`awk -- "$VAR"` is argv-programmed
+		// awk code, not inert data — v6.2.2 Oracle R6 R6-SF-1). The
+		// gawk -f/--file program file (sawFile) retires it instead.
+		// A dynamic data word AFTER a program source (`awk -f
+		// parse.awk -- "$FILE"` / `awk '1' -- "$FILE"`) is awk INPUT
+		// data, not code — it stays exempt (v6.2.2 Oracle R6
+		// positives).
+		return "dynamic code payload", false
+	}
+	return "", positional == ""
+}
+
 func awkProgramFrags(args []string) (string, bool, string) {
 	var frags []string
+	var aux []string
 	var positional string
 	sawFile := false
 	endOpts := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if isDynamicArg(a) {
-			if !endOpts && (strings.HasPrefix(a, "-") || !isSafeDynamicDataOperand(a)) {
-				// Dynamic words BEFORE the option terminator: awk's own parser
-				// (mawk/nawk positional scan, gawk getopt_long permutation) can
-				// re-read the expansion as further options — even after a -f
-				// program file or a positional program (v6.2.2 Oracle R7
-				// R7-MF-1 `awk -f /dev/null "$X"` / `gawk '1' "$X"` regression).
-				return "", sawFile, "dynamic code payload"
+			dHit, dSetPos := awkDynWordStep(a, sawFile, endOpts, positional, len(frags))
+			if dHit != "" {
+				return "", sawFile, dHit
 			}
-			if !sawFile && positional == "" && len(frags) == 0 {
-				// The first positional is awk's PROGRAM text — including the
-				// word right after `--` (`awk -- "$VAR"` is argv-programmed
-				// awk code, not inert data — v6.2.2 Oracle R6 R6-SF-1). The
-				// gawk -f/--file program file (sawFile) retires it instead.
-				// A dynamic data word AFTER a program source (`awk -f
-				// parse.awk -- "$FILE"` / `awk '1' -- "$FILE"`) is awk INPUT
-				// data, not code — it stays exempt (v6.2.2 Oracle R6
-				// positives).
-				return "", sawFile, "dynamic code payload"
-			}
-			if positional == "" {
+			if dSetPos {
 				positional = a
 			}
 			continue
@@ -9569,10 +9647,8 @@ func awkProgramFrags(args []string) (string, bool, string) {
 			}
 			i++
 		case !endOpts && (a == "-F" || a == "-v"):
-			if i+1 < len(args) {
-				if sh := awkDataValSplitHit(args[i+1]); sh != "" {
-					return "", sawFile, sh
-				}
+			if dsh := awkDataAssignOptStep(args, i); dsh != "" {
+				return "", sawFile, dsh
 			}
 			i++
 		case !endOpts && strings.HasPrefix(a, "-") && len(a) > 1:
@@ -9581,7 +9657,7 @@ func awkProgramFrags(args []string) (string, bool, string) {
 			var cHit string
 			var consumedNext int
 			var cEnd bool
-			cFrag, cSawFile, consumedNext, cHit = awkClusterFragsEnd(args, i, a, &cEnd)
+			cFrag, cSawFile, consumedNext, cHit = awkClusterFragsEnd(args, i, a, &cEnd, &aux)
 			if cEnd {
 				endOpts = true
 			}
@@ -9605,6 +9681,14 @@ func awkProgramFrags(args []string) (string, bool, string) {
 		// '{}'`).
 		frags = append(frags, positional)
 	}
+	// v6.2.2 Oracle R8 R8-MF-1: the -Wi/-W in collision operand (out-of-band
+	// aux channel) merges into the program ONLY after the positional
+	// settlement and never enters the len(frags) gates — under mawk the
+	// same bytes ARE the main program text. Appending it last keeps a
+	// library file name carrying an unclosed quote (`gawk -W i "a'b"
+	// 'BEGIN{system("pig")}'`) from poisoning the REAL program text that
+	// precedes it inside awkCommandLiterals.
+	frags = append(frags, aux...)
 	return strings.Join(frags, "\n"), sawFile, ""
 }
 
