@@ -1914,11 +1914,16 @@ func unwrapShellArgv(argv []string) (shellText string, has bool) {
 	sawC := false
 	tail := ""
 	for i := 1; i < len(argv); i++ {
-		text, has, ni, done := unwrapShellWordStep(argv, i, sawC, tail)
+		text, has, ni, done, isCluster := unwrapShellWordStep(argv, i, sawC, tail)
 		if done {
 			return text, has
 		}
-		if ni != i {
+		if !isCluster {
+			// A NON-cluster word (long option, option-name pair, terminator)
+			// is settled here — it must NEVER fall through to the short-cluster
+			// scanner, whose byte-wise walk would misread single-word long
+			// options as flag letters (`bash --restricted` colliding with 'c'
+			// — v6.2.2 Oracle R7 R7-MF-2).
 			i = ni
 			continue
 		}
@@ -1942,12 +1947,15 @@ func unwrapShellArgv(argv []string) (shellText string, has bool) {
 }
 
 // unwrapShellWordStep settles the non-cluster words of unwrapShellArgv's
-// scan (extracted — v6.2.2 Oracle R6 R6-MF-1): dynamic words, the `--`
-// terminator, `--` long options, the bare -o/+o/-O/+O option-name pair and
+// scan (extracted — v6.2.2 Oracle R6 R6-MF-1): dynamic words, the `--`/`-`
+// terminators, `--` long options, the bare -o/+o/-O/+O option-name pair and
 // the first non-option positional. done reports the scan ends here with
-// text/has; ni != i reports a consumed continuation index (long option or
-// -o operand).
-func unwrapShellWordStep(argv []string, i int, sawC bool, tail string) (text string, has bool, ni int, done bool) {
+// text/has; ni is the index the caller continues from; isCluster reports
+// the word is an unresolved SHORT-option cluster the caller must scan —
+// everything else (including every single-word `--` long option) is fully
+// settled here and must never reach the byte-wise cluster walk (v6.2.2
+// Oracle R7 R7-MF-2 `bash --restricted`).
+func unwrapShellWordStep(argv []string, i int, sawC bool, tail string) (text string, has bool, ni int, done, isCluster bool) {
 	a := argv[i]
 	if isDynamicArg(a) {
 		if sawC {
@@ -1955,41 +1963,52 @@ func unwrapShellWordStep(argv []string, i int, sawC bool, tail string) (text str
 			// downstream dynamic-payload verdict (a peel/`$0` argv word is
 			// screened as data only when the STATIC command string passes
 			// its own screen).
-			return unwrapShellJoinTail(tail, a), true, i, true
+			return unwrapShellJoinTail(tail, a), true, i, true, false
 		}
-		return "", false, i, true // let hasDynamicInterpOption / peel catch it
+		return "", false, i, true, false // let hasDynamicInterpOption / peel catch it
 	}
-	if a == "--" {
+	if a == "--" || a == "-" || (sawC && a == "+") {
+		// POSIX: an argument of `-` is equivalent to `--` (and dash treats a
+		// bare `+` the same way) — option parsing ENDS here and the word
+		// right after the terminator is the -c command string when one is
+		// pending (v6.2.2 Oracle R7 R7-MF-3 path B `sh -c - 'pig'`).
 		if !sawC {
-			return "", false, i, true
+			return "", false, i, true, false
 		}
-		// The word right after `--` is the command string when it exists
-		// (POSIX: `-c` is boolean and `--` only terminates the options).
 		if i+1 < len(argv) {
-			return unwrapShellJoinTail(tail, argv[i+1]), true, i, true
+			return unwrapShellJoinTail(tail, argv[i+1]), true, i, true, false
 		}
-		return tail, tail != "", i, true
+		return tail, tail != "", i, true, false
 	}
 	if strings.HasPrefix(a, "--") {
 		if ni2, bail := unwrapShellLongWord(argv, i); bail {
-			return "", false, i, true
+			return "", false, i, true, false
 		} else {
-			return "", false, ni2, false
+			return "", false, ni2, false, false
 		}
 	}
 	if a == "-o" || a == "+o" || a == "-O" || a == "+O" {
-		return "", false, i + 1, false // consumes the option NAME
+		// The option-NAME operand of a bare -o/+o/-O/+O: after a pending -c
+		// an UNQUOTED dynamic name word-splits at runtime and the fragments
+		// re-parse as further options — it must surface as screened text
+		// instead of being silently skipped (v6.2.2 Oracle R7 R7-MF-3 path
+		// A `sh -c -o errexit -o $X 'echo hi'`). A plain static name or a
+		// split-safe expansion stays data.
+		if sawC && i+1 < len(argv) && isDynamicArg(argv[i+1]) {
+			return unwrapShellJoinTail(tail, argv[i+1]), true, i, true, false
+		}
+		return "", false, i + 1, false, false // consumes the option NAME
 	}
 	if len(a) > 1 && (a[0] == '-' || a[0] == '+') && !strings.HasPrefix(a, "--") {
-		return "", false, i, false // cluster word — the caller scans it
+		return "", false, i, false, true // cluster word — the caller scans it
 	}
 	// First non-option word: with a pending -c it IS the command string;
 	// without -c the shell runs a script FILE — nothing to unwrap, and the
 	// positional ends the option zone either way.
 	if sawC {
-		return unwrapShellJoinTail(tail, a), true, i, true
+		return unwrapShellJoinTail(tail, a), true, i, true, false
 	}
-	return "", false, i, true
+	return "", false, i, true, false
 }
 
 // unwrapShellJoinTail prepends the recorded cluster tail to the command
@@ -2023,7 +2042,7 @@ func unwrapShellLongWord(argv []string, i int) (ni int, bail bool) {
 		if i+1 >= len(argv) {
 			return i, true
 		}
-		return i + 1, val != "/dev/null" && argv[i+1] != "/dev/null"
+		return i + 1, argv[i+1] != "/dev/null"
 	}
 	return i, val != "/dev/null"
 }
@@ -5412,12 +5431,14 @@ func interpOptionZoneHasToken(h []string, token, base string, findPathToken bool
 	codeDone := 0
 	for i := 1; i < len(h); i++ {
 		a := h[i]
-		if a == "--" {
+		if a == "--" || (shellHeads[base] && codeDone > 0 && (a == "-" || a == "+")) {
 			if shellHeads[base] && codeDone > 0 {
-				// A pending shell -c survives `--`: the word right after it
-				// IS the command string and stays inside the zone
-				// (`xargs -a <p> -I% sh -co errexit -- %` — v6.2.2 Oracle R6
-				// R6-MF-1).
+				// A pending shell -c survives the option terminator: the word
+				// right after it IS the command string and stays inside the
+				// zone (`xargs -a <p> -I% sh -co errexit -- %` — v6.2.2 Oracle
+				// R6 R6-MF-1). POSIX's bare "-"/"+" spellings settle exactly
+				// like "--" here (v6.2.2 Oracle R7 R7-MF-3 path B
+				// `xargs -a <p> -I{} sh -c - {}`).
 				end = i + 2
 				break
 			}
@@ -5888,6 +5909,13 @@ func awkWOperandTokenStep(args []string, i, j int, a, token string) (consume int
 	} else {
 		return 0, false
 	}
+	if strings.Contains(v, ",") {
+		// mawk chains several -W operands with commas — the composite is
+		// never ONE option name, so the token check must split it exactly
+		// like awkWCommaProgram splits the program grammar (v6.2.2 Oracle
+		// R7 R7-MF-4 `-W interactive,exec` / `-W i,e`).
+		return awkWCommaTokenHit(v, args, i, consume, token)
+	}
 	// Inline x=y spelling: the value is inside v itself.
 	name, eqVal, hasEq := strings.Cut(v, "=")
 	isProg, _ := awkLongProgramName(name)
@@ -5932,6 +5960,56 @@ func awkWOperandTokenStep(args []string, i, j int, a, token string) (consume int
 		return consume + 1, false
 	}
 	return consume, false
+}
+
+// awkWCommaTokenHit checks one comma-chained mawk -W operand for the
+// replacement token (v6.2.2 Oracle R7 R7-MF-4): each comma item re-runs
+// the single-item name/value checks, only the LAST item may consume the
+// next argv as its value, and a bare program/value-bearing item in
+// NON-final position fails closed as a hit — no awk can statically settle
+// where such an item's operand lives (mirrors awkWCommaProgram's
+// fail-closed shape).
+func awkWCommaTokenHit(v string, args []string, i, consume int, token string) (consumeOut int, hit bool) {
+	parts := strings.Split(v, ",")
+	consumeOut = consume
+	for k, part := range parts {
+		name, eqVal, hasEq := strings.Cut(part, "=")
+		if strings.Contains(name, token) || (hasEq && strings.Contains(eqVal, token)) {
+			hit = true
+		}
+		isProg, _ := awkLongProgramName(name)
+		if hasEq || (!isProg && !awkLongIsDataAssign(name)) {
+			continue // inline-valued or zero-operand item: nothing to consume
+		}
+		if k < len(parts)-1 {
+			// The `-Wi`/`-W in` collision names chain in mawk as the
+			// zero-operand interactive boolean (v6.2.2 Oracle R7 R7-MF-4):
+			// they never reach for the next argv. Every OTHER bare
+			// value-bearing item in non-final position has no statically
+			// knowable operand — fail closed as a hit.
+			if name == "i" || name == "in" {
+				continue
+			}
+			return consumeOut, true
+		}
+		if !isProg {
+			// trailing pure-data item: consume its value word like the
+			// single-item grammar so it cannot pose as the program.
+			if i+consumeOut+1 < len(args) {
+				consumeOut++
+			}
+			continue
+		}
+		// Trailing program item: its value lives in the NEXT argv — the
+		// token check lands there exactly like `-W exec '{}'`.
+		if i+consumeOut+1 < len(args) {
+			consumeOut++
+			if strings.Contains(args[i+consumeOut], token) {
+				hit = true
+			}
+		}
+	}
+	return consumeOut, hit
 }
 
 // awkWClusterValue extracts the -W operand of one awk short cluster:
@@ -5999,6 +6077,70 @@ func awkLongProgramName(name string) (isProgram bool, isFile bool) {
 // `gawk -W assign 'x=1' 'BEGIN{...}'` — the x=1 value can no longer usurp
 // the positional program slot and hide the real program text behind it).
 func awkWOperandProgram(v string, args []string, nextIdx int) (frag string, isFile bool, fileVal string, hit string, extraConsumed int) {
+	if strings.Contains(v, ",") {
+		// mawk chains several -W operands with commas (`-W interactive,exec
+		// FILE` / `-W i,e FILE`) where gawk would reject the composite as a
+		// single unknown option — fail-closed must track the MAWK parse, so
+		// each comma item is re-validated by the leaf grammar (v6.2.2 Oracle
+		// R7 R7-MF-4 path B).
+		return awkWCommaProgram(v, args, nextIdx)
+	}
+	return awkWOperandProgramLeaf(v, args, nextIdx)
+}
+
+// awkWCommaProgram validates one comma-chained mawk -W operand (v6.2.2
+// Oracle R7 R7-MF-4): each item re-runs the single-item leaf grammar;
+// only the LAST item may consume the next argv operand, inline fragments
+// merge, and a terminal file/exec item still ends awk's option parse
+// through the leaf's isFile channel. awk never executes a concatenated
+// composite as ONE option name, so the whole-word dynamic/ambiguous
+// fallback of the leaf cannot model it.
+func awkWCommaProgram(v string, args []string, nextIdx int) (frag string, isFile bool, fileVal string, hit string, extraConsumed int) {
+	parts := strings.Split(v, ",")
+	var frags []string
+	for k, part := range parts {
+		// A leading comma item that still names a value-bearing operand
+		// carries its value INSIDE the item (x=y) or is a zero-operand
+		// mawk boolean — only the trailing item can reach the next argv
+		// (mawk's -W exec FILE shape).
+		itemNext := len(args)
+		if k == len(parts)-1 {
+			itemNext = nextIdx
+		}
+		if strings.IndexByte(part, '=') < 0 && k < len(parts)-1 {
+			// A bare value-bearing/program operand in NON-final position
+			// would silently drop its value under every awk — fail closed
+			// rather than guess. mawk zero-operand BOOLEANS never reach this
+			// branch: they are not program-source names, and the `-Wi`/`-W
+			// in` collision names are excluded too (`-W i,e` chains the
+			// interactive boolean with exec — v6.2.2 Oracle R7 R7-MF-4).
+			if n := part; n != "i" && n != "in" {
+				if isProg, _ := awkLongProgramName(n); isProg || awkLongIsDataAssign(n) {
+					return "", false, "", "dynamic code payload", extraConsumed
+				}
+			}
+		}
+		f, fFile, fv, h, extra := awkWOperandProgramLeaf(part, args, itemNext)
+		if h != "" {
+			return "", isFile || fFile, "", h, extraConsumed
+		}
+		if extra > 0 {
+			extraConsumed += extra
+		}
+		if f != "" {
+			frags = append(frags, f)
+		}
+		if fFile {
+			isFile, fileVal = true, fv
+		}
+	}
+	return strings.Join(frags, "\n"), isFile, fileVal, "", extraConsumed
+}
+
+// awkWOperandProgramLeaf validates one comma-free -W operand item (the
+// pre-R7 grammar plus the -Wi/-W in collision handling of Oracle R7
+// R7-MF-4 and the unquoted-split data-value verdict of R7-SF-1).
+func awkWOperandProgramLeaf(v string, args []string, nextIdx int) (frag string, isFile bool, fileVal string, hit string, extraConsumed int) {
 	name, val, hasEq := strings.Cut(v, "=")
 	isProg, isF := awkLongProgramName(name)
 	if !isProg {
@@ -6013,10 +6155,7 @@ func awkWOperandProgram(v string, args []string, nextIdx int) (frag string, isFi
 			return "", false, "", "dynamic code payload", 0
 		}
 		if awkLongIsDataAssign(name) {
-			if !hasEq && nextIdx < len(args) {
-				return "", false, "", "", 1
-			}
-			return "", false, "", "", 0
+			return awkWDataAssignLeaf(v, args, nextIdx, hasEq)
 		}
 		if isDynamicArg(v) {
 			return "", false, "", "dynamic code payload", 0
@@ -6031,11 +6170,65 @@ func awkWOperandProgram(v string, args []string, nextIdx int) (frag string, isFi
 		} else {
 			val = ""
 		}
+		if extraConsumed == 1 && (name == "i" || name == "in") && val != "" {
+			return awkWIncludeCollisionLeaf(val, extraConsumed)
+		}
 	}
 	if !isF {
 		return val, false, "", "", extraConsumed
 	}
 	return "", true, val, awkProgramFileHit(val), extraConsumed
+}
+
+// awkWDataAssignLeaf validates one pure-data assignment -W operand
+// (extracted so awkWOperandProgramLeaf stays under the complexity budget
+// — v6.2.2 Oracle R7 R7-SF-1): an UNQUOTED dynamic assignment value
+// word-splits at runtime and the fragments re-arm awk's own option parse
+// — the check applies to the whole OPERAND word for the inline spelling
+// too (`gawk -W assign=x=$VAR '1'` splits inside `assign=x=<expansion>`
+// and spills `-e BEGIN{...}` out of the assignment). Quoted spellings
+// stay split-safe.
+func awkWDataAssignLeaf(v string, args []string, nextIdx int, hasEq bool) (frag string, isFile bool, fileVal string, hit string, extraConsumed int) {
+	if hasEq {
+		return "", false, "", awkDataValSplitHit(v), 0
+	}
+	if nextIdx < len(args) {
+		if sh := awkDataValSplitHit(args[nextIdx]); sh != "" {
+			return "", false, "", sh, 0
+		}
+		return "", false, "", "", 1
+	}
+	return "", false, "", "", 0
+}
+
+// awkWIncludeCollisionLeaf reports the `-Wi` / `-W i` / `-W in` collision
+// operand (extracted — v6.2.2 Oracle R7 R7-MF-4): gawk resolves them to
+// the --include library FILE (consuming the next argv) while mawk spells
+// the zero-operand BOOLEAN -W interactive, leaving the same word as awk's
+// positional PROGRAM. The file validation still runs on val (gawk
+// semantics) and extraConsumed stays 1 (gawk consumption), but val is
+// ALSO merged into the final program as a fragment — under mawk the same
+// bytes ARE the main program text, so `awk -Wi 'BEGIN{system("pig")}'`
+// can no longer pass unreviewed while `awk -Wi 'BEGIN{print 1}'` stays
+// inert. Crucially include never marks sawFile downstream, so the
+// positional program word still extracts on the gawk interpretation too
+// (`gawk -W i /dev/null 'BEGIN{system("pig")}'` blocks through BOTH
+// channels).
+func awkWIncludeCollisionLeaf(val string, extraConsumed int) (frag string, isFile bool, fileVal string, hit string, extraConsumedOut int) {
+	return val, true, val, awkProgramFileHit(val), extraConsumed
+}
+
+// awkDataValSplitHit reports a pure-data assignment VALUE (-v/-F/--assign/
+// --field-separator/-W assign) whose unquoted word split re-arms awk's
+// option parse at runtime: the placeholder expands inside a NON-split-safe
+// word (`awk -v x=$VAR` splits onto `-f /dev/stdin` / `-e BEGIN{...}` —
+// v6.2.2 Oracle R7 R7-SF-1). Quoted spellings (-v ts="$val" / "$VAR") stay
+// exempt: their expansion never leaves the word (isSplitSafeDynamicWord).
+func awkDataValSplitHit(val string) string {
+	if isDynamicArg(val) && !isSplitSafeDynamicWord(val) {
+		return "dynamic code payload"
+	}
+	return ""
 }
 
 // awkLongIsDataAssign reports whether name GNU-prefix-resolves to one of
@@ -6078,8 +6271,15 @@ func awkClusterFragsEnd(args []string, i int, a string, endOut *bool) (frags []s
 			}
 			return frags, sawFile, consumedNext, ""
 		case 'F', 'v':
-			if j+1 >= len(a) {
-				consumedNext++
+			// Pure-data assignment letters consume their operand — but an
+			// UNQUOTED dynamic operand word-splits at runtime and the
+			// fragments re-arm awk's own option parse (v6.2.2 Oracle R7
+			// R7-SF-1 `awk -v x=$VAR -f /dev/null`). A glued tail inside the
+			// cluster is a single word, which never splits.
+			dExtra, dHit := awkClusterDataAssignEnd(args, i, j, a, consumedNext)
+			consumedNext += dExtra
+			if dHit != "" {
+				return nil, sawFile, consumedNext, dHit
 			}
 			return frags, sawFile, consumedNext, ""
 		case 'i', 'l':
@@ -6121,6 +6321,23 @@ func awkClusterFragsEnd(args []string, i int, a string, endOut *bool) (frags []s
 		}
 	}
 	return frags, sawFile, consumedNext, ""
+}
+
+// awkClusterDataAssignEnd resolves the operand of one -F/-v pure-data
+// assignment letter (extracted so awkClusterFragsEnd stays under the
+// complexity budget — v6.2.2 Oracle R7 R7-SF-1): the separate operand
+// counts one EXTRA argv and both spellings run the unquoted word-split
+// validation — the separate operand splits on its own, and a glued tail
+// still splits the WHOLE cluster word when it carries a non-split-safe
+// expansion (`awk -v x=$VAR` / `-vx=$VAR` — v6.2.2 Oracle R7 R7-SF-1).
+func awkClusterDataAssignEnd(args []string, i, j int, a string, consumedNext int) (extra int, hit string) {
+	if j+1 < len(a) {
+		return 0, awkDataValSplitHit(a[j+1:])
+	}
+	if i+1+consumedNext < len(args) {
+		return 1, awkDataValSplitHit(args[i+1+consumedNext])
+	}
+	return 1, ""
 }
 
 // awkClusterFileOperand resolves the program-file operand of one -f/-E
@@ -9278,7 +9495,12 @@ func awkProgramFrags(args []string) (string, bool, string) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if isDynamicArg(a) {
-			if !endOpts && strings.HasPrefix(a, "-") {
+			if !endOpts && (strings.HasPrefix(a, "-") || !isSafeDynamicDataOperand(a)) {
+				// Dynamic words BEFORE the option terminator: awk's own parser
+				// (mawk/nawk positional scan, gawk getopt_long permutation) can
+				// re-read the expansion as further options — even after a -f
+				// program file or a positional program (v6.2.2 Oracle R7
+				// R7-MF-1 `awk -f /dev/null "$X"` / `gawk '1' "$X"` regression).
 				return "", sawFile, "dynamic code payload"
 			}
 			if !sawFile && positional == "" && len(frags) == 0 {
@@ -9347,6 +9569,11 @@ func awkProgramFrags(args []string) (string, bool, string) {
 			}
 			i++
 		case !endOpts && (a == "-F" || a == "-v"):
+			if i+1 < len(args) {
+				if sh := awkDataValSplitHit(args[i+1]); sh != "" {
+					return "", sawFile, sh
+				}
+			}
 			i++
 		case !endOpts && strings.HasPrefix(a, "-") && len(a) > 1:
 			var cFrag []string
@@ -15461,6 +15688,20 @@ func (st *interpScanState) scanOperandWord(argv []string, i int) bool {
 	if strings.HasPrefix(a, "-") && a != "-" || strings.HasPrefix(a, "+") && a != "+" {
 		return false
 	}
+	if st.pendingCode && shellOptSpecHasPlus(st.spec) && (a == "-" || a == "+") {
+		// POSIX: a bare "-"/"+" argument terminates option parsing exactly
+		// like "--" — with a pending shell -c it is NOT the command string
+		// but the terminator, and the word right AFTER it carries the code
+		// (v6.2.2 Oracle R7 R7-MF-3 path B `sh -c - 'pig'` / xargs `-a`
+		// append mode `xargs -a <p> sh -c -`). Settling it as the operand
+		// itself emitted an inert "-" slot and dropped the real payload.
+		if i+1 < len(argv) {
+			st.out = append(st.out, codeSlot{flag: i + 1, text: argv[i+1], restIdx: i + 2})
+		} else {
+			st.out = append(st.out, codeSlot{flag: i, flagOnly: true, restIdx: i + 1})
+		}
+		return true
+	}
 	if st.pendingCode {
 		// The pending flag-model code operand IS this word
 		// (`sh -c code`, `node -pe code`): argv0/positional-name
@@ -18229,10 +18470,21 @@ func hasDynamicInterpOption(head []string, base string) bool {
 // script operand, reported as end=true, dyn=false).
 func interpDynWordStep(head []string, i int, spec interpOptSpec, valueExact, codeFlags map[string]bool, pyHead, shell bool) (next int, end, dyn bool) {
 	a := head[i]
-	if a == "--" || a == "-" {
+	if a == "--" || a == "-" || (shell && a == "+") {
 		// "--" ends the option zone; "-" means stdin script source and
-		// the remaining args are script argv (W-Fix-6).
+		// the remaining args are script argv (W-Fix-6); POSIX/dash treat a
+		// bare "+" as the same terminator once the zone is a shell's
+		// (v6.2.2 Oracle R7 R7-MF-3 path B).
 		return i, true, false
+	}
+	if shell && (a == "-c" || a == "+c") {
+		// POSIX shells model -c/+c as a BOOLEAN letter — the word consumes
+		// NO operand of its own (the command string is the first non-option
+		// word). Treating the bare spelling through valueExact would swallow
+		// the NEXT option word (`sh -c -o errexit -o $X 'echo hi'` lost the
+		// first -o and the dynamic word rode the second — v6.2.2 Oracle R7
+		// R7-MF-3 path A).
+		return i, false, false
 	}
 	if isDynamicArg(a) {
 		return i, true, dynInterpWordHit(a, shell)

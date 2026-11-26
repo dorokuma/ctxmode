@@ -2145,3 +2145,119 @@ func TestGuard_V622_OracleR6Probes(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// v6.2.2 Oracle R7 (R9 终局收口): R7-MF-1..4 / R7-SF-1 探针回归 —
+// awkProgramFrags 恢复 !endOpts 动态词门控(awk -f /dev/null "$X" / gawk '1'
+// "$X" 系列 R8 安全回归);unwrapShellWordStep 的 isCluster 通道杜绝单字
+// --long-opt 落入短选项集群(bash --restricted 四路 stdin 回归);裸 -c 布
+// 尔语义与 POSIX 单横杠 "-"/"+" 终止符结算(sh -c -o ... -o $X / sh -c -
+// 'pig' / xargs -a sh -c -);mawk -W 语法冲突(-Wi/-W i/-W in 布尔吞程序
+// 与逗号串联 -W interactive,exec);awk 纯数据赋值槽无引号词拆分拦截
+// (-v/-F/--assign/-W assign)。所有探针仅依赖基线共有入口 rtGuardCwd
+// 与 guardCtxRunStdin(argv 通道)。
+// ---------------------------------------------------------------------------
+
+func TestGuard_V622_OracleR7Probes(t *testing.T) {
+	mkPayload := func(name, content string) string {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+	payloadPig := mkPayload("r7-pig", "pig\n")
+	payloadX := mkPayload("r7-x", "x\n")
+
+	blockCases := []struct {
+		name, cmd, want string
+	}{
+		// R7-MF-1: awkProgramFrags -- 前动态选项注入 R8 回归恢复 BLOCK。
+		{"P-R7-MF1-a awk -f null X", `X='-f/dev/stdin'; echo 'BEGIN{system("pig")}' | awk -f /dev/null "$X"`, "dynamic code payload"},
+		{"P-R7-MF1-b awk -f null split X", `X='-f /dev/stdin'; echo 'BEGIN{system("pig")}' | awk -f /dev/null $X`, "dynamic code payload"},
+		{"P-R7-MF1-c gawk 1 X", `X='-eBEGIN{system("pig")}'; gawk '1' "$X"`, "dynamic code payload"},
+		{"P-R7-MF1-d gawk -e 1 X", `X='-eBEGIN{system("pig")}'; gawk -e '1' "$X"`, "dynamic code payload"},
+		{"P-R7-MF1-e gawk 1 ./X", `X='x -e BEGIN{system("pig")}'; gawk '1' ./$X`, "dynamic code payload"},
+		// R7-MF-2: 单字 --long-opt 不再落入短选项集群(bash --restricted
+		// 管道/here-string/heredoc/stdin 四路 R8 回归)。
+		{"P-R7-MF2-a pipe bash --restricted", `echo 'pig' | bash --restricted`, "piped code to shell"},
+		// 注: <<< 是 bash-only 语法,外层 dash 语法门在 stdin 筛查前先 BLOCK —
+		// 该探针的裁决串不含 pig(与 Oracle R7 预期串的偏差,判别性证据由
+		// 探针 a/c/d 承担,此处断言其恒定 BLOCK 不回归为 ALLOW)。
+		{"P-R7-MF2-b bash --restricted herestring", `bash --restricted <<< 'pig'`, "bash-only syntax"},
+		{"P-R7-MF2-c bash --restricted heredoc", `bash --restricted <<'EOF'
+pig
+EOF`, "pig"},
+		// R7-MF-3 路径 A: 裸 -c 布尔语义 + 裸 -o/+o/-O/+O 动态词校验。
+		{"P-R7-MF3-a sh -c -o -o X", `X='errexit pig'; sh -c -o errexit -o $X 'echo hi'`, "dynamic code payload"},
+		{"P-R7-MF3-b bash -c -o -o X", `X='errexit pig'; bash -c -o errexit -o $X 'echo hi'`, "dynamic code payload"},
+		{"P-R7-MF3-c sh -c +o +o X", `X='errexit pig'; sh -c +o errexit +o $X 'echo hi'`, "dynamic code payload"},
+		{"P-R7-MF3-d bash -c -O -O X", `X='extglob pig'; bash -c -O extglob -O $X 'echo hi'`, "dynamic code payload"},
+		// R7-MF-3 路径 B: POSIX 单横杠 "-" 终止符结算。
+		{"P-R7-MF3-e sh -c - pig", `sh -c - 'pig'`, "pig"},
+		{"P-R7-MF3-f bash -c - pig", `bash -c - 'pig'`, "pig"},
+		{"P-R7-MF3-g sh -co errexit - pig", `sh -co errexit - 'pig'`, "pig"},
+		{"P-R7-MF3-h sh -c - X", `X='pig'; sh -c - "$X"`, "dynamic code payload"},
+		{"P-R7-MF3-i xargs sh -c -", `xargs -a ` + payloadPig + ` sh -c -`, "dynamic code payload"},
+		// R7-MF-4: mawk -W 语法冲突(布尔吞程序与逗号串联)。
+		{"P-R7-MF4-a awk -Wi", `awk -Wi 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R7-MF4-b awk -W i", `awk -W i 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R7-MF4-c awk -W in", `awk -W in 'BEGIN{system("pig")}'`, "pig"},
+		{"P-R7-MF4-d awk -W interactive,exec", `echo 'BEGIN{system("pig")}' | awk -W interactive,exec /dev/stdin`, "awk script from stdin"},
+		// R7-SF-1: awk 纯数据赋值槽无引号词拆分选项注入。
+		{"P-R7-SF1-a awk -v x=VAR", `VAR='1 -f /dev/stdin'; echo 'BEGIN{system("pig")}' | awk -v x=$VAR -f /dev/null`, "dynamic code payload"},
+		{"P-R7-SF1-b gawk -W assign=x=VAR", `VAR='1 -e BEGIN{system("pig")}'; gawk -W assign=x=$VAR '1'`, "dynamic code payload"},
+		{"P-R7-SF1-c gawk -W assign VAR", `VAR='x=1 -e BEGIN{system("pig")}'; gawk -W assign $VAR '1'`, "dynamic code payload"},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+
+	// R7-MF-2-d: guardCtxRunStdin argv+stdin 通道(argv 不走 shell 字符串)。
+	t.Run("P-R7-MF2-d argv bash --restricted stdin", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "P-R7-MF2-d", role: "worker", argv: []string{"bash", "--restricted"}, stdin: "pig\n"}, "")
+		if got == "ALLOW" {
+			t.Fatalf("rtGuardCwd(argv bash --restricted stdin pig) = ALLOW, want a guard block")
+		}
+		if !strings.Contains(got, "pig") {
+			t.Fatalf("rtGuardCwd(argv bash --restricted) = %q, want verdict substring %q", got, "pig")
+		}
+	})
+
+	// 放行守卫正例(R7 零假阳纪律,含 R6 既有放行契约的核心行)。
+	allowCases := []struct {
+		name, cmd string
+	}{
+		{"R7-pos awk -f -- $FILE", `awk -f parse.awk -- "$FILE"`},
+		{"R7-pos awk '1' -- $FILE", `awk '1' -- "$FILE"`},
+		{"R7-pos awk 1 $PWD data", `awk '1' "$PWD/data.txt"`},
+		{"R7-pos awk glob log", `awk '{print $1}' /tmp/*.log`},
+		{"R7-pos awk f static", `f=/tmp/data.log; awk '{print $1, $2}' "$f"`},
+		{"R7-pos awk -v ts quoted", `val=$(date +%s); awk -v ts="$val" 'BEGIN{print ts}'`},
+		{"R7-pos gawk -W assign=x=quoted", `gawk -W assign=x="$VAR" '1'`},
+		{"R7-pos gawk -W assign quoted", `gawk -W assign "$VAR" '1'`},
+		{"R7-pos awk -Wi benign", `awk -Wi 'BEGIN{print 1}'`},
+		{"R7-pos gawk -W i devnull benign", `gawk -W i /dev/null 'BEGIN{print 1}'`},
+		{"R7-pos bash --restricted scriptfile", `bash --restricted "a'b.sh"`},
+		{"R7-pos sh -c $1", `sh -c 'echo "$1"' _ "$ARG"`},
+		{"R7-pos sh -c -o errexit $1", `sh -c -o errexit 'echo "$1"' _ "$ARG"`},
+		{"R7-pos sh -c - $1", `sh -c - 'echo "$1"' _ "$ARG"`},
+		{"R7-pos xargs sh -c - $1", `xargs -a ` + payloadX + ` -I{} sh -c - 'echo "$1"' _ {}`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+}
