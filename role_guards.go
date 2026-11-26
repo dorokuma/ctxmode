@@ -257,6 +257,18 @@ func isSplitSafeDynamicWord(a string) bool {
 		strings.Contains(a, cmdSubPlaceholderAbsDq)
 }
 
+// isSingleWordSplitSafe reports a dynamic word guaranteed to stay ONE argv
+// word at runtime: split-safe AND free of unquoted pathname-expansion globs
+// (cmdSubPlaceholderGlob can expand into N >= 2 argv words, spilling
+// match[1..] out of a single-operand option value slot into the program
+// or command-head position — v6.2.2 Oracle R9 R9-MF-2 `awk -F B*` /
+// `gawk --assign a=1*` / `env -a p*` / `xargs -a p*` / `flock -w 0*` /
+// `git -C g*` / `npx --cache p*`). Multi-file operand slots keep the
+// wider isSplitSafeDynamicWord (glob expansion is valid input data there).
+func isSingleWordSplitSafe(a string) bool {
+	return isSplitSafeDynamicWord(a) && !strings.Contains(a, cmdSubPlaceholderGlob)
+}
+
 // globWordIsSplitSafe reports whether a word carrying cmdSubPlaceholderGlob
 // cannot expand to an option-looking argv word: the FIRST byte must be a
 // literal, non '-'/'+'/'~' character (a word starting with * ? [ ~ can
@@ -387,10 +399,15 @@ type envAssignments struct {
 	ops []envOp // ordered: prefix assignments, then env's own operands
 }
 
-// addAssign appends one KEY=VAL op when word actually looks like an
-// assignment (KEY must be a bare identifier).
+// addAssign appends one KEY=VAL op when word carries an '=' anywhere.
+// GNU env(1) consumes ANY operand containing '=' as an assignment —
+// POSIX-key or not (a.b=1, BASH_FUNC_echo%%=..., -x=1 after `--`, even
+// `=foo` with an empty key) — so the env operand peel must record them
+// all for screening instead of dropping the non-POSIX shapes (v6.2.2
+// Oracle R9 R9-MF-3/R9-MF-4). Keys are never executed; every consumer
+// matches exact names or prefixes, so an empty/odd key is inert data.
 func (e *envAssignments) addAssign(word string) {
-	if k := strings.IndexByte(word, '='); k > 0 && !strings.HasPrefix(word, "-") {
+	if k := strings.IndexByte(word, '='); k >= 0 {
 		e.ops = append(e.ops, envOp{kind: 'a', key: word[:k], value: word[k+1:]})
 	}
 }
@@ -453,6 +470,11 @@ var envHookVars = map[string]bool{
 	"DISPATCH_REPORT_PATH": true, "DISPATCH_REPORT_PARENT": true,
 	"HC_TERMINAL_ID": true, "HC_SOCKET": true,
 	"CTXMODE_EXTRA_WORKDIRS": true,
+	// GNU tar prepends $TAR_OPTIONS to its own argv before parsing the
+	// command line: --use-compress-program / --checkpoint-action=exec /
+	// --to-command / -I all hand a command string to tar outside every
+	// argv-level tar screening (v6.2.2 Oracle R9 R9-MF-4).
+	"TAR_OPTIONS": true,
 }
 
 // pagerSafeVars may be set to "" or "cat" — disabling the pager is the
@@ -470,7 +492,11 @@ func isEnvHookVar(key string) bool {
 		return true
 	}
 	if strings.HasPrefix(key, "LD_") || strings.HasPrefix(key, "DYLD_") ||
-		strings.HasPrefix(key, "GIT_CONFIG") {
+		strings.HasPrefix(key, "GIT_CONFIG") ||
+		// bash auto-imports BASH_FUNC_<name>%%=() { ... } as a shell
+		// function, hijacking builtins and external commands alike
+		// (v6.2.2 Oracle R9 R9-MF-4).
+		strings.HasPrefix(key, "BASH_FUNC_") {
 		return true
 	}
 	switch key {
@@ -1059,7 +1085,7 @@ func skipFlockArgs(argv []string, i int) (int, string) {
 			i = idx
 		case strings.HasPrefix(a, "-"):
 			if i+1 < len(argv) && flockShortTakesValue(a) {
-				if isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
+				if isDynamicArg(argv[i+1]) && !isSingleWordSplitSafe(argv[i+1]) {
 					return len(argv), cmdSubPlaceholder
 				}
 				i += 2
@@ -1169,7 +1195,7 @@ func skipFlockLong(argv []string, i int) int {
 	}
 	full, ok := flockMatchLong(name)
 	if ok && flockLongTakesValue(full) {
-		if i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
+		if i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSingleWordSplitSafe(argv[i+1]) {
 			return -1
 		}
 		return i + 2
@@ -1208,7 +1234,7 @@ func flockClusterScan(argv []string, i int) (idx int, txt string, done bool) {
 		}
 	}
 	if consumedNext {
-		if i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
+		if i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSingleWordSplitSafe(argv[i+1]) {
 			return len(argv), cmdSubPlaceholder, true
 		}
 		return i + 2, "", false
@@ -1632,19 +1658,30 @@ func skipEnvOperandsToken(argv []string, i int, envAs envAssignments, token stri
 	if depth > peelWrapperMaxSteps {
 		return argv[i:], []string{envUnknownLongPrefix + "split depth"}, envAs, false
 	}
+	// v6.2.2 Oracle R9 R9-MF-3: GNU coreutils env(1) consumes ANY operand
+	// containing '=' as an environment assignment — POSIX-key or not
+	// (a.b=1, a-b=1, BASH_FUNC_echo%%=...) and even after the `--`
+	// terminator (-x=1). endOpts latches after `--` so the assignment peel
+	// continues while option parsing stops; a dynamic word is exempted
+	// from the fail-closed verdict ONLY when it is a single-word-safe
+	// KEY=VALUE shape (unquoted `env FOO=$X` field-splits `FOO=1 pig` into
+	// a command head at runtime — unlike a shell prefix assignment, here
+	// the word is env's argv).
+	endOpts := false
 	for i < len(argv) {
 		a := argv[i]
-		if isDynamicArg(a) && !isAssignWord(a) {
+		if isDynamicArg(a) && !(strings.IndexByte(a, '=') > 0 && isSingleWordSplitSafe(a)) {
 			payloads = append(payloads, envUnknownLongPrefix+"dynamic option")
 			return argv[i:], payloads, envAs, splitTokHit
 		}
 		switch {
-		case a == "--":
-			return argv[i+1:], payloads, envAs, splitTokHit
-		case a == "-":
+		case !endOpts && a == "--":
+			endOpts = true
+			i++
+		case !endOpts && a == "-":
 			envAs.ops = append(envAs.ops, envOp{kind: 'c'})
 			i++
-		case strings.HasPrefix(a, "--"):
+		case !endOpts && strings.HasPrefix(a, "--"):
 			ls := skipEnvLongToken(argv, i, envAs, token, depth, a, splitTokHit)
 			if ls.done {
 				return ls.rest, append(payloads, ls.payloads...), ls.envAs, ls.hit
@@ -1655,7 +1692,7 @@ func skipEnvOperandsToken(argv []string, i int, envAs envAssignments, token stri
 				return argv[ls.ni:], payloads, envAs, splitTokHit
 			}
 			i = ls.ni
-		case strings.HasPrefix(a, "-"):
+		case !endOpts && strings.HasPrefix(a, "-"):
 			cl := skipEnvClusterToken(argv, i, envAs, token, depth, a, splitTokHit)
 			if cl.done {
 				return cl.rest, append(payloads, cl.payloads...), cl.envAs, cl.hit
@@ -1666,7 +1703,7 @@ func skipEnvOperandsToken(argv []string, i int, envAs envAssignments, token stri
 				return argv[cl.ni:], payloads, envAs, splitTokHit
 			}
 			i = cl.ni
-		case isAssignWord(a):
+		case strings.IndexByte(a, '=') >= 0:
 			envAs.addAssign(a)
 			i++
 		default:
@@ -1729,9 +1766,14 @@ func skipEnvLongToken(argv []string, i int, envAs envAssignments, token string, 
 			}
 			st.ni = i + 1
 		case i+1 < len(argv):
-			if isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
+			if isDynamicArg(argv[i+1]) && !isSingleWordSplitSafe(argv[i+1]) {
 				st.payloads = append(st.payloads, envUnknownLongPrefix+"dynamic option")
-				st.ni, st.early = i+1, true
+				// v6.2.2 Oracle R9 R9-MF-2: end the scan PAST the unsafe value
+				// (ni falls through to i+2 below, same as the short-cluster
+				// path in envValuedLetterOp) — ni=i+1 left the glob word in
+				// the rest stream, where peelWrappers surfaced it as a bare
+				// "dynamic command head" instead of the precise env verdict.
+				st.ni, st.early = i+2, true
 				return st
 			}
 			if isChdir {
@@ -1856,13 +1898,13 @@ func envValuedLetterOp(st *envTokenStep, opt byte, optVal string, consumedNext b
 	case 'u':
 		st.envAs.ops = append(st.envAs.ops, envOp{kind: 'u', key: optVal})
 	case 'C':
-		if consumedNext && isDynamicArg(optVal) && !isSplitSafeDynamicWord(optVal) {
+		if consumedNext && isDynamicArg(optVal) && !isSingleWordSplitSafe(optVal) {
 			st.payloads = append(st.payloads, envUnknownLongPrefix+"dynamic option")
 			return true
 		}
 		st.envAs.ops = append(st.envAs.ops, envOp{kind: 'd', value: optVal})
 	case 'a':
-		if consumedNext && isDynamicArg(optVal) && !isSplitSafeDynamicWord(optVal) {
+		if consumedNext && isDynamicArg(optVal) && !isSingleWordSplitSafe(optVal) {
 			st.payloads = append(st.payloads, envUnknownLongPrefix+"dynamic option")
 			return true
 		}
@@ -3889,7 +3931,7 @@ func screenNodeRunnerSubagent(base string, args []string, effPath string, depth 
 // (`~/.npmrc` — carries a single cmdSubPlaceholderGlob at leading '~' with no
 // unquoted $/cmdsub and no wildcard characters).
 func isSingleWordOptionValue(val string) bool {
-	if !isDynamicArg(val) || isSplitSafeDynamicWord(val) {
+	if !isDynamicArg(val) || isSingleWordSplitSafe(val) {
 		return true
 	}
 	if strings.HasPrefix(val, "~") &&
@@ -6252,10 +6294,24 @@ func awkWDataAssignLeaf(v string, args []string, nextIdx int, hasEq bool) (frag 
 // quote (`gawk -W i "a'b" ...`) can never poison the REAL program text
 // that precedes it in the joined program.
 func awkWIncludeCollisionLeaf(val string, extraConsumed int, aux *[]string) (frag string, isFile bool, fileVal string, hit string, extraConsumedOut int) {
+	if fh := awkProgramFileHit(val); fh != "" {
+		return "", true, val, fh, extraConsumed
+	}
+	// v6.2.2 Oracle R9 R9-MF-1: a collision value starting with '-' is a
+	// mawk OPTION word (-v/-F/-f/-W) that gawk would consume as the
+	// --include library file. The two parses are irreconcilable — under
+	// mawk the word re-arms awk's own option parse (its x=1 value usurps
+	// the positional program slot, or -f /dev/stdin escapes review) while
+	// dropping extraConsumed would let `gawk -W i -foo` be mis-clustered
+	// as -f oo — so fail closed. awkProgramFileHit runs first so the
+	// bare '-' spelling keeps its precise stdin verdict.
+	if strings.HasPrefix(val, "-") {
+		return "", true, val, "dynamic code payload", extraConsumed
+	}
 	if aux != nil {
 		*aux = append(*aux, val)
 	}
-	return "", true, val, awkProgramFileHit(val), extraConsumed
+	return "", true, val, "", extraConsumed
 }
 
 // awkDataValSplitHit reports a pure-data assignment VALUE (-v/-F/--assign/
@@ -6265,7 +6321,7 @@ func awkWIncludeCollisionLeaf(val string, extraConsumed int, aux *[]string) (fra
 // v6.2.2 Oracle R7 R7-SF-1). Quoted spellings (-v ts="$val" / "$VAR") stay
 // exempt: their expansion never leaves the word (isSplitSafeDynamicWord).
 func awkDataValSplitHit(val string) string {
-	if isDynamicArg(val) && !isSplitSafeDynamicWord(val) {
+	if isDynamicArg(val) && !isSingleWordSplitSafe(val) {
 		return "dynamic code payload"
 	}
 	return ""
@@ -7597,7 +7653,7 @@ func scanScriptLong(head []string, i int, sc *scriptOptScan) int {
 	for _, full := range []string{"log-out", "log-in", "log-timing", "log-io", "output-limit", "logging-format", "echo"} {
 		if strings.HasPrefix(full, name) && name != "" {
 			if !hasVal && i+1 < len(head) {
-				if isDynamicArg(head[i+1]) && !isSplitSafeDynamicWord(head[i+1]) {
+				if isDynamicArg(head[i+1]) && !isSingleWordSplitSafe(head[i+1]) {
 					sc.cmdText, sc.cmdFlagIdx = cmdSubPlaceholder, i
 					return i
 				}
@@ -7630,7 +7686,7 @@ func scanScriptCluster(head []string, i int, sc *scriptOptScan) int {
 			return i
 		case 'O', 'I', 'B', 'T', 'o', 'm', 'E':
 			if j+1 >= len(a) && i+1 < len(head) {
-				if isDynamicArg(head[i+1]) && !isSplitSafeDynamicWord(head[i+1]) {
+				if isDynamicArg(head[i+1]) && !isSingleWordSplitSafe(head[i+1]) {
 					sc.cmdText, sc.cmdFlagIdx = cmdSubPlaceholder, i
 					return i
 				}
@@ -8534,7 +8590,7 @@ func xargsTargetIndex(argv []string) int {
 		}
 		if strings.HasPrefix(a, "-") && len(a) > 1 {
 			consumedNext := xargsClusterConsumesNext(a)
-			if consumedNext && i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
+			if consumedNext && i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSingleWordSplitSafe(argv[i+1]) {
 				return i + 1
 			}
 			i++
@@ -8557,7 +8613,7 @@ func xargsLongTargetStep(argv []string, i int) (next, at int) {
 		return i + 1, -1
 	}
 	if xargsLongConsumesNext(a) {
-		if i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSplitSafeDynamicWord(argv[i+1]) {
+		if i+1 < len(argv) && isDynamicArg(argv[i+1]) && !isSingleWordSplitSafe(argv[i+1]) {
 			return i, i + 1
 		}
 		return i + 2, -1
@@ -11423,7 +11479,7 @@ func screenGitGlobalArgs(args []string) (int, string) {
 			if i+1 >= len(args) {
 				return i, "git " + a
 			}
-			if isDynamicArg(args[i+1]) && !isSplitSafeDynamicWord(args[i+1]) {
+			if isDynamicArg(args[i+1]) && !isSingleWordSplitSafe(args[i+1]) {
 				return i, "git dynamic global option"
 			}
 			i += 2
@@ -11434,8 +11490,10 @@ func screenGitGlobalArgs(args []string) (int, string) {
 			pair := args[i+1]
 			if isDynamicArg(pair) {
 				// SH11 MF-2.2: the whole KEY=VAL word must be split-safe — an
-				// unquoted $X value can field-split a second `-c` option in.
-				if !isSplitSafeDynamicWord(pair) {
+				// unquoted $X value can field-split a second `-c` option in, and
+				// an unquoted glob spills extra words past the pair slot
+				// (v6.2.2 Oracle R9 R9-MF-2).
+				if !isSingleWordSplitSafe(pair) {
 					return i, "git dynamic global option"
 				}
 				// Key must be static; value may be split-safe dynamic for non-hook keys.
@@ -11486,7 +11544,7 @@ func screenGitGlobalArgs(args []string) (int, string) {
 			return i, "git --exec-path"
 		case strings.HasPrefix(a, "--git-dir=") || strings.HasPrefix(a, "--work-tree=") ||
 			strings.HasPrefix(a, "--namespace="):
-			if isDynamicArg(a) && !isSplitSafeDynamicWord(a) {
+			if isDynamicArg(a) && !isSingleWordSplitSafe(a) {
 				return i, "git dynamic global option"
 			}
 			i++
@@ -12116,7 +12174,13 @@ func sedScriptHasWrite(s string) string {
 // (separate, =glued, or cluster tail) is an unvetted script file and
 // blocks.
 func screenAwkProgram(args []string) string {
-	program, sawFile, _ := awkProgramFrags(args)
+	program, sawFile, hit := awkProgramFrags(args)
+	// v6.2.2 Oracle R9 R9-Obs-3: honor the fail-closed hit channel — a
+	// dynamic/unsafe program source must stay blocked for direct callers
+	// too, in parity with screenAwkSubagent.
+	if hit != "" {
+		return hit
+	}
 	if sawFile {
 		return "awk -f" // unvetted program file
 	}

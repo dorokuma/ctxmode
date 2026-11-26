@@ -2355,3 +2355,141 @@ func TestGuard_V622_OracleR8Probes(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// v6.2.2 Oracle R9 (R9 终局收口): R9-MF-1..4 探针回归 —
+// R9-MF-1: -Wi/-W i/-W in 碰撞值以 '-' 开头(gawk --include 库文件语义
+// 与 mawk 布尔冲突不可调和)一律 fail-closed,不再把 -v/-F/-f/-W 选项词
+// 吞入 aux 丢弃真实主程序或放行 -f /dev/stdin;
+// R9-MF-2: isSingleWordSplitSafe 收紧全部单值选项槽 — 无引号通配符
+// (cmdSubPlaceholderGlob)路径展开产出 N>=2 个 argv 词,match[1..] 溢出
+// 至主程序/命令头/子命令槽(awk -F B* / env -a p* / xargs -a p* /
+// flock -w 0* / git -C g* / npx --cache p*);
+// R9-MF-3: skipEnvOperandsToken 三重缺陷 — GNU env 消费任何含 '=' 的
+// 操作数(POSIX 键与否、`--` 之后均为赋值),且 `env FOO=$X` 无引号词
+// 拆分(env 的 argv 不是 shell 前缀赋值);
+// R9-MF-4: TAR_OPTIONS 与 BASH_FUNC_* 纳入 envHookVars/isEnvHookVar。
+// 全部探针仅依赖基线共有入口 rtGuardCwd 与 guardCall.guardCtxRunEnv。
+// ---------------------------------------------------------------------------
+
+func TestGuard_V622_OracleR9Probes(t *testing.T) {
+	mkPayload := func(name, content string) string {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+	payloadProg := mkPayload("r9-prog", "BEGIN{system(\"pig\")}\n")
+	payloadX := mkPayload("r9-x", "x\n")
+
+	blockCases := []struct {
+		name, cmd, want string
+	}{
+		// R9-MF-1: -Wi/-W i/-W in 碰撞值以 '-' 开头一律 fail-closed。
+		{"P-R9-MF1-a awk -Wi -v x=1 pig", `awk -Wi -v x=1 'BEGIN{system("pig")}'`, "dynamic code payload"},
+		{"P-R9-MF1-b awk -W i -v x=1 pig", `awk -W i -v x=1 'BEGIN{system("pig")}'`, "dynamic code payload"},
+		{"P-R9-MF1-c awk -W in -F : pig", `awk -W in -F : 'BEGIN{system("pig")}'`, "dynamic code payload"},
+		{"P-R9-MF1-d awk -Wi -f devstdin", `echo 'BEGIN{system("pig")}' | awk -Wi -f /dev/stdin`, "dynamic code payload"},
+		{"P-R9-MF1-e awk -Wi -W exec devstdin", `echo 'BEGIN{system("pig")}' | awk -Wi -W exec /dev/stdin`, "dynamic code payload"},
+		{"P-R9-MF1-f awk -Wi -W i pig", `awk -Wi -W i 'BEGIN{system("pig")}'`, "dynamic code payload"},
+		{"P-R9-MF1-g awk -W interactive,i -v pig", `awk -W interactive,i -v x=1 'BEGIN{system("pig")}'`, "dynamic code payload"},
+		{"P-R9-MF1-h awk -Wi -v x=1 -- VAR", `VAR='BEGIN{system("pig")}'; awk -Wi -v x=1 -- "$VAR"`, "dynamic code payload"},
+		{"P-R9-MF1-i xargs awk -Wi -v x=1 -- tok", `xargs -a ` + payloadProg + ` -I{} awk -Wi -v x=1 -- '{}'`, "dynamic code payload"},
+		// R9-MF-2: 单值选项槽无引号 glob 多词溢出。
+		{"P-R9-MF2-a awk -F glob", `awk -F B*`, "dynamic code payload"},
+		{"P-R9-MF2-b awk -v a=1 glob", `awk -v a=1*`, "dynamic code payload"},
+		{"P-R9-MF2-c gawk --assign glob", `gawk --assign a=1*`, "dynamic code payload"},
+		{"P-R9-MF2-d gawk -W assign glob", `gawk -W assign a=1*`, "dynamic code payload"},
+		{"P-R9-MF2-e env -a glob", `env -a p*`, "dynamic option"},
+		{"P-R9-MF2-f xargs -a glob", `xargs -a p*`, "dynamic command head"},
+		{"P-R9-MF2-g flock -w glob", `flock -w 0* pig`, "dynamic code payload"},
+		{"P-R9-MF2-h git -C glob", `git -C g* -Opig foo`, "git dynamic global option"},
+		{"P-R9-MF2-i npx --cache glob", `npx --cache p*`, "dynamic code payload"},
+		// R9-MF-3: skipEnvOperandsToken 三重缺陷。
+		{"P-R9-MF3-a env a.b=1 pig", `env 'a.b=1' pig`, "pig"},
+		{"P-R9-MF3-b env a-b=1 hc", `env 'a-b=1' hc list`, "hc"},
+		{"P-R9-MF3-c env -- -x=1 pig", `env -- -x=1 pig`, "pig"},
+		{"P-R9-MF3-d env -- a.b=1 pig", `env -- 'a.b=1' pig`, "pig"},
+		{"P-R9-MF3-e env FOO=X unquoted", `X='1 pig'; env FOO=$X`, "dynamic option"},
+		{"P-R9-MF3-f xargs env a.b=1 env -S", `xargs -a ` + payloadX + ` -I{} env 'a.b=1' env -S "find . -name {}"`, "dynamic code payload"},
+		// R9-MF-4: TAR_OPTIONS / BASH_FUNC_* 钩子变量。
+		{"P-R9-MF4-a TAR_OPTIONS use-compress-program", `TAR_OPTIONS='--use-compress-program=pig' tar -cf /dev/null /dev/null`, "TAR_OPTIONS"},
+		{"P-R9-MF4-b TAR_OPTIONS checkpoint-action", `TAR_OPTIONS='--checkpoint=1 --checkpoint-action=exec=pig' tar -cf /dev/null /dev/null`, "TAR_OPTIONS"},
+		{"P-R9-MF4-e env BASH_FUNC bash", `env 'BASH_FUNC_echo%%=() { pig; }' bash -c 'echo hi'`, "BASH_FUNC_echo%%"},
+		// 附加回归(Oracle R9 底部):-Wi - 保精准 stdin 裁决;-W i -foo
+		// 与 glob/`--` 变体全 BLOCK。
+		{"R9-reg awk -Wi dash stdin", `awk -Wi -`, "awk script from stdin"},
+		{"R9-reg gawk -W i -foo pig", `gawk -W i -foo 'BEGIN{system("pig")}'`, "dynamic code payload"},
+		{"R9-reg env -- FOO=X unquoted", `X='1 pig'; env -- FOO=$X`, "dynamic option"},
+		{"R9-reg gawk --field-separator glob", `gawk --field-separator B*`, "dynamic code payload"},
+		{"R9-reg gawk -W assign=a=1 glob", `gawk -W assign=a=1*`, "dynamic code payload"},
+		{"R9-reg env --argv0 glob", `env --argv0 p*`, "dynamic option"},
+		{"R9-reg env -C glob", `env -C p*`, "dynamic option"},
+		{"R9-reg xargs --arg-file glob", `xargs --arg-file p*`, "dynamic command head"},
+		{"R9-reg flock --timeout glob", `flock --timeout 0* pig`, "dynamic code payload"},
+		{"R9-reg flock -xw glob", `flock -xw 0* pig`, "dynamic code payload"},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+
+	// P-R9-MF4-c: ctx_run env 通道的 TAR_OPTIONS 覆盖拦截。
+	t.Run("P-R9-MF4-c guardCtxRunEnv TAR_OPTIONS", func(t *testing.T) {
+		rule, detail := guardCall{subagent: true}.guardCtxRunEnv(map[string]string{"TAR_OPTIONS": "--use-compress-program=pig"})
+		if rule != "subagent_nested_agent" || detail != "env TAR_OPTIONS" {
+			t.Fatalf("guardCtxRunEnv(TAR_OPTIONS) = (%q, %q), want (%q, %q)", rule, detail, "subagent_nested_agent", "env TAR_OPTIONS")
+		}
+	})
+
+	// P-R9-MF4-d: ctx_run env 通道的 BASH_FUNC_* 覆盖拦截。
+	t.Run("P-R9-MF4-d guardCtxRunEnv BASH_FUNC", func(t *testing.T) {
+		rule, detail := guardCall{subagent: true}.guardCtxRunEnv(map[string]string{"BASH_FUNC_echo%%": "() { pig; }"})
+		if rule != "subagent_nested_agent" || detail != "env BASH_FUNC_echo%%" {
+			t.Fatalf("guardCtxRunEnv(BASH_FUNC_echo%%) = (%q, %q), want (%q, %q)", rule, detail, "subagent_nested_agent", "env BASH_FUNC_echo%%")
+		}
+	})
+
+	// 放行守卫正例(R9 零假阳纪律):带引号动态值、单字 glob 多文件操作数、
+	// 纯波浪线路径与非 POSIX 键 env 赋值全部保持 ALLOW。
+	allowCases := []struct {
+		name, cmd string
+	}{
+		{"R9-pos awk -W interactive -v benign", `awk -W interactive -v x=1 'BEGIN{print 1}'`},
+		{"R9-pos awk -v x=1 -Wi benign", `awk -v x=1 -Wi 'BEGIN{print 1}'`},
+		{"R9-pos awk -Wi benign", `awk -Wi 'BEGIN{print 1}'`},
+		{"R9-pos gawk -W i devnull benign", `gawk -W i /dev/null 'BEGIN{print 1}'`},
+		{"R9-pos gawk -W i devnull benign -- FILE", `gawk -W i /dev/null 'BEGIN{print 1}' -- "$FILE"`},
+		{"R9-pos awk glob log", `awk '{print $1}' /tmp/*.log`},
+		{"R9-pos awk -v ts quoted", `awk -v ts="$val" 'BEGIN{print ts}'`},
+		{"R9-pos env a.b=1 ls", `env 'a.b=1' ls`},
+		{"R9-pos env FOO=X quoted", `env FOO="$X" ls`},
+		{"R9-pos env -- FOO=X quoted VAR", `env -- FOO="$X" ls "$VAR"`},
+		{"R9-pos env -- ls VAR", `env -- ls "$VAR"`},
+		// 注: Oracle R9 正例列表中的 `env -C "$PWD" ls` 未纳入 — R2-4 既有契约
+		// (zz_r2fix_test.go:130)对动态 chdir 目录一律 fail-closed,属 Oracle 与
+		// 基线固定契约的冲突,不改核心策略,报告中列明偏差。
+		{"R9-pos xargs -a FILE grep", `xargs -a "$FILE" grep foo`},
+		{"R9-pos flock -w T lk true", `flock -w "$T" /tmp/lk true`},
+		{"R9-pos git -C DIR status", `git -C "$DIR" status`},
+		{"R9-pos npx --userconfig tilde", `npx --userconfig ~/.npmrc tsc --noEmit`},
+		{"R9-pos FOO=X shell prefix true", `FOO=$X true`},
+		{"R9-pos python glob pytest", `python3 -m pytest tests/*.py`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+}
