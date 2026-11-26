@@ -1449,7 +1449,7 @@ func (c *subCollector) failClosedFile(f *syntax.File) bool {
 			}
 		case *syntax.ForClause:
 			if wi, is := x.Loop.(*syntax.WordIter); is && wi.Name != nil {
-				if envHookVars[wi.Name.Value] || guardTaintVars[wi.Name.Value] {
+				if isEnvHookVar(wi.Name.Value) || guardTaintVars[wi.Name.Value] {
 					ok = false
 					return false
 				}
@@ -1536,7 +1536,7 @@ func peAssignsHookOrTaint(pe *syntax.ParamExp) bool {
 	switch pe.Exp.Op {
 	case syntax.AssignUnset, syntax.AssignUnsetOrNull:
 		name := pe.Param.Value
-		return envHookVars[name] || guardTaintVars[name]
+		return isEnvHookVar(name) || guardTaintVars[name]
 	}
 	return false
 }
@@ -1556,7 +1556,7 @@ func arithmTargetIsHookOrTaint(x syntax.ArithmExpr) bool {
 	if name == "" {
 		return false
 	}
-	return envHookVars[name] || guardTaintVars[name]
+	return isEnvHookVar(name) || guardTaintVars[name]
 }
 
 func arithmTargetName(x syntax.ArithmExpr) string {

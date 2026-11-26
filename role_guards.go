@@ -4251,6 +4251,26 @@ func wrapperWriteOpHit(argv []string) string {
 	return ""
 }
 
+// peelPreludeHasNonAssign reports whether peeling argv down to head
+// consumed at least one word that is not a KEY=VAL assignment. head is a
+// contiguous tail of argv (peelWrappers only drops leading words), so the
+// prelude is argv[:len(argv)-len(head)]. A bare declaration builtin
+// (export FOO=$X) keeps POSIX declaration-utility status even behind
+// prefix assignments, but any wrapper word (command/builtin/env/...)
+// demotes it to an ordinary command whose operands DO field-split
+// (v6.2.2 Oracle R10 R10-MF-4).
+func peelPreludeHasNonAssign(argv, head []string) bool {
+	if len(head) == 0 || len(argv) <= len(head) {
+		return false
+	}
+	for _, w := range argv[:len(argv)-len(head)] {
+		if !isAssignWord(w) {
+			return true
+		}
+	}
+	return false
+}
+
 // straceArgHasValue reports whether an strace/ltrace option consumes a
 // separate value slot (so the next argv word is its argument, not the
 // traced command). The list MUST match skipStraceArgs' two-slot set — an
@@ -4469,8 +4489,19 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 				return "env " + base + " -n"
 			}
 			var envAs2 envAssignments
+			// R10-MF-4: when a NON-ASSIGNMENT wrapper word (command/builtin/
+			// env/timeout/...) was peeled in front of the declaration builtin,
+			// the shell runs export/readonly/declare as an ORDINARY command —
+			// the declaration-utility exemption from field splitting no longer
+			// applies, so `command export FOO=$X` word-splits $X and exports
+			// the smuggled KEY=VAL words. The lenient isAssignWord-only rule
+			// is correct only for the bare declaration form, whose operands
+			// never field-split. (A prefix-assignment-only prelude keeps the
+			// declaration status in dash/bash, so only a non-assignment peeled
+			// word flips this check strict.)
+			strict := peelPreludeHasNonAssign(argv, head)
 			for _, a := range head[1:] {
-				if isDynamicArg(a) && !isAssignWord(a) {
+				if isDynamicArg(a) && (!isAssignWord(a) || (strict && !isSingleWordSplitSafe(a))) {
 					return "env dynamic export"
 				}
 				if strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+") {
@@ -7526,6 +7557,14 @@ func parseSSHInvocation(head []string) (remoteCmd, hit string) {
 					if j+1 < len(a) {
 						// Glued operand: cluster ends here.
 					} else if i+1 < len(head) {
+						// R10-MF-3: the separate operand must stay one argv
+						// word — an unquoted $VAR field-splits into extra
+						// option words (-o ProxyCommand=pig, executed locally
+						// before connect) and a multi-match glob overflows
+						// the slot, shifting the remote command boundary.
+						if isDynamicArg(head[i+1]) && !isSingleWordSplitSafe(head[i+1]) {
+							return "", "dynamic code payload"
+						}
 						i++ // separate operand
 					} else {
 						return "", "ssh"
@@ -8781,10 +8820,16 @@ func screenFindArgsSeg(args []string, outerSeg shellSegment, kind byte, depth in
 		a := args[i]
 		if skipNextAlso {
 			skipNextAlso = false
+			if hit := findValueSlotHit(a); hit != "" {
+				return hit
+			}
 			continue
 		}
 		if expectValue {
 			expectValue = false
+			if hit := findValueSlotHit(a); hit != "" {
+				return hit
+			}
 			continue
 		}
 		if kind == 'r' && (a == "-delete" || a == "-fprint" || a == "-fprint0" || a == "-fprintf" || a == "-fls") {
@@ -8817,6 +8862,19 @@ func screenFindArgsSeg(args []string, outerSeg shellSegment, kind byte, depth in
 		if strings.HasPrefix(a, "-") {
 			pathDone = true
 		}
+	}
+	return ""
+}
+
+// findValueSlotHit vets one operand CONSUMED by a find value predicate
+// (-name/-path/-fprintf FILE+FORMAT/...): an unquoted $VAR field-splits at
+// runtime and can inject extra predicates (-exec pig) past the statically
+// expected operand count, and a multi-match glob both overflows its slot
+// and shifts the allocation of every later operand (the -fprintf FILE+
+// FORMAT pair swallowing a static -exec word — v6.2.2 Oracle R10 R10-MF-2).
+func findValueSlotHit(a string) string {
+	if isDynamicArg(a) && !isSingleWordSplitSafe(a) {
+		return "find dynamic predicate"
 	}
 	return ""
 }
@@ -9989,6 +10047,14 @@ func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
 					}
 				case isLongOptAbbrev(name, "line-length", 1):
 					if !hasEq {
+						// R10-MF-3: the separate length operand must stay one
+						// argv word — an unquoted $VAR splits into extra options
+						// (-e 1epig) and a multi-match glob overflows the slot.
+						if i+1 < len(args) {
+							if hit := sedValueSlotHit(args[i+1]); hit != "" {
+								return hit
+							}
+						}
 						i++
 					}
 				case name == "f":
@@ -10065,6 +10131,13 @@ func screenSedSubagent(args []string, depth int, caller callerIdentity) string {
 						j = len(a)
 					case 'l':
 						if j+1 >= len(a) {
+							// R10-MF-3: vet the separate -l operand like
+							// --line-length above.
+							if i+1 < len(args) {
+								if hit := sedValueSlotHit(args[i+1]); hit != "" {
+									return hit
+								}
+							}
 							i++
 						}
 						j = len(a)
@@ -10124,6 +10197,19 @@ func sedDynamicOptValue(a string) (val string, kind byte) {
 	return "", 0
 }
 
+// sedValueSlotHit vets one operand CONSUMED by sed's -l/--line-length
+// value slot: an unquoted $VAR field-splits at runtime into extra options
+// (-e 1epig executes pig) and a multi-match glob overflows the single
+// operand slot (v6.2.2 Oracle R10 R10-MF-3). sedScripts has no error
+// channel, so its callers surface the verdict by recording the unsafe
+// operand as a script fragment; screenSedSubagent returns the hit text.
+func sedValueSlotHit(a string) string {
+	if isDynamicArg(a) && !isSingleWordSplitSafe(a) {
+		return "dynamic code payload"
+	}
+	return ""
+}
+
 // sedScripts extracts the script text fragments a sed invocation actually
 // executes: every -e/--expression payload (separate, =glued, or a
 // short-option-cluster tail) plus the FIRST positional operand when no -e/-f
@@ -10159,6 +10245,14 @@ func sedScripts(args []string) (scripts []string, sawFile bool) {
 				}
 			case isLongOptAbbrev(name, "line-length", 1):
 				if !hasEq {
+					if i+1 < len(args) {
+						// R10-MF-3: record the unsafe value operand so the
+						// caller's dynamic check fails closed (it never
+						// validates as script text).
+						if sedValueSlotHit(args[i+1]) != "" {
+							scripts = append(scripts, args[i+1])
+						}
+					}
 					i++
 				}
 			case name == "f":
@@ -10211,6 +10305,9 @@ func sedScripts(args []string) (scripts []string, sawFile bool) {
 					case 'l':
 						sawValLetter = true
 						if j+1 >= len(a) {
+							if i+1 < len(args) && sedValueSlotHit(args[i+1]) != "" {
+								scripts = append(scripts, args[i+1])
+							}
 							i++
 						}
 						j = lim
@@ -10474,7 +10571,23 @@ func screenTarSubagent(args []string, depth int, caller callerIdentity) string {
 		}
 		var cmd string
 		consume, cmdText := tarSubagentWordStep(args, i, &bsdAction)
+		// R10-MF-1: every operand the word consumes must stay exactly ONE
+		// argv word at runtime — an unquoted $VAR or a multi-match glob in a
+		// -f/-C/--file value slot expands past the slot boundary, shifting
+		// every later operand allocation (in particular -I's exec hook) or
+		// smuggling option-shaped words back into the parse (tar -cf $VAR).
+		unsafeVal := false
+		for k := 1; k <= consume; k++ {
+			v := args[i+k]
+			if isDynamicArg(v) && !isSingleWordSplitSafe(v) {
+				unsafeVal = true
+				break
+			}
+		}
 		i += consume
+		if unsafeVal {
+			return "dynamic code payload"
+		}
 		cmd = cmdText
 		if cmd == "" {
 			continue
@@ -10596,6 +10709,13 @@ func tarSubagentLongStep(args []string, i int) (consume int, cmd string) {
 	if i+1 < len(args) {
 		v := args[i+1]
 		if isCheckpoint {
+			if isDynamicArg(v) {
+				// R10-MF-1: a --checkpoint-action operand is shell text at
+				// runtime, so even a split-safe dynamic word cannot be
+				// statically vetted — refuse it like the glued
+				// --checkpoint-action="$VAR" form the outer scan blocks.
+				return 1, v
+			}
 			if strings.HasPrefix(v, "exec=") {
 				return 1, v[len("exec="):]
 			}

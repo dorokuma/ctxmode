@@ -2493,3 +2493,82 @@ func TestGuard_V622_OracleR9Probes(t *testing.T) {
 		})
 	}
 }
+
+// TestGuard_V622_OracleR10Probes covers the Oracle R10 must-fix matrix:
+// tar/find/sed/ssh separated single-value operand slots must require
+// isSingleWordSplitSafe on dynamic words (R10-MF-1/2/3), the separated
+// --checkpoint-action operand must refuse every dynamic word, and a
+// declaration builtin demoted by a non-assignment wrapper (command/
+// builtin) must reject non-split-safe dynamic export operands
+// (R10-MF-4) — plus the shell_ast.go isEnvHookVar closure for
+// GIT_CONFIG_PARAMETERS-style hook variables. Zero new production symbols
+// are referenced here: every probe goes through rtGuardCwd.
+func TestGuard_V622_OracleR10Probes(t *testing.T) {
+	blockCases := []struct {
+		name, cmd, want string
+	}{
+		// R10-MF-1: tar 分离值槽词拆分/glob 溢出与动态 --checkpoint-action。
+		{"P-R10-MF1-a tar checkpoint-action quoted VAR", `VAR='exec=pig'; tar --checkpoint=1 --checkpoint-action "$VAR" -cf /dev/null /dev/null`, "dynamic code payload"},
+		{"P-R10-MF1-b tar -cf unquoted VAR", `VAR='/dev/null -Ipig'; tar -cf $VAR /dev/null`, "dynamic code payload"},
+		{"P-R10-MF1-c tar -f unquoted VAR", `VAR='/dev/null --use-compress-program=pig'; tar -f $VAR -c /dev/null`, "dynamic code payload"},
+		{"P-R10-MF1-d tar --file unquoted VAR", `VAR='/dev/null --use-compress-program=pig'; tar --file $VAR -c /dev/null`, "dynamic code payload"},
+		{"P-R10-MF1-e tar cfI glob", `tar cfI p*`, "dynamic code payload"},
+		{"P-R10-MF1-e2 tar cfI unquoted VAR", `X='/dev/null pig /dev/null'; tar cfI $X`, "dynamic code payload"},
+		// R10-MF-2: find -name/-fprintf 值槽词拆分与 glob 吞噬 -exec。
+		{"P-R10-MF2-a find -name unquoted VAR", `VAR='null -exec pig ;'; find /dev/null -name $VAR`, "find dynamic predicate"},
+		{"P-R10-MF2-b find -fprintf glob", `find /dev/null -fprintf p* -exec pig \;`, "find dynamic predicate"},
+		{"P-R10-MF2-c find -fprintf unquoted VAR", `VAR='/dev/null fmt'; find /dev/null -fprintf $VAR -exec pig \;`, "find dynamic predicate"},
+		// R10-MF-3: sed -l/--line-length 与 ssh 值选项分离值槽。
+		{"P-R10-MF3-a sed -l unquoted VAR", `VAR='80 -e 1epig'; sed -e '1p' -l $VAR CHANGELOG.md`, "dynamic code payload"},
+		{"P-R10-MF3-a2 sed --line-length unquoted VAR", `VAR='80 -e 1epig'; sed -e '1p' --line-length $VAR CHANGELOG.md`, "dynamic code payload"},
+		{"P-R10-MF3-b sed -l glob", `sed -l 1* CHANGELOG.md`, "dynamic code payload"},
+		{"P-R10-MF3-b2 sed --line-length glob", `sed --line-length 1* CHANGELOG.md`, "dynamic code payload"},
+		{"P-R10-MF3-c ssh -p unquoted VAR", `VAR='22 -o ProxyCommand=pig'; ssh -p $VAR dmit ls`, "dynamic code payload"},
+		{"P-R10-MF3-d ssh -l glob", `ssh -l p* a true`, "dynamic code payload"},
+		// R10-MF-4: command/builtin export 词拆分导出与 GIT_CONFIG_* 钩子变量。
+		{"P-R10-MF4-a command export TAR_OPTIONS", `X='1 TAR_OPTIONS=--use-compress-program=pig'; command export FOO=$X; tar -cf /dev/null /dev/null`, "env dynamic export"},
+		{"P-R10-MF4-b builtin export BASH_FUNC", `bash -c 'X="1 BASH_FUNC_echo%%=() { pig; }"; builtin export FOO=$X; bash -c "echo hi"'`, "env dynamic export"},
+		{"P-R10-MF4-c command export glob", `command export FOO=T*`, "env dynamic export"},
+		{"P-R10-MF4-d GIT_CONFIG_PARAMETERS paramexp", `set -a; printf '' "${GIT_CONFIG_PARAMETERS:='alias.x=!pig'}"; git x`, ""},
+		{"P-R10-MF4-e GIT_CONFIG_PARAMETERS for-loop", `set -a; for GIT_CONFIG_PARAMETERS in "'alias.x=!pig'"; do git x; done`, ""},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+
+	// 放行守卫正例(R10 零假阳纪律):带引号单值槽、BSD 消耗槽带引号值、
+	// xargs 静态 {} 替换、裸/包装声明内建的带引号与无包装动态赋值全部
+	// 保持 ALLOW。
+	allowCases := []struct {
+		name, cmd string
+	}{
+		{"R10-pos tar -cf quoted OUT", `tar -cf "$OUT" /tmp/*.log`},
+		{"R10-pos tar -C xf quoted", `tar -C "$DIR" -xf "$ARCHIVE"`},
+		{"R10-pos find -name quoted PAT", `find . -name "$PAT"`},
+		{"R10-pos find PWD maxdepth", `find "$PWD" -maxdepth 1`},
+		{"R10-pos xargs find -ctime token", `echo 5 | xargs -I{} find . -ctime {}`},
+		{"R10-pos find -exec rg", `find . -name '*.go' -exec rg foo {} \;`},
+		{"R10-pos sed -l quoted N", `sed -l "$N" '1p' CHANGELOG.md`},
+		{"R10-pos ssh -p quoted PORT", `ssh -p "$PORT" dmit ls`},
+		{"R10-pos ssh -i quoted KEY", `ssh -i "$KEY" dmit ls`},
+		{"R10-pos command export quoted", `command export FOO="$X"`},
+		{"R10-pos bash -c export quoted", `bash -c 'export FOO="$X"'`},
+		{"R10-pos bare export unquoted", `export FOO=$X`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+}
