@@ -2529,7 +2529,11 @@ func TestGuard_V622_OracleR10Probes(t *testing.T) {
 		{"P-R10-MF4-a command export TAR_OPTIONS", `X='1 TAR_OPTIONS=--use-compress-program=pig'; command export FOO=$X; tar -cf /dev/null /dev/null`, "env dynamic export"},
 		{"P-R10-MF4-b builtin export BASH_FUNC", `bash -c 'X="1 BASH_FUNC_echo%%=() { pig; }"; builtin export FOO=$X; bash -c "echo hi"'`, "env dynamic export"},
 		{"P-R10-MF4-c command export glob", `command export FOO=T*`, "env dynamic export"},
-		{"P-R10-MF4-d GIT_CONFIG_PARAMETERS paramexp", `set -a; printf '' "${GIT_CONFIG_PARAMETERS:='alias.x=!pig'}"; git x`, ""},
+		// R11-MF-3: the UNQUOTED spelling is the discriminating probe — the
+		// quoted variant hits paramExpD2Ambiguous before reaching
+		// peAssignsHookOrTaint, so it could never reproduce RED on b13a82b.
+		{"P-R10-MF4-d GIT_CONFIG_PARAMETERS paramexp", `set -a; printf '' ${GIT_CONFIG_PARAMETERS:='alias.x=!pig'}; git x`, ""},
+		{"P-R10-MF4-d2 GIT_CONFIG_PARAMETERS quoted", `set -a; printf '' "${GIT_CONFIG_PARAMETERS:='alias.x=!pig'}"; git x`, ""},
 		{"P-R10-MF4-e GIT_CONFIG_PARAMETERS for-loop", `set -a; for GIT_CONFIG_PARAMETERS in "'alias.x=!pig'"; do git x; done`, ""},
 	}
 	for _, tc := range blockCases {
@@ -2562,6 +2566,132 @@ func TestGuard_V622_OracleR10Probes(t *testing.T) {
 		{"R10-pos command export quoted", `command export FOO="$X"`},
 		{"R10-pos bash -c export quoted", `bash -c 'export FOO="$X"'`},
 		{"R10-pos bare export unquoted", `export FOO=$X`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+}
+
+// TestGuard_V622_OracleR11Probes covers the Oracle R11 must-fix matrix:
+// trailing dangling tar value options must never panic the guard
+// (R11-MF-1), quoted/escaped/enum-expanded/env -S-rewritten declaration
+// builtins lose their field-splitting exemption (R11-MF-2), and
+// printf -v/read/getopts write-target slots must vet glued and repeated
+// spellings plus dynamic single-value operands (R11-MF-3). Zero new
+// production symbols are referenced here: every probe goes through
+// rtGuardCwd so an independent verifier can copy this file onto the
+// pre-fix tree fd8f417 and reproduce FAIL/panic directly.
+func TestGuard_V622_OracleR11Probes(t *testing.T) {
+	// R11-MF-1: trailing dangling value options must not panic. On the
+	// pre-fix tree ANY of these crashes the test binary with
+	// `panic: index out of range`; the rows assert nothing about the
+	// verdict itself — reaching the comparison IS the assertion.
+	noPanicShell := []struct {
+		name, cmd string
+	}{
+		{"P-R11-MF1-a tar -f dangling", `tar -f`},
+		{"P-R11-MF1-b tar --file dangling", `tar --file`},
+		{"P-R11-MF1-b2 tar -cf then -C dangling", `tar -cf /dev/null -C`},
+		{"P-R11-MF1-b3 tar -C dangling", `tar -C`},
+		{"P-R11-MF1-b4 tar --directory dangling", `tar --directory`},
+	}
+	for _, tc := range noPanicShell {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "" {
+				t.Fatalf("rtGuardCwd(%q) returned empty verdict", tc.cmd)
+			}
+		})
+	}
+	noPanicArgv := []struct {
+		name string
+		argv []string
+	}{
+		{"P-R11-MF1-c argv tar -f dangling", []string{"tar", "-f"}},
+		{"P-R11-MF1-d argv tar --file dangling", []string{"tar", "--file"}},
+		{"P-R11-MF1-e argv tar -cf then -C dangling", []string{"tar", "-cf", "/dev/null", "-C"}},
+	}
+	for _, tc := range noPanicArgv {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", argv: tc.argv}, "")
+			if got == "" {
+				t.Fatalf("rtGuardCwd(%v) returned empty verdict", tc.argv)
+			}
+		})
+	}
+
+	blockCases := []struct {
+		name, cmd, want string
+	}{
+		// R11-MF-2: quoted/escaped/enum-expanded/env -S declaration heads.
+		{"P-R11-MF2-a dq export demotion", `X='1 TAR_OPTIONS=--use-compress-program=pig'; "export" FOO=$X; tar -cf /dev/null /dev/null`, "env dynamic export"},
+		{"P-R11-MF2-b backslash export demotion", `X='1 TAR_OPTIONS=--use-compress-program=pig'; \export FOO=$X; tar -cf /dev/null /dev/null`, "env dynamic export"},
+		{"P-R11-MF2-b2 sq export demotion", `X='1 TAR_OPTIONS=--use-compress-program=pig'; 'export' FOO=$X; tar -cf /dev/null /dev/null`, "env dynamic export"},
+		{"P-R11-MF2-c enum export demotion", `X='1 TAR_OPTIONS=--use-compress-program=pig'; for E in export; do $E FOO=$X; done; tar -cf /dev/null /dev/null`, "env dynamic export"},
+		{"P-R11-MF2-d env -S rewrite demotion", `X='1 TAR_OPTIONS=--use-compress-program=pig'; env -S 'command export a=1 b=2' FOO=$X`, "env dynamic export"},
+		// R11-MF-3: printf -v glued/repeated, read/getopts dynamic slots.
+		{"P-R11-MF3-a printf -vTAR_OPTIONS glued", `bash -c 'set -a; printf -vTAR_OPTIONS "%s" "--use-compress-program=pig"; tar -cf /dev/null /dev/null'`, "env TAR_OPTIONS"},
+		{"P-R11-MF3-b printf repeated -v", `bash -c 'set -a; printf -v x -v TAR_OPTIONS "%s" "--use-compress-program=pig"; tar -cf /dev/null /dev/null'`, "env TAR_OPTIONS"},
+		{"P-R11-MF3-c read -p dynamic split", `bash -c 'set -a; X="x TAR_OPTIONS"; read -p $X <<< "--use-compress-program=pig"; tar -cf /dev/null /dev/null'`, "env dynamic read"},
+		{"P-R11-MF3-d getopts dynamic optstring", `set -a; X='1 GIT_CONFIG_COUNT'; getopts $X -1`, "env dynamic getopts"},
+		{"P-R11-MF3-e getopts glob optstring", `set -a; getopts p* -1`, "env dynamic getopts"},
+		// R11 closure: quoted dynamic OPTION-ZONE words pick their option
+		// letters (or terminator status) at runtime even though the expansion
+		// itself never field-splits.
+		{"P-R11-MF3-f printf dq dynamic format", `bash -c 'set -a; OPT="-vTAR_OPTIONS"; printf "$OPT" "%s" "--use-compress-program=pig"; tar -cf /dev/null /dev/null'`, "env dynamic printf"},
+		// NOTE: the value must NOT be a static-literal single assignment —
+		// the collector in-lines safe literals, so `OPT="vTAR_OPTIONS"` would
+		// statically resolve `-$OPT` to `-vTAR_OPTIONS` and hit the (correct)
+		// static `env TAR_OPTIONS` verdict instead of exercising the dynamic
+		// branch. Concatenating an undefined expansion keeps the word dynamic.
+		{"P-R11-MF3-g printf dq dash-prefixed", `bash -c 'set -a; OPT="vTAR_OPTIONS$NOPE"; printf "-$OPT" "%s" "--use-compress-program=pig"; tar -cf /dev/null /dev/null'`, "env dynamic printf"},
+		{"P-R11-MF3-h read dq dash-prefixed cluster", `bash -c 'set -a; OPT="aTAR_OPTIONS"; read "-$OPT" <<< "--use-compress-program=pig"; tar -cf /dev/null /dev/null'`, "env dynamic read"},
+		{"P-R11-MF3-i getopts dq terminator shift", `set -a; H="--"; getopts "$H" opt TAR_OPTIONS`, "env TAR_OPTIONS"},
+		{"P-R11-MF3-j getopts dq terminator dyn name", `set -a; H="--"; V='GIT_CONFIG_COUNT'; getopts "$H" opt "$V"`, "env dynamic getopts"},
+		// R11 closure: quoted/escaped declaration heads inside the BASH-dialect
+		// parse (bash -c) lose field-splitting exemption exactly like the
+		// POSIX-level probes a/b above.
+		{"P-R11-MF2-e bash -c dq export demotion", `bash -c 'X="1 TAR_OPTIONS=--use-compress-program=pig"; "export" FOO=$X; tar -cf /dev/null /dev/null'`, "env dynamic export"},
+		{"P-R11-MF2-f bash -c backslash export demotion", `bash -c 'X="1 TAR_OPTIONS=--use-compress-program=pig"; \export FOO=$X; tar -cf /dev/null /dev/null'`, "env dynamic export"},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+
+	// 放行守卫正例(R11 零假阳纪律):无包装声明内建、带引号包装导出、
+	// printf 格式串/-- 终止、带引号 read 提示符、静态/带引号 getopts
+	// 与正常 tar 带值选项全部保持 ALLOW。
+	allowCases := []struct {
+		name, cmd string
+	}{
+		{"R11-pos tar -cf quoted OUT", `tar -cf "$OUT" /dev/null`},
+		{"R11-pos tar -C xf normal", `tar -C /tmp -xf "$ARCHIVE"`},
+		{"R11-pos bare export unquoted", `export FOO=$X`},
+		{"R11-pos prefix-assign export", `A=1 export FOO=$X`},
+		{"R11-pos bash -c export quoted", `bash -c 'export FOO="$X"'`},
+		{"R11-pos command export quoted", `command export FOO="$X"`},
+		{"R11-pos printf format quoted", `printf '%s\n' "$X"`},
+		{"R11-pos printf dq static format", `printf "val=$X\n"`},
+		{"R11-pos printf -- terminator", `printf -- -v TAR_OPTIONS`},
+		{"R11-pos printf -v benign", `printf -v myvar '%s' "$X"`},
+		{"R11-pos printf -vmyvar glued benign", `printf -vmyvar '%s' "$X"`},
+		{"R11-pos read -p quoted prompt", `bash -c 'read -p "$PROMPT" x <<< y'`},
+		{"R11-pos read -r plain", `read -r line`},
+		{"R11-pos getopts static optstring", `getopts ":ab:" opt`},
+		{"R11-pos getopts quoted optstring", `getopts "$OPTS" opt`},
 	}
 	for _, tc := range allowCases {
 		t.Run(tc.name, func(t *testing.T) {

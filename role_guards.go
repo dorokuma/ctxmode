@@ -156,6 +156,12 @@ type shellSegment struct {
 	// Rewrite decisions are taken from the primary tree only; a dynamic hc send
 	// visible solely here fails closed instead of being silently dropped.
 	secondaryDialect bool
+	// declClause marks a segment emitted from a bash DeclClause (export/readonly
+	// FOO=1 with UNQUOTED keyword spelling — the parser itself proves the
+	// keyword was a bare literal token). POSIX parses `export FOO=1` as a
+	// CallExpr, so all other paths rely on peelPreludeHasNonAssign's word-shape
+	// verification instead (v6.2.2 Oracle R11 R11-MF-2).
+	declClause bool
 }
 
 // shellSplitMaxDepth bounds recursion into $(...)/`...`/subshell text so a
@@ -4251,22 +4257,54 @@ func wrapperWriteOpHit(argv []string) string {
 	return ""
 }
 
-// peelPreludeHasNonAssign reports whether peeling argv down to head
-// consumed at least one word that is not a KEY=VAL assignment. head is a
-// contiguous tail of argv (peelWrappers only drops leading words), so the
-// prelude is argv[:len(argv)-len(head)]. A bare declaration builtin
-// (export FOO=$X) keeps POSIX declaration-utility status even behind
-// prefix assignments, but any wrapper word (command/builtin/env/...)
-// demotes it to an ordinary command whose operands DO field-split
-// (v6.2.2 Oracle R10 R10-MF-4).
-func peelPreludeHasNonAssign(argv, head []string) bool {
-	if len(head) == 0 || len(argv) <= len(head) {
+// peelPreludeHasNonAssign reports whether the declaration builtin at
+// head[0] LOSES POSIX declaration-utility status at runtime, in which case
+// its KEY=VAL operands DO field-split like ordinary command arguments.
+// Four demotion channels are covered (v6.2.2 Oracle R10 R10-MF-4 extended
+// by Oracle R11 R11-MF-2):
+//  1. a peeled non-assignment wrapper word (command/builtin/env/timeout/...)
+//     — the posix prelude scan over argv[:len(argv)-len(head)];
+//  2. an env -S operand-stream rewrite — head is no longer a contiguous
+//     tail slice of argv, so the positional correspondence the lenient
+//     declaration rule relies on is unprovable;
+//  3. a QUOTED or ESCAPED command word ("export"/\export/ex"port") —
+//     dash and bash gate declaration status on an unquoted, unescaped
+//     literal token, which seg.argWords' parse shape proves: the head
+//     word must be exactly one *syntax.Lit whose value IS head[0];
+//  4. a for-loop enum-expanded command head ($E) — runtime expansion
+//     never carries declaration status, and the expansion leaves
+//     argWords[headIdx] == nil.
+//
+// A bash DeclClause segment (seg.declClause) is exempt from channel 3/4:
+// the parser itself only forms that node for an unquoted literal keyword.
+func peelPreludeHasNonAssign(argv, head []string, seg shellSegment) bool {
+	if len(head) == 0 {
 		return false
 	}
-	for _, w := range argv[:len(argv)-len(head)] {
+	if len(argv) < len(head) || &argv[len(argv)-len(head)] != &head[0] {
+		return true // env -S (or any) operand-stream rewrite (channel 2)
+	}
+	headIdx := len(argv) - len(head)
+	for _, w := range argv[:headIdx] {
 		if !isAssignWord(w) {
-			return true
+			return true // non-assignment wrapper word (channel 1)
 		}
+	}
+	if seg.declClause {
+		return false
+	}
+	if len(seg.argWords) != len(argv) {
+		// No parse-shape provenance for these words (ctx_run argv mode, or a
+		// rebuilt stream): fail closed on the command word's lexical status.
+		return true
+	}
+	hw := seg.argWords[headIdx]
+	if hw == nil || len(hw.Parts) != 1 {
+		return true // enum-expanded head / concatenated or empty word
+	}
+	lit, ok := hw.Parts[0].(*syntax.Lit)
+	if !ok || lit.Value != head[0] {
+		return true // quoted/escaped or non-literal command word
 	}
 	return false
 }
@@ -4499,7 +4537,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			// never field-split. (A prefix-assignment-only prelude keeps the
 			// declaration status in dash/bash, so only a non-assignment peeled
 			// word flips this check strict.)
-			strict := peelPreludeHasNonAssign(argv, head)
+			strict := peelPreludeHasNonAssign(argv, head, seg)
 			for _, a := range head[1:] {
 				if isDynamicArg(a) && (!isAssignWord(a) || (strict && !isSingleWordSplitSafe(a))) {
 					return "env dynamic export"
@@ -8248,92 +8286,223 @@ func declFlagOps(base string, args []string) (dropsExport, nameref bool) {
 // dynamic (unvettable) target name (SH11 MF-4 tail). getopts implicitly
 // writes OPTARG/OPTIND — hook names are impossible there, so only an
 // explicit dynamic target matters; printf -v takes the name as its operand.
+// The per-command scanners are extracted so each stays small enough to
+// audit (v6.2.2 Oracle R11 R11-MF-3).
 func screenEnvWriteTargets(head []string, base string) string {
-	tainted := func(name string) string {
-		if isDynamicArg(name) {
-			return "env dynamic " + base
-		}
-		if guardTaintVars[name] || isEnvHookVar(name) {
-			return "env " + name
-		}
-		return ""
-	}
 	switch base {
 	case "read":
-		sawDashDash := false
-		j := 1
-		for j < len(head) {
-			a := head[j]
-			if a == "--" && !sawDashDash {
-				sawDashDash = true
-				j++
-				continue
-			}
-			if !sawDashDash && strings.HasPrefix(a, "-") && len(a) > 1 {
-				// Option cluster: value letters d n N p t u a consume a
-				// value (the cluster tail, or the next argv when last); every
-				// other letter (r s e i) is a boolean. R13: -s is silent echo,
-				// NOT a value option — `read -s x` still writes x.
-				for k := 1; k < len(a); k++ {
-					switch a[k] {
-					case 'a':
-						// -a ARRAY is itself a write target.
-						var arr string
-						if k+1 < len(a) {
-							arr = a[k+1:]
-						} else if j+1 < len(head) {
-							arr = head[j+1]
-							j++
-						}
-						if hit := tainted(arr); hit != "" {
-							return hit
-						}
-						k = len(a)
-					case 'd', 'n', 'N', 'p', 't', 'u':
-						if k+1 >= len(a) && j+1 < len(head) {
-							j++ // separate value operand
-						}
-						k = len(a)
-					}
-				}
-				j++
-				continue
-			}
-			if a == "" {
-				j++
-				continue
-			}
-			if hit := tainted(a); hit != "" {
-				return hit
-			}
-			j++
-		}
+		return screenReadEnvWrite(head)
 	case "getopts":
-		// getopts OPTSTRING NAME [args...]: the second operand is the target
-		// (the optstring itself may begin with ':' or '-').
-		opIdx := 0
-		if len(head) > 1 {
-			if head[1] == "--" {
-				if len(head) > 2 {
-					opIdx = 2
-				}
-			} else {
-				opIdx = 1
+		return screenGetoptsEnvWrite(head)
+	case "printf":
+		return screenPrintfEnvWrite(head)
+	}
+	return ""
+}
+
+// envWriteTainted vets one write-target NAME slot: dynamic (unvettable)
+// names and role-identity / execution-hook variables are refused.
+func envWriteTainted(name, base string) string {
+	if isDynamicArg(name) {
+		return "env dynamic " + base
+	}
+	if guardTaintVars[name] || isEnvHookVar(name) {
+		return "env " + name
+	}
+	return ""
+}
+
+// envDynSlotHit vets a single-value OPTION OPERAND slot (read's -p/-t/-d/...
+// argument, getopts' OPTSTRING): a word that field-splits or pathname-
+// expands at runtime overflows its slot, so the positional layout the
+// scanner validated no longer matches what the builtin consumes (R11-MF-3).
+func envDynSlotHit(v, base string) string {
+	if isDynamicArg(v) && !isSingleWordSplitSafe(v) {
+		return "env dynamic " + base
+	}
+	return ""
+}
+
+// readClusterStep scans ONE static `read` option-cluster word (the '-'
+// already vetted by the caller): value letters d n N p t u a consume a
+// value — the cluster tail, or the next argv when last; every other
+// letter (r s e i) is a boolean. R13: -s is silent echo, NOT a value
+// option — `read -s x` still writes x. extra reports how many ADDITIONAL
+// argv words (separate value operands) were consumed. Every separate
+// value slot is vetted BEFORE being skipped: a word-splitting $X
+// prompt/nchars/delim overflows into a forged write-target name slot at
+// runtime (R11-MF-3).
+func readClusterStep(head []string, j int) (hit string, extra int) {
+	a := head[j]
+	for k := 1; k < len(a); k++ {
+		switch a[k] {
+		case 'a':
+			// -a ARRAY is itself a write target.
+			if k+1 < len(a) {
+				return envWriteTainted(a[k+1:], "read"), extra
 			}
+			if j+1+extra < len(head) {
+				arr := head[j+1+extra]
+				if hit := envDynSlotHit(arr, "read"); hit != "" {
+					return hit, extra
+				}
+				extra++
+				return envWriteTainted(arr, "read"), extra
+			}
+			return "", extra
+		case 'd', 'n', 'N', 'p', 't', 'u':
+			if k+1 < len(a) {
+				return "", extra // glued value tail ends the cluster
+			}
+			if j+1+extra < len(head) {
+				if hit := envDynSlotHit(head[j+1+extra], "read"); hit != "" {
+					return hit, extra
+				}
+				extra++ // separate value operand
+			}
+			return "", extra
 		}
-		if opIdx > 0 && opIdx+1 < len(head) {
-			if hit := tainted(head[opIdx+1]); hit != "" {
+	}
+	return "", extra
+}
+
+// screenReadEnvWrite scans bash's `read` builtin: option letters are
+// consumed cluster-wise, every separate value slot is vetted against
+// runtime word-splitting, and the positional names are write targets
+// (R11-MF-3).
+func screenReadEnvWrite(head []string) string {
+	sawDashDash := false
+	j := 1
+	for j < len(head) {
+		a := head[j]
+		if a == "--" && !sawDashDash {
+			sawDashDash = true
+			j++
+			continue
+		}
+		if !sawDashDash && strings.HasPrefix(a, "-") && len(a) > 1 {
+			// R11 closure: ANY dynamic word in the option zone is unvettable —
+			// `read "-$OPT"` picks its cluster letters at runtime even though
+			// the quoted expansion stays one argv word (split-safe is not
+			// enough when the option LETTERS themselves are unknown). Single
+			// value OPERANDS (read -p "$PROMPT") keep the looser envDynSlotHit
+			// inside readClusterStep, since their slot positions are
+			// statically proven.
+			if isDynamicArg(a) {
+				return "env dynamic read"
+			}
+			hit, extra := readClusterStep(head, j)
+			if hit != "" {
+				return hit
+			}
+			j += 1 + extra
+			continue
+		}
+		if a == "" {
+			j++
+			continue
+		}
+		if hit := envWriteTainted(a, "read"); hit != "" {
+			return hit
+		}
+		j++
+	}
+	return ""
+}
+
+// screenGetoptsEnvWrite scans `getopts OPTSTRING NAME [args...]`: the
+// OPTSTRING operand itself may be a static word starting with ':' or '-'
+// (bash getopts treats the first operand as the optstring regardless),
+// but a dynamic word in the pre-`--` zone or in the OPTSTRING slot can
+// word-split at runtime, shifting NAME into an attacker-chosen slot
+// (R11-MF-3: `getopts $X -1` with X='1 GIT_CONFIG_COUNT').
+func screenGetoptsEnvWrite(head []string) string {
+	opIdx := 0
+	if len(head) > 1 {
+		if head[1] == "--" {
+			if len(head) > 2 {
+				opIdx = 2
+			}
+		} else {
+			if hit := envDynSlotHit(head[1], "getopts"); hit != "" {
+				return hit
+			}
+			// R11 closure: a dynamic first operand may expand to "--" at
+			// runtime (`H="--"; getopts "$H" opt TAR_OPTIONS`), shifting the
+			// positional layout so head[3] becomes the write-target NAME —
+			// vet that standby slot in addition to the static layout below.
+			if isDynamicArg(head[1]) && len(head) > 3 {
+				if hit := envWriteTainted(head[3], "getopts"); hit != "" {
+					return hit
+				}
+			}
+			opIdx = 1
+		}
+	}
+	if opIdx > 0 {
+		if hit := envDynSlotHit(head[opIdx], "getopts"); hit != "" {
+			return hit
+		}
+		if opIdx+1 < len(head) {
+			if hit := envWriteTainted(head[opIdx+1], "getopts"); hit != "" {
 				return hit
 			}
 		}
-	case "printf":
-		for j := 1; j+1 < len(head); j++ {
-			if head[j] == "-v" {
-				return tainted(head[j+1])
+	}
+	return ""
+}
+
+// screenPrintfEnvWrite scans bash's `printf` builtin the way
+// internal_getopt(list, "v:") actually consumes it: -v takes its variable
+// name glued (-vVAR) or as the next argv, short clusters end at the 'v'
+// letter, `--` terminates the option zone (bash then errors on the
+// dangling -- itself, so `printf -- -v TAR_OPTIONS` is inert data), and
+// EVERY -v name slot is vetted in sequence — a leading innocuous
+// `-v x` no longer hides a later `-v TAR_OPTIONS` (R11-MF-3).
+func screenPrintfEnvWrite(head []string) string {
+	for j := 1; j < len(head); j++ {
+		a := head[j]
+		if a == "--" {
+			return "" // the option zone is closed; the rest is format/arguments
+		}
+		// R11 closure: a word STARTING with a dynamic placeholder — even the
+		// quoted-safe spelling — can expand to `-v...` at runtime, so it must
+		// never vet as a static format string (`OPT="-vTAR_OPTIONS";
+		// printf "$OPT" "%s" "--use-compress-program=pig"`).
+		if strings.HasPrefix(a, cmdSubPlaceholder) || strings.HasPrefix(a, cmdSubPlaceholderQuoted) ||
+			strings.HasPrefix(a, cmdSubPlaceholderGlob) {
+			return "env dynamic printf"
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			return "" // static format string; the rest is arguments
+		}
+		// R11 closure: a dynamic word inside the option zone is unvettable
+		// even when it stays ONE argv word — `printf "-$OPT" ...` picks its
+		// option letters at runtime, so no static slot attribution exists.
+		if isDynamicArg(a) {
+			return "env dynamic printf"
+		}
+		// Walk the short cluster; only 'v' is a real printf option letter.
+		for k := 1; k < len(a); k++ {
+			if a[k] != 'v' {
+				continue // unknown letters end in bash's usage error — inert
 			}
-			if !strings.HasPrefix(head[j], "-") {
+			if k+1 < len(a) {
+				// Glued -vVAR: the cluster tail IS the variable name and the
+				// cluster ends there (internal_getopt "v:" semantics).
+				if hit := envWriteTainted(a[k+1:], "printf"); hit != "" {
+					return hit
+				}
 				break
 			}
+			if j+1 >= len(head) {
+				return "" // dangling -v: bash errors, nothing is written
+			}
+			j++ // separate -v VAR operand
+			if hit := envWriteTainted(head[j], "printf"); hit != "" {
+				return hit
+			}
+			break
 		}
 	}
 	return ""
@@ -10577,7 +10746,10 @@ func screenTarSubagent(args []string, depth int, caller callerIdentity) string {
 		// every later operand allocation (in particular -I's exec hook) or
 		// smuggling option-shaped words back into the parse (tar -cf $VAR).
 		unsafeVal := false
-		for k := 1; k <= consume; k++ {
+		// R11-MF-1: the consume count is only validated against the words
+		// ACTUALLY present — a trailing dangling value option (tar -f / tar -C
+		// / tar --file with no operand) must never index past len(args).
+		for k := 1; k <= consume && i+k < len(args); k++ {
 			v := args[i+k]
 			if isDynamicArg(v) && !isSingleWordSplitSafe(v) {
 				unsafeVal = true
@@ -10619,7 +10791,12 @@ func tarSubagentWordStep(args []string, i int, bsdAction *bool) (consume int, cm
 		return 0, a[2:]
 	}
 	if tarShortDataOpt(a) {
-		return 1, "" // plain data value operand
+		// R11-MF-1: a trailing dangling data option consumes NOTHING — there
+		// is no operand word to validate (tar itself errors at runtime).
+		if i+1 < len(args) {
+			return 1, "" // plain data value operand
+		}
+		return 0, ""
 	}
 	if strings.HasPrefix(a, "-") && len(a) > 1 {
 		return tarSubagentClusterStep(args, i)
@@ -10690,7 +10867,11 @@ func tarSubagentLongStep(args []string, i int) (consume int, cmd string) {
 		// BSD action word and swallow the REAL exec option behind it
 		// (v6.2.2 R3 R3-MF-1).
 		if !hasEq && tarShortDataOpt("--"+lname) {
-			return 1, ""
+			// R11-MF-1: a trailing dangling data option consumes NOTHING.
+			if i+1 < len(args) {
+				return 1, ""
+			}
+			return 0, ""
 		}
 		return 0, "" // other long options (--numeric-owner, --exclude=pat, ...)
 	}

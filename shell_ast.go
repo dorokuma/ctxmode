@@ -1990,7 +1990,7 @@ func (c *subCollector) emitDecl(st *syntax.Stmt, d *syntax.DeclClause, feed stdi
 			argv = append(argv, s)
 		}
 	}
-	seg := shellSegment{argv: argv, pipedStdin: feed.piped, backgrounded: st.Background}
+	seg := shellSegment{argv: argv, pipedStdin: feed.piped, backgrounded: st.Background, declClause: true}
 	c.applyRedirs(&seg, st.Redirs, feed)
 	c.segs = append(c.segs, seg)
 }
