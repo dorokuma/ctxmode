@@ -704,13 +704,17 @@ func peelWrappersWithIndex(argv []string, caller callerIdentity) (headArgv []str
 	return argv[i:], -1, nil, envAs, true
 }
 
-// locateShellCSlot finds the argv index of the `shell -c` script operand
-// (the word AFTER the short cluster whose tail is 'c'), walking the same
-// --rcfile/--init-file/-o/+o/-O/+O skips unwrapShellArgv honours. When the
-// 'c' carries a glued/ambiguous tail (-cCODE, -ce, -co errexit) the slot is
-// NOT a clean script word: glued reports true with the decoded unwrapped
-// text so callers can fail closed on dynamic hc and otherwise leave the
-// argv alone for the ordinary guard.
+// locateShellCSlot finds the argv index of the `shell -c` script operand,
+// mirroring unwrapShellArgv's option-zone walk word for word: the bare
+// terminators `--` / `-` (and the dash-only `+` after a pending -c) end
+// option parsing and the word right AFTER them is the command string, so
+// `bash -c -- 'echo ok'` locates slot 4 exactly like the unwrap decodes it
+// (R17-Oracle-M5 — the former implementation read `--` itself as the
+// script word and production prepare rewrote a slot the guard never
+// screened). When the 'c' carries a glued/ambiguous tail (-cCODE, -ce,
+// -co errexit) the slot is NOT a clean script word: glued reports true
+// with the decoded unwrapped text so callers can fail closed on dynamic
+// hc and otherwise leave the argv alone for the ordinary guard.
 func locateShellCSlot(argv []string) (scriptIdx int, rawScript string, glued bool, ok bool) {
 	text, has := unwrapShellArgv(argv)
 	if !has {
@@ -719,13 +723,23 @@ func locateShellCSlot(argv []string) (scriptIdx int, rawScript string, glued boo
 	if len(argv) < 2 {
 		return -1, "", false, false
 	}
+	sawC := false
 	for i := 1; i < len(argv); i++ {
 		a := argv[i]
 		if isDynamicArg(a) {
 			return -1, "", false, false
 		}
-		if a == "--" {
-			return -1, "", false, false
+		if a == "--" || a == "-" || (sawC && a == "+") {
+			// POSIX option terminator: after a pending -c the NEXT word is
+			// the command string (mirroring unwrapShellWordStep); before it
+			// the positional zone ends any -c semantics at all.
+			if !sawC || i+1 >= len(argv) {
+				return -1, "", false, false
+			}
+			if isDynamicArg(argv[i+1]) {
+				return -1, "", false, false
+			}
+			return i + 1, argv[i+1], false, true
 		}
 		if strings.HasPrefix(a, "--") {
 			name, val, hasVal := a[2:], "", false
@@ -748,36 +762,72 @@ func locateShellCSlot(argv []string) (scriptIdx int, rawScript string, glued boo
 			continue
 		}
 		if a == "-o" || a == "+o" || a == "-O" || a == "+O" {
+			// The option-NAME operand: after a pending -c a dynamic name
+			// re-parses as further options at runtime — the slot can never
+			// be statically located then (mirrors unwrapShellWordStep).
+			if sawC && i+1 < len(argv) && isDynamicArg(argv[i+1]) {
+				return -1, "", false, false
+			}
 			i++
 			continue
 		}
-		if (strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+")) && len(a) > 1 {
-			plus := a[0] == '+'
-			for j := 1; j < len(a); j++ {
-				ch := a[j]
-				if ch == 'c' && !plus {
-					tail := a[j+1:]
-					if tail == "" && i+1 < len(argv) {
-						return i + 1, argv[i+1], false, true
-					}
-					// letter tail (sh -ce 'x') or non-letter glued tail
-					// (-cCODE, -c=…): unwrapShellArgv decodes them into
-					// `tail + "\n" + argv[i+1]` or `tail`; either way the
-					// script operand is NOT a clean rewritable word.
-					return -1, text, true, true
-				}
-				if ch == 'o' || ch == 'O' {
-					if j+1 >= len(a) {
-						i++
-					}
-					break
-				}
+		if len(a) > 1 && (a[0] == '-' || a[0] == '+') && !strings.HasPrefix(a, "--") {
+			var ni int
+			var dynName bool
+			sawC, ni, dynName, glued = scanShellCClusterWord(argv, i, sawC)
+			if dynName {
+				return -1, "", false, false
 			}
+			if glued {
+				return -1, text, true, true
+			}
+			i = ni
 			continue
+		}
+		// First non-option word: with a pending -c it IS the command
+		// string; without one the shell runs a script FILE and nothing
+		// can be located.
+		if sawC {
+			return i, a, false, true
 		}
 		return -1, "", false, false
 	}
 	return -1, "", false, false
+}
+
+// scanShellCClusterWord advances locateShellCSlot past one short-option
+// cluster word (extracted for the v6.2.2 R17 complexity budget): the 'c'
+// letter arms the pending state, a second 'c' after a pending -c stays a
+// plain flag (mirroring unwrapShellClusterWord), a trailing bare -o/-O
+// consumes the next argv as its option name, and a non-empty tail after
+// 'c' marks the slot glued. ni is the argv index the caller continues
+// from, dynName reports a dynamic option-name operand after a pending -c.
+func scanShellCClusterWord(argv []string, i int, sawC bool) (newSawC bool, ni int, dynName, glued bool) {
+	a := argv[i]
+	plus := a[0] == '+'
+	for j := 1; j < len(a); j++ {
+		ch := a[j]
+		if ch == 'c' && !plus {
+			if sawC {
+				continue // a second c is a flag letter, not a new slot
+			}
+			if a[j+1:] != "" {
+				return sawC, i, false, true // glued tail — no clean script word
+			}
+			newSawC = true
+			continue
+		}
+		if ch == 'o' || ch == 'O' {
+			if j+1 >= len(a) {
+				if i+1 < len(argv) && sawC && isDynamicArg(argv[i+1]) {
+					return newSawC, i, true, false
+				}
+				return newSawC, i + 1, false, false // consumes the option NAME
+			}
+			return newSawC, i, false, false
+		}
+	}
+	return newSawC, i, false, false
 }
 
 // mergeEnvTaint returns base ∪ extra without mutating either map.
@@ -1297,14 +1347,22 @@ func (g guardCall) prepareCtxRunShellTargets(code string, targetEnvs []envAssign
 // on the dialect: a MIXED bash/dash consumer set can never be rewritten
 // under one parser honestly, so the rewrite is refused (ok=false) and the
 // caller falls back to the verbatim per-target stdin screen.
+// R17-Oracle-M6: a data consumer riding the target list (a nested
+// `bash -c "cat; bash"` unwrap that surfaced the plain cat) refuses the
+// rewrite exactly like the flat `cat; bash` — the shared stream is partly
+// DATA and must never be rewritten into a shell program.
 func stdinSingleShellTargetDialect(targets []stdinTarget, sshTunnel bool) (envs []envAssignments, ok bool, bash bool) {
 	if sshTunnel || len(targets) == 0 {
 		return nil, false, false
 	}
+	first, hasFirst := firstProgramTarget(targets)
+	if !hasFirst {
+		return nil, false, false
+	}
 	envs = make([]envAssignments, 0, len(targets))
-	bash = targets[0].bash
+	bash = first.bash
 	for _, t := range targets {
-		if t.lang != "" || t.remote || t.bash != bash {
+		if t.data || t.lang != "" || t.remote || t.bash != bash {
 			return nil, false, false
 		}
 		envs = append(envs, t.envAs)

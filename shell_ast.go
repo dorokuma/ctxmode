@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -1304,26 +1305,17 @@ func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVarian
 	if primary == nil {
 		return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 	}
-	if hit := checkCommentsAndContinuations(code, primary, false); hit != "" {
+	if hit := validateParsedShellFile(col, code, primary); hit != "" {
 		return []shellSegment{{parseErr: hit}}, false
 	}
-	if !col.failClosedFile(primary) {
-		return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
-	}
 	if !useBashVariant && bashFile != nil {
-		if hit := checkCommentsAndContinuations(code, bashFile, false); hit != "" {
+		if hit := validateParsedShellFile(col, code, bashFile); hit != "" {
 			return []shellSegment{{parseErr: hit}}, false
-		}
-		if !col.failClosedFile(bashFile) {
-			return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 		}
 	}
 	if useBashVariant && posixFile != nil {
-		if hit := checkCommentsAndContinuations(code, posixFile, false); hit != "" {
+		if hit := validateParsedShellFile(col, code, posixFile); hit != "" {
 			return []shellSegment{{parseErr: hit}}, false
-		}
-		if !col.failClosedFile(posixFile) {
-			return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 		}
 	}
 
@@ -1367,22 +1359,12 @@ func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVarian
 	if col.rejected {
 		return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 	}
-	if useBashVariant && posixFile != nil {
-		pre := len(col.segs)
-		col.walkStmts(posixFile.Stmts, stdinFeed{piped: pipeIn})
-		if col.rejected {
-			return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
-		}
-		col.segs = dedupeSegTail(col.segs, pre)
-		markSecondaryDialect(col.segs, pre)
-	} else if !useBashVariant && bashFile != nil {
-		pre := len(col.segs)
-		col.walkStmts(bashFile.Stmts, stdinFeed{piped: pipeIn})
-		if col.rejected {
-			return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
-		}
-		col.segs = dedupeSegTail(col.segs, pre)
-		markSecondaryDialect(col.segs, pre)
+	secondary := posixFile
+	if !useBashVariant {
+		secondary = bashFile
+	}
+	if !col.walkSecondaryShellFile(secondary, pipeIn) {
+		return []shellSegment{{parseErr: "shell AST fail-closed"}}, false
 	}
 	// R16-Oracle-M2: every segment this parse produced was encoded under
 	// ONE interpreter dialect — the same collector's posixNoBraces applies
@@ -1394,6 +1376,41 @@ func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVarian
 		col.segs[i].bashDialect = useBashVariant
 	}
 	return col.segs, true
+}
+
+// validateParsedShellFile runs the comment/continuation scan and the
+// fail-closed walk for one already-parsed file (extracted for the v6.2.2
+// R17 complexity budget): "" means valid, anything else is the parseErr
+// detail the caller surfaces.
+func validateParsedShellFile(col *subCollector, code string, f *syntax.File) string {
+	if f == nil {
+		return ""
+	}
+	if hit := checkCommentsAndContinuations(code, f, false); hit != "" {
+		return hit
+	}
+	if !col.failClosedFile(f) {
+		return "shell AST fail-closed"
+	}
+	return ""
+}
+
+// walkSecondaryShellFile walks the non-primary dialect tree of one parse
+// (extracted for the v6.2.2 R17 complexity budget), dedupes the appended
+// tail against the primary segments and marks it secondary-dialect. A nil
+// file (the cross-parse failed) is a no-op success.
+func (col *subCollector) walkSecondaryShellFile(f *syntax.File, pipeIn bool) bool {
+	if f == nil {
+		return true
+	}
+	pre := len(col.segs)
+	col.walkStmts(f.Stmts, stdinFeed{piped: pipeIn})
+	if col.rejected {
+		return false
+	}
+	col.segs = dedupeSegTail(col.segs, pre)
+	markSecondaryDialect(col.segs, pre)
+	return true
 }
 
 // markSecondaryDialect flags the segments appended by the non-primary dialect
@@ -2920,8 +2937,10 @@ func (c *subCollector) staticAssignVal(w *syntax.Word) (string, bool) {
 			// substitution path (dqSubstPlaceholder) — a TMPDIR=/dev/null or
 			// TMPDIR=/proc makes mktemp fail with EMPTY stdout, so a variable
 			// bound here must not pose as the non-empty absolute mktemp
-			// directory either.
-			if !c.isTainted("TMPDIR") && inheritedTmpdirValid() && isMktempDashDCallStmts(cs.Stmts) {
+			// directory either. R17-Oracle-M1: a writable TMPDIR still does
+			// not prove the child RUNS at all — the effective PATH must also
+			// resolve an executable mktemp (canResolveMktempInPath).
+			if c.mktempGrantOK() && isMktempDashDCallStmts(cs.Stmts) {
 				return mktempDirPlaceholder, true
 			}
 		}
@@ -2930,6 +2949,64 @@ func (c *subCollector) staticAssignVal(w *syntax.Word) (string, bool) {
 		return "", false
 	}
 	return c.wordToArg(w)
+}
+
+// mktempGrantOK reports whether a bare `$(mktemp -d)` substitution is
+// guaranteed to SUCCEED: TMPDIR untainted and inherited-valid (so the child
+// can create the directory) AND the collector's effective PATH resolves an
+// executable mktemp binary (R17-Oracle-M1). A PATH carrying only directories
+// without mktemp (e.g. a minimal /usr/local/sbin sandbox PATH) makes the
+// shell report "command not found", the substitution collapses to the empty
+// string and no absolute-dir / non-empty proof may stand — not even the
+// assignment-binding mktempDirPlaceholder grant. When the script wrote PATH
+// in any unreadable shape (tainted) no proof exists either.
+func (c *subCollector) mktempGrantOK() bool {
+	if c.isTainted("TMPDIR") || !inheritedTmpdirValid() {
+		return false
+	}
+	return c.canResolveMktempInPath()
+}
+
+// canResolveMktempInPath reports whether the EFFECTIVE PATH the shell child
+// would resolve against contains an executable `mktemp` in one of its
+// directories. A tainted PATH is unvettable; an unreadable script bind falls
+// through to the caller's effective PATH (replay of the process PATH through
+// every env op seen so far), finally os.Getenv("PATH"). Every candidate
+// directory must itself be absolute (a relative PATH segment resolves
+// against the child's cwd — unknowable here — and never proves the lookup)
+// and yield a non-directory entry with any execute bit set.
+func (c *subCollector) canResolveMktempInPath() bool {
+	if c.isTainted("PATH") || c.ssaBlocked["PATH"] {
+		return false
+	}
+	pathEnv := ""
+	if c.staticVars != nil {
+		pathEnv = c.staticVars["PATH"]
+	}
+	if pathEnv == "" {
+		pathEnv = c.caller.effectivePATH()
+	}
+	for _, d := range strings.Split(pathEnv, ":") {
+		if pathHasExecutable(d, "mktemp") {
+			return true
+		}
+	}
+	return false
+}
+
+// pathHasExecutable reports whether dir (an absolute directory of a PATH
+// value) contains a non-directory entry `name` with any execute bit. Empty
+// (the PATH "current directory" entry) and relative segments can never
+// prove a lookup — the resolution base is the child's cwd, not ours.
+func pathHasExecutable(dir, name string) bool {
+	if dir == "" || !filepath.IsAbs(dir) {
+		return false
+	}
+	st, err := os.Stat(filepath.Join(dir, name))
+	if err != nil || st.IsDir() {
+		return false
+	}
+	return st.Mode()&0111 != 0
 }
 
 // pwdSwitchTainted reports whether the whole-script mutation pre-scan saw a
@@ -3330,19 +3407,20 @@ func writeCtxFreeDqParts(b *strings.Builder, p *syntax.DblQuoted) bool {
 }
 
 // writeBraceExpansionMarkers emits the glob markers a real brace expansion
-// word carries (R16-Oracle-S1): the encoding must hold AT LEAST TWO glob
-// placeholders so the consumer can distinguish a true brace expansion (the
-// word multiplied into several argv words — every one of them carrying the
-// literal '{' bytes of the source spelling) from a plain pathname glob that
-// merely passes through a QUOTED literal '{' (docs/'{v1}'/*.txt carries
-// exactly ONE marker). Topping up to two markers keeps `~/{red,blue}` at
-// exactly two (tilde marker + brace marker) while `{docs/a,-blue}` — no
-// glob metacharacter of its own — also reaches two.
+// word carries (R16-Oracle-S1, R17-Oracle-S1): the encoding must end with
+// TWO CONSECUTIVE ADJACENT glob placeholders so the consumer can
+// distinguish a true brace expansion (the word multiplied into several
+// argv words) from a plain pathname glob that merely passes through a
+// QUOTED literal '{' — docs/*/'{v1}'/*.txt legitimately carries TWO
+// markers already (one per unquoted '*' Lit), but they are separated by
+// the static infix "/{v1}/*.txt" and never adjacent, so it stays a safe
+// data operand while {docs/a,-blue} and ~/{red,blue} both end in the
+// adjacent __ctx_glob____ctx_glob__ pair the consumers key on.
 func writeBraceExpansionMarkers(b *strings.Builder) {
-	b.WriteString(cmdSubPlaceholderGlob)
-	if strings.Count(b.String(), cmdSubPlaceholderGlob) < 2 {
+	if !strings.HasSuffix(b.String(), cmdSubPlaceholderGlob) {
 		b.WriteString(cmdSubPlaceholderGlob)
 	}
+	b.WriteString(cmdSubPlaceholderGlob)
 }
 
 func (c *subCollector) wordToArg(w *syntax.Word) (string, bool) {
@@ -3412,10 +3490,8 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 	for i, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
-			if litHasUnquotedGlobOrTilde(p.Value, i == 0 && b.Len() == 0, &openBracket) {
+			if c.writeUnquotedGlobTildeLit(&b, p.Value, i == 0 && b.Len() == 0, &openBracket) {
 				static = false
-				b.WriteString(posixUnescapeLit(p.Value))
-				b.WriteString(cmdSubPlaceholderGlob)
 				continue
 			}
 			b.WriteString(posixUnescapeLit(p.Value))
@@ -3541,15 +3617,7 @@ func (c *subCollector) unquotedParamPlaceholder(pe *syntax.ParamExp) string {
 		// the potential pathname expansion), so isSingleWordOptionValue and
 		// the zero-argument printf review can no longer treat HOME="/home/
 		// Team Blue" as one operand slot.
-		if !c.isTainted("HOME") {
-			if h, ok := inheritedHomeDir(); ok {
-				if strings.ContainsAny(h, " \t\n\r*?[") {
-					return cmdSubPlaceholderAbsDq + cmdSubPlaceholder + cmdSubPlaceholderGlob
-				}
-				return h
-			}
-		}
-		return cmdSubPlaceholder
+		return c.unquotedHomePlaceholder()
 	case "$":
 		// R13-SF-2: digit-prefixed encoding — a decimal PID can never spell
 		// "--" nor start with '-', so dynWordCanSpellDashDash must not
@@ -3557,6 +3625,95 @@ func (c *subCollector) unquotedParamPlaceholder(pe *syntax.ParamExp) string {
 		return "0" + cmdSubPlaceholderQuoted
 	}
 	return cmdSubPlaceholder
+}
+
+// unquotedHomePlaceholder is the HOME case of unquotedParamPlaceholder
+// (extracted for the v6.2.2 R17 complexity budget). A whitespace/glob-free
+// absolute inherited HOME encodes as literal path text only while BOTH the
+// name is untainted and the IFS model is clean; whitespace/glob bytes — or
+// R17-Oracle-M3: a polluted IFS — degrade it to the multi-word encoding
+// (the abs-dq prefix is what a DOUBLE-quoted expansion could keep, the
+// plain cmdsub marks the word splittable, and the glob marker blocks the
+// single-word option-value exemption outright). Everything else is the
+// conservative splittable placeholder.
+func (c *subCollector) unquotedHomePlaceholder() string {
+	if c.isTainted("HOME") {
+		return cmdSubPlaceholder
+	}
+	h, ok := inheritedHomeDir()
+	if !ok {
+		return cmdSubPlaceholder
+	}
+	if strings.ContainsAny(h, " \t\n\r*?[") || !c.ifsClean() {
+		// A whitespace/glob HOME splits or glob-expands regardless of IFS;
+		// a polluted IFS (':'/',' are legal separators here) re-splits even
+		// a clean value — e.g. HOME=/home/red:blue with IFS=: yields TWO
+		// argv words, never one.
+		return cmdSubPlaceholderAbsDq + cmdSubPlaceholder + cmdSubPlaceholderGlob
+	}
+	return h
+}
+
+// tmpdirPseudoRoot reports whether td names a pseudo filesystem root or a
+// device tree mktemp can never create a subdirectory in (extracted for the
+// v6.2.2 R17 complexity budget). /dev/shm — a real 1777 tmpfs the
+// repository itself lists as an allowed scratch root — is the sole /dev
+// exception (R17-Oracle-S2).
+func tmpdirPseudoRoot(td string) bool {
+	for _, pseudo := range []string{"/proc", "/sys"} {
+		if td == pseudo || strings.HasPrefix(td, pseudo+"/") {
+			return true
+		}
+	}
+	return strings.HasPrefix(td, "/dev") && td != "/dev/shm" && !strings.HasPrefix(td, "/dev/shm/")
+}
+
+// writeUnquotedGlobTildeLit encodes one unquoted literal that carries a
+// glob or tilde metacharacter (extracted for the v6.2.2 R17 complexity
+// budget): the text plus its glob marker — and, for a word-leading tilde
+// whose expansion HOME is unknowable, the exemption-revoking second
+// marker. Returns false when the literal carries no glob/tilde byte at all.
+func (c *subCollector) writeUnquotedGlobTildeLit(b *strings.Builder, rawLit string, wordStart bool, openBracket *bool) bool {
+	if !litHasUnquotedGlobOrTilde(rawLit, wordStart, openBracket) {
+		return false
+	}
+	b.WriteString(posixUnescapeLit(rawLit))
+	b.WriteString(cmdSubPlaceholderGlob)
+	if tildeGrantRevoked(rawLit, wordStart, c) {
+		b.WriteString(cmdSubPlaceholderGlob)
+	}
+	return true
+}
+
+// tildeGrantRevoked reports whether this word-leading tilde literal lost
+// its single-path exemption because the collector cannot know the HOME the
+// consuming shell will expand it against (R17-Oracle-M4 criterion B):
+// resolveNodeRunnerPathOpt restores `~` against the SERVICE process HOME,
+// so a tainted HOME must mint a second glob marker that revokes the
+// exemption outright instead of substituting the wrong environment.
+func tildeGrantRevoked(rawLit string, wordStart bool, c *subCollector) bool {
+	return wordStart && strings.HasPrefix(rawLit, "~") && c.isTainted("HOME")
+}
+
+// ifsClean reports whether the unquoted expansion model may assume POSIX
+// field splitting on the DEFAULT whitespace set (R17-Oracle-M3). The grant
+// is false the moment the script wrote IFS (tainted — the value is
+// unreadable), the process itself inherited a non-default exported IFS, or
+// a static bind carrying separators other than the default " \t\n" (or the
+// POSIX no-split empty string) is visible.
+func (c *subCollector) ifsClean() bool {
+	if c.isTainted("IFS") {
+		return false
+	}
+	if c.staticVars != nil {
+		if ifs, ok := c.staticVars["IFS"]; ok && ifs != " \t\n" && ifs != "" {
+			return false
+		}
+	}
+	if ifs, ok := os.LookupEnv("IFS"); ok && ifs != " \t\n" && ifs != "" {
+		return false
+	}
+	return true
 }
 
 // dqParamPlaceholder classifies an unresolved $VAR inside double quotes.
@@ -3637,7 +3794,7 @@ func (c *subCollector) dqSubstPlaceholder(cs *syntax.CmdSubst) string {
 		// therefore additionally requires the inherited TMPDIR to be a
 		// validated absolute existing directory; every failure shape falls
 		// back to the ordinary quoted placeholder.
-		if !c.isTainted("TMPDIR") && inheritedTmpdirValid() && isMktempDashDCallStmts(cs.Stmts) {
+		if c.mktempGrantOK() && isMktempDashDCallStmts(cs.Stmts) {
 			return cmdSubPlaceholderAbsDq
 		}
 	}
@@ -3700,10 +3857,13 @@ func inheritedTmpdirValid() bool {
 	// the non-directory TMPDIR=/dev/null. The perm-bit check plus a real
 	// write/search access probe together approximate "a subdirectory could
 	// be created here"; both must pass.
-	for _, pseudo := range []string{"/proc", "/sys", "/dev"} {
-		if td == pseudo || strings.HasPrefix(td, pseudo+"/") {
-			return false
-		}
+	// R17-Oracle-S2: /dev is NOT uniformly a pseudo root — /dev/shm is a
+	// real tmpfs (mode 1777) the repository itself lists as an allowed
+	// scratch root, so TMPDIR=/dev/shm[/...] keeps the validity proof
+	// while /dev/null (a device NODE, not even a directory — already
+	// rejected by the Stat walk below) and /dev/foo stay out.
+	if tmpdirPseudoRoot(td) {
+		return false
 	}
 	fi, err := os.Stat(td)
 	if err != nil || !fi.IsDir() {

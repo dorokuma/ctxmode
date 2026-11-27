@@ -331,7 +331,14 @@ func isSafeDynamicDataOperand(a string) bool {
 	// pathname glob — docs/'{v1}'/*.txt — carries exactly ONE marker and
 	// stays a safe data operand: every match shares the fixed docs/ prefix
 	// and {v1} is a literal directory, never an expansion branch.
-	if strings.Contains(a, "{") && strings.Count(a, cmdSubPlaceholderGlob) >= 2 {
+	// R17-Oracle-S1: the brace shape is the CONSECUTIVE ADJACENT pair of
+	// glob markers writeBraceExpansionMarkers guarantees at the word tail —
+	// ordinary pathname globs never produce one even when several unquoted
+	// '*'/tilde parts of the same word each emitted their own marker
+	// (docs/*/'{v1}'/*.txt carries two SEPARATED markers and must stay a
+	// safe data operand: every match keeps the fixed docs/ prefix and {v1}
+	// is a literal directory).
+	if strings.Contains(a, "{") && strings.Contains(a, cmdSubPlaceholderGlob+cmdSubPlaceholderGlob) {
 		return false
 	}
 	if strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+") {
@@ -7216,7 +7223,7 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 				bodyKind = 'r'
 			}
 			for _, lang := range langs {
-				if h := screenStdinProgram(body, lang, bodyKind, depth, caller); h != "" {
+				if h := screenStdinProgram(body, lang, bodyKind, depth, caller, false); h != "" {
 					if kind == 'r' || callerReadonlyRole(caller) {
 						return roSSHWriteHit
 					}
@@ -9585,11 +9592,14 @@ func screenFindExecInner(args []string, i, j int, op string, outerSeg shellSegme
 // interpreter code otherwise (python3 -, node -, a heredoc or a `<<<`
 // here-string into python3). The heredoc body, the here-string and the
 // ctx_run stdin payload all come through here so the same bytes always get
-// the same verdict.
-func screenStdinProgram(text, lang string, kind byte, depth int, caller callerIdentity) string {
+// the same verdict. bash (variadic, default false) is the consuming shell's
+// dialect (R17-Oracle-M2): a local bash reading its program from stdin
+// brace-expands exactly like `bash -c`, so the dash default re-parse must
+// not stand in for it.
+func screenStdinProgram(text, lang string, kind byte, depth int, caller callerIdentity, bash bool) string {
 	if lang == "" {
 		if kind == 's' {
-			return guardShellSubagentDepth(text, depth+1, caller)
+			return guardShellSubagentDepthDialect(text, depth+1, caller, bash)
 		}
 		return guardShellReadonlyDepth(text, depth+1, caller)
 	}
@@ -9632,7 +9642,7 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 	// model (screenSSHHead) — it returns the remote-aware roSSHWriteHit /
 	// "piped stdin to ssh" verdict.
 	if seg.pipedStdin && !seg.stdinRedir && !sshTunnelsStdinProgram(seg.argv, caller.pathEnv, caller) {
-		if lang, isProg, _ := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller); isProg {
+		if lang, isProg, _, _ := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller); isProg {
 			if lang == "" {
 				return "piped code to shell"
 			}
@@ -9649,8 +9659,11 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 		// R15: the program head may itself hide inside wrappers
 		// (flock/watch/xargs/env) — env ops found at ANY recursion
 		// level are the env the here-string text runs under.
-		if lang, isProg, envAs := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller); isProg {
-			if hit := screenStdinProgram(seg.hereString, lang, kind, depth, caller.seededWith(envAs)); hit != "" {
+		// R17-Oracle-M2: the bash dialect of the consuming shell rides
+		// the projection into the screen — the dash default must not
+		// re-parse a bash-consumed program.
+		if lang, isProg, envAs, bash := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller); isProg {
+			if hit := screenStdinProgram(seg.hereString, lang, kind, depth, caller.seededWith(envAs), bash); hit != "" {
 				return hit
 			}
 		}
@@ -9671,7 +9684,7 @@ func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller c
 	if seg.stdinRedir {
 		return ""
 	}
-	lang, isProg, envAs := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller)
+	lang, isProg, envAs, bash := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller)
 	if !isProg {
 		return ""
 	}
@@ -9687,7 +9700,10 @@ func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller c
 		if hb.dynamic || isDynamicArg(hb.text) {
 			return "dynamic code payload"
 		}
-		if hit := screenStdinProgram(hb.text, lang, bodyKind, depth, caller); hit != "" {
+		// R17-Oracle-M2: the heredoc re-parse inherits the consuming
+		// shell's dialect — a local bash heredoc brace-expands exactly
+		// like `bash -c`.
+		if hit := screenStdinProgram(hb.text, lang, bodyKind, depth, caller, bash); hit != "" {
 			if sshTunnel && (kind == 'r' || callerReadonlyRole(caller)) && bodyKind == 'r' {
 				return roSSHWriteHit
 			}
@@ -15162,7 +15178,7 @@ func (g guardCall) guardCtxRunCode(language, code string) (rule, detail string) 
 					}
 					return ruleSubagentNestedAgent, hit
 				}
-				if _, isProg, _ := stdinProgramHeadWithEnv(argv, 0, envAssignments{}, caller.pathEnv, caller); isProg {
+				if _, isProg, _, _ := stdinProgramHeadWithEnv(argv, 0, envAssignments{}, caller.pathEnv, caller); isProg {
 					if g.readonly && !g.strictReadonly && sshTunnelsStdinProgram(argv, caller.pathEnv, caller) {
 						return ruleReadonlyWrite, roSSHWriteHit
 					}
@@ -19727,7 +19743,7 @@ func hasInterpScriptExt(a string) bool {
 // its cwd so relative heads inside the argv resolve against the call's
 // directory, not the process cwd the zero caller would fall back to.
 func stdinProgramHeadCwd(argv []string, cwd string) (lang string, isInterp bool) {
-	lang, isProg, _ := stdinProgramHeadWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"), callerIdentity{cwd: cwd})
+	lang, isProg, _, _ := stdinProgramHeadWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"), callerIdentity{cwd: cwd})
 	return lang, isProg
 }
 
@@ -19742,12 +19758,33 @@ func stdinProgramHeadCwd(argv []string, cwd string) (lang string, isInterp bool)
 // caller's effective PATH — its own process PATH at depth 0): a peeled
 // `PATH=$PATH:<dir>` prefix then expands $PATH like the runtime instead
 // of collapsing to `:<dir>`.
-func stdinProgramHeadWithEnv(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity) (lang string, isInterp bool, envAs envAssignments) {
+// R17-Oracle-M2: the bash dialect of the consuming shell is projected out
+// of the target instead of being dropped — a local bash reading its
+// program from a heredoc / here-string / pipe brace-expands exactly like
+// `bash -c`, so the screen must re-parse under the bash dialect.
+func stdinProgramHeadWithEnv(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity) (lang string, isInterp bool, envAs envAssignments, bash bool) {
 	targets := stdinProgramTargetsWithEnv(argv, depth, inherited, basePath, caller)
-	if len(targets) == 0 {
-		return "", false, inherited
+	// R17-Oracle-M6: nested data consumers ride the target list now — they
+	// are not programs, so the projection skips them and surfaces the first
+	// real program target (or none).
+	t, has := firstProgramTarget(targets)
+	if !has {
+		return "", false, inherited, false
 	}
-	return targets[0].lang, true, targets[0].envAs
+	return t.lang, true, t.envAs, t.bash
+}
+
+// firstProgramTarget returns the first non-data stdin target (extracted
+// for the v6.2.2 R17 complexity budget): data consumers are byte sinks,
+// never programs.
+func firstProgramTarget(targets []stdinTarget) (stdinTarget, bool) {
+	for _, t := range targets {
+		if t.data {
+			continue
+		}
+		return t, true
+	}
+	return stdinTarget{}, false
 }
 
 // peelToSSHHead peels both standard wrappers and statement-level stdin
@@ -19833,7 +19870,19 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 	if len(targets) == 0 {
 		return "", ""
 	}
+	return g.screenStdinTargets(targets, argv, stdin, caller)
+}
+
+// screenStdinTargets screens one stdin payload against every program
+// target of an argv (extracted for the v6.2.2 R17 complexity budget):
+// remote targets upgrade the strictness, data consumers are byte sinks and
+// never programs, shell targets re-parse under their own dialect and
+// interpreter targets face their own language screen.
+func (g guardCall) screenStdinTargets(targets []stdinTarget, argv []string, stdin string, caller callerIdentity) (rule, detail string) {
 	for _, t := range targets {
+		if t.data {
+			continue // a data consumer is not a program target (R17-Oracle-M6)
+		}
 		gSeg := g
 		if gSeg.readonly && !gSeg.strictReadonly &&
 			(t.remote || sshTunnelsStdinProgram(argv, os.Getenv("PATH"), caller)) {
@@ -19884,21 +19933,8 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 		if len(targets) == 0 {
 			continue
 		}
-		for _, t := range targets {
-			gSeg := g
-			if gSeg.readonly && !gSeg.strictReadonly &&
-				(t.remote || sshTunnelsStdinProgram(seg.argv, os.Getenv("PATH"), caller)) {
-				gSeg.strictReadonly = true
-			}
-			if t.lang == "" {
-				if r, d := gSeg.guardCtxRunShellEnvDialect(stdin, t.envAs, t.bash); r != "" {
-					return r, d
-				}
-				continue
-			}
-			if r, d := gSeg.guardCtxRunCode(t.lang, stdin); r != "" {
-				return r, d
-			}
+		if rule, detail := g.screenStdinTargets(targets, seg.argv, stdin, caller); rule != "" {
+			return rule, detail
 		}
 	}
 	return "", ""
@@ -20137,6 +20173,14 @@ type stdinTarget struct {
 	// `<selfExe> --hc-gate` call, and a read-only-but-not-strict caller
 	// screening them escalates to the strict rules.
 	remote bool
+	// data marks a segment that CONSUMES the shared stdin stream without
+	// being a program-reading shell/interpreter (R17-Oracle-M6): a plain
+	// data consumer (cat, jq ., git apply) found while unwrapping a nested
+	// shell -c script. Such a consumer must never vanish from the summary
+	// — a mixed `cat; bash` stream can never be honestly rewritten as a
+	// pure shell program, so scriptAllowsLocalShellStdinPrepareDialect
+	// must refuse it exactly like the flat spelling.
+	data bool
 }
 
 func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity) []stdinTarget {
@@ -20199,7 +20243,17 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
-			for _, t := range stdinProgramTargetsDialect(seg.argv, depth+1, subEnv, subPath, subCaller, seg.bashDialect) {
+			sub := stdinProgramTargetsDialect(seg.argv, depth+1, subEnv, subPath, subCaller, seg.bashDialect)
+			if len(sub) == 0 {
+				// R17-Oracle-M6: a segment that can read the shared stream but
+				// resolves to NO program target is a plain data consumer (cat,
+				// jq .) — it must surface as such instead of silently dropping
+				// out of the nested summary, or `bash -c "cat; bash"` would
+				// earn a rewrite the flat `cat; bash` never gets.
+				out = append(out, stdinTarget{data: true, envAs: envAs})
+				continue
+			}
+			for _, t := range sub {
 				if mergeOuter {
 					t.envAs = envAs.merged(t.envAs)
 				}
@@ -20544,7 +20598,15 @@ func resolveNodeRunnerPathOpt(val string, cwd string) (string, bool) {
 	}
 	var cand string
 	switch {
-	case strings.HasPrefix(val, "~"):
+	case tildeExpansionSpelling(val):
+		// R17-Oracle-M4 criterion A: the HOME restoration applies ONLY to a
+		// word that genuinely carries the shell's tilde-expansion marker —
+		// a bare leading `~` byte (direct argv, or a single-quoted shell
+		// word) reaches the consumer VERBATIM and is a relative path
+		// segment, never an expansion site. Inside this branch the sole
+		// glob marker IS the unquoted word-start tilde's: isSingleWordOptionValue
+		// already forced exactly one marker and ruled out every other
+		// glob/tilde source byte.
 		raw := strings.Replace(val, cmdSubPlaceholderGlob, "", 1)
 		if isDynamicArg(raw) || strings.ContainsAny(raw, "*?[") {
 			return "", false
@@ -20594,6 +20656,16 @@ func resolveNodeRunnerPathOpt(val string, cwd string) (string, bool) {
 		}
 	}
 	return cand, true
+}
+
+// tildeExpansionSpelling reports whether a value carries the shell's
+// real tilde-expansion marker at a leading `~` (extracted for the v6.2.2
+// R17 complexity budget — R17-Oracle-M4 criterion A): the marker never
+// sits adjacent to the `~` byte itself because the encoder appends it
+// after the whole unquoted literal part, so a bare leading `~` without
+// any glob marker is a VERBATIM relative-path byte, never an expansion.
+func tildeExpansionSpelling(val string) bool {
+	return strings.HasPrefix(val, "~") && strings.Contains(val, cmdSubPlaceholderGlob)
 }
 
 func trimByteAligned(raw, mask string) (string, string) {

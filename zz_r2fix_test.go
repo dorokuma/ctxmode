@@ -3905,3 +3905,299 @@ func TestGuard_V622_OracleR16Probes(t *testing.T) {
 		}
 	})
 }
+
+// TestGuard_V622_OracleR17Probes pins the Oracle R17 audit closure:
+// the mktemp grants additionally require the effective PATH to resolve an
+// executable mktemp (R17-M1), local bash heredoc / here-string stdin
+// re-parses keep the bash dialect instead of falling back to dash
+// (R17-M2), the unquoted-$HOME single-word proof collapses the moment IFS
+// is polluted (R17-M3), ~/... restoration demands both the real tilde
+// marker and an untainted expansion environment (R17-M4), locateShellCSlot
+// skips the `--` terminator after a pending -c exactly like
+// unwrapShellArgv (R17-M5), nested -c stdin classification no longer
+// drops plain data consumers (R17-M6), a multi-glob path with quoted
+// literal braces is never a brace expansion (R17-S1) and /dev/shm is a
+// valid tmpfs TMPDIR (R17-S2). Pure-function pins reference only
+// production symbols that exist verbatim on the pre-fix tree 841473c
+// (the consumer predicates, the collectors, unwrapShellArgv,
+// locateShellCSlot, scriptAllowsLocalShellStdinPrepareDialect and
+// stdinProgramTargetsWithEnv), so the discriminating rows reproduce FAIL
+// directly there.
+func TestGuard_V622_OracleR17Probes(t *testing.T) {
+	// ---- R17-M1: a missing mktemp on the effective PATH revokes the grants ----
+	t.Run("R17-M1-a dq grant requires PATH resolvable mktemp", func(t *testing.T) {
+		// /usr/local/sbin is verified root-owned without mktemp on this
+		// host (Oracle R17 read-only metadata check); TMPDIR=/tmp is
+		// valid, so only the missing lookup can revoke the grant.
+		t.Setenv("TMPDIR", "/tmp")
+		t.Setenv("PATH", "/usr/local/sbin")
+		w := parseBashSingleCmdWord(t, `echo "$(mktemp -d)"`, 1)
+		s, static := blankSubCollector().wordToArg(w)
+		if static {
+			t.Fatalf("wordToArg(\"$(mktemp -d)\") static under mktemp-less PATH")
+		}
+		if strings.Contains(s, cmdSubPlaceholderAbsDq) {
+			t.Fatalf("encoding %q carries the abs-dq class under PATH=/usr/local/sbin, want the ordinary quoted placeholder (mktemp is not runnable there)", s)
+		}
+		if dynGluedTailNonEmpty(s) {
+			t.Fatalf("dynGluedTailNonEmpty(%q) = true, want false — a failing substitution is empty", s)
+		}
+	})
+	t.Run("R17-M1-b assignment binding requires PATH resolvable mktemp", func(t *testing.T) {
+		t.Setenv("TMPDIR", "/tmp")
+		t.Setenv("PATH", "/usr/local/sbin")
+		p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+		f, err := p.Parse(strings.NewReader(`d=$(mktemp -d)`), "")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		call, ok := f.Stmts[0].Cmd.(*syntax.CallExpr)
+		if !ok || len(call.Assigns) != 1 || call.Assigns[0].Value == nil {
+			t.Fatalf("parse shape %T, want one Assign with a value", f.Stmts[0].Cmd)
+		}
+		v, ok := blankSubCollector().staticAssignVal(call.Assigns[0].Value)
+		if ok && v == mktempDirPlaceholder {
+			t.Fatalf("staticAssignVal($(mktemp -d)) under PATH=/usr/local/sbin = (%q, true), want the mktemp-dir grant withheld — the child cannot even be exec'd there", v)
+		}
+	})
+	t.Run("R17-M1-pos normal PATH keeps the grants", func(t *testing.T) {
+		t.Setenv("TMPDIR", "")
+		t.Setenv("PATH", "/usr/bin:/bin")
+		w := parseBashSingleCmdWord(t, `echo "$(mktemp -d)"`, 1)
+		s, _ := blankSubCollector().wordToArg(w)
+		if !strings.Contains(s, cmdSubPlaceholderAbsDq) {
+			t.Fatalf("encoding %q lost the abs-dq class under PATH=/usr/bin:/bin, want it kept (/usr/bin/mktemp is executable)", s)
+		}
+		p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+		f, err := p.Parse(strings.NewReader(`d=$(mktemp -d)`), "")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		call := f.Stmts[0].Cmd.(*syntax.CallExpr)
+		v, ok := blankSubCollector().staticAssignVal(call.Assigns[0].Value)
+		if !ok || v != mktempDirPlaceholder {
+			t.Fatalf("staticAssignVal($(mktemp -d)) under PATH=/usr/bin:/bin = (%q, %v), want (%q, true)", v, ok, mktempDirPlaceholder)
+		}
+	})
+
+	// ---- R17-M2: bash heredoc / here-string keep the bash dialect ----
+	t.Run("R17-M2-api bash API stdin keeps the bash dialect (control)", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "R17-M2-api", role: "worker", argv: []string{"bash"}, stdin: "printf tag{red,blue}\n"}, "")
+		if !strings.Contains(got, "env dynamic printf") {
+			t.Fatalf("bash API stdin path = %q, want substring %q", got, "env dynamic printf")
+		}
+	})
+	t.Run("R17-M2-hd bash heredoc keeps the bash dialect", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "R17-M2-hd", role: "worker", cmd: "bash -c 'bash <<\"EOF\"\nprintf tag{red,blue}\nEOF'"}, "")
+		if !strings.Contains(got, "env dynamic printf") {
+			t.Fatalf("bash heredoc path = %q, want substring %q — a bash reading its program from a heredoc brace-expands exactly like bash -c", got, "env dynamic printf")
+		}
+	})
+	t.Run("R17-M2-hs bash here-string keeps the bash dialect", func(t *testing.T) {
+		got := rtGuardCwd(t, rtCase{id: "R17-M2-hs", role: "worker", cmd: "bash -c 'bash <<< \"printf tag{red,blue}\"'"}, "")
+		if !strings.Contains(got, "env dynamic printf") {
+			t.Fatalf("bash here-string path = %q, want substring %q", got, "env dynamic printf")
+		}
+	})
+	t.Run("R17-M2-pos dash heredoc / here-string keep the POSIX literal", func(t *testing.T) {
+		for _, cmd := range []string{
+			"bash -c 'sh <<\"EOF\"\nprintf tag{red,blue}\nEOF'",
+			"bash -c 'sh <<< \"printf tag{red,blue}\"'",
+		} {
+			got := rtGuardCwd(t, rtCase{id: "R17-M2-pos", role: "worker", cmd: cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("dash stdin path %q = %q, want ALLOW — dash performs no brace expansion", cmd, got)
+			}
+		}
+	})
+
+	// ---- R17-M3: a polluted IFS revokes the unquoted-$HOME single-word proof ----
+	ifsFixture := func(t *testing.T, script string, argIdx int) string {
+		t.Helper()
+		segs, ok := parseSubagentShellASTEnv(script, 0, false, true, nil, callerIdentity{})
+		if !ok || len(segs) == 0 {
+			t.Fatalf("parse %q failed: ok=%v segs=%v", script, ok, segs)
+		}
+		last := segs[len(segs)-1]
+		if argIdx >= len(last.argv) {
+			t.Fatalf("parse %q: last seg argv=%v, want index %d", script, last.argv, argIdx)
+		}
+		return last.argv[argIdx]
+	}
+	t.Run("R17-M3 IFS=':' degrades unquoted HOME but keeps the quoted word", func(t *testing.T) {
+		t.Setenv("HOME", "/home/red:blue")
+		unq := ifsFixture(t, "IFS=:; echo $HOME", 1)
+		quo := ifsFixture(t, "IFS=:; echo \"$HOME\"", 1)
+		if isSingleWordOptionValue(unq) {
+			t.Fatalf("isSingleWordOptionValue(%q) = true, want false — unquoted $HOME field-splits on ':' at runtime", unq)
+		}
+		if !isSingleWordOptionValue(quo) {
+			t.Fatalf("isSingleWordOptionValue(%q) = false, want true — a double-quoted expansion is exactly one argv word regardless of IFS", quo)
+		}
+	})
+	t.Run("R17-M3-pos untainted IFS keeps the unquoted literal text", func(t *testing.T) {
+		t.Setenv("HOME", "/home/red:blue")
+		unq := ifsFixture(t, "echo $HOME", 1)
+		if !isSingleWordOptionValue(unq) {
+			t.Fatalf("isSingleWordOptionValue(%q) = false, want true — a whitespace/glob-free HOME expands to one field under the default IFS", unq)
+		}
+	})
+
+	// ---- R17-M4: tilde restoration needs the marker AND the environment ----
+	t.Run("R17-M4-a unmarked literal ~/notes never resolves to the service HOME", func(t *testing.T) {
+		t.Setenv("HOME", "/home/parent")
+		cand, ok := resolveNodeRunnerPathOpt("~/notes", "/opt/example")
+		if ok && cand == "/home/parent/notes" {
+			t.Fatalf("resolveNodeRunnerPathOpt(%q) = (%q, true) — a direct argv or single-quoted word reaches the consumer VERBATIM and must never be home-restored", "~/notes", cand)
+		}
+		if ok && cand != "/opt/example/~/notes" {
+			t.Fatalf("resolveNodeRunnerPathOpt(%q) = (%q, true), want ok=false or the cwd-relative %q", "~/notes", cand, "/opt/example/~/notes")
+		}
+	})
+	t.Run("R17-M4-b tainted HOME revokes the tilde restoration", func(t *testing.T) {
+		t.Setenv("HOME", "/home/parent")
+		w := parseBashSingleCmdWord(t, `echo ~/notes`, 1)
+		col := blankSubCollector()
+		col.taintedVars["HOME"] = true
+		s, _ := col.wordToArg(w)
+		cand, ok := resolveNodeRunnerPathOpt(s, "/opt/example")
+		if ok && cand == "/home/parent/notes" {
+			t.Fatalf("resolveNodeRunnerPathOpt(%q) = (%q, true) — the service HOME must never stand in for the consuming shell's tainted HOME", s, cand)
+		}
+		if ok {
+			t.Fatalf("resolveNodeRunnerPathOpt(%q) = (%q, true), want ok=false under a tainted HOME", s, cand)
+		}
+	})
+	t.Run("R17-M4-pos untainted tilde expansion keeps the restoration", func(t *testing.T) {
+		t.Setenv("HOME", "/home/user")
+		w := parseBashSingleCmdWord(t, `echo ~/notes`, 1)
+		s, _ := blankSubCollector().wordToArg(w)
+		cand, ok := resolveNodeRunnerPathOpt(s, "/opt/example")
+		if !ok || cand != "/home/user/notes" {
+			t.Fatalf("resolveNodeRunnerPathOpt(%q) = (%q, %v), want (/home/user/notes, true)", s, cand, ok)
+		}
+	})
+
+	// ---- R17-M5: locateShellCSlot skips the terminator after a pending -c ----
+	t.Run("R17-M5 located slot equals the unwrapped script text", func(t *testing.T) {
+		argv := []string{"bash", "-c", "--", "echo ok"}
+		idx, rawScript, glued, ok := locateShellCSlot(argv)
+		text, has := unwrapShellArgv(argv)
+		if !has || text != "echo ok" {
+			t.Fatalf("unwrapShellArgv(%v) = (%q, %v), want (echo ok, true)", argv, text, has)
+		}
+		if !ok || glued {
+			t.Fatalf("locateShellCSlot(%v) = (%d, %q, glued=%v, ok=%v), want a clean unglued slot", argv, idx, rawScript, glued, ok)
+		}
+		if idx != 3 || rawScript != "echo ok" || argv[idx] != rawScript {
+			t.Fatalf("locateShellCSlot(%v) = (%d, %q), want (3, echo ok) with argv[idx] == rawScript == unwrap text", argv, idx, rawScript)
+		}
+	})
+	t.Run("R17-M5-pos dash terminator spellings locate the same word", func(t *testing.T) {
+		for _, argv := range [][]string{
+			{"sh", "-c", "echo ok"},
+			{"bash", "-c", "-", "echo ok"},
+			{"bash", "--rcfile", "/dev/null", "-c", "--", "echo ok"},
+		} {
+			idx, rawScript, glued, ok := locateShellCSlot(argv)
+			text, has := unwrapShellArgv(argv)
+			if !ok || glued || !has || rawScript != text || argv[idx] != rawScript {
+				t.Fatalf("locateShellCSlot(%v) = (%d, %q, glued=%v, ok=%v) vs unwrap=(%q,%v), want the same clean script word", argv, idx, rawScript, glued, ok, text, has)
+			}
+		}
+	})
+	t.Run("R17-M5-neg glued cluster tails stay unrewritable", func(t *testing.T) {
+		for _, argv := range [][]string{
+			{"sh", "-ce", "echo ok"},
+			{"sh", "-co", "vi", "echo ok"},
+		} {
+			_, _, glued, ok := locateShellCSlot(argv)
+			if !glued || !ok {
+				t.Fatalf("locateShellCSlot(%v) glued=%v ok=%v, want a glued-but-decoded verdict", argv, glued, ok)
+			}
+		}
+	})
+
+	// ---- R17-M6: nested stdin classification keeps data consumers ----
+	t.Run("R17-M6 flat and nested cat+bash both refuse the rewrite", func(t *testing.T) {
+		_, flatOK, _ := scriptAllowsLocalShellStdinPrepareDialect("cat; bash", false, envAssignments{}, "", callerIdentity{})
+		if flatOK {
+			t.Fatal("flat 'cat; bash' permits a stdin program rewrite, want ok=false (the stream is partly data)")
+		}
+		targets := stdinProgramTargetsWithEnv([]string{"bash", "-c", "cat; bash"}, 0, envAssignments{}, "", callerIdentity{})
+		_, nestedOK, nestedBash := stdinSingleShellTargetDialect(targets, false)
+		if nestedOK {
+			t.Fatalf("nested 'bash -c \"cat; bash\"' targets permit a stdin program rewrite (bash=%v), want ok=false — the inner cat must not vanish from the summary", nestedBash)
+		}
+	})
+	t.Run("R17-M6-pos pure nested shell targets keep the rewrite", func(t *testing.T) {
+		targets := stdinProgramTargetsWithEnv([]string{"bash", "-c", "sh; bash"}, 0, envAssignments{}, "", callerIdentity{})
+		if _, mixedOK, _ := stdinSingleShellTargetDialect(targets, false); mixedOK {
+			t.Fatal("mixed sh+bash consumers permit a stdin rewrite, want ok=false (R16 dialect agreement)")
+		}
+		pure := stdinProgramTargetsWithEnv([]string{"bash", "-c", "bash; bash"}, 0, envAssignments{}, "", callerIdentity{})
+		envs, ok, bash := stdinSingleShellTargetDialect(pure, false)
+		if !ok || len(envs) == 0 || !bash {
+			t.Fatalf("pure nested bash targets = (envs=%d, ok=%v, bash=%v), want (>=1, true, true)", len(envs), ok, bash)
+		}
+	})
+
+	// ---- R17-S1: two ordinary glob fragments are not a brace expansion ----
+	t.Run("R17-S1 multi-glob quoted-brace path stays a safe data operand", func(t *testing.T) {
+		w := parseBashSingleCmdWord(t, `cat docs/*/'{v1}'/*.txt`, 1)
+		if wordBraceExpHit(w) {
+			t.Fatal("wordBraceExpHit(docs/*/'{v1}'/*.txt) = true, want false — the braces are single-quoted literal text")
+		}
+		s1, _ := wordToArg(w)
+		if strings.Contains(s1, cmdSubPlaceholderGlob+cmdSubPlaceholderGlob) {
+			t.Fatalf("wordToArg encoding %q carries adjacent glob markers, want the two glob fragments SEPARATED by the static infix", s1)
+		}
+		if !isSafeDynamicDataOperand(s1) {
+			t.Fatalf("isSafeDynamicDataOperand(%q) = false, want true — every match keeps the fixed docs/ prefix and {v1} is a literal directory", s1)
+		}
+		s2, _ := blankSubCollector().wordToArg(w)
+		if !isSafeDynamicDataOperand(s2) {
+			t.Fatalf("isSafeDynamicDataOperand(%q) = false, want true (collector encoding)", s2)
+		}
+	})
+	t.Run("R17-S1-neg real brace expansions keep the refusal", func(t *testing.T) {
+		for _, src := range []string{`echo {docs/a,-blue}`, `echo ~/{red,blue}`} {
+			w := parseBashSingleCmdWord(t, src, 1)
+			s1, _ := wordToArg(w)
+			if !strings.Contains(s1, cmdSubPlaceholderGlob+cmdSubPlaceholderGlob) {
+				t.Fatalf("wordToArg(%q) = %q, want the adjacent glob-pair encoding of a real brace expansion", src, s1)
+			}
+			if isSafeDynamicDataOperand(s1) {
+				t.Fatalf("isSafeDynamicDataOperand(%q) = true, want false — a real brace expansion's sibling branches can spell options", s1)
+			}
+			s2, _ := blankSubCollector().wordToArg(w)
+			if isSafeDynamicDataOperand(s2) {
+				t.Fatalf("isSafeDynamicDataOperand(%q) = true, want false (collector encoding)", s2)
+			}
+		}
+	})
+
+	// ---- R17-S2: /dev/shm is a valid tmpfs TMPDIR ----
+	t.Run("R17-S2 TMPDIR=/dev/shm keeps the success proof", func(t *testing.T) {
+		st, err := os.Stat("/dev/shm")
+		if err != nil || !st.IsDir() || st.Mode().Perm() != 0o777 || st.Mode()&os.ModeSticky == 0 {
+			t.Skipf("/dev/shm not a 1777 tmpfs directory on this host: %v", err)
+		}
+		t.Setenv("TMPDIR", "/dev/shm")
+		if !inheritedTmpdirValid() {
+			t.Fatal("inheritedTmpdirValid() = false under TMPDIR=/dev/shm, want true — /dev/shm is a real 1777 tmpfs scratch root")
+		}
+		got := rtGuardCwd(t, rtCase{id: "R17-S2", role: "worker", cmd: `out=$(mktemp -d); tar -czf "$out/archive.tgz" -C /tmp/src .`}, "")
+		if got != "ALLOW" {
+			t.Fatalf("rtGuardCwd(mktemp success path under TMPDIR=/dev/shm) = %q, want ALLOW", got)
+		}
+	})
+	t.Run("R17-S2-neg /proc /dev/null /dev/pts stay rejected", func(t *testing.T) {
+		for _, td := range []string{"/proc", "/sys", "/dev/null", "/dev/pts"} {
+			t.Setenv("TMPDIR", td)
+			if inheritedTmpdirValid() {
+				t.Fatalf("inheritedTmpdirValid() = true under TMPDIR=%s, want false", td)
+			}
+		}
+	})
+}
