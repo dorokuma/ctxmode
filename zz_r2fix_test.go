@@ -3314,6 +3314,241 @@ func TestGuard_V622_OracleR14Probes(t *testing.T) {
 		// one argv word even when empty — no glued-tail collapse is
 		// possible — so the unbound-OLDPWD tightening must not refuse it.
 		{"R14-M2-pos read separate OLDPWD prompt in script", `bash -c 'cmd=/bin/true; read -p "$OLDPWD" answer <<< ok; "$cmd"'`},
+		// R14-S2-pos combo-script variant (R15-Oracle-S4: replaces the row
+		// that duplicated R13's `bash -c` external-printf combination
+		// script verbatim — two identical rows cannot count as two
+		// independent behavior evidences). This is the combination-script
+		// counterpart of the pure-tilde printf exemption: the tilde format
+		// word inside `bash -c` must not all-taint the write pre-scan, so
+		// `cmd` keeps its static bind.
+		{"R14-S2-pos printf tilde fmt combo script", `bash -c 'cmd=/bin/true; printf ~/banner; "$cmd"'`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+}
+
+// TestGuard_V622_OracleR15Probes pins the Oracle R15 audit closure:
+// brace-expansion words never pass the merged path-prefix/slash review
+// of isSafeDynamicDataOperand (R15-M1), the non-empty absolute-path
+// grants of `"$(mktemp -d)"` and `"$HOME"` require an actually inherited
+// valid TMPDIR/HOME (R15-M2), quoted literal braces keep the pure-tilde
+// single-path exemption while the POSIX/dash top-level dialect performs
+// no brace expansion (R15-S1), awk distinguishes an explicitly empty
+// positional program from a not-yet-provided one (R15-S2) and nested
+// separator-less literal braces are rejected by the single-pass budget
+// scan without any SplitBraces replay (R15-S3). Pure-function pins
+// reference only production symbols that exist verbatim on the pre-fix
+// tree c02027c (the consumer predicates and parsers), so the
+// discriminating rows reproduce FAIL directly there; rows whose verdict
+// is unchanged by the bounded-cost rewrite are marked as invariant
+// controls.
+func TestGuard_V622_OracleR15Probes(t *testing.T) {
+	// ---- R15-M1: brace words never pass isSafeDynamicDataOperand ----
+	t.Run("R15-M1 context-free encoding brace word unsafe operand", func(t *testing.T) {
+		w := parseBashSingleCmdWord(t, `echo {docs/a,-blue}`, 1)
+		s, static := wordToArg(w)
+		if static {
+			t.Fatalf("wordToArg({docs/a,-blue}) = (%q, true), want static=false", s)
+		}
+		if !strings.Contains(s, cmdSubPlaceholderGlob) || !strings.Contains(s, "{") {
+			t.Fatalf("wordToArg({docs/a,-blue}) = %q, want the brace-list glob encoding", s)
+		}
+		if isSafeDynamicDataOperand(s) {
+			t.Fatalf("isSafeDynamicDataOperand(%q) = true, want false — the '/' of docs/a says nothing about the sibling '-blue' branch expanding to an option spelling", s)
+		}
+	})
+	t.Run("R15-M1 collector encoding brace word unsafe operand", func(t *testing.T) {
+		w := parseBashSingleCmdWord(t, `echo {docs/a,-blue}`, 1)
+		s, static := blankSubCollector().wordToArg(w)
+		if static {
+			t.Fatalf("subCollector.wordToArg({docs/a,-blue}) = (%q, true), want static=false", s)
+		}
+		if isSafeDynamicDataOperand(s) {
+			t.Fatalf("isSafeDynamicDataOperand(%q) = true, want false (collector encoding)", s)
+		}
+	})
+	t.Run("R15-M1-pos ordinary path glob stays a safe operand", func(t *testing.T) {
+		w := parseBashSingleCmdWord(t, `cat docs/*.txt`, 1)
+		s, static := wordToArg(w)
+		if static {
+			t.Fatalf("wordToArg(docs/*.txt) = (%q, true), want dynamic", s)
+		}
+		if !isSafeDynamicDataOperand(s) {
+			t.Fatalf("isSafeDynamicDataOperand(%q) = false, want true — a plain pathname glob carries no '{' brace byte and keeps its data-operand grant", s)
+		}
+	})
+
+	// ---- R15-M2: failing $(mktemp -d) and empty $HOME lose the grant ----
+	t.Run("R15-M2 mktemp invalid TMPDIR encoding can collapse empty", func(t *testing.T) {
+		// TMPDIR pointing at a regular file makes GNU mktemp fail: the
+		// diagnostic goes to stderr and stdout inside the double quotes is
+		// EMPTY, so the substitution must never carry the absolute-dir
+		// class here (pure parse probe — no child process runs).
+		t.Setenv("TMPDIR", "/dev/null")
+		w := parseBashSingleCmdWord(t, `echo "$(mktemp -d)"`, 1)
+		s, static := blankSubCollector().wordToArg(w)
+		if static {
+			t.Fatalf("subCollector.wordToArg(\"$(mktemp -d)\") under TMPDIR=/dev/null is static, want dynamic")
+		}
+		if strings.Contains(s, cmdSubPlaceholderAbsDq) {
+			t.Fatalf("encoding %q carries the abs-dq class, want the ordinary quoted placeholder (mktemp can fail empty under TMPDIR=/dev/null)", s)
+		}
+		if dynGluedTailNonEmpty(s) {
+			t.Fatalf("dynGluedTailNonEmpty(%q) = true, want false", s)
+		}
+		if !dynWordCanSpellDashDash("--" + s) {
+			t.Fatalf("dynWordCanSpellDashDash(--%q) = false, want true (an empty substitution spells exactly '--')", s)
+		}
+	})
+	t.Run("R15-M2-pos mktemp valid TMPDIR keeps the abs-dq class", func(t *testing.T) {
+		// An unset TMPDIR makes mktemp use its /tmp default — the success
+		// grant must survive (control row for the tightened gate).
+		t.Setenv("TMPDIR", "")
+		w := parseBashSingleCmdWord(t, `echo "$(mktemp -d)"`, 1)
+		s, _ := blankSubCollector().wordToArg(w)
+		if !strings.Contains(s, cmdSubPlaceholderAbsDq) {
+			t.Fatalf("encoding %q lost the abs-dq class under a valid inherited TMPDIR, want it kept", s)
+		}
+		if dynWordCanSpellDashDash("--" + s) {
+			t.Fatalf("dynWordCanSpellDashDash(--%q) = true, want false (a successful mktemp -d is a non-empty absolute path)", s)
+		}
+	})
+	t.Run("R15-M2 empty inherited HOME is not a static /root", func(t *testing.T) {
+		t.Setenv("HOME", "")
+		w := parseBashSingleCmdWord(t, `echo "$HOME"`, 1)
+		s, static := blankSubCollector().wordToArg(w)
+		if static {
+			t.Fatalf("subCollector.wordToArg(\"$HOME\") under HOME=\"\" = (%q, true), want dynamic — childEnv copies keys verbatim and never re-populates HOME, so the expansion is EMPTY", s)
+		}
+		if strings.Contains(s, "/root") {
+			t.Fatalf("encoding %q contains the fabricated /root fallback, want the plain quoted placeholder", s)
+		}
+		if dynGluedTailNonEmpty(s) {
+			t.Fatalf("dynGluedTailNonEmpty(%q) = true, want false", s)
+		}
+		if !dynWordCanSpellDashDash("--" + s) {
+			t.Fatalf("dynWordCanSpellDashDash(--%q) = false, want true (an empty HOME spells exactly '--')", s)
+		}
+	})
+	t.Run("R15-M2-pos valid inherited HOME keeps the static abs path", func(t *testing.T) {
+		t.Setenv("HOME", "/root")
+		w := parseBashSingleCmdWord(t, `echo "$HOME"`, 1)
+		s, static := blankSubCollector().wordToArg(w)
+		if !static || s != "/root" {
+			t.Fatalf("subCollector.wordToArg(\"$HOME\") under HOME=/root = (%q, %v), want (/root, true)", s, static)
+		}
+	})
+
+	// ---- R15-S1: quoted literal braces and the dash dialect ----
+	t.Run("R15-S1 quoted tilde brace literal is single-word safe", func(t *testing.T) {
+		// `~/'{red,blue}'`: the braces are SINGLE-QUOTED literal text —
+		// bash expands only the tilde, so the runtime result is exactly
+		// ONE path word. wordBraceExpHit must not fire on the quoted
+		// braces, and the encoding carries exactly one glob placeholder
+		// (from the tilde) with '{' only AFTER the placeholder marker, so
+		// the pure-tilde exemption applies again.
+		w := parseBashSingleCmdWord(t, `echo ~/'{red,blue}'`, 1)
+		if wordBraceExpHit(w) {
+			t.Fatal("wordBraceExpHit(~/'{red,blue}') = true, want false (quoted braces never expand)")
+		}
+		s, static := blankSubCollector().wordToArg(w)
+		if static {
+			t.Fatalf("subCollector.wordToArg(~/'{red,blue}') = (%q, true), want dynamic (the tilde is expansion)", s)
+		}
+		if _, dyn := printfFmtWriteSlots(s, nil); dyn {
+			t.Fatalf("printfFmtWriteSlots(%q, nil): dyn = true, want false — tilde expansion yields exactly ONE path word even with quoted literal brace bytes", s)
+		}
+	})
+	t.Run("R15-S1-pos unquoted tilde brace still multiplies words", func(t *testing.T) {
+		// `~/{red,blue}` DOES brace-expand into multiple path words: the
+		// tilde glob placeholder plus the brace hit's own marker make TWO
+		// glob placeholders, denying the single-word exemption.
+		w := parseBashSingleCmdWord(t, `echo ~/{red,blue}`, 1)
+		if !wordBraceExpHit(w) {
+			t.Fatal("wordBraceExpHit(~/{red,blue}) = false, want true")
+		}
+		s, _ := blankSubCollector().wordToArg(w)
+		if strings.Count(s, cmdSubPlaceholderGlob) != 2 {
+			t.Fatalf("subCollector.wordToArg(~/{red,blue}) = %q, want exactly 2 glob placeholders (tilde + brace)", s)
+		}
+		if _, dyn := printfFmtWriteSlots(s, nil); !dyn {
+			t.Fatalf("printfFmtWriteSlots(%q, nil): dyn = false, want true", s)
+		}
+	})
+
+	// ---- R15-S2: awk empty positional program vs absent program ----
+	t.Run("R15-S2 awk empty positional program parity", func(t *testing.T) {
+		F := cmdSubPlaceholderQuoted
+		prog1, sf1, hit1 := awkProgramFrags([]string{"--", "", F})
+		prog2, sf2, hit2 := awkProgramFrags([]string{"-e", "", "--", F})
+		if hit1 != "" || hit2 != "" {
+			t.Fatalf("awkProgramFrags hits = (%q, %q), want both empty — an explicitly EMPTY positional program already supplies awk's program text, so the post-`--` word is input data exactly like after `-e ''`", hit1, hit2)
+		}
+		if prog1 != "" || prog2 != "" || sf1 || sf2 {
+			t.Fatalf("awkProgramFrags = (%q,%v) / (%q,%v), want (\"\",false) for both", prog1, sf1, prog2, sf2)
+		}
+	})
+
+	// ---- R15-S3: nested separator-less braces rejected in one pass ----
+	t.Run("R15-S3 nested literal braces never reach SplitBraces", func(t *testing.T) {
+		// INVARIANT-CONTROL rows: the verdict was false on the pre-fix
+		// tree too — the change is the COST model (the former recursive
+		// replay copied already-restored inner Parts at every level,
+		// quadratic in depth; the single-pass budget scan performs zero
+		// WordPart copies for separator-less shapes). These rows pin the
+		// verdict so the bounded-cost rewrite cannot regress correctness.
+		for _, depth := range []int{4, 8} {
+			word := strings.Repeat("{", depth) + "a" + strings.Repeat("}", depth)
+			w := parseBashSingleCmdWord(t, `echo `+word, 1)
+			if wordBraceExpHit(w) {
+				t.Fatalf("wordBraceExpHit(%s) = true, want false (no ',' or '..' separator — bash never expands it)", word)
+			}
+			s, static := wordToArg(w)
+			if !static || s != word {
+				t.Fatalf("wordToArg(%s) = (%q, %v), want the static literal", word, s, static)
+			}
+			s2, static2 := blankSubCollector().wordToArg(w)
+			if !static2 || s2 != word {
+				t.Fatalf("subCollector.wordToArg(%s) = (%q, %v), want the static literal", word, s2, static2)
+			}
+		}
+	})
+
+	// ---- End-to-end guard verdicts ----
+	blockCases := []struct {
+		name, cmd, want string
+	}{
+		// R15-S1 control: bash really performs brace expansion, so the
+		// explicit `bash -c` spelling keeps blocking exactly like R14.
+		{"P-R15-S1-b bash printf brace fmt", `bash -c 'printf tag{red,blue}'`, "env dynamic printf"},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+	allowCases := []struct {
+		name, cmd string
+	}{
+		// R15-S1-b: /bin/sh is dash on this topology — dash performs NO
+		// brace expansion, so `printf tag{red,blue}` arrives as exactly
+		// ONE literal format word with no '%' conversions and no arguments.
+		{"P-R15-S1-b-pos dash printf literal brace fmt", `printf tag{red,blue}`},
+		// R15-S1-a: the single-quoted tilde-brace word is exactly one path
+		// word after tilde expansion — the pure-tilde exemption restored.
+		{"P-R15-S1-a-pos printf quoted tilde brace fmt", `printf ~/'{red,blue}'`},
 	}
 	for _, tc := range allowCases {
 		t.Run(tc.name, func(t *testing.T) {

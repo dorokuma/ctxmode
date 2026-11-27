@@ -1278,7 +1278,7 @@ func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVarian
 		}
 	}
 
-	col := &subCollector{code: code, depth: depth, staticVars: map[string]string{}, enumVars: map[string]string{}, taintedVars: map[string]bool{}, enumCmdWords: map[string][]string{}, allowBind: true, caller: caller}
+	col := &subCollector{code: code, depth: depth, staticVars: map[string]string{}, enumVars: map[string]string{}, taintedVars: map[string]bool{}, enumCmdWords: map[string][]string{}, allowBind: true, caller: caller, posixNoBraces: !useBashVariant}
 	for name := range envTaint {
 		col.taintedVars[name] = true
 	}
@@ -1447,6 +1447,14 @@ type subCollector struct {
 	// placeholder instead of a literal the guard trusts.
 	caller callerIdentity
 	hasCd  bool // any directory-switch builtin seen anywhere in the script
+	// posixNoBraces marks the POSIX/dash TOP-LEVEL dialect (R15-Oracle-S1):
+	// /bin/sh is dash on the deployment topology, which performs NO brace
+	// expansion, so the primary-dialect encoding must not treat literal
+	// '{a,b}' text as a word-multiplying bash expansion. Explicit
+	// `bash -c` payloads keep posixNoBraces=false — bash really does
+	// expand — and the blank-collector zero value keeps the conservative
+	// bash detection for pure parser probes.
+	posixNoBraces bool
 }
 
 func (c *subCollector) reject() {
@@ -3094,51 +3102,54 @@ func litHasUnquotedGlobOrTilde(rawLit string, isWordStart bool, openBracket *boo
 // static word becomes MULTIPLE argv words, so any hit forces the dynamic
 // encoding even when no glob/tilde byte is present.
 func wordBraceExpHit(w *syntax.Word) bool {
-	hasBrace := false
+	// R15-Oracle-S3: single-pass work-budget scan BEFORE any SplitBraces
+	// replay. A VALID brace expansion must carry a closing '}' AND a
+	// separator (',' or '..'); nested pure-literal braces without a
+	// separator ({{{{a}}}}) never materialize a BraceExp node — but the
+	// former recursive replay copied the already-restored inner Parts at
+	// every nesting level (1+3+5+... items: QUADRATIC in depth, 16 copied
+	// items at depth 4, 64 at depth 8, for a word bash leaves as ONE
+	// literal). Skipping those words entirely costs one O(N) literal scan
+	// with ZERO WordPart copies. The scan is conservative in both
+	// directions: quoted/concatenated '{' bytes it cannot see keep the
+	// SplitBraces replay, and pathologically deep nesting WITH a
+	// separator (openCount > 8) conservatively reports a hit without
+	// replaying anything — failing closed with a bounded budget.
+	openCount := 0
+	hasClose := false
+	hasSep := false
 	for _, part := range w.Parts {
-		if lit, ok := part.(*syntax.Lit); ok && strings.Contains(lit.Value, "{") {
-			hasBrace = true
-			break
+		lit, ok := part.(*syntax.Lit)
+		if !ok {
+			continue
+		}
+		for i := 0; i < len(lit.Value); i++ {
+			switch lit.Value[i] {
+			case '{':
+				openCount++
+			case '}':
+				hasClose = true
+			case ',':
+				hasSep = true
+			case '.':
+				if i+1 < len(lit.Value) && lit.Value[i+1] == '.' {
+					hasSep = true
+				}
+			}
 		}
 	}
-	if !hasBrace {
+	if openCount == 0 || !hasClose || !hasSep {
 		return false
+	}
+	if openCount > 8 {
+		return true // deep nesting with separators: conservatively dynamic
 	}
 	cp := *w
 	cp.Parts = append([]syntax.WordPart(nil), w.Parts...)
 	syntax.SplitBraces(&cp)
-	return wordSplitBraceExpHit(&cp)
-}
-
-// wordSplitBraceExpHit reports whether a SplitBraces-processed word copy
-// carries a *syntax.BraceExp node at any nesting depth. SplitBraces leaves
-// malformed expansions ({a, {1..2..3..4}) as plain literal text — exactly
-// the words bash leaves unexpanded — so they never hit. The recursive
-// split mirrors bash's nested brace expansion ({a,{b,c}}).
-func wordSplitBraceExpHit(w *syntax.Word) bool {
-	topHit := false
-	for _, part := range w.Parts {
+	for _, part := range cp.Parts {
 		if _, ok := part.(*syntax.BraceExp); ok {
-			topHit = true
-			break
-		}
-	}
-	if topHit {
-		return true
-	}
-	for _, part := range w.Parts {
-		br, ok := part.(*syntax.BraceExp)
-		if !ok {
-			continue
-		}
-		for _, elem := range br.Elems {
-			if elem == nil {
-				continue
-			}
-			syntax.SplitBraces(elem)
-			if wordSplitBraceExpHit(elem) {
-				return true
-			}
+			return true
 		}
 	}
 	return false
@@ -3163,12 +3174,13 @@ func wordToArg(w *syntax.Word) (string, bool) {
 	static := true
 	openBracket := false
 	// R14-Oracle-M1: brace expansion turns ONE static word into MANY argv
-	// words under bash — the encoding can never stay static. Exactly one
-	// split-safe glob placeholder marks the expansion; a leading '~' that
-	// already emitted one keeps the word single-glob (printf's pure-tilde
-	// exemption counts exactly one placeholder).
+	// words under bash — the encoding can never stay static.
+	// R15-Oracle-S1: the brace hit UNCONDITIONALLY appends its own glob
+	// placeholder — a leading '~' that already emitted one therefore yields
+	// TWO markers, which is exactly what denies `~/{red,blue}` (but not the
+	// single-glob `~/x` or the quoted-literal `~/'{red,blue}'`) the
+	// pure-tilde single-path exemption in isSingleWordOptionValue.
 	braceSeen := wordBraceExpHit(w)
-	hasGlobPh := false
 	for i, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
@@ -3176,7 +3188,6 @@ func wordToArg(w *syntax.Word) (string, bool) {
 				static = false
 				b.WriteString(posixUnescapeLit(p.Value))
 				b.WriteString(cmdSubPlaceholderGlob)
-				hasGlobPh = true
 				continue
 			}
 			b.WriteString(posixUnescapeLit(p.Value))
@@ -3244,9 +3255,7 @@ func wordToArg(w *syntax.Word) (string, bool) {
 	}
 	if braceSeen {
 		static = false
-		if !hasGlobPh {
-			b.WriteString(cmdSubPlaceholderGlob)
-		}
+		b.WriteString(cmdSubPlaceholderGlob)
 	}
 	if !static {
 		if b.Len() == 0 {
@@ -3308,10 +3317,19 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 	openBracket := false
 	// R14-Oracle-M1: same brace-expansion encoding as the context-free
 	// wordToArg — one word becomes MANY argv words under bash, so a brace
-	// hit can never stay static and carries exactly one glob placeholder
-	// (single-glob invariant preserved when a leading '~' emitted one).
-	braceSeen := wordBraceExpHit(w)
-	hasGlobPh := false
+	// hit can never stay static.
+	// R15-Oracle-S1: under the POSIX/dash top-level dialect brace
+	// expansion does not exist at all (posixNoBraces), so the scan is
+	// skipped for the primary-dialect encoding; when it IS applied (bash
+	// payloads and the blank collector default) the hit UNCONDITIONALLY
+	// appends its own glob placeholder — a leading '~' that already
+	// emitted one therefore yields TWO markers, which is exactly what
+	// denies `~/{red,blue}` (but not the quoted-literal `~/'{red,blue}'`)
+	// the pure-tilde single-path exemption in isSingleWordOptionValue.
+	braceSeen := false
+	if !c.posixNoBraces {
+		braceSeen = wordBraceExpHit(w)
+	}
 	for i, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
@@ -3319,7 +3337,6 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 				static = false
 				b.WriteString(posixUnescapeLit(p.Value))
 				b.WriteString(cmdSubPlaceholderGlob)
-				hasGlobPh = true
 				continue
 			}
 			b.WriteString(posixUnescapeLit(p.Value))
@@ -3383,9 +3400,7 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 	}
 	if braceSeen {
 		static = false
-		if !hasGlobPh {
-			b.WriteString(cmdSubPlaceholderGlob)
-		}
+		b.WriteString(cmdSubPlaceholderGlob)
 	}
 	if !static {
 		if b.Len() == 0 {
@@ -3429,8 +3444,16 @@ func (c *subCollector) unquotedParamPlaceholder(pe *syntax.ParamExp) string {
 		}
 		return cmdSubPlaceholder
 	case "HOME":
+		// R15-Oracle-M2: only an ACTUALLY inherited absolute HOME may
+		// expand as static absolute path text — an empty/unset/relative
+		// inherited value (childEnv copies existing keys verbatim; nothing
+		// re-populates HOME) makes "$HOME" expand EMPTY, so the word must
+		// fall back to the plain splittable placeholder instead of
+		// fabricating a "/root" the shell never received.
 		if !c.isTainted("HOME") {
-			return safeHomeDir()
+			if h, ok := inheritedHomeDir(); ok {
+				return h
+			}
 		}
 		return cmdSubPlaceholder
 	case "$":
@@ -3463,8 +3486,16 @@ func (c *subCollector) dqParamPlaceholder(pe *syntax.ParamExp) (string, bool) {
 			return envPathSelfPlaceholder, false
 		}
 	case "HOME":
+		// R15-Oracle-M2: same inherited-HOME gate as the unquoted encoder —
+		// HOME="" in the parent environment expands EMPTY inside double
+		// quotes too, so it must NOT keep the ("/root", true) static grant
+		// (a glued tail can collapse and "--"+"$HOME" can spell the
+		// terminator). The plain quoted placeholder is split-safe but
+		// empty-able, which is exactly what the consumer predicates model.
 		if !c.isTainted("HOME") {
-			return safeHomeDir(), true // static absolute path text
+			if h, ok := inheritedHomeDir(); ok {
+				return h, true // static absolute path text
+			}
 		}
 	case "PWD":
 		// PWD is a bash-special variable the shell itself maintains: a
@@ -3504,7 +3535,15 @@ func (c *subCollector) dqSubstPlaceholder(cs *syntax.CmdSubst) string {
 			}
 			return cmdSubPlaceholderQuoted
 		}
-		if !c.isTainted("TMPDIR") && isMktempDashDCallStmts(cs.Stmts) {
+		// R15-Oracle-M2: a spelling match plus untainted TMPDIR does NOT
+		// prove the mktemp child succeeded — when the inherited TMPDIR
+		// points at a non-directory (or is a relative/NUL-carrying path),
+		// GNU mktemp fails, writes its diagnostic to stderr and stdout is
+		// the EMPTY string inside the double quotes. The absolute-dir grant
+		// therefore additionally requires the inherited TMPDIR to be a
+		// validated absolute existing directory; every failure shape falls
+		// back to the ordinary quoted placeholder.
+		if !c.isTainted("TMPDIR") && inheritedTmpdirValid() && isMktempDashDCallStmts(cs.Stmts) {
 			return cmdSubPlaceholderAbsDq
 		}
 	}
@@ -3520,14 +3559,49 @@ func (c *subCollector) unquotedSubstPlaceholder(cs *syntax.CmdSubst) string {
 	return cmdSubPlaceholder
 }
 
-// safeHomeDir returns the process home as a static absolute path used for
-// $HOME expansion when the script never reassigned it. Falls back to "/root"
-// when HOME is unset/relative — matching the deployment user.
+// safeHomeDir returns the process home as a static absolute path for
+// NON-shell-variable consumers (configuration search paths, default
+// config locations). Falls back to "/root" when HOME is unset/relative
+// — matching the deployment user. R15-Oracle-M2: shell "$HOME"
+// EXPANSION encoding must use inheritedHomeDir instead — a config
+// fallback directory is not the value the shell actually received.
 func safeHomeDir() string {
 	if h := os.Getenv("HOME"); h != "" && strings.HasPrefix(h, "/") && !strings.Contains(h, "\x00") {
 		return h
 	}
 	return "/root"
+}
+
+// inheritedHomeDir reports the shell "$HOME" expansion value exactly as
+// the child process inherits it: an empty/unset/relative/NUL-carrying
+// HOME means the expansion is empty or unsafe, so ("", false) is
+// returned instead of fabricating a fallback home the shell never
+// received (R15-Oracle-M2). Only a non-empty absolute NUL-free inherited
+// value is granted the static-path encoding.
+func inheritedHomeDir() (string, bool) {
+	if h := os.Getenv("HOME"); h != "" && strings.HasPrefix(h, "/") && !strings.Contains(h, "\x00") {
+		return h, true
+	}
+	return "", false
+}
+
+// inheritedTmpdirValid reports whether the TMPDIR the mktemp child would
+// inherit names an existing absolute directory — the only shape under
+// which `$(mktemp -d)` is guaranteed to SUCCEED and therefore print a
+// non-empty absolute path (R15-Oracle-M2). An unset/empty TMPDIR makes
+// mktemp use its built-in "/tmp" default, which is valid; a relative,
+// NUL-carrying, missing or non-directory value (TMPDIR=/dev/null) makes
+// mktemp fail with EMPTY stdout, so the grant must not apply.
+func inheritedTmpdirValid() bool {
+	td := os.Getenv("TMPDIR")
+	if td == "" {
+		return true // mktemp falls back to /tmp
+	}
+	if !strings.HasPrefix(td, "/") || strings.Contains(td, "\x00") {
+		return false
+	}
+	fi, err := os.Stat(td)
+	return err == nil && fi.IsDir()
 }
 
 func callHasProcSubst(call *syntax.CallExpr) bool {

@@ -306,6 +306,19 @@ func isSafeDynamicDataOperand(a string) bool {
 	if !isSplitSafeDynamicWord(a) {
 		return false
 	}
+	// R15-Oracle-M1: a brace-expansion word (the glob placeholder plus
+	// surviving '{' list text, e.g. `{docs/a,-blue}`) encodes SEVERAL
+	// expansion results in one string — the leading '{' byte is NOT a
+	// path property of any result and a '/' carried by ONE branch
+	// (docs/a) says nothing about the sibling branches (-blue, which
+	// expands to an OPTION spelling). Neither the per-result option
+	// review nor the per-result data review can be discharged from this
+	// merged encoding, so brace words can never be proven safe data
+	// operands here (ordinary pathname globs like docs/*.txt carry no
+	// '{' byte and are unaffected).
+	if strings.Contains(a, cmdSubPlaceholderGlob) && strings.Contains(a, "{") {
+		return false
+	}
 	if strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+") {
 		return false
 	}
@@ -3948,8 +3961,9 @@ func isSingleWordOptionValue(val string) bool {
 	}
 	if strings.HasPrefix(val, "~") &&
 		!strings.Contains(val, cmdSubPlaceholder) &&
-		!strings.ContainsAny(val, "*?[{\"") &&
-		strings.Count(val, cmdSubPlaceholderGlob) == 1 {
+		!strings.ContainsAny(val, "*?[") &&
+		strings.Count(val, cmdSubPlaceholderGlob) == 1 &&
+		!strings.Contains(strings.SplitN(val, cmdSubPlaceholderGlob, 2)[0], "{") {
 		return true
 	}
 	return false
@@ -10280,7 +10294,7 @@ func awkDataAssignOptStep(args []string, i int) (hit string) {
 // verdict or the argv-programmed positional-program verdict; setPos
 // reports the word must be recorded as the positional candidate when
 // none is set yet (input data after a program source).
-func awkDynWordStep(a string, sawFile, endOpts bool, positional string, nFrags int) (hit string, setPos bool) {
+func awkDynWordStep(a string, sawFile, endOpts bool, hasPos bool, nFrags int) (hit string, setPos bool) {
 	if !endOpts && (strings.HasPrefix(a, "-") || !isSafeDynamicDataOperand(a)) {
 		// Dynamic words BEFORE the option terminator: awk's own parser
 		// (mawk/nawk positional scan, gawk getopt_long permutation) can
@@ -10289,7 +10303,12 @@ func awkDynWordStep(a string, sawFile, endOpts bool, positional string, nFrags i
 		// R7-MF-1 `awk -f /dev/null "$X"` / `gawk '1' "$X"` regression).
 		return "dynamic code payload", false
 	}
-	if !sawFile && positional == "" && nFrags == 0 {
+	// R15-Oracle-S2: hasPos distinguishes "an EMPTY positional program
+	// was explicitly provided" (hasPos=true, positional=="") from "no
+	// positional program yet" — the former already supplies awk's program
+	// text (an inert empty one), so a following dynamic word is INPUT
+	// data, not argv-programmed code.
+	if !sawFile && !hasPos && nFrags == 0 {
 		// The first positional is awk's PROGRAM text — including the
 		// word right after `--` (`awk -- "$VAR"` is argv-programmed
 		// awk code, not inert data — v6.2.2 Oracle R6 R6-SF-1). The
@@ -10300,24 +10319,30 @@ func awkDynWordStep(a string, sawFile, endOpts bool, positional string, nFrags i
 		// positives).
 		return "dynamic code payload", false
 	}
-	return "", positional == ""
+	return "", !hasPos
 }
 
 func awkProgramFrags(args []string) (string, bool, string) {
 	var frags []string
 	var aux []string
 	var positional string
+	// R15-Oracle-S2: hasPos records that a positional program word was
+	// PROVIDED — even an explicitly empty one (`awk -- "" data`) — so it
+	// is never confused with the not-yet-provided state the empty string
+	// also encoded before.
+	hasPos := false
 	sawFile := false
 	endOpts := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if isDynamicArg(a) {
-			dHit, dSetPos := awkDynWordStep(a, sawFile, endOpts, positional, len(frags))
+			dHit, dSetPos := awkDynWordStep(a, sawFile, endOpts, hasPos, len(frags))
 			if dHit != "" {
 				return "", sawFile, dHit
 			}
 			if dSetPos {
 				positional = a
+				hasPos = true
 			}
 			continue
 		}
@@ -10394,17 +10419,21 @@ func awkProgramFrags(args []string) (string, bool, string) {
 			sawFile = sawFile || cSawFile
 			i += consumedNext
 		default:
-			if positional == "" && len(frags) == 0 {
+			if !hasPos && len(frags) == 0 {
 				positional = a
+				hasPos = true
 			}
 		}
 	}
-	if len(frags) == 0 && !sawFile && positional != "" && !isDynamicArg(positional) {
+	if len(frags) == 0 && !sawFile && hasPos && !isDynamicArg(positional) {
 		// The first positional is awk's program text ONLY when no explicit
 		// -f program file supplied it — folding input filenames into the
 		// program here masked a REAL later -e fragment behind `!sawFile`
 		// downstream (v6.2.2 R3 R3-MF-6 `gawk -f /dev/null /dev/null -e
-		// '{}'`).
+		// '{}'`). An explicitly EMPTY positional program joins as the empty
+		// fragment (a no-op in the joined program) and — crucially — the
+		// hasPos settlement above already kept post-terminator data words
+		// out of the program slot (R15-Oracle-S2).
 		frags = append(frags, positional)
 	}
 	// v6.2.2 Oracle R8 R8-MF-1: the -Wi/-W in collision operand (out-of-band
