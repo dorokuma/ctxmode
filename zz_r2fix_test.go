@@ -2733,15 +2733,25 @@ func TestGuard_V622_ReviewerR4Probes(t *testing.T) {
 		{"P-R4-MF3-g printf %n dynamic target", `bash -c 'printf "%n" "$X"'`, "env dynamic printf"},
 		{"P-R4-MF3-h printf %n array subscript hook", `bash -c 'printf "%n" '\''TAR_OPTIONS[0]'\'''`, "env TAR_OPTIONS"},
 		{"P-R4-MF3-i printf %n dynamic subscript", `bash -c 'printf "%n" "x[$(echo 0)]"'`, "env dynamic printf"},
-		{"P-R4-MF3-j printf %n positional slot", `bash -c 'printf "%2$s%n" x TAR_OPTIONS'`, "env dynamic printf"},
+		// R13-SF-4: inside bash double quotes '$' starts a parameter expansion,
+		// so the positional designator must be backslash-escaped to reach
+		// printf as literal '%2$s%n' (unescaped '$s' expanded empty and the
+		// probe tested the wrong string).
+		{"P-R4-MF3-j printf %n positional slot", `bash -c 'printf "%2\$s%n" x TAR_OPTIONS'`, "env dynamic printf"},
 		// R14 closure: bash printf honours length modifiers on '%n', the
 		// '%*2$n' star-positional width is unvettable, and a glob-expanded
 		// filename can legitimately spell '%n' (`lit%n`) so a glob-only
 		// format word WITH arguments is no longer trusted.
 		{"P-R14-1 printf glob-only fmt with args", `printf lit* TAR_OPTIONS`, "env dynamic printf"},
+		// R13-MF-1: even with NO trailing argument an unquoted glob format
+		// word can expand to MULTIPLE words at runtime — match[0] becomes the
+		// real format string and match[1] the first argument, so `lit%n`
+		// content would write into whatever match[1] names. Only a split-safe
+		// (quoted) zero-argument spelling stays safe.
+		{"P-R13-MF1 printf glob fmt no args", `printf lit*`, "env dynamic printf"},
 		{"P-R14-2 printf %ln length modifier", `bash -c 'printf "%ln" TAR_OPTIONS'`, "env TAR_OPTIONS"},
 		{"P-R14-3 printf %hhn length modifier", `bash -c 'printf "%hhn" TAR_OPTIONS'`, "env TAR_OPTIONS"},
-		{"P-R14-4 printf star-positional %n", `bash -c 'printf "%*2$n" 1 TAR_OPTIONS'`, "env dynamic printf"},
+		{"P-R14-4 printf star-positional %n", `bash -c 'printf "%*2\$n" 1 TAR_OPTIONS'`, "env dynamic printf"},
 		// R14 closure: read's separate value operand word-splits at runtime
 		// when unquoted (`read -p $X` with X="p cmd"), shifting the positional
 		// layout. The argv layer already refused this shape at 9139e0e
@@ -2769,6 +2779,11 @@ func TestGuard_V622_ReviewerR4Probes(t *testing.T) {
 		// R4-SF-1: a dynamic placeholder inside read's option-letter zone is
 		// unvettable, including a glued -p tail that word-splits at runtime.
 		{"P-R4-SF1-a read glued -p unquoted dyn", `bash -c 'read -p$P x <<< y'`, "env dynamic read"},
+		// R13-MF-4: a glued dynamic prompt tail that can expand EMPTY at
+		// runtime (`read -p"$PROMPT"` with PROMPT='') turns into `read -p`
+		// which consumes the NEXT argv word as the prompt — the positional
+		// write-target layout diverges from the static scan.
+		{"P-R13-MF4 read glued empty-able dq prompt", `bash -c 'read -p"$PROMPT" answer <<< y'`, "env dynamic read"},
 		// R4-SF-2: a dynamic getopts first operand may expand to exactly "--",
 		// shifting NAME out of its static slot.
 		{"P-R4-SF2-a getopts dyn terminator hook", `set -a; H="--"; getopts "$H" opt TAR_OPTIONS`, "env TAR_OPTIONS"},
@@ -2802,13 +2817,12 @@ func TestGuard_V622_ReviewerR4Probes(t *testing.T) {
 		// zero-argument spelling — with no arguments nothing can be written
 		// regardless of what the expansion spells; ANY trailing argument
 		// makes the dynamically shaped format unvettable (blocked above).
-		{"R4-pos printf glob literal prefix no args", `printf lit*`},
+		{"R4-pos printf glob literal prefix quoted no args", `printf 'lit*'`},
 		{"R14-pos printf strftime width conv", `bash -c 'printf "%10(%Y)T\n" -1'`},
 		{"R4-pos printf quoted star format", `printf '*' '%s' x`},
 		{"R4-pos tar occurrence value benign", `tar --occurrence 2 -tf /dev/null`},
 		{"R4-pos tar occurrence glued benign", `tar --occurrence=2 -tf /dev/null`},
 		{"R4-pos read -p glued dq prompt", `bash -c 'read -p"Prompt: $PROMPT" line <<< y'`},
-		{"R4-pos read -p dq prompt whole word", `bash -c 'read -p"$PROMPT" answer <<< y'`},
 		{"R4-pos read -ei separate value", `bash -c 'read -ei "$DEFAULT" answer <<< y'`},
 		{"R4-pos getopts colon dyn optstring", `getopts ":$OPTS" opt TAR_OPTIONS`},
 		{"R4-pos getopts colon dyn optstring arg", `getopts ":$OPTS" opt "$arg"`},
@@ -2854,4 +2868,142 @@ func TestGuard_V622_ReviewerR4Probes(t *testing.T) {
 			t.Fatal("preScanVarMutations(read -p \"$PROMPT\" x): allTainted = true, want false (quoted value stays one argv word)")
 		}
 	})
+}
+
+// TestGuard_V622_OracleR13Probes pins the Oracle R13 audit closure:
+// printf zero-argument dynamic/glob format write slots (R13-MF-1), the
+// '%q' conversion letter mis-parsed as a length modifier (R13-MF-2),
+// read's static-cluster end-letter misjudgment `-eii` (R13-MF-3), a glued
+// dynamic read prompt tail that can expand empty and swallow the next
+// argv word (R13-MF-4), the printf/read/getopts AST pre-scan alignment
+// (R13-SF-1), dynWordCanSpellDashDash exactness and the '$$' PID
+// recognition (R13-SF-2) and external-path /usr/bin/printf exemption
+// (R13-SF-3). Pure-function pins reference only existing production
+// symbols plus parse helpers, so the file can be copied onto the pre-fix
+// tree 056cb3e5 to reproduce FAIL directly.
+func TestGuard_V622_OracleR13Probes(t *testing.T) {
+	// ---- Pure-function pins (R13-SF-4) ----
+	t.Run("R13-MF1 printfFmtWriteSlots zero-arg glob fmt is dyn", func(t *testing.T) {
+		if _, dyn := printfFmtWriteSlots("sample*"+cmdSubPlaceholderGlob, nil); !dyn {
+			t.Fatal("printfFmtWriteSlots(glob-only fmt, no args): dyn = false, want true (glob expands to many words — match[0] becomes the format, match[1] a '%n' write target)")
+		}
+	})
+	t.Run("R13-MF1-pos printfFmtWriteSlots zero-arg split-safe fmt stays safe", func(t *testing.T) {
+		if _, dyn := printfFmtWriteSlots("sample"+cmdSubPlaceholderQuoted, nil); dyn {
+			t.Fatal("printfFmtWriteSlots(quoted dyn fmt, no args): dyn = true, want false (no arguments — nothing can be written)")
+		}
+	})
+	t.Run("R13-MF2 printfFmtSlots %q%n is conv+write pair", func(t *testing.T) {
+		slots, pos := printfFmtSlots("%q%n")
+		if pos || len(slots) != 2 || slots[0] || !slots[1] {
+			t.Fatalf("printfFmtSlots(%%q%%n) = %v positional=%v, want [false true] positional=false ('q' is a conversion letter, not a length modifier)", slots, pos)
+		}
+	})
+	t.Run("R13-MF2-pos printfFmtSlots %qn is single non-write slot", func(t *testing.T) {
+		slots, pos := printfFmtSlots("%qn")
+		if pos || len(slots) != 1 || slots[0] {
+			t.Fatalf("printfFmtSlots(%%qn) = %v positional=%v, want [false] positional=false (the trailing 'n' is literal text after the %%q conversion)", slots, pos)
+		}
+	})
+	t.Run("R13-MF3 preScanVarMutations read -eii counts sample", func(t *testing.T) {
+		p := syntax.NewParser()
+		f, err := p.Parse(strings.NewReader(`read -eii sample <<< ok`), "")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		writes, tainted := preScanVarMutations(f)
+		if tainted {
+			t.Fatal("preScanVarMutations(read -eii sample): allTainted = true, want false")
+		}
+		if writes["sample"] != 1 {
+			t.Fatalf("preScanVarMutations(read -eii sample): writes[sample] = %d, want 1 (the glued -i VALUE ends the cluster — trailing 'i' text never consumes the next word)", writes["sample"])
+		}
+	})
+	t.Run("R13-MF4 readDynClusterHit empty-able glued prompt tail blocks", func(t *testing.T) {
+		if hit := readDynClusterHit("-p" + cmdSubPlaceholderQuoted); hit == "" {
+			t.Fatal("readDynClusterHit(-p\"$PROMPT\") = \"\", want non-empty (an empty PROMPT collapses the glued tail so -p swallows the next argv word)")
+		}
+	})
+	t.Run("R13-MF4-pos readDynClusterHit static-prefix prompt tail allows", func(t *testing.T) {
+		if hit := readDynClusterHit("-pPrompt: " + cmdSubPlaceholderQuoted); hit != "" {
+			t.Fatalf("readDynClusterHit(-p\"Prompt: $PROMPT\") = %q, want empty (static non-empty prefix keeps the glued tail non-empty at runtime)", hit)
+		}
+	})
+	t.Run("R13-SF2 dynWordCanSpellDashDash precision", func(t *testing.T) {
+		if dynWordCanSpellDashDash("---" + cmdSubPlaceholderQuoted) {
+			t.Fatal("dynWordCanSpellDashDash(---$X) = true, want false (three static dashes can never shrink to exactly '--')")
+		}
+		if dynWordCanSpellDashDash(cmdSubPlaceholderAbsDq) {
+			t.Fatal("dynWordCanSpellDashDash(abs-dq) = true, want false (absolute-path expansions always start with '/')")
+		}
+		if dynWordCanSpellDashDash("0" + cmdSubPlaceholderQuoted) {
+			t.Fatal("dynWordCanSpellDashDash(PID encoding) = true, want false ('$$' is decimal digits, never '--')")
+		}
+		if !dynWordCanSpellDashDash("--" + cmdSubPlaceholderQuoted) {
+			t.Fatal("dynWordCanSpellDashDash(--$X) = false, want true (an empty expansion spells exactly '--')")
+		}
+	})
+
+	// ---- End-to-end guard verdicts ----
+	blockCases := []struct {
+		name, cmd, want string
+	}{
+		// R13-MF-2 argv layer: '%q' was skipped as a length modifier, so
+		// printf "%q%n" hid its write conversion and printf "%qn" invented
+		// a false '%n' write.
+		{"P-R13-MF2-a printf %q%n write", `bash -c 'printf "%q%n" x TAR_OPTIONS'`, "env TAR_OPTIONS"},
+		// R13-MF-3: `read -eii sample` — the trailing 'i' is the glued -i
+		// initial value text, so `sample` remains the write target; the
+		// pre-scan must count it so a double write into `sample` blocks the
+		// static bind.
+		{"P-R13-MF3 read -eii sample rewrite", `bash -c 'sample=/bin/true; read -eii sample <<< pig; "$sample"'`, ""},
+		// R13-MF-4 shell layer: an empty-expanding glued prompt swallows the
+		// positional layout inside a bash -c script.
+		{"P-R13-MF4-shell read empty-able prompt in script", `bash -c 'cmd=/bin/true; read -p"$PROMPT" answer <<< ok; "$cmd"'`, ""},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+
+	// 放行守卫正例(R13 零假阳纪律):'%q' 引号转换、分离写法 read 提示符、
+	// 静态非空前缀粘连提示符、printf/read/getopts 带安全动态参数的组合脚
+	// 本、'$$' PID OPTSTRING 与显式路径 /usr/bin/printf 全部保持 ALLOW。
+	allowCases := []struct {
+		name, cmd string
+	}{
+		{"R13-pos printf %qn conversion benign", `bash -c 'printf "%qn" "$X"'`},
+		{"R13-pos read -p separate dq prompt", `bash -c 'read -p "$PROMPT" answer <<< y'`},
+		{"R13-pos read -p glued static-prefix prompt", `bash -c 'read -p"Prompt: $PROMPT" line <<< y'`},
+		// R13-SF-1: combination scripts with dynamic but safe printf/read/
+		// getopts arguments must not all-taint the pre-scan — `cmd` keeps
+		// its static bind and the script stays ALLOW.
+		{"R13-SF1 printf dyn args in script", `bash -c 'cmd=/bin/true; printf "%s" "$DATA"; "$cmd"'`},
+		{"R13-SF1 read static-prefix prompt in script", `bash -c 'cmd=/bin/true; read -p"Prompt: $PROMPT" answer <<< ok; "$cmd"'`},
+		{"R13-SF1 getopts colon dyn optstring in script", `bash -c 'cmd=/bin/true; getopts ":$OPTS" opt; "$cmd"'`},
+		// R13-SF-2: '$$' expands to decimal PID digits — it can never spell
+		// the "--" terminator, so the standby NAME slot is not vetted.
+		{"R13-SF2 getopts PID optstring", `bash -c 'getopts "$$" opt "$arg"'`},
+		// R13-SF-3: an explicit-path printf invokes /usr/bin/printf — a
+		// child process can never write shell variables, so neither the
+		// dynamic format text nor '%n'-looking content is vetted as a
+		// shell write.
+		{"R13-SF3 usr bin printf dyn format", `/usr/bin/printf "label=$LABEL %s" value`},
+		{"R13-SF3 usr bin printf static format", `/usr/bin/printf 'label=%s' value`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
 }

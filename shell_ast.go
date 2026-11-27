@@ -987,19 +987,44 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 				// getopts OPTSTRING NAME [args...]: the first operand is the
 				// optstring (may begin with ':' or '-'), the second is the
 				// target variable name.
+				// R13-SF-1: aligned with the argv-layer screenGetoptsEnvWrite —
+				// a DYNAMIC first operand keeps its static layout whenever it
+				// cannot word-split its slot open (envDynSlotHit) and can never
+				// expand to exactly "--" (dynWordCanSpellDashDash — including
+				// the '$$' PID digits encoding, R13-SF-2), so `getopts ":$OPTS"
+				// opt` no longer blinds the whole-script write scan. Only the
+				// dash-shaped runtime-terminator spelling vets the standby NAME
+				// slot at args[3] as a write target.
 				opIdx := 0
 				if len(args) > 1 {
-					s, ok := wordToArg(args[1])
-					if !ok || isDynamicArg(s) {
+					s1, ok1 := wordToArg(args[1])
+					if !ok1 && s1 == "" {
 						allTainted = true
 						return false
 					}
-					if s == "--" {
+					if envDynSlotHit(s1, "getopts") != "" {
+						allTainted = true
+						return false
+					}
+					if s1 == "--" {
 						if len(args) > 2 {
 							opIdx = 2
 						}
 					} else {
 						opIdx = 1
+						if isDynamicArg(s1) && len(args) > 3 && dynWordCanSpellDashDash(s1) {
+							s3, ok3 := wordToArg(args[3])
+							if !ok3 || isDynamicArg(s3) {
+								allTainted = true
+								return false
+							}
+							if bn, bok := writeTargetBase(s3); bok {
+								inc(bn)
+							} else {
+								allTainted = true
+								return false
+							}
+						}
 					}
 				}
 				if opIdx > 0 && opIdx+1 < len(args) {
@@ -1023,29 +1048,21 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 				for j < len(args) {
 					s, ok := wordToArg(args[j])
 					if !ok || isDynamicArg(s) {
-						// R4-SF-1: a dynamic word whose STATIC letter prefix already
-						// ended at a value letter carries a glued prompt/initial
-						// value (`read -p"$PROMPT" x`) — no variable is written by
-						// the option word itself and the letters cannot change.
-						if ok && !sawDashDash && strings.HasPrefix(s, "-") && len(s) > 1 && isSingleWordSplitSafe(s) {
-							valueTail := false
-							for k := 1; k < len(s); k++ {
-								c := s[k]
-								if c == '_' {
-									break
-								}
-								if strings.IndexByte("dnNptui", c) >= 0 {
-									valueTail = true
-									break
-								}
-								if c == 'a' {
-									break // glued -a ARRAY is a write target: unvettable
-								}
-							}
-							if valueTail {
-								j++
-								continue
-							}
+						// R13-SF-1/R13-MF-4: delegate to the SAME readDynClusterHit
+						// the argv layer uses — a dynamic word whose static letters
+						// end at a value letter carries a glued prompt/initial value
+						// (`read -p"Prompt: $PROMPT" x`) and writes nothing itself,
+						// but only while the glued tail is provably non-empty so an
+						// empty expansion cannot swallow the next argv word. (The
+						// old inline walk was dead code: context-free wordToArg
+						// always reports ok=false for dynamic words.)
+						if !ok && s == "" {
+							allTainted = true
+							return false
+						}
+						if !sawDashDash && strings.HasPrefix(s, "-") && len(s) > 1 && readDynClusterHit(s) == "" {
+							j++
+							continue
 						}
 						allTainted = true
 						return false
@@ -1056,7 +1073,15 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 						continue
 					}
 					if !sawDashDash && strings.HasPrefix(s, "-") && len(s) > 1 {
-						endLetter := byte(0)
+						// R13-MF-3: a value-carrying letter consumes the NEXT argv
+						// word only when it sits at the END of its cluster — the
+						// decision is positional (k == len(s)-1 at the hit), never
+						// a comparison of the cluster's last byte against the value
+						// letter itself. `read -eii sample` glues the -i initial
+						// value text 'i' AFTER the option letter, so the cluster's
+						// trailing byte matching 'i' by coincidence must not make
+						// the scan swallow `sample` as a consumed value operand.
+						consumesNext := false
 						for k := 1; k < len(s); k++ {
 							switch s[k] {
 							case 'r', 's', 'e':
@@ -1083,10 +1108,9 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 										return false
 									}
 								}
-								endLetter = 'a'
 								k = len(s)
 							case 'd', 'n', 'N', 'p', 't', 'u', 'i':
-								endLetter = s[k]
+								consumesNext = k == len(s)-1
 								k = len(s)
 							default:
 								// Unknown option letter: be conservative.
@@ -1094,8 +1118,7 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 								return false
 							}
 						}
-						if endLetter != 0 && len(s) > 1 && s[len(s)-1] == endLetter &&
-							strings.IndexByte("dnNptui", endLetter) >= 0 && j+1 < len(args) {
+						if consumesNext && j+1 < len(args) {
 							// R14 closure: the consumed value operand is vetted BEFORE
 							// it is skipped — an unquoted expansion (`read -p $X` with
 							// X="p cmd") word-splits at runtime, shifting the positional
@@ -1152,19 +1175,22 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 				// (R4-MF-3). The option zone, glob gate and format-reuse cycle are
 				// the shared printfOptionScan used by screenPrintfEnvWrite; a
 				// dynamic/unvettable shape taints everything.
+				// R13-SF-1: wordToArg emits (encoded, false) for DYNAMIC words —
+				// the encoding still carries the exact option/format letters, so
+				// the word is COLLECTED whenever it has any content and
+				// printfOptionScan decides vettable-vs-dynamic itself. Only a
+				// conversion failure (empty encoding, never produced for real
+				// dynamic words) taints everything. A data-only dynamic
+				// argument like `printf '%s' "$DATA"` no longer blinds the
+				// whole-script write scan.
 				words := make([]string, 0, len(args)-1)
-				wordsOK := true
 				for _, w := range args[1:] {
 					s, ok := wordToArg(w)
-					if !ok {
-						wordsOK = false
-						break
+					if !ok && s == "" {
+						allTainted = true
+						return false
 					}
 					words = append(words, s)
-				}
-				if !wordsOK {
-					allTainted = true
-					return false
 				}
 				hits, _, pdyn := printfOptionScan(words)
 				if pdyn {
@@ -3099,6 +3125,10 @@ func wordToArg(w *syntax.Word) (string, bool) {
 					static = false
 					if paramExpSplitsInDblQuotes(ipp) {
 						b.WriteString(cmdSubPlaceholder)
+					} else if ipp.Param != nil && ipp.Param.Value == "$" && ipp.Exp == nil {
+						// R13-SF-2: decimal PID — the digit prefix keeps
+						// dynWordCanSpellDashDash from a vacuous all-dash match.
+						b.WriteString("0" + cmdSubPlaceholderQuoted)
 					} else {
 						b.WriteString(cmdSubPlaceholderQuoted)
 					}
@@ -3109,9 +3139,13 @@ func wordToArg(w *syntax.Word) (string, bool) {
 			}
 		case *syntax.ParamExp:
 			// Context-free: only $$ (a decimal PID) is known split-safe.
+			// R13-SF-2: the encoding carries a leading digit — a PID can never
+			// expand to "--" (or any dash spelling) and never starts with '-',
+			// so dynWordCanSpellDashDash must not vacuously strip the whole
+			// word. The digit prefix is a marker, not a value claim.
 			static = false
 			if p.Param != nil && p.Param.Value == "$" && p.Exp == nil {
-				b.WriteString(cmdSubPlaceholderQuoted)
+				b.WriteString("0" + cmdSubPlaceholderQuoted)
 			} else {
 				b.WriteString(cmdSubPlaceholder)
 			}
@@ -3297,7 +3331,10 @@ func (c *subCollector) unquotedParamPlaceholder(pe *syntax.ParamExp) string {
 		}
 		return cmdSubPlaceholder
 	case "$":
-		return cmdSubPlaceholderQuoted // PID: digits, no field-split
+		// R13-SF-2: digit-prefixed encoding — a decimal PID can never spell
+		// "--" nor start with '-', so dynWordCanSpellDashDash must not
+		// strip the word to a vacuous all-dash match.
+		return "0" + cmdSubPlaceholderQuoted
 	}
 	return cmdSubPlaceholder
 }
@@ -3331,7 +3368,9 @@ func (c *subCollector) dqParamPlaceholder(pe *syntax.ParamExp) (string, bool) {
 			return cmdSubPlaceholderAbsDq, false // guaranteed to start with /
 		}
 	case "$":
-		return cmdSubPlaceholderQuoted, false
+		// R13-SF-2: digit-prefixed encoding — a decimal PID can never spell
+		// "--" nor start with '-' (see unquotedParamPlaceholder).
+		return "0" + cmdSubPlaceholderQuoted, false
 	}
 	return cmdSubPlaceholderQuoted, false
 }

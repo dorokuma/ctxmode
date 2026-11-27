@@ -4566,8 +4566,14 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		}
 	}
 	if kind == 's' {
-		if hit := screenEnvWriteTargets(head, base); hit != "" {
-			return hit
+		// R13-SF-3: only the shell BUILTIN printf writes shell variables —
+		// an explicit-path spelling (/usr/bin/printf, ./printf, ...) execs
+		// the external binary in a child process that can never mutate the
+		// parent's environment, so the write-target scan does not apply.
+		if !(base == "printf" && strings.Contains(typedHead[0], "/")) {
+			if hit := screenEnvWriteTargets(head, base); hit != "" {
+				return hit
+			}
 		}
 	}
 	if text, has := unwrapShellArgv(head); has {
@@ -8370,10 +8376,23 @@ func envWriteTainted(name, base string) string {
 // bytes (or nothing — an empty expansion still lands as one operand, never
 // shifting into head[3]'s slot in a way the static layout misses). Any
 // surviving ':'/letter/digit makes "--" unreachable at runtime (R4-SF-2).
+// R13-SF-2 exactness: an absolute-path placeholder ($PWD/$(pwd)/$(mktemp
+// -d)) or the PATH self-sentinel ALWAYS yields '/'-leading or colon-joined
+// path text — never a bare "--". And since expansion can only GROW or
+// shrink the dynamic part, a static remainder of three or more dashes
+// (`---$X`) can never shrink back to exactly two, so len(rest) must stay
+// within the two-byte terminator. A bare dynamic word (no static bytes)
+// still qualifies: X="--" is a legal runtime expansion.
 func dynWordCanSpellDashDash(a string) bool {
+	if strings.Contains(a, cmdSubPlaceholderAbsDq) || strings.Contains(a, envPathSelfPlaceholder) {
+		return false
+	}
 	rest := a
 	for _, ph := range []string{cmdSubPlaceholderAbsDq, cmdSubPlaceholderQuoted, cmdSubPlaceholderGlob, cmdSubPlaceholder} {
 		rest = strings.ReplaceAll(rest, ph, "")
+	}
+	if len(rest) > 2 {
+		return false
 	}
 	for i := 0; i < len(rest); i++ {
 		if rest[i] != '-' {
@@ -8453,7 +8472,14 @@ func readDynClusterHit(a string) string {
 			break // every placeholder spelling starts with '_'
 		}
 		if strings.IndexByte("dnNptui", c) >= 0 {
-			if isSingleWordSplitSafe(a) {
+			// R13-MF-4: split-safety alone is not enough — the glued value
+			// tail must be PROVABLY NON-EMPTY at runtime. `read -p"$PROMPT"`
+			// with PROMPT='' collapses to `read -p`, and bash then consumes
+			// the NEXT argv word as the prompt text, silently shifting the
+			// positional write-target layout the scan validated. A tail with
+			// at least one static literal byte (`-p"Prompt: $P"`) or a
+			// guaranteed non-empty placeholder class can never collapse.
+			if isSingleWordSplitSafe(a) && dynGluedTailNonEmpty(a[k+1:]) {
 				return "" // glued dynamic value tail: data, not letters
 			}
 			return "env dynamic read"
@@ -8471,6 +8497,25 @@ func readDynClusterHit(a string) string {
 		}
 	}
 	return "env dynamic read"
+}
+
+// dynGluedTailNonEmpty reports whether a glued read-option value tail is
+// PROVABLY non-empty at runtime (R13-MF-4): after stripping every
+// placeholder spelling at least one static literal byte must survive, or
+// the tail must carry the absolute-path placeholder class (an expansion
+// guaranteed to start with '/'). Ordinary quoted placeholders
+// (cmdSubPlaceholderQuoted — including the '$$' PID digits, which are
+// never empty), unquoted splittable expansions and globs can all collapse
+// to the empty string, so a tail built from nothing else is unvettable.
+func dynGluedTailNonEmpty(tail string) bool {
+	if strings.Contains(tail, cmdSubPlaceholderAbsDq) {
+		return true
+	}
+	rest := tail
+	for _, ph := range []string{cmdSubPlaceholder, cmdSubPlaceholderQuoted, cmdSubPlaceholderGlob, cmdSubPlaceholderAbsDq, envPathSelfPlaceholder} {
+		rest = strings.ReplaceAll(rest, ph, "")
+	}
+	return rest != ""
 }
 
 // screenReadEnvWrite scans bash's `read` builtin: option letters are
@@ -8568,13 +8613,15 @@ func screenGetoptsEnvWrite(head []string) string {
 // attribution). ok=false means the conversion is malformed — bash errors
 // out before writing anything.
 //
-// R14 closure: bash printf HONOURS the length modifiers hh/h/l/ll/j/z/t/L/q
+// R14 closure: bash printf HONOURS the length modifiers hh/h/l/ll/j/z/t/L
 // on EVERY conversion including 'n' (`printf "%ln" TAR_OPTIONS` writes 3
 // into TAR_OPTIONS outright), so the modifiers are skipped BEFORE the
 // conversion letter is judged. `%(...)T` (strftime) consumes one argument
 // even with flags/width/precision in front (`%10(%Y)T`), and a digits+'$'
 // sequence directly AFTER a '*' or '.*' (`%*2$n`) is a positional width
-// designator — unvettable slot attribution, fail closed.
+// designator — unvettable slot attribution, fail closed. 'q' is
+// deliberately absent from the length modifiers: bash printf '%q' is the
+// shell-quoting CONVERSION specifier, not a length modifier (R13-MF-2).
 func printfFmtConv(fmtStr string, i int) (preArgs int, isN bool, next int, positional bool, ok bool) {
 	// Positional 'm$' designator: unvettable slot attribution.
 	if printfStarPositional(fmtStr, i) {
@@ -8597,7 +8644,7 @@ func printfFmtConv(fmtStr string, i int) (preArgs int, isN bool, next int, posit
 		preArgs += prec
 		i = pnext
 	}
-	// Optional length modifier: hh/ll or single h/l/j/z/t/L/q. Bash applies
+	// Optional length modifier: hh/ll or single h/l/j/z/t/L. Bash applies
 	// them to every conversion INCLUDING 'n', so skipping them is what makes
 	// `%ln`/`%hhn`/`%lln` visible as write conversions at all.
 	if i < len(fmtStr) {
@@ -8607,7 +8654,12 @@ func printfFmtConv(fmtStr string, i int) (preArgs int, isN bool, next int, posit
 			if i < len(fmtStr) && fmtStr[i] == fmtStr[i-1] {
 				i++ // doubled hh / ll
 			}
-		case 'j', 'z', 't', 'L', 'q':
+		// R13-MF-2: bash printf's length modifiers are h/hh/l/ll/j/z/t/L only
+		// (LENMODS = "hjlLtz") — 'q' is NOT among them. '%q'/'%Q' are
+		// CONVERSION specifiers emitting shell-quoted text, so `%q%n` is a
+		// quoting conversion followed by a '%n' write conversion and `%qn`
+		// is a quoting conversion followed by a literal 'n'.
+		case 'j', 'z', 't', 'L':
 			i++
 		}
 	}
@@ -8735,7 +8787,19 @@ func printfOptionScan(words []string) (hits []printfWriteHit, fmtIdx int, dyn bo
 // with no arguments nothing can be written regardless of the format text.
 func printfFmtWriteSlots(fmtStr string, fmtArgs []string) (hits []printfWriteHit, dyn bool) {
 	if len(fmtArgs) == 0 {
-		return nil, false // no arguments: nothing can be written
+		// R13-MF-1: zero argv arguments only means "nothing can be written"
+		// when the format word itself is guaranteed to arrive as ONE runtime
+		// argv word. An unquoted glob (`printf lit*` expanding to
+		// `lit%n litTARGET`) or a word-splitting unquoted expansion can
+		// produce MULTIPLE argv words at runtime — match[0]/word[0] becomes
+		// the real format string (whose '%n' conversions bash then honours)
+		// and match[1]/word[1] the first write-target argument. Only a
+		// split-safe, glob-free spelling (e.g. `printf x"$FMT"`) stays
+		// exactly one word, so with no arguments nothing is ever written.
+		if isDynamicArg(fmtStr) && !isSingleWordSplitSafe(fmtStr) {
+			return nil, true
+		}
+		return nil, false
 	}
 	if isDynamicArg(fmtStr) {
 		return nil, true
