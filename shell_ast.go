@@ -1096,6 +1096,25 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 						}
 						if endLetter != 0 && len(s) > 1 && s[len(s)-1] == endLetter &&
 							strings.IndexByte("dnNptui", endLetter) >= 0 && j+1 < len(args) {
+							// R14 closure: the consumed value operand is vetted BEFORE
+							// it is skipped — an unquoted expansion (`read -p $X` with
+							// X="p cmd") word-splits at runtime, shifting the positional
+							// layout so the REAL write-target variable lands one slot
+							// later than the static scan assumed. A QUOTED expansion
+							// (`read -p "$PROMPT" x`) stays exactly one argv word at
+							// runtime (bash consumes it even when empty — measured),
+							// so the downstream positional layout can never shift and
+							// the slot is skipped like static text. wordToArg grades
+							// every dynamic word with ok=false plus a placeholder
+							// encoding, so the ok flag cannot separate quoted from
+							// unquoted here — isDynamicArg && !isSingleWordSplitSafe
+							// is the discriminating condition, matching the argv
+							// layer's envDynSlotHit exactly.
+							vn, _ := wordToArg(args[j+1])
+							if isDynamicArg(vn) && !isSingleWordSplitSafe(vn) {
+								allTainted = true
+								return false
+							}
 							j++ // value operand consumed
 						}
 						j++

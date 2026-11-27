@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"mvdan.cc/sh/v3/syntax"
 )
 
 // ---------------------------------------------------------------------------
@@ -2732,6 +2734,21 @@ func TestGuard_V622_ReviewerR4Probes(t *testing.T) {
 		{"P-R4-MF3-h printf %n array subscript hook", `bash -c 'printf "%n" '\''TAR_OPTIONS[0]'\'''`, "env TAR_OPTIONS"},
 		{"P-R4-MF3-i printf %n dynamic subscript", `bash -c 'printf "%n" "x[$(echo 0)]"'`, "env dynamic printf"},
 		{"P-R4-MF3-j printf %n positional slot", `bash -c 'printf "%2$s%n" x TAR_OPTIONS'`, "env dynamic printf"},
+		// R14 closure: bash printf honours length modifiers on '%n', the
+		// '%*2$n' star-positional width is unvettable, and a glob-expanded
+		// filename can legitimately spell '%n' (`lit%n`) so a glob-only
+		// format word WITH arguments is no longer trusted.
+		{"P-R14-1 printf glob-only fmt with args", `printf lit* TAR_OPTIONS`, "env dynamic printf"},
+		{"P-R14-2 printf %ln length modifier", `bash -c 'printf "%ln" TAR_OPTIONS'`, "env TAR_OPTIONS"},
+		{"P-R14-3 printf %hhn length modifier", `bash -c 'printf "%hhn" TAR_OPTIONS'`, "env TAR_OPTIONS"},
+		{"P-R14-4 printf star-positional %n", `bash -c 'printf "%*2$n" 1 TAR_OPTIONS'`, "env dynamic printf"},
+		// R14 closure: read's separate value operand word-splits at runtime
+		// when unquoted (`read -p $X` with X="p cmd"), shifting the positional
+		// layout. The argv layer already refused this shape at 9139e0e
+		// (readClusterStep vets the consumed operand), so the discriminating
+		// regression pin is the direct preScanVarMutations unit row below the
+		// positive table.
+		{"P-R14-5-shell read -p unquoted value blocks", `bash -c 'cmd=/bin/true; X="p cmd"; read -p $X <<< pig; "$cmd"'`, ""},
 		// R4-MF-4: write-target subscripts must validate their base name and
 		// reject arithmetic/dynamic subscripts fail-closed. NOTE: an UNQUOTED
 		// arr[0] is itself a glob character class (litHasUnquotedGlobOrTilde),
@@ -2781,7 +2798,12 @@ func TestGuard_V622_ReviewerR4Probes(t *testing.T) {
 		{"R4-pos printf %n benign var", `bash -c 'printf "%n" myvar'`},
 		{"R4-pos printf %n benign array", `bash -c 'printf "%n" '\''arr[0]'\'''`},
 		{"R4-pos printf -v benign array", `bash -c 'printf -v '\''arr[0]'\'' "%s" x'`},
-		{"R4-pos printf glob literal prefix", `printf lit* '%s' x`},
+		// R14 closure: the glob-only literal-prefix positive keeps ONLY the
+		// zero-argument spelling — with no arguments nothing can be written
+		// regardless of what the expansion spells; ANY trailing argument
+		// makes the dynamically shaped format unvettable (blocked above).
+		{"R4-pos printf glob literal prefix no args", `printf lit*`},
+		{"R14-pos printf strftime width conv", `bash -c 'printf "%10(%Y)T\n" -1'`},
 		{"R4-pos printf quoted star format", `printf '*' '%s' x`},
 		{"R4-pos tar occurrence value benign", `tar --occurrence 2 -tf /dev/null`},
 		{"R4-pos tar occurrence glued benign", `tar --occurrence=2 -tf /dev/null`},
@@ -2799,4 +2821,37 @@ func TestGuard_V622_ReviewerR4Probes(t *testing.T) {
 			}
 		})
 	}
+
+	// P-R14-5 direct unit pin: rtGuardCwd cannot discriminate this fix
+	// because screenReadEnvWrite's readClusterStep already refuses a
+	// word-splitting separate value operand at the argv layer — the
+	// preScanVarMutations taint is DEPTH defense for the shell-string
+	// static-bind analysis inside bash -c. The regression is pinned at
+	// the function itself: an unquoted expansion in read's consumed value
+	// slot (`read -p $X` — X="p cmd" word-splits at runtime, shifting the
+	// positional layout so the REAL write targets diverge from the static
+	// operand scan) must taint every static bind, while the split-safe
+	// quoted spelling keeps the scan clean.
+	t.Run("P-R14-5 preScanVarMutations read unquoted value slot", func(t *testing.T) {
+		p := syntax.NewParser()
+		f, err := p.Parse(strings.NewReader(`X="p cmd"; read -p $X <<< pig; echo ok`), "")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		_, tainted := preScanVarMutations(f)
+		if !tainted {
+			t.Fatal("preScanVarMutations(read -p $X): allTainted = false, want true (unquoted value slot word-splits at runtime)")
+		}
+	})
+	t.Run("P-R14-5-pos preScanVarMutations read quoted value slot", func(t *testing.T) {
+		p := syntax.NewParser()
+		f, err := p.Parse(strings.NewReader(`read -p "$PROMPT" x <<< pig; echo ok`), "")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		_, tainted := preScanVarMutations(f)
+		if tainted {
+			t.Fatal("preScanVarMutations(read -p \"$PROMPT\" x): allTainted = true, want false (quoted value stays one argv word)")
+		}
+	})
 }

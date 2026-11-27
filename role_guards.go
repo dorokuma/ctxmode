@@ -8461,6 +8461,14 @@ func readDynClusterHit(a string) string {
 		if c == 'a' {
 			return "env dynamic read" // dynamic array-name tail: unvettable
 		}
+		// R14 closure: only the known BOOLEAN letters may precede the dynamic
+		// part (parity with shell_ast.go's 'r', 's', 'e' case arm) — any other
+		// static byte is an unknown option letter whose runtime consumption
+		// shape is unvettable, so fail closed instead of silently stepping over
+		// it.
+		if strings.IndexByte("rse", c) < 0 {
+			return "env dynamic read"
+		}
 	}
 	return "env dynamic read"
 }
@@ -8552,47 +8560,102 @@ func screenGetoptsEnvWrite(head []string) string {
 }
 
 // printfFmtConv parses ONE printf conversion starting just after '%':
-// flags, width ('*' consumes an argument), precision ('.*' likewise) and
-// the conversion letter. It reports the number of argument slots consumed
-// AHEAD of the conversion plus whether the conversion is 'n', the index of
-// the first byte AFTER the conversion, and whether a positional 'm$'
-// designator appeared (unvettable slot attribution). ok=false means the
-// conversion is malformed — bash errors out before writing anything.
+// flags, width ('*' consumes an argument), precision ('.*' likewise), an
+// optional length modifier and the conversion letter. It reports the number
+// of argument slots consumed AHEAD of the conversion plus whether the
+// conversion is 'n', the index of the first byte AFTER the conversion, and
+// whether a positional 'm$' designator appeared (unvettable slot
+// attribution). ok=false means the conversion is malformed — bash errors
+// out before writing anything.
+//
+// R14 closure: bash printf HONOURS the length modifiers hh/h/l/ll/j/z/t/L/q
+// on EVERY conversion including 'n' (`printf "%ln" TAR_OPTIONS` writes 3
+// into TAR_OPTIONS outright), so the modifiers are skipped BEFORE the
+// conversion letter is judged. `%(...)T` (strftime) consumes one argument
+// even with flags/width/precision in front (`%10(%Y)T`), and a digits+'$'
+// sequence directly AFTER a '*' or '.*' (`%*2$n`) is a positional width
+// designator — unvettable slot attribution, fail closed.
 func printfFmtConv(fmtStr string, i int) (preArgs int, isN bool, next int, positional bool, ok bool) {
 	// Positional 'm$' designator: unvettable slot attribution.
-	dig := i
-	for dig < len(fmtStr) && fmtStr[dig] >= '0' && fmtStr[dig] <= '9' {
-		dig++
-	}
-	if dig > i && dig < len(fmtStr) && fmtStr[dig] == '$' {
+	if printfStarPositional(fmtStr, i) {
 		return 0, false, i, true, false
 	}
 	for i < len(fmtStr) && strings.IndexByte("-+' #0,", fmtStr[i]) >= 0 {
 		i++ // flag characters
 	}
-	if i < len(fmtStr) && fmtStr[i] == '*' {
-		preArgs++ // width argument
-		i++
-	} else {
-		for i < len(fmtStr) && fmtStr[i] >= '0' && fmtStr[i] <= '9' {
-			i++ // numeric width
-		}
+	width, wpos, wnext := printfFmtMeasure(fmtStr, i)
+	if wpos {
+		return 0, false, i, true, false
 	}
+	preArgs += width
+	i = wnext
 	if i < len(fmtStr) && fmtStr[i] == '.' {
-		i++
-		if i < len(fmtStr) && fmtStr[i] == '*' {
-			preArgs++ // precision argument
+		prec, ppos, pnext := printfFmtMeasure(fmtStr, i+1)
+		if ppos {
+			return 0, false, i, true, false
+		}
+		preArgs += prec
+		i = pnext
+	}
+	// Optional length modifier: hh/ll or single h/l/j/z/t/L/q. Bash applies
+	// them to every conversion INCLUDING 'n', so skipping them is what makes
+	// `%ln`/`%hhn`/`%lln` visible as write conversions at all.
+	if i < len(fmtStr) {
+		switch fmtStr[i] {
+		case 'h', 'l':
 			i++
-		} else {
-			for i < len(fmtStr) && fmtStr[i] >= '0' && fmtStr[i] <= '9' {
-				i++ // numeric precision
+			if i < len(fmtStr) && fmtStr[i] == fmtStr[i-1] {
+				i++ // doubled hh / ll
 			}
+		case 'j', 'z', 't', 'L', 'q':
+			i++
 		}
 	}
 	if i >= len(fmtStr) {
 		return preArgs, false, i, false, false // missing conversion letter
 	}
+	if fmtStr[i] == '(' {
+		// '%(...)T' strftime conversion: exactly ONE argument slot (never a
+		// write), the parenthesized text is strftime layout where '%n' is a
+		// newline. Without the closing ')' or the trailing 'T' bash errors
+		// out before writing anything.
+		close := strings.IndexByte(fmtStr[i:], ')')
+		if close < 0 {
+			return preArgs, false, len(fmtStr), false, false
+		}
+		i += close + 1
+		if i < len(fmtStr) && fmtStr[i] == 'T' {
+			return preArgs, false, i + 1, false, true
+		}
+		return preArgs, false, i, false, false
+	}
 	return preArgs, fmtStr[i] == 'n', i + 1, false, true
+}
+
+// printfFmtMeasure parses ONE width/precision measure starting at i: a
+// '*' consumes one argument slot (and a digits+'$' directly after it is a
+// positional width designator, reported as positional=true), a digit run
+// is a numeric measure consuming nothing. The same shape serves both the
+// width position and the post-'.' precision position.
+func printfFmtMeasure(fmtStr string, i int) (preArgs int, positional bool, next int) {
+	if i < len(fmtStr) && fmtStr[i] == '*' {
+		return 1, printfStarPositional(fmtStr, i+1), i + 1
+	}
+	for i < len(fmtStr) && fmtStr[i] >= '0' && fmtStr[i] <= '9' {
+		i++ // numeric measure
+	}
+	return 0, false, i
+}
+
+// printfStarPositional reports whether the bytes directly AFTER a '*' width
+// or '.*' precision spell digits+'$' — a positional width designator
+// (`%*2$n`) whose slot attribution is unvettable statically.
+func printfStarPositional(fmtStr string, i int) bool {
+	dig := i
+	for dig < len(fmtStr) && fmtStr[dig] >= '0' && fmtStr[dig] <= '9' {
+		dig++
+	}
+	return dig > i && dig < len(fmtStr) && fmtStr[dig] == '$'
 }
 
 // printfWriteHit is one write-target event from printfOptionScan: kind 'v'
@@ -8664,19 +8727,18 @@ func printfOptionScan(words []string) (hits []printfWriteHit, fmtIdx int, dyn bo
 // static format carrying a real '%n' first requires EVERY argument to stay
 // a single argv word (an unquoted $X field-split shifts the positional
 // alignment), then replays Bash's format-reuse cycle so the argument
-// landing in each '%n' slot becomes a write hit. A glob-only format word
-// scans as its unexpanded literal: expansions are filenames, which can
-// never spell a valid write-target variable name (R4-MF-2 safe branch).
+// landing in each '%n' slot becomes a write hit. A dynamic format word
+// (R14 closure — INCLUDING a glob-only one) with ANY trailing argument is
+// unvettable: pathname expansion can legitimately spell '%n' inside a
+// filename (`lit%n`), so `printf lit* TAR_OPTIONS` writes the byte count
+// into TAR_OPTIONS outright. Only the no-argument spelling stays safe —
+// with no arguments nothing can be written regardless of the format text.
 func printfFmtWriteSlots(fmtStr string, fmtArgs []string) (hits []printfWriteHit, dyn bool) {
 	if len(fmtArgs) == 0 {
 		return nil, false // no arguments: nothing can be written
 	}
-	globOnly := printfGlobOnlyFmt(fmtStr)
-	if isDynamicArg(fmtStr) && !globOnly {
+	if isDynamicArg(fmtStr) {
 		return nil, true
-	}
-	if globOnly {
-		fmtStr = strings.ReplaceAll(fmtStr, cmdSubPlaceholderGlob, "")
 	}
 	if !strings.Contains(fmtStr, "%") {
 		return nil, false
@@ -8711,13 +8773,16 @@ func printfFmtWriteSlots(fmtStr string, fmtArgs []string) (hits []printfWriteHit
 // printfFmtSlots scans ONE linear pass of a static printf FORMAT string,
 // emitting the argv-consumption shape of a single cycle: '%%' is literal,
 // '%(...)T' consumes one argument (its parentheses are strftime text, not
-// format conversions), '*' width and '.*' precision each consume one
-// argument ahead of the conversion's own, and conversion 'n' marks its
+// format conversions — printfFmtConv settles flags/width/precision in
+// front of it), '*' width and '.*' precision each consume one argument
+// ahead of the conversion's own, length modifiers (hh/h/l/ll/j/z/t/L/q)
+// are skipped before the conversion letter, and conversion 'n' marks its
 // slot as a WRITE TARGET (bash printf %n stores the byte count into the
-// named variable). Positional conversions ('m$') cannot be attributed to
-// argv slots statically — the second return reports them so the caller
-// can fail closed. Scanning stops at a malformed conversion exactly the
-// way bash errors out before writing.
+// named variable). Positional conversions ('m$' — including the `%*2$n`
+// star-positional shape) cannot be attributed to argv slots statically —
+// the second return reports them so the caller can fail closed. Scanning
+// stops at a malformed conversion exactly the way bash errors out before
+// writing.
 func printfFmtSlots(fmtStr string) (slots []bool, hasPositional bool) {
 	for i := 0; i < len(fmtStr); i++ {
 		if fmtStr[i] != '%' {
@@ -8729,18 +8794,6 @@ func printfFmtSlots(fmtStr string) (slots []bool, hasPositional bool) {
 		}
 		if fmtStr[i] == '%' {
 			continue // literal '%%'
-		}
-		if fmtStr[i] == '(' {
-			// '%(...)T' strftime: one argument; '%n' inside is a newline.
-			close := strings.IndexByte(fmtStr[i:], ')')
-			if close < 0 {
-				break
-			}
-			i += close + 1
-			if i < len(fmtStr) && fmtStr[i] == 'T' {
-				slots = append(slots, false)
-			}
-			continue
 		}
 		preArgs, isN, next, positional, ok := printfFmtConv(fmtStr, i)
 		if positional {
@@ -8756,21 +8809,6 @@ func printfFmtSlots(fmtStr string) (slots []bool, hasPositional bool) {
 		i = next - 1
 	}
 	return slots, hasPositional
-}
-
-// printfGlobOnlyFmt reports whether a dynamic word's ONLY dynamic content
-// is unquoted pathname-expansion glob literals: unlike a $VAR/$(...) format
-// whose text is attacker-controlled input, a filename cannot spell a valid
-// write target and printf consumes the first expansion as the FORMAT, so
-// the glob word stays vettable as one format string (R4-MF-2's safe
-// literal-prefix branch). A surviving '%' in the static parts means the
-// conversion shape is knowable apart from the expansion itself.
-func printfGlobOnlyFmt(a string) bool {
-	if strings.Contains(a, cmdSubPlaceholder) || strings.Contains(a, cmdSubPlaceholderQuoted) ||
-		strings.Contains(a, cmdSubPlaceholderAbsDq) {
-		return false
-	}
-	return strings.Contains(a, cmdSubPlaceholderGlob)
 }
 
 // printfGlobFormatHit reports whether a word carrying an unquoted
