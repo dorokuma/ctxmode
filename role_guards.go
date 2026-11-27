@@ -8300,16 +8300,87 @@ func screenEnvWriteTargets(head []string, base string) string {
 	return ""
 }
 
+// writeTargetBase parses one bash write-target NAME slot: a plain variable
+// name or a scalar array-element spelling BASE[SUBSCRIPT]. The subscript
+// must be a non-empty run of decimal digits — bash evaluates [...] as
+// arithmetic, so any arithmetic/dynamic shape (x[1+1], x[$i], nested or
+// unbalanced brackets, whitespace, a bare closing ']') is unvettable and
+// reported ok=false. The returned name is the BASE for lookup: assigning
+// arr[0] is an assignment to the array arr itself.
+func writeTargetBase(raw string) (name string, ok bool) {
+	lb := strings.IndexByte(raw, '[')
+	if lb < 0 {
+		if strings.IndexByte(raw, ']') >= 0 {
+			return raw, false // dangling ']': never a valid write target
+		}
+		return raw, true
+	}
+	if !strings.HasSuffix(raw, "]") || lb == 0 {
+		return raw, false
+	}
+	base := raw[:lb]
+	if !isShellIdentStart(base) {
+		return base, false
+	}
+	if !allDigits(raw[lb+1 : len(raw)-1]) {
+		return base, false // arithmetic/dynamic subscript: unvettable
+	}
+	return base, true
+}
+
+// isShellIdentStart reports whether s matches bash's identifier grammar
+// [A-Za-z_][A-Za-z0-9_]* — the only spellings printf -v / read / getopts
+// accept as a write-target variable name.
+func isShellIdentStart(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isAlpha := c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		if isAlpha || (i > 0 && c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 // envWriteTainted vets one write-target NAME slot: dynamic (unvettable)
-// names and role-identity / execution-hook variables are refused.
+// names, malformed/arithmetic array subscripts and role-identity /
+// execution-hook variables are refused. Array-element spellings are vetted
+// through writeTargetBase (R4-MF-4): a legal arr[0] reduces to the array
+// base for the hook lookup.
 func envWriteTainted(name, base string) string {
 	if isDynamicArg(name) {
 		return "env dynamic " + base
 	}
-	if guardTaintVars[name] || isEnvHookVar(name) {
-		return "env " + name
+	target, ok := writeTargetBase(name)
+	if !ok {
+		return "env dynamic " + base
+	}
+	if guardTaintVars[target] || isEnvHookVar(target) {
+		return "env " + target
 	}
 	return ""
+}
+
+// dynWordCanSpellDashDash reports whether a dynamic word's expansion can
+// be EXACTLY "--": stripping every placeholder marker must leave only '-'
+// bytes (or nothing — an empty expansion still lands as one operand, never
+// shifting into head[3]'s slot in a way the static layout misses). Any
+// surviving ':'/letter/digit makes "--" unreachable at runtime (R4-SF-2).
+func dynWordCanSpellDashDash(a string) bool {
+	rest := a
+	for _, ph := range []string{cmdSubPlaceholderAbsDq, cmdSubPlaceholderQuoted, cmdSubPlaceholderGlob, cmdSubPlaceholder} {
+		rest = strings.ReplaceAll(rest, ph, "")
+	}
+	for i := 0; i < len(rest); i++ {
+		if rest[i] != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // envDynSlotHit vets a single-value OPTION OPERAND slot (read's -p/-t/-d/...
@@ -8350,7 +8421,7 @@ func readClusterStep(head []string, j int) (hit string, extra int) {
 				return envWriteTainted(arr, "read"), extra
 			}
 			return "", extra
-		case 'd', 'n', 'N', 'p', 't', 'u':
+		case 'd', 'n', 'N', 'p', 't', 'u', 'i':
 			if k+1 < len(a) {
 				return "", extra // glued value tail ends the cluster
 			}
@@ -8364,6 +8435,34 @@ func readClusterStep(head []string, j int) (hit string, extra int) {
 		}
 	}
 	return "", extra
+}
+
+// readDynClusterHit vets ONE dynamic `read` option-zone word
+// (R11 closure / R4-SF-1): a placeholder inside the option-LETTER zone is
+// unvettable — `read "-$OPT"` picks its cluster letters at runtime even
+// though the quoted expansion stays one argv word. A value letter
+// (d n N p t u i) reached BEFORE the dynamic part ends the cluster — the
+// tail is a glued prompt/initial value, not option letters — so split-safe
+// spellings (`read -p"$PROMPT" x`, `read -p"Prompt: $P" x`) stay ALLOW. A
+// glued dynamic -a ARRAY tail is a write TARGET, not a value: the
+// variable name is unvettable either way.
+func readDynClusterHit(a string) string {
+	for k := 1; k < len(a); k++ {
+		c := a[k]
+		if c == '_' {
+			break // every placeholder spelling starts with '_'
+		}
+		if strings.IndexByte("dnNptui", c) >= 0 {
+			if isSingleWordSplitSafe(a) {
+				return "" // glued dynamic value tail: data, not letters
+			}
+			return "env dynamic read"
+		}
+		if c == 'a' {
+			return "env dynamic read" // dynamic array-name tail: unvettable
+		}
+	}
+	return "env dynamic read"
 }
 
 // screenReadEnvWrite scans bash's `read` builtin: option letters are
@@ -8381,15 +8480,12 @@ func screenReadEnvWrite(head []string) string {
 			continue
 		}
 		if !sawDashDash && strings.HasPrefix(a, "-") && len(a) > 1 {
-			// R11 closure: ANY dynamic word in the option zone is unvettable —
-			// `read "-$OPT"` picks its cluster letters at runtime even though
-			// the quoted expansion stays one argv word (split-safe is not
-			// enough when the option LETTERS themselves are unknown). Single
-			// value OPERANDS (read -p "$PROMPT") keep the looser envDynSlotHit
-			// inside readClusterStep, since their slot positions are
-			// statically proven.
 			if isDynamicArg(a) {
-				return "env dynamic read"
+				if hit := readDynClusterHit(a); hit != "" {
+					return hit
+				}
+				j++
+				continue
 			}
 			hit, extra := readClusterStep(head, j)
 			if hit != "" {
@@ -8427,11 +8523,14 @@ func screenGetoptsEnvWrite(head []string) string {
 			if hit := envDynSlotHit(head[1], "getopts"); hit != "" {
 				return hit
 			}
-			// R11 closure: a dynamic first operand may expand to "--" at
-			// runtime (`H="--"; getopts "$H" opt TAR_OPTIONS`), shifting the
-			// positional layout so head[3] becomes the write-target NAME —
-			// vet that standby slot in addition to the static layout below.
-			if isDynamicArg(head[1]) && len(head) > 3 {
+			// R11 closure / R4-SF-2: a dynamic first operand may expand to
+			// exactly "--" at runtime ONLY when its static remainder is dash-
+			// shaped — `H="--"; getopts "$H" opt TAR_OPTIONS` shifts the
+			// positional layout so head[3] becomes the write-target NAME, but
+			// `getopts ":$OPTS" opt TAR_OPTIONS` can never spell "--" (the
+			// literal ':'/`o` survive every expansion) and keeps the static
+			// layout. Vet the standby slot only for the dash-shaped form.
+			if isDynamicArg(head[1]) && len(head) > 3 && dynWordCanSpellDashDash(head[1]) {
 				if hit := envWriteTainted(head[3], "getopts"); hit != "" {
 					return hit
 				}
@@ -8452,35 +8551,88 @@ func screenGetoptsEnvWrite(head []string) string {
 	return ""
 }
 
-// screenPrintfEnvWrite scans bash's `printf` builtin the way
-// internal_getopt(list, "v:") actually consumes it: -v takes its variable
-// name glued (-vVAR) or as the next argv, short clusters end at the 'v'
-// letter, `--` terminates the option zone (bash then errors on the
-// dangling -- itself, so `printf -- -v TAR_OPTIONS` is inert data), and
-// EVERY -v name slot is vetted in sequence — a leading innocuous
-// `-v x` no longer hides a later `-v TAR_OPTIONS` (R11-MF-3).
-func screenPrintfEnvWrite(head []string) string {
-	for j := 1; j < len(head); j++ {
-		a := head[j]
-		if a == "--" {
-			return "" // the option zone is closed; the rest is format/arguments
+// printfFmtConv parses ONE printf conversion starting just after '%':
+// flags, width ('*' consumes an argument), precision ('.*' likewise) and
+// the conversion letter. It reports the number of argument slots consumed
+// AHEAD of the conversion plus whether the conversion is 'n', the index of
+// the first byte AFTER the conversion, and whether a positional 'm$'
+// designator appeared (unvettable slot attribution). ok=false means the
+// conversion is malformed — bash errors out before writing anything.
+func printfFmtConv(fmtStr string, i int) (preArgs int, isN bool, next int, positional bool, ok bool) {
+	// Positional 'm$' designator: unvettable slot attribution.
+	dig := i
+	for dig < len(fmtStr) && fmtStr[dig] >= '0' && fmtStr[dig] <= '9' {
+		dig++
+	}
+	if dig > i && dig < len(fmtStr) && fmtStr[dig] == '$' {
+		return 0, false, i, true, false
+	}
+	for i < len(fmtStr) && strings.IndexByte("-+' #0,", fmtStr[i]) >= 0 {
+		i++ // flag characters
+	}
+	if i < len(fmtStr) && fmtStr[i] == '*' {
+		preArgs++ // width argument
+		i++
+	} else {
+		for i < len(fmtStr) && fmtStr[i] >= '0' && fmtStr[i] <= '9' {
+			i++ // numeric width
 		}
-		// R11 closure: a word STARTING with a dynamic placeholder — even the
-		// quoted-safe spelling — can expand to `-v...` at runtime, so it must
-		// never vet as a static format string (`OPT="-vTAR_OPTIONS";
-		// printf "$OPT" "%s" "--use-compress-program=pig"`).
+	}
+	if i < len(fmtStr) && fmtStr[i] == '.' {
+		i++
+		if i < len(fmtStr) && fmtStr[i] == '*' {
+			preArgs++ // precision argument
+			i++
+		} else {
+			for i < len(fmtStr) && fmtStr[i] >= '0' && fmtStr[i] <= '9' {
+				i++ // numeric precision
+			}
+		}
+	}
+	if i >= len(fmtStr) {
+		return preArgs, false, i, false, false // missing conversion letter
+	}
+	return preArgs, fmtStr[i] == 'n', i + 1, false, true
+}
+
+// printfWriteHit is one write-target event from printfOptionScan: kind 'v'
+// carries a -v variable name, kind 'n' a '%n' slot target argument.
+type printfWriteHit struct {
+	kind byte
+	name string
+}
+
+// printfOptionScan walks bash printf's internal_getopt(list, "v:") option
+// zone over the ALREADY-STRING argv words in order: glued -vVAR, clustered
+// '-v' and repeated '-v x' spellings each emit a write hit, '--' or the
+// first non-option word settles fmtIdx (the format-string position), and
+// the format string plus arguments are scanned for '%n' write targets
+// (printfFmtWriteHit applies — the per-target vetting is left to the
+// caller so the argv guard can report a verdict while the AST pre-scan
+// counts writes). dyn=true means a dynamic word in the option-letter zone
+// or an unvettable format/target shape was seen: fail closed.
+func printfOptionScan(words []string) (hits []printfWriteHit, fmtIdx int, dyn bool) {
+	fmtIdx = -1
+	j := 0
+	for ; j < len(words); j++ {
+		a := words[j]
+		if a == "--" {
+			fmtIdx = j + 1
+			break
+		}
 		if strings.HasPrefix(a, cmdSubPlaceholder) || strings.HasPrefix(a, cmdSubPlaceholderQuoted) ||
 			strings.HasPrefix(a, cmdSubPlaceholderGlob) {
-			return "env dynamic printf"
+			return hits, fmtIdx, true
 		}
 		if !strings.HasPrefix(a, "-") || a == "-" {
-			return "" // static format string; the rest is arguments
+			if printfGlobFormatHit(a) {
+				return hits, fmtIdx, true
+			}
+			fmtIdx = j
+			break
 		}
-		// R11 closure: a dynamic word inside the option zone is unvettable
-		// even when it stays ONE argv word — `printf "-$OPT" ...` picks its
-		// option letters at runtime, so no static slot attribution exists.
 		if isDynamicArg(a) {
-			return "env dynamic printf"
+			return hits, fmtIdx, true
 		}
 		// Walk the short cluster; only 'v' is a real printf option letter.
 		for k := 1; k < len(a); k++ {
@@ -8488,21 +8640,187 @@ func screenPrintfEnvWrite(head []string) string {
 				continue // unknown letters end in bash's usage error — inert
 			}
 			if k+1 < len(a) {
-				// Glued -vVAR: the cluster tail IS the variable name and the
-				// cluster ends there (internal_getopt "v:" semantics).
-				if hit := envWriteTainted(a[k+1:], "printf"); hit != "" {
-					return hit
-				}
+				hits = append(hits, printfWriteHit{kind: 'v', name: a[k+1:]})
+				break // glued -vVAR ends the cluster
+			}
+			if j+1 >= len(words) {
+				return hits, fmtIdx, false // dangling -v: bash errors, inert
+			}
+			j++
+			hits = append(hits, printfWriteHit{kind: 'v', name: words[j]})
+			break
+		}
+	}
+	if fmtIdx < 0 || fmtIdx >= len(words) {
+		return hits, fmtIdx, dyn
+	}
+	nHits, nDyn := printfFmtWriteSlots(words[fmtIdx], words[fmtIdx+1:])
+	return append(hits, nHits...), fmtIdx, dyn || nDyn
+}
+
+// printfFmtWriteSlots scans printf's format string for '%n' write targets
+// (R4-MF-3): a dynamic variable/command-substitution format text is
+// unvettable (dyn=true), positional 'm$' conversions fail closed, and a
+// static format carrying a real '%n' first requires EVERY argument to stay
+// a single argv word (an unquoted $X field-split shifts the positional
+// alignment), then replays Bash's format-reuse cycle so the argument
+// landing in each '%n' slot becomes a write hit. A glob-only format word
+// scans as its unexpanded literal: expansions are filenames, which can
+// never spell a valid write-target variable name (R4-MF-2 safe branch).
+func printfFmtWriteSlots(fmtStr string, fmtArgs []string) (hits []printfWriteHit, dyn bool) {
+	if len(fmtArgs) == 0 {
+		return nil, false // no arguments: nothing can be written
+	}
+	globOnly := printfGlobOnlyFmt(fmtStr)
+	if isDynamicArg(fmtStr) && !globOnly {
+		return nil, true
+	}
+	if globOnly {
+		fmtStr = strings.ReplaceAll(fmtStr, cmdSubPlaceholderGlob, "")
+	}
+	if !strings.Contains(fmtStr, "%") {
+		return nil, false
+	}
+	slots, positional := printfFmtSlots(fmtStr)
+	if positional {
+		return nil, true
+	}
+	hasN := false
+	for _, w := range slots {
+		if w {
+			hasN = true
+			break
+		}
+	}
+	if !hasN || len(slots) == 0 {
+		return nil, false
+	}
+	for _, arg := range fmtArgs {
+		if isDynamicArg(arg) && !isSingleWordSplitSafe(arg) {
+			return nil, true // word-splitting shifts %n alignment
+		}
+	}
+	for i, arg := range fmtArgs {
+		if slots[i%len(slots)] {
+			hits = append(hits, printfWriteHit{kind: 'n', name: arg})
+		}
+	}
+	return hits, false
+}
+
+// printfFmtSlots scans ONE linear pass of a static printf FORMAT string,
+// emitting the argv-consumption shape of a single cycle: '%%' is literal,
+// '%(...)T' consumes one argument (its parentheses are strftime text, not
+// format conversions), '*' width and '.*' precision each consume one
+// argument ahead of the conversion's own, and conversion 'n' marks its
+// slot as a WRITE TARGET (bash printf %n stores the byte count into the
+// named variable). Positional conversions ('m$') cannot be attributed to
+// argv slots statically — the second return reports them so the caller
+// can fail closed. Scanning stops at a malformed conversion exactly the
+// way bash errors out before writing.
+func printfFmtSlots(fmtStr string) (slots []bool, hasPositional bool) {
+	for i := 0; i < len(fmtStr); i++ {
+		if fmtStr[i] != '%' {
+			continue
+		}
+		i++
+		if i >= len(fmtStr) {
+			break // trailing '%': bash errors, inert
+		}
+		if fmtStr[i] == '%' {
+			continue // literal '%%'
+		}
+		if fmtStr[i] == '(' {
+			// '%(...)T' strftime: one argument; '%n' inside is a newline.
+			close := strings.IndexByte(fmtStr[i:], ')')
+			if close < 0 {
 				break
 			}
-			if j+1 >= len(head) {
-				return "" // dangling -v: bash errors, nothing is written
+			i += close + 1
+			if i < len(fmtStr) && fmtStr[i] == 'T' {
+				slots = append(slots, false)
 			}
-			j++ // separate -v VAR operand
-			if hit := envWriteTainted(head[j], "printf"); hit != "" {
-				return hit
-			}
+			continue
+		}
+		preArgs, isN, next, positional, ok := printfFmtConv(fmtStr, i)
+		if positional {
+			return slots, true
+		}
+		if !ok {
 			break
+		}
+		for ; preArgs > 0; preArgs-- {
+			slots = append(slots, false)
+		}
+		slots = append(slots, isN)
+		i = next - 1
+	}
+	return slots, hasPositional
+}
+
+// printfGlobOnlyFmt reports whether a dynamic word's ONLY dynamic content
+// is unquoted pathname-expansion glob literals: unlike a $VAR/$(...) format
+// whose text is attacker-controlled input, a filename cannot spell a valid
+// write target and printf consumes the first expansion as the FORMAT, so
+// the glob word stays vettable as one format string (R4-MF-2's safe
+// literal-prefix branch). A surviving '%' in the static parts means the
+// conversion shape is knowable apart from the expansion itself.
+func printfGlobOnlyFmt(a string) bool {
+	if strings.Contains(a, cmdSubPlaceholder) || strings.Contains(a, cmdSubPlaceholderQuoted) ||
+		strings.Contains(a, cmdSubPlaceholderAbsDq) {
+		return false
+	}
+	return strings.Contains(a, cmdSubPlaceholderGlob)
+}
+
+// printfGlobFormatHit reports whether a word carrying an unquoted
+// pathname-expansion glob may expand into a printf OPTION spelling at
+// runtime: with a glob-starting first byte ('*', '?', '[') or an extglob
+// prefix ('@(', '+(' or '!(') the expansion can produce `-vNAME`,
+// desynchronizing the statically scanned option zone (R4-MF-2). A word
+// with a definite non-'-' literal first byte can only expand into more
+// data words and stays a format string.
+func printfGlobFormatHit(a string) bool {
+	if !strings.Contains(a, cmdSubPlaceholderGlob) {
+		return false
+	}
+	if strings.HasPrefix(a, "@(") || strings.HasPrefix(a, "+(") || strings.HasPrefix(a, "!(") {
+		return true
+	}
+	if a == "" {
+		return false
+	}
+	switch a[0] {
+	case '*', '?', '[':
+		return true
+	}
+	return false
+}
+
+// screenPrintfEnvWrite scans bash's `printf` builtin the way
+// internal_getopt(list, "v:") actually consumes it: -v takes its variable
+// name glued (-vVAR) or as the next argv, short clusters end at the 'v'
+// letter, `--` terminates the option zone (bash then errors on the
+// dangling -- itself, so `printf -- -v TAR_OPTIONS` is inert data), and
+// EVERY -v name slot is vetted in sequence — a leading innocuous
+// `-v x` no longer hides a later `-v TAR_OPTIONS` (R11-MF-3). Once the
+// format word settles (post-`--` or the first non-option word) the format
+// string and its arguments are vetted for '%n' write targets through
+// printfFmtWriteHit (R4-MF-3).
+func screenPrintfEnvWrite(head []string) string {
+	// R11 closure: a word STARTING with a dynamic placeholder — even the
+	// quoted-safe spelling — can expand to `-v...` at runtime, so it must
+	// never vet as a static format string (`OPT="-vTAR_OPTIONS";
+	// printf "$OPT" "%s" "--use-compress-program=pig"`). R4-MF-2/-MF-3:
+	// printfOptionScan additionally refuses glob-expansion option spells
+	// and scans the format string's '%n' write slots.
+	hits, _, dyn := printfOptionScan(head[1:])
+	if dyn {
+		return "env dynamic printf"
+	}
+	for _, h := range hits {
+		if hit := envWriteTainted(h.name, "printf"); hit != "" {
+			return hit
 		}
 	}
 	return ""
@@ -10846,7 +11164,7 @@ func tarShortDataOpt(a string) bool {
 	case "-f", "--file", "-C", "--directory", "-T", "--files-from", "-X",
 		"--exclude-from", "--exclude", "--owner", "--group", "--mode",
 		"--mtime", "--strip-components", "--transform", "--format",
-		"--index-file", "--occurrence":
+		"--index-file":
 		return true
 	}
 	return false

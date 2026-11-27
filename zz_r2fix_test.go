@@ -2702,3 +2702,101 @@ func TestGuard_V622_OracleR11Probes(t *testing.T) {
 		})
 	}
 }
+
+// TestGuard_V622_ReviewerR4Probes covers the Reviewer R4 / Oracle R12 audit
+// matrix: printf write-target closure (glued/clustered -v, static %n slots
+// with Bash format reuse, dynamic format strings and array-subscripted write
+// targets — R4-MF-1/MF-3/MF-4), printf first-word glob expansion into the
+// option zone (R4-MF-2), GNU tar --occurrence as an OPTIONAL-argument option
+// (R4-MF-5), read's -i value letter and glued dynamic value tails (R4-SF-1),
+// and the getopts dynamic first operand standby slot narrowed to a real "--"
+// expansion shape (R4-SF-2). Zero new production symbols are referenced here:
+// every probe goes through rtGuardCwd so an independent verifier can copy
+// this file onto the pre-fix tree 9139e0e and reproduce FAIL directly.
+func TestGuard_V622_ReviewerR4Probes(t *testing.T) {
+	blockCases := []struct {
+		name, cmd, want string
+	}{
+		// R4-MF-1: preScanVarMutations never counted glued/clustered -v or
+		// %n writes, so a second write into `cmd` stayed static-bindable.
+		{"P-R4-MF1-a printf glued -v double write", `bash -c 'cmd=/bin/true; printf -vcmd %s pig; "$cmd"'`, ""},
+		{"P-R4-MF1-b printf clustered -v double write", `bash -c 'cmd=/bin/true; printf -v cmd %s pig; "$cmd"'`, ""},
+		// R4-MF-3: static format-string %n write targets were never scanned.
+		{"P-R4-MF3-a printf %n TAR_OPTIONS", `bash -c 'printf "%n" TAR_OPTIONS'`, "env TAR_OPTIONS"},
+		{"P-R4-MF3-b printf %n aligned arg", `bash -c 'printf "%s %n" x TAR_OPTIONS'`, "env TAR_OPTIONS"},
+		{"P-R4-MF3-c printf -- %n", `bash -c 'printf -- "%n" TAR_OPTIONS'`, "env TAR_OPTIONS"},
+		{"P-R4-MF3-d printf width-star %n alignment", `bash -c 'printf "%*s %n" 1 x TAR_OPTIONS'`, "env TAR_OPTIONS"},
+		{"P-R4-MF3-e printf dynamic fmt args", `bash -c 'printf x"$FMT" "%s" x'`, "env dynamic printf"},
+		{"P-R4-MF3-f printf %n unquoted arg splitting", `bash -c 'printf "%s %n" $X TAR_OPTIONS'`, "env dynamic printf"},
+		{"P-R4-MF3-g printf %n dynamic target", `bash -c 'printf "%n" "$X"'`, "env dynamic printf"},
+		{"P-R4-MF3-h printf %n array subscript hook", `bash -c 'printf "%n" '\''TAR_OPTIONS[0]'\'''`, "env TAR_OPTIONS"},
+		{"P-R4-MF3-i printf %n dynamic subscript", `bash -c 'printf "%n" "x[$(echo 0)]"'`, "env dynamic printf"},
+		{"P-R4-MF3-j printf %n positional slot", `bash -c 'printf "%2$s%n" x TAR_OPTIONS'`, "env dynamic printf"},
+		// R4-MF-4: write-target subscripts must validate their base name and
+		// reject arithmetic/dynamic subscripts fail-closed. NOTE: an UNQUOTED
+		// arr[0] is itself a glob character class (litHasUnquotedGlobOrTilde),
+		// so the static-subscript spellings are single-quoted here.
+		{"P-R4-MF4-a printf -v array hook", `bash -c 'printf -v '\''TAR_OPTIONS[0]'\'' "%s" x'`, "env TAR_OPTIONS"},
+		{"P-R4-MF4-b printf -v glued array hook", `bash -c 'printf "-vTAR_OPTIONS[0]" "%s" x'`, "env TAR_OPTIONS"},
+		{"P-R4-MF4-c printf -v arithmetic subscript", `bash -c 'printf -v x[1+1] "%s" y'`, "env dynamic printf"},
+		{"P-R4-MF4-d printf -v dangling subscript", `bash -c 'printf -v x[0 "%s" y'`, "env dynamic printf"},
+		// R4-MF-2: a glob word first in the format position may expand into
+		// -vNAME at runtime, desynchronizing the option zone.
+		{"P-R4-MF2-a printf glob star format", `printf * '%s' x`, "env dynamic printf"},
+		{"P-R4-MF2-b printf glob qmark format", `printf ? '%s' x`, "env dynamic printf"},
+		// R4-MF-5: GNU tar --occurrence[=N] is optional-argument — the bare
+		// spelling consumes NO operand, so the following exec hook must be
+		// scanned instead of swallowed as the "occurrence value".
+		{"P-R4-MF5-a tar occurrence swallow glued hook", `tar --occurrence --use-compress-program=pig -cf /dev/null /dev/null`, ""},
+		{"P-R4-MF5-b tar occurrence swallow split hook", `tar --occurrence --use-compress-program pig -cf /dev/null /dev/null`, ""},
+		// R4-SF-1: a dynamic placeholder inside read's option-letter zone is
+		// unvettable, including a glued -p tail that word-splits at runtime.
+		{"P-R4-SF1-a read glued -p unquoted dyn", `bash -c 'read -p$P x <<< y'`, "env dynamic read"},
+		// R4-SF-2: a dynamic getopts first operand may expand to exactly "--",
+		// shifting NAME out of its static slot.
+		{"P-R4-SF2-a getopts dyn terminator hook", `set -a; H="--"; getopts "$H" opt TAR_OPTIONS`, "env TAR_OPTIONS"},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("rtGuardCwd(%q) = %q, want verdict substring %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+
+	// 放行守卫正例(R4 零假阳纪律):普通/复用格式串参数、带引号动态格式串
+	// 无参、静态下标合法数组写、安全字面前缀 glob、tar 正常带参、read -p/-i
+	// 带引号提示与初始值、getopts 带冒号/字母的动态 OPTSTRING 全部保持 ALLOW。
+	allowCases := []struct {
+		name, cmd string
+	}{
+		{"R4-pos printf static fmt benign", `bash -c 'printf "%s %s" "$A" "$B"'`},
+		{"R4-pos printf fmt reuse benign", `bash -c 'printf "%s" "$A" "$B"'`},
+		{"R4-pos printf dq fmt no args", `bash -c 'printf x"$FMT"'`},
+		{"R4-pos printf unquoted arg no %n", `printf '%s\n' $UNQUOTED`},
+		{"R4-pos printf %n benign var", `bash -c 'printf "%n" myvar'`},
+		{"R4-pos printf %n benign array", `bash -c 'printf "%n" '\''arr[0]'\'''`},
+		{"R4-pos printf -v benign array", `bash -c 'printf -v '\''arr[0]'\'' "%s" x'`},
+		{"R4-pos printf glob literal prefix", `printf lit* '%s' x`},
+		{"R4-pos printf quoted star format", `printf '*' '%s' x`},
+		{"R4-pos tar occurrence value benign", `tar --occurrence 2 -tf /dev/null`},
+		{"R4-pos tar occurrence glued benign", `tar --occurrence=2 -tf /dev/null`},
+		{"R4-pos read -p glued dq prompt", `bash -c 'read -p"Prompt: $PROMPT" line <<< y'`},
+		{"R4-pos read -p dq prompt whole word", `bash -c 'read -p"$PROMPT" answer <<< y'`},
+		{"R4-pos read -ei separate value", `bash -c 'read -ei "$DEFAULT" answer <<< y'`},
+		{"R4-pos getopts colon dyn optstring", `getopts ":$OPTS" opt TAR_OPTIONS`},
+		{"R4-pos getopts colon dyn optstring arg", `getopts ":$OPTS" opt "$arg"`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+}

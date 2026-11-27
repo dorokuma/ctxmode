@@ -1013,15 +1013,40 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 			case "read":
 				// Bare read writes REPLY; -a ARRAY writes the array.
 				inc("REPLY")
-				// read option letters: boolean r s; value-carrying d n N p t u a
+				// read option letters: boolean r s e; value-carrying d n N p t u i a
 				// (a separate argv when last in its cluster). -a ARRAY is itself
 				// a write target. R13: -s is a BOOLEAN (silent echo) — treating
 				// it as value-carrying hides the real write target (`read -s x`).
+				// R4-SF-1: -e is boolean and -i carries the initial-value text.
 				sawDashDash := false
 				j := 1
 				for j < len(args) {
 					s, ok := wordToArg(args[j])
 					if !ok || isDynamicArg(s) {
+						// R4-SF-1: a dynamic word whose STATIC letter prefix already
+						// ended at a value letter carries a glued prompt/initial
+						// value (`read -p"$PROMPT" x`) — no variable is written by
+						// the option word itself and the letters cannot change.
+						if ok && !sawDashDash && strings.HasPrefix(s, "-") && len(s) > 1 && isSingleWordSplitSafe(s) {
+							valueTail := false
+							for k := 1; k < len(s); k++ {
+								c := s[k]
+								if c == '_' {
+									break
+								}
+								if strings.IndexByte("dnNptui", c) >= 0 {
+									valueTail = true
+									break
+								}
+								if c == 'a' {
+									break // glued -a ARRAY is a write target: unvettable
+								}
+							}
+							if valueTail {
+								j++
+								continue
+							}
+						}
 						allTainted = true
 						return false
 					}
@@ -1034,24 +1059,33 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 						endLetter := byte(0)
 						for k := 1; k < len(s); k++ {
 							switch s[k] {
-							case 'r', 's':
+							case 'r', 's', 'e':
 								continue
 							case 'a':
 								// -a ARRAY: the array name is a write target.
+								arrName := ""
 								if k+1 < len(s) {
-									inc(s[k+1:])
+									arrName = s[k+1:]
 								} else if j+1 < len(args) {
 									an, aok := wordToArg(args[j+1])
 									if !aok || isDynamicArg(an) {
 										allTainted = true
 										return false
 									}
-									inc(an)
+									arrName = an
 									j++
+								}
+								if arrName != "" {
+									if bn, bok := writeTargetBase(arrName); bok {
+										inc(bn)
+									} else {
+										allTainted = true
+										return false
+									}
 								}
 								endLetter = 'a'
 								k = len(s)
-							case 'd', 'n', 'N', 'p', 't', 'u':
+							case 'd', 'n', 'N', 'p', 't', 'u', 'i':
 								endLetter = s[k]
 								k = len(s)
 							default:
@@ -1061,14 +1095,19 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 							}
 						}
 						if endLetter != 0 && len(s) > 1 && s[len(s)-1] == endLetter &&
-							strings.IndexByte("dnNptu", endLetter) >= 0 && j+1 < len(args) {
+							strings.IndexByte("dnNptui", endLetter) >= 0 && j+1 < len(args) {
 							j++ // value operand consumed
 						}
 						j++
 						continue
 					}
 					if s != "" {
-						inc(s)
+						if bn, bok := writeTargetBase(s); bok {
+							inc(bn)
+						} else {
+							allTainted = true
+							return false
+						}
 					}
 					j++
 				}
@@ -1088,20 +1127,41 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 					}
 				}
 			case "printf":
-				// printf -v VAR ...
-				for i := 1; i+1 < len(args); i++ {
-					s, ok := wordToArg(args[i])
+				// printf -v VAR writes VAR (glued -vVAR and clustered spellings
+				// included — R4-MF-1), and every '%n' conversion in the format
+				// string writes its aligned argument as a variable name
+				// (R4-MF-3). The option zone, glob gate and format-reuse cycle are
+				// the shared printfOptionScan used by screenPrintfEnvWrite; a
+				// dynamic/unvettable shape taints everything.
+				words := make([]string, 0, len(args)-1)
+				wordsOK := true
+				for _, w := range args[1:] {
+					s, ok := wordToArg(w)
 					if !ok {
-						continue
+						wordsOK = false
+						break
 					}
-					if s == "-v" {
-						vn, vok := wordToArg(args[i+1])
-						if !vok {
-							allTainted = true
-							return false
-						}
-						inc(vn)
-						i++
+					words = append(words, s)
+				}
+				if !wordsOK {
+					allTainted = true
+					return false
+				}
+				hits, _, pdyn := printfOptionScan(words)
+				if pdyn {
+					allTainted = true
+					return false
+				}
+				for _, h := range hits {
+					if isDynamicArg(h.name) {
+						allTainted = true
+						return false
+					}
+					if bn, bok := writeTargetBase(h.name); bok {
+						inc(bn)
+					} else {
+						allTainted = true
+						return false
 					}
 				}
 			}
