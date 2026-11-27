@@ -1677,6 +1677,25 @@ func (c *subCollector) taintOperandParamAssigns(words []*syntax.Word) {
 				(pe.Exp.Op == syntax.AssignUnset || pe.Exp.Op == syntax.AssignUnsetOrNull) {
 				c.taintVar(pe.Param.Value)
 			}
+			// R24-Reviewer-#4 / R24-Oracle-M4: the pre-scan counts arithmetic
+			// writes inside the operand words too — a `$((X=1))` BinaryArithm
+			// assignment or a `$((X++))` UnaryArithm increment expands when
+			// the shell evaluates the operand, before eval re-parses
+			// anything. The truncated root-call scan drops exactly these
+			// nodes for a bind verdict, so the replication owns them here
+			// under the same pollution verdict as the parameter-expansion
+			// assignments: the counted write may never vanish between the
+			// two owners.
+			switch x := node.(type) {
+			case *syntax.BinaryArithm:
+				if isArithAssignOp(x.Op) {
+					c.taintVar(arithmTargetName(x.X))
+				}
+			case *syntax.UnaryArithm:
+				if x.Op == syntax.Inc || x.Op == syntax.Dec {
+					c.taintVar(arithmTargetName(x.X))
+				}
+			}
 			return true
 		})
 	}
@@ -1850,7 +1869,10 @@ func (c *subCollector) taintEvalTextWrites(text string, depth int) {
 		// taint verdict means uncertainty, never impossibility), and
 		// the fail-closed direction for the positional tracks is to
 		// register it exactly like the certain replication does.
+		// R24-Reviewer-#3: readonly declarations share the same positional
+		// registration exactly — the attribute may still take effect.
 		c.noteEvalStmtFuncDefs(st)
+		c.noteEvalStmtReadonlyDecls(st)
 		c.taintStmtSharedWrites(st)
 		c.taintHiddenEvalWrites(st, depth)
 	}
@@ -1861,11 +1883,92 @@ func (c *subCollector) taintEvalTextWrites(text string, depth int) {
 // a top-level FuncDecl registers directly, every other statement shape
 // is scanned for definitions inside its same-process compound blocks.
 func (c *subCollector) noteEvalStmtFuncDefs(st *syntax.Stmt) {
-	if fd, isFd := st.Cmd.(*syntax.FuncDecl); isFd {
-		c.noteFuncDef(fd)
+	// R24-Reviewer-#3 / R24-Oracle-M3: the statement's own process
+	// boundary precedes even the fast top-level path — a backgrounded
+	// FuncDecl (`eval() { :; } &`) executes in a child shell and can
+	// never shadow the parent's later name resolution. Extracted into
+	// childProcStmtBoundary so all three positional scans share one
+	// boundary verdict (R24 complexity budget).
+	if childProcStmtBoundary(st) {
 		return
 	}
+	// No fast path for a top-level FuncDecl: the noteSameProcessFuncDefs
+	// walk visits st.Cmd itself as the ROOT node of the traversal, so a
+	// plain same-process FuncDecl registers through exactly the same
+	// FuncDecl case — one single scan owner, zero duplication.
 	c.noteSameProcessFuncDefs(st)
+}
+
+// childProcStmtBoundary reports whether one statement is unusable for
+// the same-process positional scans (extracted for the R24 complexity
+// budget): a nil/headless statement carries nothing to scan, and a
+// backgrounded or coprocess statement runs in its own child process so
+// every definition/declaration inside it dies with the child.
+func childProcStmtBoundary(st *syntax.Stmt) bool {
+	return st == nil || st.Cmd == nil || st.Background || st.Coprocess
+}
+
+// noteEvalStmtReadonlyDecls records the readonly attributes one
+// eval-text statement installs in the SAME shell process
+// (R24-Reviewer-#3 / R24-Oracle-M3): the main traversal registers them
+// through emitDecl/emitCall, but the static eval replication re-parses
+// the operand text without those emission paths — a bare
+// `eval 'readonly X'` otherwise left the positional track unchanged,
+// so a later assignment replication minted a bind the frozen runtime
+// variable can never receive. The scan shares the function-definition
+// process boundary exactly: backgrounded/coprocess subtrees, pipeline
+// components, substitutions and subshells die with their child.
+func (c *subCollector) noteEvalStmtReadonlyDecls(st *syntax.Stmt) {
+	if childProcStmtBoundary(st) {
+		return
+	}
+	if d, isDecl := st.Cmd.(*syntax.DeclClause); isDecl {
+		c.noteReadonlyDecls(c.declClauseArgv(d))
+	}
+	syntax.Walk(st.Cmd, func(node syntax.Node) bool {
+		if node == nil {
+			return false
+		}
+		switch x := node.(type) {
+		case *syntax.Stmt:
+			if x.Background || x.Coprocess {
+				return false
+			}
+			return true
+		case *syntax.DeclClause:
+			c.noteReadonlyDecls(c.declClauseArgv(x))
+			return true
+		case *syntax.BinaryCmd:
+			if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
+				return false
+			}
+			return true
+		case *syntax.CmdSubst, *syntax.ProcSubst, *syntax.Subshell, *syntax.CoprocClause:
+			return false
+		}
+		return true
+	})
+}
+
+// declClauseArgv serializes the positional operands of one declare/
+// readonly/typeset/local clause into the argv shape noteReadonlyDecls
+// consumes (extracted so noteEvalStmtReadonlyDecls carries no operand
+// conversion branching): the variant word leads, naked names ride as
+// bare operands, and assignments serialize exactly like the emitDecl
+// path — the declaration's own inline bind is irrelevant here, only
+// the attribute the word installs matters.
+func (c *subCollector) declClauseArgv(d *syntax.DeclClause) []string {
+	if d == nil {
+		return nil
+	}
+	argv := make([]string, 0, 1+len(d.Args))
+	if d.Variant != nil {
+		argv = append(argv, d.Variant.Value)
+	}
+	for _, a := range d.Args {
+		argv = append(argv, c.assignToPrefix(a))
+	}
+	return argv
 }
 
 // taintStmtSharedWrites taints every name of one statement according to
@@ -2023,7 +2126,12 @@ func (c *subCollector) bindEvalOneStmt(st *syntax.Stmt, depth int) {
 	// exactly like a top-level FuncDecl — name resolution in the real
 	// shell does not distinguish where inside the same process the
 	// definition executed.
+	// R24-Reviewer-#3 / R24-Oracle-M3: the readonly attribute replay is
+	// part of the same positional registration — a declaration inside the
+	// eval text freezes the variable for every LATER write exactly like
+	// the direct spelling registered through emitDecl/emitCall.
 	c.noteEvalStmtFuncDefs(st)
+	c.noteEvalStmtReadonlyDecls(st)
 	call, isCall := st.Cmd.(*syntax.CallExpr)
 	if isCall && !st.Background && !st.Negated && !st.Coprocess && len(st.Redirs) == 0 && len(call.Args) == 0 {
 		// R20-Oracle-M1: the statement must be a PROVABLY-executed bare
@@ -2433,6 +2541,39 @@ type subCollector struct {
 	// a later definition cannot shadow an earlier call either at
 	// runtime or in this model.
 	funcNames map[string]bool
+	// funcNamesShared / readonlyVarsShared mark a map newSub handed to a
+	// substitution collector WITHOUT cloning (R24-Oracle-S2): the first
+	// positional-track write inside the child clones lazily, so a
+	// substitution that never defines a function or declares a readonly
+	// variable pays no copy at all. Only the two mutation owners
+	// (noteFuncDef, noteReadonlyDecls) consult the bits; every read of
+	// the shared map is exactly as correct as a read of the clone.
+	funcNamesShared    bool
+	readonlyVarsShared bool
+	// regUndo is the incremental undo log of open child-process
+	// boundaries (R24-Reviewer-#3 / R24-Oracle-S2): entering a subshell,
+	// pipeline component, backgrounded subtree or coprocess pushes one
+	// frame, and the mutation owners append only the keys they newly
+	// insert while that frame is innermost. Restoring deletes exactly
+	// those keys — the parent maps never move — so a child process that
+	// writes nothing pays O(1) instead of one full-table clone per map.
+	regUndo []*processRegFrame
+	// regCopyElements counts positional-registry map elements copied by
+	// copy-on-write for THIS collector (test observability for
+	// R24-Oracle-S2): the child-process boundary itself must never copy
+	// anything, so an empty child shell keeps the count at zero no matter
+	// how many names the parent registered before entering it.
+	regCopyElements int
+}
+
+// processRegFrame is one open child-process registry boundary of
+// subCollector.regUndo: the names added to funcNames/readonlyVars while
+// the frame is innermost. Keys are recorded only on first insertion —
+// redefining an already-registered name leaves the parent's truth value
+// unchanged, so nothing needs undoing.
+type processRegFrame struct {
+	funcs    map[string]bool
+	readonly map[string]bool
 }
 
 // shellNonBindableVars are the Bash/POSIX special variables whose value
@@ -2488,27 +2629,67 @@ func (c *subCollector) enterConditional() func() {
 	return func() { c.condDepth-- }
 }
 
-// snapshotProcessRegs copies the positional process-state tracks
-// (funcNames/readonlyVars — R23-Reviewer-#3 / R23-Oracle-M1) and returns
-// the restore closure: entering a CHILD-PROCESS boundary (subshell,
-// pipeline component, backgrounded subtree, coprocess) snapshots first
-// so definitions minted inside the child never leak into the parent's
-// later name resolution. The maps are copy-on-enter: child-side
-// additions mutate the clone the child walks with, and restoring the
-// parent's originals discards them exactly like the runtime does. The
-// snapshot is nil-preserving — neither nil map is materialized for a
-// subtree that never uses the feature.
+// snapshotProcessRegs opens one incremental child-process boundary on
+// the positional process-state tracks (funcNames/readonlyVars —
+// R23-Reviewer-#3 / R24-Oracle-S2) and returns the restore closure.
+// R24-Reviewer-#3 / R24-Oracle-S2: the pre-R24 implementation cloned
+// BOTH maps on entry, so registering n functions and then walking n
+// child processes copied n(n+1)/2 entries even when no child wrote a
+// single name. The boundary is copy-on-WRITE instead: the frame records
+// only the keys actually inserted while it is innermost, and restoring
+// deletes exactly those additions. The maps themselves never move, the
+// parent's entries are immutable at runtime (registrations only ever
+// write true), and a child that defines or declares nothing pays O(1).
 func (c *subCollector) snapshotProcessRegs() func() {
-	funcs, readonly := c.funcNames, c.readonlyVars
-	if c.funcNames != nil {
-		c.funcNames = cloneBoolMap(c.funcNames)
-	}
-	if c.readonlyVars != nil {
-		c.readonlyVars = cloneBoolMap(c.readonlyVars)
-	}
+	frame := &processRegFrame{}
+	c.regUndo = append(c.regUndo, frame)
+	restored := false
 	return func() {
-		c.funcNames, c.readonlyVars = funcs, readonly
+		if restored {
+			return
+		}
+		restored = true
+		idx := -1
+		for i := len(c.regUndo) - 1; i >= 0; i-- {
+			if c.regUndo[i] == frame {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return
+		}
+		c.regUndo = append(c.regUndo[:idx], c.regUndo[idx+1:]...)
+		for name := range frame.funcs {
+			delete(c.funcNames, name)
+		}
+		for name := range frame.readonly {
+			delete(c.readonlyVars, name)
+		}
 	}
+}
+
+// noteProcessRegAdd records one first insertion into the innermost open
+// child-process registry frame (extracted so both mutation owners carry
+// no frame-walk nesting): the addition belongs to the boundary it was
+// minted under, and restoring that boundary deletes it exactly like the
+// runtime discarding the child process's name table.
+func (c *subCollector) noteProcessRegAdd(name string, readonly bool) {
+	if len(c.regUndo) == 0 {
+		return
+	}
+	frame := c.regUndo[len(c.regUndo)-1]
+	if readonly {
+		if frame.readonly == nil {
+			frame.readonly = map[string]bool{}
+		}
+		frame.readonly[name] = true
+		return
+	}
+	if frame.funcs == nil {
+		frame.funcs = map[string]bool{}
+	}
+	frame.funcs[name] = true
 }
 
 // noteSameProcessFuncDefs registers every shell function definition
@@ -2525,7 +2706,13 @@ func (c *subCollector) snapshotProcessRegs() func() {
 // background bit of the statement itself is the caller's boundary,
 // already handled at the outer scope level.
 func (c *subCollector) noteSameProcessFuncDefs(st *syntax.Stmt) {
-	if st == nil || st.Cmd == nil {
+	// R24-Reviewer-#3 / R24-Oracle-M3: the statement's own process
+	// boundary is the FIRST check — a backgrounded or coprocess subtree
+	// runs in its own child process, so every definition inside it dies
+	// with the child no matter how shallowly it nests. The pre-R24 scan
+	// walked straight into st.Cmd and registered `{ eval() { :; }; } &`
+	// into the parent table.
+	if childProcStmtBoundary(st) {
 		return
 	}
 	syntax.Walk(st.Cmd, func(node syntax.Node) bool {
@@ -2533,6 +2720,14 @@ func (c *subCollector) noteSameProcessFuncDefs(st *syntax.Stmt) {
 			return false
 		}
 		switch x := node.(type) {
+		case *syntax.Stmt:
+			// Nested statements carry their own process bits: a pipeline
+			// component or brace group followed by `&` inside the eval text
+			// is a child process exactly like the outer spelling.
+			if x.Background || x.Coprocess {
+				return false
+			}
+			return true
 		case *syntax.FuncDecl:
 			c.noteFuncDef(x)
 			return true
@@ -2541,7 +2736,7 @@ func (c *subCollector) noteSameProcessFuncDefs(st *syntax.Stmt) {
 				return false // pipeline components are child processes
 			}
 			return true
-		case *syntax.CmdSubst, *syntax.ProcSubst, *syntax.Subshell:
+		case *syntax.CmdSubst, *syntax.ProcSubst, *syntax.Subshell, *syntax.CoprocClause:
 			return false // child processes: definitions die with them
 		}
 		return true
@@ -2558,10 +2753,51 @@ func (c *subCollector) noteFuncDef(fd *syntax.FuncDecl) {
 	if fd == nil || fd.Name == nil {
 		return
 	}
+	// R24-Oracle-S2: the insertion path clones the shared substitution
+	// map lazily on its first positional write — reads never needed the
+	// copy. Extracted so the registration owner carries no registry
+	// bookkeeping nesting (R24 complexity budget).
+	c.regInsertFuncNames(fd.Name.Value)
+}
+
+// regInsertFuncNames installs one name into the positional function
+// registry (extracted from noteFuncDef / noteReadonlyDecls for the R24
+// complexity budget): the copy-on-write clone, the nil-table mint, the
+// incremental undo bookkeeping and the insertion itself are the SAME
+// single-owner registry operation every positional write shares.
+func (c *subCollector) regInsertFuncNames(name string) {
+	if c.funcNamesShared {
+		// R24-Oracle-S2: the shared substitution map clones lazily on its
+		// first positional write — reads never needed the copy.
+		c.regCopyElements += len(c.funcNames)
+		c.funcNames = cloneBoolMap(c.funcNames)
+		c.funcNamesShared = false
+	}
 	if c.funcNames == nil {
 		c.funcNames = map[string]bool{}
 	}
-	c.funcNames[fd.Name.Value] = true
+	if !c.funcNames[name] {
+		c.noteProcessRegAdd(name, false)
+	}
+	c.funcNames[name] = true
+}
+
+// regInsertReadonlyVar installs one name into the positional readonly
+// registry — the same single-owner registry operation as
+// regInsertFuncNames, keyed on the readonly table.
+func (c *subCollector) regInsertReadonlyVar(name string) {
+	if c.readonlyVarsShared {
+		c.regCopyElements += len(c.readonlyVars)
+		c.readonlyVars = cloneBoolMap(c.readonlyVars)
+		c.readonlyVarsShared = false
+	}
+	if c.readonlyVars == nil {
+		c.readonlyVars = map[string]bool{}
+	}
+	if !c.readonlyVars[name] {
+		c.noteProcessRegAdd(name, true)
+	}
+	c.readonlyVars[name] = true
 }
 
 // visitIf walks one if/elif/else statement (extracted from walkStmt so
@@ -3126,28 +3362,31 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 		case syntax.Pipe, syntax.PipeAll:
 			prevBind := c.allowBind
 			c.allowBind = false // no static head-bind across/inside pipelines
-			// R23-Reviewer-#3: the child-process boundary covers the
-			// positional tracks too — a function defined inside either
-			// component never shadows the parent shell's later calls. The
-			// snapshot must precede BOTH component walks: definitions
-			// minted while walking either side mutate the cloned maps the
-			// boundary discards.
-			restoreRegs := c.snapshotProcessRegs()
-			// R20-Oracle-M3/R21-Oracle-M3: every pipeline component runs in
-			// its OWN child process — the two sides fork sibling scopes (two
-			// distinct ids off the same parent prefix): an assignment inside
-			// either component binds within THAT component's environment
-			// only, never the sibling's and never the parent's.
+			// R24-Reviewer-#3 / R24-Oracle-M3: EVERY pipeline component is
+			// its own child process, so each side derives its positional
+			// registry boundary from the SAME parent state independently —
+			// a function defined in the left component can never be visible
+			// while the right component is walked, and neither side leaks
+			// into the parent. The pre-R24 single snapshot covered both
+			// walks: it kept definitions out of the parent, but the left
+			// side's additions were still live when the right side ran.
+			// R20-Oracle-M3/R21-Oracle-M3: the two sides fork sibling scopes
+			// (two distinct ids off the same parent prefix): an assignment
+			// inside either component binds within THAT component's
+			// environment only, never the sibling's and never the parent's.
+			restoreRegsX := c.snapshotProcessRegs()
 			restoreX := c.enterChildScope()
 			c.walkStmt(cmd.X, feed)
 			restoreX()
+			restoreRegsX()
 			// Pipe right: fd0 becomes the upstream stream, but the rest of
 			// the descriptor table is inherited — { cat | sh 0<&9; } 9<&0
 			// still resolves fd9 to the pipe.
+			restoreRegsY := c.snapshotProcessRegs()
 			restoreY := c.enterChildScope()
 			c.walkStmt(cmd.Y, stdinFeed{piped: true, fds: feed.fds})
 			restoreY()
-			restoreRegs()
+			restoreRegsY()
 			c.allowBind = prevBind
 		case syntax.AndStmt, syntax.OrStmt:
 			c.walkStmt(cmd.X, feed)
@@ -3392,6 +3631,18 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 				// R22-Oracle-M1: a readonly-declared variable can never
 				// receive the write at runtime, so the declaration-aware
 				// gate applies exactly like the eval replication.
+				// R24-Reviewer-#2 / R24-Oracle-M2: the assignment OPERATOR
+				// decides whether a scalar bind can exist at all — exactly
+				// like the eval replication at bindEvalOneStmt: bash's `+=`
+				// concatenates onto the unknowable inherited value, and an
+				// array-subscript write `name[i]=v` leaves every other
+				// element intact, so neither can ever mint the literal RHS
+				// as the scalar binding. The conservative verdict for both
+				// is pollution, never the exact value.
+				if a.Append || a.Index != nil {
+					c.noteShellAssign(a.Name.Value, "", false)
+					continue
+				}
 				val, stOk := c.staticAssignVal(a.Value)
 				c.noteShellAssign(a.Name.Value, val, stOk)
 			} else {
@@ -3454,46 +3705,11 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 	// A for-loop enum command head ($X) that expanded to a directory-
 	// switch or code-eval builtin invalidates every later static $(pwd)
 	// bind exactly like a literal `cd` sighting — `for X in cd; do $X
-	// <evil>; done; D=$(pwd)` must stay dynamic (R4 MF-2). The same
-	// builtin/command strip the CallExpr sighting uses applies here.
-	if enumHeadExpanded && !c.hasCd {
-		args := argv
-		// Prefix env assigns (FOO=1 $X "cd ...") sit ahead of the expanded
-		// head word — skip them before the builtin/command strip or the
-		// first word reads as the assignment, not the builtin (R5 MF-2).
-		for len(args) > 0 && isAssignWord(args[0]) {
-			args = args[1:]
-		}
-		for len(args) > 0 {
-			base := args[0]
-			if k := strings.LastIndexByte(base, '/'); k >= 0 {
-				base = base[k+1:]
-			}
-			if base != "builtin" && base != "command" {
-				break
-			}
-			args = args[1:]
-			for len(args) > 0 {
-				a := args[0]
-				if a == "--" || isDynamicArg(a) || !strings.HasPrefix(a, "-") || a == "-" {
-					break
-				}
-				args = args[1:]
-			}
-			if len(args) > 0 && args[0] == "--" {
-				args = args[1:]
-			}
-		}
-		if len(args) > 0 {
-			base := args[0]
-			if k := strings.LastIndexByte(base, '/'); k >= 0 {
-				base = base[k+1:]
-			}
-			switch base {
-			case "cd", "chdir", "pushd", "popd", "eval", "source", ".":
-				c.hasCd = true
-			}
-		}
+	// <evil>; done; D=$(pwd)` must stay dynamic (R4 MF-2). Extracted so
+	// the assignment-operator ownership carries no enum chain-scan
+	// nesting (R24 complexity budget).
+	if enumHeadExpanded {
+		c.noteEnumHeadBuiltin(argv)
 	}
 
 	seg := shellSegment{
@@ -3513,6 +3729,53 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 	if len(seg.argv) > 0 || seg.redirectFile != "" || len(seg.heredocText) > 0 ||
 		seg.hereString != "" || seg.processSubst || seg.depthExceeded {
 		c.segs = append(c.segs, seg)
+	}
+}
+
+// noteEnumHeadBuiltin marks the collector's directory-switch sighting
+// when one expanded enum command head resolves to cd/eval/source (R4
+// MF-2 — extracted from emitCall for the R24 complexity budget, verbatim
+// behavior): prefix env assigns (FOO=1 $X "cd ...") sit ahead of the
+// expanded head word — skip them before the builtin/command strip or the
+// first word reads as the assignment, not the builtin (R5 MF-2). The
+// strip itself is the same one the CallExpr sighting uses.
+func (c *subCollector) noteEnumHeadBuiltin(argv []string) {
+	if c.hasCd {
+		return
+	}
+	args := argv
+	for len(args) > 0 && isAssignWord(args[0]) {
+		args = args[1:]
+	}
+	for len(args) > 0 {
+		base := args[0]
+		if k := strings.LastIndexByte(base, '/'); k >= 0 {
+			base = base[k+1:]
+		}
+		if base != "builtin" && base != "command" {
+			break
+		}
+		args = args[1:]
+		for len(args) > 0 {
+			a := args[0]
+			if a == "--" || isDynamicArg(a) || !strings.HasPrefix(a, "-") || a == "-" {
+				break
+			}
+			args = args[1:]
+		}
+		if len(args) > 0 && args[0] == "--" {
+			args = args[1:]
+		}
+	}
+	if len(args) > 0 {
+		base := args[0]
+		if k := strings.LastIndexByte(base, '/'); k >= 0 {
+			base = base[k+1:]
+		}
+		switch base {
+		case "cd", "chdir", "pushd", "popd", "eval", "source", ".":
+			c.hasCd = true
+		}
 	}
 }
 
@@ -3984,23 +4247,32 @@ func (c *subCollector) emitNestedFromNode(n syntax.Node, feed stdinFeed) {
 // inside bind within this substitution's environment only.
 func (c *subCollector) newSub() *subCollector {
 	sub := &subCollector{
-		code:          c.code,
-		depth:         c.depth + 1,
-		staticVars:    cloneStringMap(c.staticVars),
-		litVars:       cloneStringMap(c.litVars),
-		enumVars:      cloneStringMap(c.enumVars),
-		enumCmdWords:  cloneStringsMap(c.enumCmdWords),
-		taintedVars:   cloneBoolMap(c.taintedVars),
-		ssaBlocked:    cloneBoolMap(c.ssaBlocked),
-		readonlyVars:  cloneBoolMap(c.readonlyVars),
-		funcNames:     cloneBoolMap(c.funcNames),
-		allowBind:     false,
-		childScope:    true,           // $(...) / <(...) run in their own child process (R20-Oracle-M3)
-		scopeCounter:  c.scopeCounter, // R21-Oracle-M3: share the unique scope id space
-		fdUnvetted:    c.fdUnvetted,
-		caller:        c.caller,        // $(pwd) binds the same screened cwd inside $(...)
-		hasCd:         c.hasCd,         // an outer cd already sighted stays sighted
-		posixNoBraces: c.posixNoBraces, // R18-Oracle-S4: the $(...) re-parse runs in the SAME shell — dash never brace-expands there either, so the dialect must ride into the substitution collector or echo $(printf tag{red,blue}) under dash encodes a brace word the runtime never produces
+		code:         c.code,
+		depth:        c.depth + 1,
+		staticVars:   cloneStringMap(c.staticVars),
+		litVars:      cloneStringMap(c.litVars),
+		enumVars:     cloneStringMap(c.enumVars),
+		enumCmdWords: cloneStringsMap(c.enumCmdWords),
+		taintedVars:  cloneBoolMap(c.taintedVars),
+		ssaBlocked:   cloneBoolMap(c.ssaBlocked),
+		// R24-Oracle-S2: the positional tracks move to copy-on-write —
+		// a substitution that defines no function and declares no readonly
+		// variable never pays a table copy. The first write inside the
+		// substitution clones lazily in noteFuncDef/noteReadonlyDecls;
+		// the parent's map can never mutate underneath because the walk
+		// is single-threaded and the substitution collector is discarded
+		// before the walk resumes.
+		readonlyVars:       c.readonlyVars,
+		funcNames:          c.funcNames,
+		readonlyVarsShared: len(c.readonlyVars) > 0,
+		funcNamesShared:    len(c.funcNames) > 0,
+		allowBind:          false,
+		childScope:         true,           // $(...) / <(...) run in their own child process (R20-Oracle-M3)
+		scopeCounter:       c.scopeCounter, // R21-Oracle-M3: share the unique scope id space
+		fdUnvetted:         c.fdUnvetted,
+		caller:             c.caller,        // $(pwd) binds the same screened cwd inside $(...)
+		hasCd:              c.hasCd,         // an outer cd already sighted stays sighted
+		posixNoBraces:      c.posixNoBraces, // R18-Oracle-S4: the $(...) re-parse runs in the SAME shell — dash never brace-expands there either, so the dialect must ride into the substitution collector or echo $(printf tag{red,blue}) under dash encodes a brace word the runtime never produces
 	}
 	// Mint this substitution's own child scope id once: the sub-collector
 	// is single-use, so the scope never pops (the restore closure is
@@ -4132,10 +4404,7 @@ func (c *subCollector) noteReadonlyDecls(argv []string) {
 		if name == "" || strings.ContainsAny(name, "\x00") || isDynamicArg(name) {
 			continue
 		}
-		if c.readonlyVars == nil {
-			c.readonlyVars = map[string]bool{}
-		}
-		c.readonlyVars[name] = true
+		c.regInsertReadonlyVar(name)
 	}
 }
 

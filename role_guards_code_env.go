@@ -3406,6 +3406,15 @@ type xargsWorkState struct {
 	mu    sync.Mutex
 	memo  map[string]bool
 	steps int
+	// exhausted is the sticky single-request ANALYSIS-CUTOFF verdict
+	// (R24-Reviewer-#5 / R24-Oracle-M5): it is set only when the recursion
+	// depth cutoff fires or when a new step is requested after the 512th
+	// step already ran — never merely because steps reached the budget.
+	// A step count alone cannot distinguish "the 512th step computed a
+	// definite answer" from "the analysis had to give up", so the
+	// fail-closed exhaustion verdict must be recorded at the cutoff
+	// itself, not inferred after the fact.
+	exhausted bool
 }
 
 // xargsEnsureWork is xargsWork plus the write-back: the minted table is
@@ -3428,7 +3437,7 @@ func xargsEnsureWork(c callerIdentity) (callerIdentity, *xargsWorkState) {
 // exhaustion verdict distinct from a confirmed code-slot hit.
 func xargsBudgetSpent(ws *xargsWorkState) bool {
 	ws.mu.Lock()
-	spent := ws.steps >= xargsWorkBudget
+	spent := ws.exhausted
 	ws.mu.Unlock()
 	return spent
 }
@@ -3453,6 +3462,16 @@ func xargsFeedsCodeFlagDepth(inner, outerXargs []string, pathEnv string, caller 
 		return false
 	}
 	if depth >= peelChainMaxDepth {
+		// R24-Reviewer-#5 / R24-Oracle-M5: the recursion-depth cutoff is an
+		// ANALYSIS cutoff exactly like the step ceiling — the consumer
+		// identity is unknowable, so the sticky exhaustion bit must be
+		// recorded on the request table. Returning the same boolean as a
+		// confirmed code-slot hit is correct for the fail-closed analysis,
+		// but the TARGET projection distinguishes the two through the bit.
+		_, ws := xargsEnsureWork(caller)
+		ws.mu.Lock()
+		ws.exhausted = true
+		ws.mu.Unlock()
 		return true
 	}
 	// R23-Reviewer-#1 / R23-Oracle-M5: a caller carrying no request table
@@ -3470,8 +3489,13 @@ func xargsFeedsCodeFlagDepth(inner, outerXargs []string, pathEnv string, caller 
 		return v
 	}
 	if ws.steps >= xargsWorkBudget {
-		// Single-request budget ceiling: fail closed rather than pay an
-		// attacker-shaped re-peel cascade.
+		// Single-request budget ceiling: the NEXT step request fails
+		// closed rather than pay an attacker-shaped re-peel cascade.
+		// R24-Reviewer-#5: only THIS denied request sets the exhaustion
+		// bit — the 512th step itself executes normally, and a definite
+		// verdict computed exactly on it must not be re-read as an
+		// analysis cutoff after the fact.
+		ws.exhausted = true
 		ws.mu.Unlock()
 		return true
 	}
@@ -3557,7 +3581,7 @@ func xargsSSHFeedsCodeSlot(h []string, repl string, outerXargs []string, outerCa
 		// a program — the sshTunnelsStdinProgram/xargsDerivedSeg modelling
 		// screens that vehicle path with the precise verdict, so the open
 		// feed only matters for remote shell-text joins (v6.2.2 MF-8).
-		return xargsSSHAppendFeedsRemoteShell(h)
+		return xargsSSHAppendFeedsRemoteShell(h, outerCaller)
 	}
 	remoteCmd, hit := parseSSHInvocation(h)
 	if hit != "" {

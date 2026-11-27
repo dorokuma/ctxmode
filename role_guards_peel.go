@@ -316,7 +316,11 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		// The inner code screen resolves under the same call cwd as the
 		// enclosing head — the guardCall must inherit it or the
 		// process-cwd fallback would resolve differently.
+		// R24-Reviewer-#1 / R24-Oracle-M1: it also inherits the request's
+		// xargs memo/budget table — an inner code screen is the same
+		// analysis request, never a fresh 512-step allowance.
 		g.cwd = caller.cwd
+		g.xw = caller.xw
 		if rule, detail := g.guardCtxRunCode(lang, code); rule != "" {
 			if detail == roSSHWriteHit || detail == "ctxmode index" || isReportGuardDetail(detail) {
 				return detail

@@ -703,7 +703,13 @@ func sshTunnelsStdinProgram(argv []string, pathEnv string, caller callerIdentity
 	if hit != "" {
 		return false
 	}
-	return remoteReadsProgramFromStdinCwd(remoteCmd, caller.screenCwd())
+	// R24-Reviewer-#1 / R24-Oracle-M1: the remote stdin-program verdict
+	// charges the SAME request xargs table — the pre-R24 call passed only
+	// cwd, so each remote statement minted a private 512-step budget and
+	// the answer to "is this projection exhausted" could differ from the
+	// table the rest of the request was consuming.
+	caller, _ = xargsEnsureWork(caller)
+	return remoteReadsProgramFromStdinCaller(remoteCmd, sshRemoteCallerIdentity(caller))
 }
 
 // guardCtxRunStdin screens a ctx_run stdin payload when the argv's resolved
@@ -1109,12 +1115,20 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 		return nil
 	}
 	base := filepath.Base(head[0])
-	if canon := canonicalResolvedBase(base); canon != base {
-		if isPeeledWrapperBase(canon) {
-			return stdinProgramTargetsDialect(append([]string{canon}, head[1:]...), depth+1, envAs, basePath, caller, bash)
-		}
-		head = append([]string{canon}, head[1:]...)
-		base = canon
+	// R24-Reviewer-#6 / R24-Oracle-M6: remember whether the ORIGINAL
+	// command spelling carried a path separator BEFORE any canonical
+	// rewrite. The resolved-basename normalization below can map a
+	// versioned absolute interpreter (/usr/bin/ruby3.2 -> ruby) onto its
+	// canonical slash-free name; the PATH-dependency verdict must key on
+	// the spelling the user typed — a fixed absolute spelling never
+	// depends on PATH resolution no matter what the normalization
+	// rewrites it to ("fixed paths are unaffected"). The rewrite itself
+	// is the extracted owner so the head classification carries no
+	// canonical-alias branching (R24 complexity budget).
+	origHasSlash := strings.ContainsRune(head[0], '/')
+	head, base, recursed := stdinCanonHeadRewrite(head, base, depth, envAs, basePath, caller, bash)
+	if recursed.fired {
+		return recursed.targets
 	}
 	effPath := envAs.effectivePATHFrom(basePath)
 	// R23-Reviewer-#6 / R23-Oracle-#6: a bare (slash-free) command head
@@ -1122,7 +1136,9 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 	// static head tables recognize (sh/dash/ash/bash/cat/…). When the
 	// effective PATH is untrusted the lookup answer is unknowable BEFORE
 	// any static spelling or symlink resolution may be adopted.
-	if bareHeadUntrustedPATH(head[0], envAs, basePath, caller) {
+	// R24-Reviewer-#6: the test consults the ORIGINAL spelling — a
+	// canon-rewritten absolute head keeps its fixed-path identity.
+	if !origHasSlash && bareHeadUntrustedPATH(head[0], envAs, basePath, caller) {
 		return []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
 	}
 	if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath, caller.screenCwd())); rb != "" && rb != base {
@@ -1203,10 +1219,13 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 // — a canon-rewritten recursion (`env -C sub genv ./mysh`) must keep
 // the -C re-anchor and the `u`/`a` taints it peeled (R5 MF-4).
 func stdinTargetsPeelPrologue(argv []string, depth int, inherited envAssignments, caller callerIdentity) ([]string, envAssignments, callerIdentity, []stdinTarget) {
-	if len(argv) == 0 || depth >= shellSplitMaxDepth {
-		if len(argv) == 0 {
-			return nil, inherited, caller, nil
-		}
+	if len(argv) == 0 {
+		return nil, inherited, caller, nil
+	}
+	if depth >= shellSplitMaxDepth {
+		return nil, inherited, caller, []stdinTarget{{lang: "", envAs: inherited, exhausted: true}}
+	}
+	if stdinWrapperPeelUntrusted(argv, inherited, caller) {
 		return nil, inherited, caller, []stdinTarget{{lang: "", envAs: inherited, exhausted: true}}
 	}
 	head, _, ea, exhausted := peelWrappers(argv)
@@ -1215,6 +1234,93 @@ func stdinTargetsPeelPrologue(argv []string, depth int, inherited envAssignments
 		return nil, envAs, caller, []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
 	}
 	return head, envAs, caller.seededWith(ea), nil
+}
+
+// stdinCanonRewrite is the recursion discharge of stdinCanonHeadRewrite:
+// fired reports whether the canonical alias is itself a peeled wrapper
+// (the recursion verdict IS the final answer — including a legitimate
+// nil data-consumer fallback), and targets carries that verdict.
+type stdinCanonRewrite struct {
+	fired   bool
+	targets []stdinTarget
+}
+
+// stdinCanonHeadRewrite is the canonical-alias rewrite owner of
+// stdinProgramTargetsDialect (extracted for the R24 complexity budget):
+// a recognized wrapper alias recursion discharges the whole head
+// classification, while an ordinary canonical spelling simply replaces
+// the head word and the caller proceeds with the classification.
+func stdinCanonHeadRewrite(head []string, base string, depth int, envAs envAssignments, basePath string, caller callerIdentity, bash bool) ([]string, string, stdinCanonRewrite) {
+	canon := canonicalResolvedBase(base)
+	if canon == base {
+		return head, base, stdinCanonRewrite{}
+	}
+	if isPeeledWrapperBase(canon) {
+		return head, base, stdinCanonRewrite{fired: true, targets: stdinProgramTargetsDialect(append([]string{canon}, head[1:]...), depth+1, envAs, basePath, caller, bash)}
+	}
+	return append([]string{canon}, head[1:]...), canon, stdinCanonRewrite{}
+}
+
+// stdinWrapperPeelUntrusted is the pre-adoption validation owner of
+// stdinTargetsPeelPrologue (extracted for the R24 complexity budget —
+// R24-Reviewer-#6 / R24-Oracle-M6): it validates the EXTERNAL wrapper
+// identities BEFORE peelWrappers adopts them. A bare slash-free external
+// wrapper (env/nice/nohup/timeout/stdbuf/setsid/…) owes its own
+// resolution to PATH exactly like the final head does; once the peel
+// strips it, only the inner command spelling remains and the
+// bareHeadUntrustedPATH check can never see the identity that actually
+// depended on the untrusted search list. Shell builtins
+// (command/builtin/exec) resolve inside the shell itself — never through
+// PATH — so they are deliberately exempt. The scan is intentionally
+// shallow: it walks past KEY=VAL prefixes, inert compound fragments and
+// `--` exactly like the peel does, checks the FIRST external wrapper
+// layer, and each canonical alias recursion re-enters the prologue so
+// later layers are validated when they are adopted too. The wrapper's
+// own PATH dependency is judged against the SAME base the final head
+// resolves under: the caller's effective PATH (depth-0 basePath is
+// exactly that — see stdinProgramTargetsDialect — and recursion layers
+// inherit it through caller.seededWith).
+func stdinWrapperPeelUntrusted(argv []string, inherited envAssignments, caller callerIdentity) bool {
+	return externalWrapperUntrustedPATH(argv, inherited, caller, caller.effectivePATH())
+}
+
+// externalWrapperUntrustedPATH reports whether the leading external
+// wrapper layer of argv is a bare slash-free name whose own resolution
+// depends on an untrusted PATH (R24-Reviewer-#6 / R24-Oracle-M6,
+// extracted so stdinTargetsPeelPrologue carries no chain-scan nesting).
+// Only EXTERNAL wrappers count: command/builtin/exec are shell builtins
+// the kernel never resolves through PATH, and shell syntax words are
+// not programs at all. Assignment words, inert fragments and `--` skip
+// exactly like peelWrappers' own prologue so the checked word is the
+// same one the peel would adopt.
+func externalWrapperUntrustedPATH(argv []string, envAs envAssignments, caller callerIdentity, basePath string) bool {
+	for _, a := range argv {
+		if isAssignWord(a) || shellNoopWords[a] || a == "--" {
+			continue
+		}
+		switch a {
+		case "if", "then", "elif", "else", "while", "until", "do", "!", "coproc":
+			continue
+		}
+		base := filepath.Base(a)
+		switch base {
+		case "command", "builtin", "exec":
+			// Shell builtins: resolved inside the shell process, never
+			// through PATH. `command`/`builtin` may still launch an external
+			// command in the NEXT position, but the peel adopts that next
+			// word itself — its own PATH dependency is validated when this
+			// prologue re-enters or when the final head is classified.
+			return false
+		}
+		if !isPeeledWrapperBase(base) {
+			return false
+		}
+		if strings.ContainsRune(a, '/') {
+			return false
+		}
+		return envAs.pathUntrusted(basePath) || caller.pathUntrusted()
+	}
+	return false
 }
 
 // stdinUnknownHeadTargets is the tail verdict of

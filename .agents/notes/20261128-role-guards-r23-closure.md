@@ -10,12 +10,12 @@ Oracle R23（Must-Fix 6 + Should-Fix 2）与 Reviewer R23（Must-Fix 8）两份�
 
 ## 根因与修复要点（留痕口径）
 
-1. **单请求共享一份 xargs 预算**：`guardCall` 预初始化一份 `xw *xargsWorkState`（`newGuardCall` 铸造），全部派生身份经 `pickRequestXargsWork` 继承同一指针；`xargsEnsureWork` 在首个递归消费前把新表写回 caller（按值传递的修复）；无 caller 入口（`stdinEntryCaller`）预装自己的表。零值手工 guardCall 保留偶发欠共享但绝不跨请求的退路。坑：测试须断言 `c1.xw == c2.xw` 指针同一，且另一新 guardCall 独立满预算。
+1. **单请求共享一份 xargs 预算**：`guardCall` 预初始化一份 `xw *xargsWorkState`（`currentGuardCall` 铸造），全部派生身份经 `pickRequestXargsWork` 继承同一指针；`xargsEnsureWork` 在首个递归消费前把新表写回 caller（按值传递的修复）；无 caller 入口（`stdinEntryCaller`）预装自己的表。零值手工 guardCall 保留偶发欠共享但绝不跨请求的退路。坑：测试须断言 `c1.xw == c2.xw` 指针同一，且另一新 guardCall 独立满预算。
 2. **赋值运算符身份随序列化传递**：`assignToPrefix` 丢弃 `Append`/`Index` 会把 `PATH+=/x` 与 `arr[1]=v` 抹成独立常量覆写。并行 `assignFlags` 字节串随段传递，`foldAssignWord` 仅对纯标量 `=` 且 RHS 无自引用/动态才清除 taint；`+=` 在旧值确定时保留自引用形式、不确定时保持 taint，下标写绝不建立标量精确值。坑：复杂度预算下 `foldAssignWord` 的三个分支形态（cond/index/append）提取为 `taintTrackedVar`/`foldAppendWrite`。
-3. **函数定义/readonly 按执行作用域传播**：同进程复合块（`{ }`、if/while/for/case 体）内的 `FuncDecl` 登记进当前进程；子 shell/管道段/后台/命令替换/否定命令退出时恢复父快照（`snapshotProcessRegs`/`noteSameProcessFuncDefs`/`restoreRegs`）。eval 重放与主遍历共用同一登记助手。`PIPESTATUS` 与 `_` 入 non-bindable 表（每条命令被 shell 重写）。
+3. **函数定义/readonly 按执行作用域传播**：同进程复合块（`{ }`、if/while/for/case 体）内的 `FuncDecl` 登记进当前进程；子 shell/管道段/后台/命令替换退出时恢复父快照（`snapshotProcessRegs`/`noteSameProcessFuncDefs`）。eval 重放与主遍历共用同一登记助手。`PIPESTATUS` 与 `_` 入 non-bindable 表（每条命令被 shell 重写）。
 4. **eval 操作数求值写与重解析写分属不同所有者**：`writeNamesInStmtFuncs` 对 bind 根调用截断到首词时同时扣掉了操作数词片自己的参数展开写（`${X=/v}`），动态操作数回放只污染 sentinel 集不覆盖普通变量——写凭空消失。`taintOperandParamAssigns` 对每个存活链判定显式扫描操作数词片；嵌套两条回放路径对短/无 rest 的 Taint 链统一走 `taintEvalBoundary`。
 5. **远端认证查全表，xargs 预算耗尽与命中可分**：`remoteStdinProgramLangsCwd` 遍历全部非数据目标并传播 exhaustion（heredoc/here-string 流按深度判定失败）；`isPureRemoteStdinVehicleCwd` 要求每个非数据目标都是正面识别的纯 shell（`stdinTargetsAllPureShell`）。`xargsBudgetSpent` 读共享表的粘性耗尽位，`stdinXargsTargets` 在预算耗尽时即使内层是 cat 也返回 `exhausted: true`。死助手 `stdinProgramHeadCwd`/`stdinProgramHeadCwdExh`/`xargsWork` 删除。
-6. **裸头先判 PATH 可信再采用任何解析**：`bareHeadUntrustedPATH` 在 typed 分支之前拦截一切无斜杠头——PATH 不可信时裸 `sh` 也是身份不明（exhausted），固定绝对拼写不受影响。`hc_prepare` 两入口共享 `stdinRewriteableTarget` 经源码核实自 R22 已成立，缺的是投影侧拦截。
+6. **裸头先判 PATH 可信再采用任何解析**：`bareHeadUntrustedPATH` 在 typed 分支之前拦截一切无斜杠头——PATH 不可信时裸 `sh` 也是身份不明（exhausted），固定绝对拼写不受影响。`hc_prepare` 两入口共享 `stdinRewriteableTarget` 是本轮 R23 才接线的：R23 diff 前脚本入口仍走 `stdinSingleShellTargetDialect` + 内联拒绝；缺的是投影侧拦截。
 7. **嵌套纯赋值跳过条件写反 + O(1) 父查表**：`collectOneStdinSeg` 的 `!seg.pureAssign` 只包住空头检查，真正纯赋值逐段复制前缀（4/8 段复制 10/36 ops）。fold 后 pureAssign 直接 return nil；`stateFor` 切尾 id 一步查父；heredoc 侧 `segNeedsConsumerView` 仅在屏幕实际读 runEnv 时物化。
 8. **文档校准**：CHANGELOG 19/24-27/40 与 R22 closure note 按 blob 与测量对象分别写数（详见 R22 note 内联 R23 校正标记与 CHANGELOG R23 条）。
 

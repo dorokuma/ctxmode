@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"runtime"
 	"strings"
@@ -1276,7 +1277,14 @@ func TestGuard_V622_OracleR23Probes(t *testing.T) {
 		// inner target has no open code slot — the budget cutoff must
 		// surface as an EXPLICIT exhaustion verdict, never the zero-value
 		// lang:"" pseudo-POSIX-shell target the control produces.
-		caller := callerIdentity{xw: &xargsWorkState{steps: xargsWorkBudget}}
+		// R24-Reviewer-#5: the exhaustion verdict is explicit state, never a
+		// post-hoc reading of the step counter — the fixture forces it
+		// through the public denied-step path rather than naming state
+		// fields, so setting only the step count models "the 512th step
+		// completed normally", not an analysis cutoff.
+		spent := &xargsWorkState{steps: xargsWorkBudget}
+		_ = xargsFeedsCodeFlagDepth([]string{"cat"}, []string{"xargs"}, "/usr/bin:/bin", callerIdentity{xw: spent}, 0)
+		caller := callerIdentity{xw: spent}
 		targets := stdinProgramTargetsDialect([]string{"xargs", "cat"}, 0, envAssignments{}, "/usr/bin:/bin", caller, false)
 		hasExhausted := false
 		for _, tg := range targets {
@@ -1391,6 +1399,391 @@ func TestGuard_V622_OracleR23Probes(t *testing.T) {
 		}
 		if late > early*3/2 {
 			t.Fatalf("nested collectOneStdinSeg marginal allocation GROWS with the prefix length: %d bytes for segments 1-8 vs %d for segments 57-64 (ratio %.2f, want ≤ 1.5) — the nested loop still materializes one view copy per pure-assignment segment instead of skipping before the view", early, late, float64(late)/float64(early))
+		}
+	})
+}
+
+// TestGuard_V622_OracleR24Probes pins the Oracle R24 / Reviewer R24
+// closure — one discriminating subtest per intersecting finding:
+//
+//	R24-1: the SSH remote projection threads the SAME request xargs
+//	  memo/budget table end to end — an already-exhausted caller reports
+//	  the remote xargs data consumer as program-shaped (fail closed),
+//	  a fresh caller reports it as data, and the fresh projection's steps
+//	  accumulate on the caller's own table (Reviewer #1 / Oracle M1).
+//	R24-2: the main AST collector never mints a scalar static binding for
+//	  an array-subscript or `+=` assignment, while a plain independent `=`
+//	  keeps its exact binding (Reviewer #2 / Oracle M2).
+//	R24-3: static eval replay shares the main traversal's process
+//	  boundaries — background definitions die with the child, readonly
+//	  declarations replay, pipeline components are mutually isolated —
+//	  and child-process registry isolation is incremental instead of
+//	  cloning the whole registry at every boundary (Reviewer #3 /
+//	  Oracle M3 + S2).
+//	R24-4: arithmetic writes inside eval operand expansion words are
+//	  owned by the replication exactly like parameter-expansion default
+//	  assignments, and a nested tainted chain with a short rest still
+//	  reaches the maximal pollution boundary (Reviewer #4 / Oracle M4).
+//	R24-5: xargs recursion-depth cutoff is explicit exhaustion distinct
+//	  from both a confirmed hit and a normally completed 512th step; the
+//	  remote projection folds environment writes across segments and
+//	  keeps the consuming shell's dialect (Reviewer #5 / Oracle M5).
+//	R24-6: bare external wrapper identities are validated before the
+//	  peel adopts them, and a canon-normalized absolute interpreter
+//	  keeps the original spelling's fixed-path identity (Reviewer #6 /
+//	  Oracle M6).
+//
+// Every discriminating row is FAIL-first on the pre-fix tree f8cd003:
+// the probes reference only symbols that already exist there (the
+// collectors, remote projections, peel helpers and xargsWorkState), so
+// the file compiles verbatim on the parent tree and the failures
+// reproduce the audit findings directly. The only exception is the
+// process-registry copy probe: f8cd003 has no incremental undo log to
+// observe, so that row uses the same allocation-window discrimination
+// style as R23-7 and compares marginal copy cost across registry sizes
+// without naming any post-fix implementation detail.
+func TestGuard_V622_OracleR24Probes(t *testing.T) {
+	// lastOperand encodes the last segment's second argv word of a bash
+	// script — the substitution/binding result the replication state
+	// decides. It mirrors the R23 fixture exactly.
+	lastOperand := func(t *testing.T, script string) string {
+		t.Helper()
+		segs, ok := parseSubagentShellASTEnv(script, 0, false, true, nil, callerIdentity{})
+		if !ok || len(segs) == 0 {
+			t.Fatalf("parse %q failed: ok=%v segs=%v", script, ok, segs)
+		}
+		last := segs[len(segs)-1]
+		if len(last.argv) < 2 {
+			t.Fatalf("parse %q: last seg argv=%v, want at least 2 words", script, last.argv)
+		}
+		return last.argv[1]
+	}
+
+	// ---- R24-1: one xargs budget spans the SSH remote projection ----
+	t.Run("R24-1 the SSH remote projection shares the caller's request xargs table", func(t *testing.T) {
+		argv := []string{"ssh", "host", "xargs cat"}
+		exhaustedState := &xargsWorkState{steps: xargsWorkBudget}
+		// Force the sticky analysis-cutoff state through the public analysis
+		// path rather than naming implementation fields: on f8cd003 the step
+		// count itself is the cutoff state; after the explicit-verdict fix
+		// this denied 513th-step request is what records exhaustion.
+		_ = xargsFeedsCodeFlagDepth([]string{"cat"}, []string{"xargs"}, "/usr/bin:/bin", callerIdentity{xw: exhaustedState}, 0)
+		if !sshTunnelsStdinProgram(argv, "/usr/bin:/bin", callerIdentity{xw: exhaustedState}) {
+			t.Fatalf("sshTunnelsStdinProgram(ssh host xargs cat, exhausted caller) = false — the budget cutoff means the remote consumer identity is unknowable, so the projection must fail closed as program-shaped")
+		}
+		freshState := &xargsWorkState{}
+		if sshTunnelsStdinProgram(argv, "/usr/bin:/bin", callerIdentity{xw: freshState}) {
+			t.Fatalf("sshTunnelsStdinProgram(ssh host xargs cat, fresh caller) = true — a plain remote xargs cat is a data consumer, not a stdin program")
+		}
+		freshState.mu.Lock()
+		steps := freshState.steps
+		freshState.mu.Unlock()
+		if steps == 0 {
+			t.Fatalf("fresh SSH remote projection consumed ZERO xargs steps on the caller's table — the remote statements each minted a private budget through stdinEntryCaller instead of sharing the request's xargsWorkState")
+		}
+	})
+
+	// ---- R24-2: no scalar bind for append/subscript assignment writes ----
+	t.Run("R24-2 array-subscript and append assignments never mint scalar static bindings", func(t *testing.T) {
+		// Feed one pure-assignment statement directly to the main collector's
+		// emitCall: the discriminating state is staticVars itself, the same
+		// table later scalar expansion reads. (The array-subscript spelling
+		// intentionally never reaches the segment parser as a plain command
+		// word — a full-script echo probe would test glob encoding instead.)
+		emitAssign := func(src string) *subCollector {
+			t.Helper()
+			p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+			f, err := p.Parse(strings.NewReader(src), "")
+			if err != nil || len(f.Stmts) != 1 {
+				t.Fatalf("parse %q: err=%v stmts=%d", src, err, len(f.Stmts))
+			}
+			call, isCall := f.Stmts[0].Cmd.(*syntax.CallExpr)
+			if !isCall {
+				t.Fatalf("fixture broken: %q root cmd is %T, want CallExpr", src, f.Stmts[0].Cmd)
+			}
+			c := blankSubCollector()
+			c.allowBind = true
+			c.emitCall(f.Stmts[0], call, stdinFeed{})
+			return c
+		}
+		if got := emitAssign(`ARR[1]=/marker`).staticVars["ARR"]; got == "/marker" {
+			t.Fatalf("ARR[1]=/marker minted staticVars[ARR]=%q — a subscript write touches one array element and can never establish the scalar value later expansion reads", got)
+		}
+		if got := emitAssign(`VAR+=/marker`).staticVars["VAR"]; got == "/marker" {
+			t.Fatalf("VAR+=/marker minted staticVars[VAR]=%q — bash concatenates the suffix onto the inherited value, so the literal suffix is never the exact scalar binding", got)
+		}
+		if got := emitAssign(`VAR=/marker`).staticVars["VAR"]; got != "/marker" {
+			t.Fatalf("control broken: plain VAR=/marker staticVars[VAR]=%q, want /marker — the independent plain assignment must keep its exact binding", got)
+		}
+	})
+
+	// ---- R24-3: shared process boundaries in eval replay and traversal ----
+	t.Run("R24-3 backgrounded eval-text definitions never shadow the parent but foreground ones do", func(t *testing.T) {
+		bg := lastOperand(t, `eval '{ eval() { :; }; } &'; eval 'R24_BG=/after'; echo "$R24_BG"`)
+		if bg != "/after" {
+			t.Fatalf("backgrounded eval-text shadowing binding query = %q, want /after — the backgrounded brace block runs in a child shell, so its definition must die with the child", bg)
+		}
+		fg := lastOperand(t, `eval '{ eval() { :; }; }'; eval 'R24_FG=/after'; echo "$R24_FG"`)
+		if fg == "/after" {
+			t.Fatalf("control broken: foreground eval-text shadowing binding query = %q — the same-process foreground definition must shadow the later bare eval", fg)
+		}
+	})
+	t.Run("R24-3 eval replay records readonly declarations", func(t *testing.T) {
+		c := blankSubCollector()
+		c.allowBind = true
+		c.bindEvalTextWrites("readonly R24_RO", 0)
+		if !c.readonlyVars["R24_RO"] {
+			t.Fatalf("static eval replay of readonly R24_RO left readonlyVars=%v — the main traversal records the attribute through emitDecl/emitCall, and the replication must share that process state", c.readonlyVars)
+		}
+		got := lastOperand(t, `eval 'readonly R24_ROV'; eval 'R24_ROV=/after'; echo "$R24_ROV"`)
+		if got == "/after" {
+			t.Fatalf("readonly eval binding query = %q — the frozen runtime variable can never receive the replicated write, so the exact bind is impossible", got)
+		}
+	})
+	t.Run("R24-3 pipeline components derive independent registry boundaries", func(t *testing.T) {
+		// The left pipe component defines eval in its own child process; the
+		// right component then invokes a bare eval with no operand. Isolated
+		// correctly, that right-side eval is the real builtin with an empty
+		// re-parse — no pollution. If the left component's definition is
+		// still visible while the right side is walked, the invocation is
+		// function-shadowed, its operand boundary is unconfirmable, and the
+		// maximal eval boundary taints PATH for every later proof.
+		t.Setenv("TMPDIR", "/tmp")
+		t.Setenv("PATH", "/usr/bin:/bin")
+		script := `{ eval() { :; }; } | { eval; }; echo "$(mktemp -d)"`
+		p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+		f, err := p.Parse(strings.NewReader(script), "")
+		if err != nil {
+			t.Fatalf("parse pipeline fixture: %v", err)
+		}
+		c := blankSubCollector()
+		c.allowBind = true
+		zero := 0
+		c.scopeCounter = &zero
+		c.walkStmts(f.Stmts, stdinFeed{})
+		if c.funcNames["eval"] {
+			t.Fatalf("pipeline function definition leaked into the parent registry (funcNames=%v) — both components are child processes", c.funcNames)
+		}
+		if c.taintedVars["PATH"] {
+			t.Fatalf("right-side bare eval was shadowed by the LEFT pipeline component's definition (tainted PATH=true) — the two components must derive independent registry boundaries from the same parent state")
+		}
+		if len(c.segs) == 0 || !strings.Contains(c.segs[len(c.segs)-1].argv[len(c.segs[len(c.segs)-1].argv)-1], "__ctx_abspath_dq__") {
+			t.Fatalf("mktemp substitution after isolated pipeline encoded as %v — left-to-right registry leakage polluted PATH and revoked the resolution proof", c.segs)
+		}
+	})
+	t.Run("R24-3 child-process registry isolation does not copy the whole registry", func(t *testing.T) {
+		// Register n empty functions OUTSIDE the allocation window, then
+		// measure one writeless child shell `(:)`. The pre-R24 snapshot
+		// cloned both positional maps on entry, so the marginal cost grew
+		// with the parent's registered population; the incremental undo
+		// boundary pays constant cost when the child writes nothing.
+		measure := func(n int) uint64 {
+			p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+			f, err := p.Parse(strings.NewReader(`(:)`), "")
+			if err != nil {
+				t.Fatalf("parse subshell fixture: %v", err)
+			}
+			c := blankSubCollector()
+			zero := 0
+			c.scopeCounter = &zero
+			for i := 0; i < n; i++ {
+				c.noteFuncDef(&syntax.FuncDecl{Name: &syntax.Lit{Value: fmt.Sprintf("r24f%03d", i)}})
+			}
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			c.walkStmts(f.Stmts, stdinFeed{})
+			runtime.ReadMemStats(&after)
+			return after.TotalAlloc - before.TotalAlloc
+		}
+		small, large := measure(4), measure(64)
+		if small == 0 {
+			t.Fatalf("fixture broken: zero marginal allocation for the n=4 child shell")
+		}
+		if large > small*3/2 {
+			t.Fatalf("writeless child-process boundary marginal allocation grows with the parent registry: %d bytes at n=4 vs %d at n=64 (ratio %.2f, want ≤ 1.5) — snapshotProcessRegs still copies the whole funcNames table on entry (f8cd003 copied n elements per child: 10 total for n=4 with four children, 36 for n=8)", small, large, float64(large)/float64(small))
+		}
+	})
+
+	// ---- R24-4: eval operand arithmetic writes have an owner ----
+	t.Run("R24-4 arithmetic writes inside an eval operand land as pollution", func(t *testing.T) {
+		p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+		f, err := p.Parse(strings.NewReader(`eval "$((AUDIT_MARK=1))"`), "")
+		if err != nil {
+			t.Fatalf("parse arithmetic operand fixture: %v", err)
+		}
+		writes, _ := preScanVarMutations(f, false)
+		if writes["AUDIT_MARK"] != 1 {
+			t.Fatalf("pre-scan AUDIT_MARK arithmetic write count = %d, want 1 — the operand arithmetic expansion is exactly the counted shape", writes["AUDIT_MARK"])
+		}
+		call, isCall := f.Stmts[0].Cmd.(*syntax.CallExpr)
+		if !isCall {
+			t.Fatalf("fixture broken: root cmd is %T, want CallExpr", f.Stmts[0].Cmd)
+		}
+		c := blankSubCollector()
+		c.allowBind = true
+		c.bindEvalCallWrites(f.Stmts[0], call)
+		if !c.taintedVars["AUDIT_MARK"] {
+			t.Fatalf("bindEvalCallWrites left AUDIT_MARK untouched (taintedVars=%v staticVars=%v) — the counted arithmetic write vanished between the truncated root scan and the operand replication", c.taintedVars, c.staticVars)
+		}
+		c.noteBuiltinWrites(f.Stmts[0], call)
+		if !c.taintedVars["AUDIT_MARK"] {
+			t.Fatalf("noteBuiltinWrites removed or never preserved AUDIT_MARK pollution (taintedVars=%v) — the counted write must survive the full bind/builtin replay", c.taintedVars)
+		}
+	})
+	t.Run("R24-4 a nested tainted short-rest eval chain reaches the maximal pollution boundary", func(t *testing.T) {
+		// `command -x eval` is an invocation error before eval can run:
+		// the chain verdict is tainted, the visible operand boundary is
+		// too short to carry text, and the replication must apply the
+		// uniform sentinel/PATH pollution instead of silently dropping
+		// the unconfirmable boundary.
+		c := blankSubCollector()
+		c.allowBind = true
+		c.bindEvalTextWrites("command -x eval", 0)
+		if !c.taintedVars["PATH"] {
+			t.Fatalf("nested tainted short-rest chain left PATH untainted (taintedVars=%v) — taintShortRestBoundary must reach taintEvalBoundary for an unconfirmable eval operand boundary", c.taintedVars)
+		}
+		for _, name := range []string{"HOME", "PWD", "OLDPWD"} {
+			if !c.taintedVars[name] {
+				t.Fatalf("nested tainted short-rest chain left sentinel %s untainted (taintedVars=%v) — the maximal pollution boundary is incomplete", name, c.taintedVars)
+			}
+		}
+	})
+
+	// ---- R24-5: explicit cutoff kinds, remote env folding and dialect ----
+	t.Run("R24-5 recursion-depth cutoff is exhaustion but a normal 512th step is not", func(t *testing.T) {
+		argv := []string{"cat"}
+		for i := 0; i < peelChainMaxDepth+2; i++ {
+			argv = append([]string{"xargs"}, argv...)
+		}
+		fresh := &xargsWorkState{}
+		targets := stdinProgramTargetsDialect(argv, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{xw: fresh}, false)
+		hasExhausted := false
+		for _, tg := range targets {
+			if tg.exhausted {
+				hasExhausted = true
+			}
+		}
+		if !hasExhausted {
+			t.Fatalf("deeply nested xargs projection = %v targets with NO exhaustion marker — the recursion-depth cutoff is an analysis cutoff exactly like the step ceiling, never a confirmed empty-language target", targets)
+		}
+		if !xargsBudgetSpent(fresh) {
+			t.Fatalf("deeply nested xargs projection did not mark the caller's request table exhausted — the cutoff state must be sticky for every later stage of the same request")
+		}
+		first, _ := firstProgramTarget(targets)
+		if stdinShellTargetRewriteable(first, false) {
+			t.Fatalf("depth-cutoff xargs projection remained rewrite-eligible (%+v) — an unidentified consumer can never be rewritten as a certified shell program", first)
+		}
+		// Control: completing exactly the 512th permitted step is a normal
+		// analysis result, not an analysis cutoff.
+		ws := &xargsWorkState{steps: xargsWorkBudget - 1}
+		stepTargets := stdinProgramTargetsDialect([]string{"xargs", "cat"}, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{xw: ws}, false)
+		if ws.steps != xargsWorkBudget {
+			t.Fatalf("fixture broken: xargs cat consumed %d steps from a %d-step table, want exactly %d", ws.steps, xargsWorkBudget-1, xargsWorkBudget)
+		}
+		if xargsBudgetSpent(ws) {
+			t.Fatalf("the normally completed 512th xargs step marked the request table exhausted — step count is not the analysis-cutoff verdict")
+		}
+		for _, tg := range stepTargets {
+			if tg.exhausted {
+				t.Fatalf("the normally completed 512th xargs step produced an exhausted target (%+v) — a definite answer computed on the final permitted step must stand", tg)
+			}
+		}
+	})
+	t.Run("R24-5 the remote projection folds environment writes across segments", func(t *testing.T) {
+		// The first remote segment conditionally writes PATH; the second
+		// segment is a bare sh whose identity depends entirely on PATH
+		// resolution. A per-segment empty-env projection misses the write;
+		// the folded remote shell environment makes the consumer unknowable.
+		// The legacy language-only API is deliberately the probe surface:
+		// it exists on both trees, so this row compiles verbatim on
+		// f8cd003 while the production screen consumes the richer target
+		// projection underneath it.
+		_, reads, exhausted := remoteStdinProgramLangsCwd("if x; then PATH=/evil; fi; sh", "/tmp")
+		if !reads {
+			t.Fatalf("remote conditional-PATH bare sh projection reads=false — the unknowable consumer must still fail closed as program-shaped")
+		}
+		if !exhausted {
+			t.Fatalf("remote conditional-PATH bare sh projection exhausted=false — the first segment's conditional PATH write never reached the second segment's bare-shell resolution")
+		}
+	})
+	t.Run("R24-5 the remote projection preserves the consuming shell dialect", func(t *testing.T) {
+		// Both dialects project the same language ("") through the legacy
+		// narrow view by design — it carries no dialect bits. The
+		// discriminating surface is the consuming screen: a brace-word
+		// heredoc body is a parse error under dash but valid bash text
+		// under bash, so the remote bash body must face the bash dialect
+		// rather than collapsing to the same POSIX re-review as sh.
+		// The pre-R24 screenStdinProgram invocation hard-coded false and
+		// made the two consumers indistinguishable.
+		bashSeg := shellSegment{argv: []string{"ssh", "host", "bash"}, heredocText: []heredocBody{{text: "printf tag{red,blue}"}}}
+		shSeg := shellSegment{argv: []string{"ssh", "host", "sh"}, heredocText: []heredocBody{{text: "printf tag{red,blue}"}}}
+		bashHit := screenSSHHead([]string{"ssh", "host", "bash"}, bashSeg, 's', 0, callerIdentity{})
+		shHit := screenSSHHead([]string{"ssh", "host", "sh"}, shSeg, 's', 0, callerIdentity{})
+		if bashHit == shHit {
+			t.Fatalf("remote bash and sh heredoc bodies received the same screening verdict %q — the projection collapsed both consuming shells to the dash POSIX default instead of preserving the bash dialect", bashHit)
+		}
+	})
+
+	// ---- R24-6: validate wrapper identity before adoption; keep fixed paths fixed ----
+	t.Run("R24-6 bare external wrappers are validated before the peel adopts them", func(t *testing.T) {
+		var untrusted envAssignments
+		untrusted.ops = append(untrusted.ops, envOp{kind: 't', key: "PATH"})
+		assertExhaustion := func(argv []string, want bool) {
+			t.Helper()
+			targets := stdinProgramTargetsDialect(argv, 0, untrusted, "/usr/bin:/bin", callerIdentity{}, false)
+			got := false
+			for _, tg := range targets {
+				if tg.exhausted {
+					got = true
+				}
+			}
+			if got != want {
+				t.Fatalf("stdinProgramTargetsDialect(%v) exhaustion = %v, want %v (targets=%v) — a bare external wrapper owes its own resolution to the untrusted PATH even when the peeled inner command is absolute", argv, got, want, targets)
+			}
+		}
+		assertExhaustion([]string{"env", "/bin/sh"}, true)
+		assertExhaustion([]string{"nice", "/bin/sh"}, true)
+		assertExhaustion([]string{"/usr/bin/env", "/bin/sh"}, false)
+		assertExhaustion([]string{"exec", "/bin/sh"}, false)
+	})
+	t.Run("R24-6 a canon-normalized absolute interpreter keeps its fixed-path identity", func(t *testing.T) {
+		var untrusted envAssignments
+		untrusted.ops = append(untrusted.ops, envOp{kind: 't', key: "PATH"})
+		// Acceptance spelling: even when the versioned interpreter is absent
+		// on this host, its static basename classification is python — and a
+		// host where it resolves to python3 must never let the canonical
+		// rewrite erase the original fixed-path identity.
+		targets := stdinProgramTargetsDialect([]string{"/usr/bin/python3.11"}, 0, untrusted, "/usr/bin:/bin", callerIdentity{}, false)
+		prog, has := firstProgramTarget(targets)
+		if !has {
+			t.Fatalf("absolute versioned python projection produced no program target (%v) — the fixed absolute spelling must keep its interpreter identity", targets)
+		}
+		if prog.exhausted {
+			t.Fatalf("absolute versioned python under untrusted PATH became exhausted (%+v) — the canonical rewrite to a slash-free interpreter name must not erase the original spelling's fixed-path identity", prog)
+		}
+		if prog.lang != "python" {
+			t.Fatalf("absolute versioned python projection lang=%q, want python — the recognized interpreter type must survive the fixed-path PATH check", prog.lang)
+		}
+		// Discriminating rows: ruby/perl version suffixes are exactly the
+		// canonical-resolved-base rewrite the R24 audit named. They need no
+		// host executable because the typed basename itself carries the
+		// static interpreter classification.
+		for _, tc := range []struct{ exe, lang string }{
+			{"/usr/bin/ruby3.2", "ruby"},
+			{"/usr/bin/perl5.38", "perl"},
+		} {
+			rows := stdinProgramTargetsDialect([]string{tc.exe}, 0, untrusted, "/usr/bin:/bin", callerIdentity{}, false)
+			row, rowHas := firstProgramTarget(rows)
+			if !rowHas {
+				t.Fatalf("absolute %s projection produced no program target (%v) — the fixed absolute spelling must keep its interpreter identity", tc.exe, rows)
+			}
+			if row.exhausted {
+				t.Fatalf("absolute %s under untrusted PATH became exhausted (%+v) — canonical normalization rewrote the fixed absolute spelling into a slash-free name and then misread it as PATH-dependent", tc.exe, row)
+			}
+			if row.lang != tc.lang {
+				t.Fatalf("absolute %s projection lang=%q, want %q — the recognized interpreter type must survive the fixed-path PATH check", tc.exe, row.lang, tc.lang)
+			}
 		}
 	})
 }

@@ -14,6 +14,14 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 	if hit != "" {
 		return hit
 	}
+	// R24-Reviewer-#1 / R24-Oracle-M1: the SSH remote projection is part
+	// of the SAME analysis request — before any remote recursion consumes
+	// the identity, install the request's xargs memo/budget table on this
+	// caller and thread it through the remote caller derivation. The
+	// pre-R24 projection passed only cwd, so every remote statement minted
+	// a private 512-step budget through stdinEntryCaller.
+	caller, _ = xargsEnsureWork(caller)
+	remoteCaller := sshRemoteCallerIdentity(caller)
 	if kind == 'r' || callerReadonlyRole(caller) {
 		// Block piped stdin and local file input redirection (< file) to
 		// prevent local file exfiltration; inline heredoc/here-string data
@@ -26,7 +34,7 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 			return h
 		}
 	}
-	langs, stdinIsProg, remoteExhausted := remoteStdinProgramLangsCwd(remoteCmd, caller.screenCwd())
+	targets, stdinIsProg, remoteExhausted := remoteStdinProgramTargets(remoteCmd, remoteCaller)
 	if hit := sshExhaustedStdinHit(seg, kind, stdinIsProg, remoteExhausted, caller); hit != "" {
 		return hit
 	}
@@ -42,14 +50,13 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 		}
 		return "file stdin to ssh stdin-program"
 	}
-	if h := sshStdinProgramBodiesHit(langs, seg, kind, depth, stdinIsProg, caller); h != "" {
+	if h := sshStdinProgramBodiesHit(targets, seg, kind, depth, stdinIsProg, caller); h != "" {
 		return h
 	}
 	vehicleOnly := stdinIsProg &&
 		(seg.hereString != "" || len(seg.heredocText) > 0) &&
-		isPureRemoteStdinVehicleCwd(remoteCmd, caller.screenCwd())
+		isPureRemoteStdinVehicleCaller(remoteCmd, remoteCaller)
 
-	remoteCaller := sshRemoteCallerIdentity(caller)
 	if kind == 's' {
 		if h := guardShellSubagentDepthEnv(remoteCmd, depth+1, remoteCaller, nil); h != "" {
 			return h
@@ -76,11 +83,11 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 // static body is screened under EACH projected language with the
 // readonly escalation a subagent kind 's' caller owes (the ssh stdin
 // program runs the bytes as a program the remote side never typed).
-func sshStdinProgramBodiesHit(langs []string, seg shellSegment, kind byte, depth int, stdinIsProg bool, caller callerIdentity) string {
+func sshStdinProgramBodiesHit(targets []stdinTarget, seg shellSegment, kind byte, depth int, stdinIsProg bool, caller callerIdentity) string {
 	if !stdinIsProg {
 		return ""
 	}
-	if len(langs) > 1 && (seg.hereString != "" || len(seg.heredocText) > 0) {
+	if len(targets) > 1 && (seg.hereString != "" || len(seg.heredocText) > 0) {
 		return "ssh multi-stage stdin program"
 	}
 	screenBody := func(body string) string {
@@ -90,15 +97,20 @@ func sshStdinProgramBodiesHit(langs []string, seg shellSegment, kind byte, depth
 		if body == "" {
 			return ""
 		}
-		if len(langs) == 0 {
-			langs = []string{""}
+		bodyTargets := targets
+		if len(bodyTargets) == 0 {
+			bodyTargets = []stdinTarget{{lang: ""}}
 		}
 		bodyKind := kind
 		if kind == 's' && callerReadonlyRole(caller) {
 			bodyKind = 'r'
 		}
-		for _, lang := range langs {
-			if h := screenStdinProgram(body, lang, bodyKind, depth, caller, false); h != "" {
+		for _, target := range bodyTargets {
+			// R24-Reviewer-#5 / R24-Oracle-M5: the consuming shell's dialect
+			// survives the remote projection — a remote bash reading stdin
+			// brace-expands exactly like a local one, so the body review must
+			// not collapse every shell target to the dash default.
+			if h := screenStdinProgram(body, target.lang, bodyKind, depth, caller, target.bash); h != "" {
 				if kind == 'r' || callerReadonlyRole(caller) {
 					return roSSHWriteHit
 				}
@@ -210,6 +222,32 @@ func isPureRemoteStdinVehicleCwd(remoteCmd, cwd string) bool {
 	return stdinTargetsAllPureShell(targets)
 }
 
+// isPureRemoteStdinVehicleCaller is isPureRemoteStdinVehicleCwd under an
+// explicit caller identity (R24-Reviewer-#1 / R24-Oracle-M1): the remote
+// vehicle certification shares the request's xargs memo/budget table
+// exactly like the language projection — a private per-entry table would
+// let one SSH screening consume several independent 512-step budgets of
+// the same tool request.
+func isPureRemoteStdinVehicleCaller(remoteCmd string, caller callerIdentity) bool {
+	roSegs, hit := parseReadonlyShellSegments(remoteCmd)
+	if hit != "" || len(roSegs) != 1 {
+		return false
+	}
+	s := roSegs[0]
+	if s.pipedStdin || s.redirectFile != "" || len(s.heredocText) > 0 || len(s.argv) == 0 {
+		return false
+	}
+	if wrapperWriteOpHit(s.argv) != "" {
+		return false
+	}
+	if _, _, envAs, _ := peelWrappers(s.argv); len(envAs.ops) > 0 {
+		return false
+	}
+	caller, _ = xargsEnsureWork(caller)
+	targets := stdinProgramTargetsWithEnv(s.argv, 0, envAssignments{}, os.Getenv("PATH"), caller)
+	return stdinTargetsAllPureShell(targets)
+}
+
 // stdinTargetsAllPureShell is the full-list certification of
 // isPureRemoteStdinVehicleCwd (extracted for the R23 complexity budget):
 // at least one non-data PROGRAM target must exist, and EVERY non-data
@@ -230,13 +268,31 @@ func stdinTargetsAllPureShell(targets []stdinTarget) bool {
 	return sawProg
 }
 
-// remoteReadsProgramFromStdin reports whether the remote command string
-// contains a head that reads its program from stdin (a bare remote
-// `sh`/`python3 -` with no inline code). Only then are piped bytes
+// remoteReadsProgramFromStdinCaller reports under an explicit caller
+// identity whether the remote command string contains a head that reads
+// its program from stdin (a bare remote `sh`/`python3 -` with no inline
+// code) — the same verdict the pre-R24 cwd-only
+// remoteReadsProgramFromStdinCwd answered. Only then are piped bytes
 // unaudited remote CODE rather than data for the remote command.
-func remoteReadsProgramFromStdinCwd(remoteCmd, cwd string) bool {
-	_, reads, _ := remoteStdinProgramLangsCwd(remoteCmd, cwd)
+// R24-Reviewer-#1 / R24-Oracle-M1: the cwd-only wrapper lost its last
+// consumer to the caller-threading rewrite and is deleted.
+func remoteReadsProgramFromStdinCaller(remoteCmd string, caller callerIdentity) bool {
+	_, reads, _ := remoteStdinProgramTargets(remoteCmd, caller)
 	return reads
+}
+
+// remoteStdinProgramLangsCwd is the legacy language-only remote
+// projection view (kept for unit-screening callers that predate the
+// dialect-carrying target list): production screens consume
+// remoteStdinProgramTargets instead because this view necessarily drops
+// the consuming shell's bash dialect. The exhaustion semantics are the
+// same fail-closed bits either way.
+func remoteStdinProgramLangsCwd(remoteCmd, cwd string) (langs []string, readsProg, exhausted bool) {
+	targets, reads, ex := remoteStdinProgramTargets(remoteCmd, stdinEntryCaller(cwd))
+	for _, t := range targets {
+		langs = append(langs, t.lang)
+	}
+	return langs, reads, ex
 }
 
 // remoteStdinProgramLangs returns the interpreter langs of remote heads that
@@ -251,13 +307,26 @@ func remoteReadsProgramFromStdinCwd(remoteCmd, cwd string) bool {
 // never be re-read as a certified POSIX shell body reviewer there, so
 // callers fail closed on the explicit bit instead of screening bytes
 // under a shell grammar nobody confirmed.
-func remoteStdinProgramLangsCwd(remoteCmd, cwd string) (langs []string, readsProg, exhausted bool) {
-	for _, seg := range splitShellSegments(remoteCmd) {
+func remoteStdinProgramTargets(remoteCmd string, caller callerIdentity) (targets []stdinTarget, readsProg, exhausted bool) {
+	caller, _ = xargsEnsureWork(caller)
+	// R24-Reviewer-#5 / R24-Oracle-M5: the remote segment list is ONE
+	// shell execution — pure-assignment segments rewrite the remote
+	// environment every later segment inherits, so the projection must
+	// fold them into a scope-aware tracker exactly like the local nested
+	// collectSegs loop. The pre-R24 loop projected every segment against
+	// an empty env: a first segment's conditional PATH write never
+	// reached the second segment's bare-shell resolution.
+	tracker := &scopeEnvTracker{}
+	for _, seg := range splitShellSegmentsCaller(remoteCmd, nil, caller) {
 		if seg.depthExceeded || seg.parseErr != "" {
-			return []string{""}, true, true
+			return []stdinTarget{{lang: "", exhausted: true}}, true, true
 		}
+		// The fold runs BEFORE the consumption skip exactly like
+		// collectOneStdinSeg: an assignment segment consumes no stdin but
+		// still rewrites the running remote shell's environment.
+		tracker.foldSegment(seg, caller)
 		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || seg.backgrounded ||
-			len(seg.heredocText) > 0 || seg.hereString != "" {
+			len(seg.heredocText) > 0 || seg.hereString != "" || seg.pureAssign {
 			continue
 		}
 		// R23-Reviewer-#5: the per-segment projection must exhaustively
@@ -265,27 +334,27 @@ func remoteStdinProgramLangsCwd(remoteCmd, cwd string) (langs []string, readsPro
 		// several (a nested `bash -c` script), and an exhausted target
 		// hiding behind a positively identified shell head is exactly
 		// the laundering shape the certification order forbids.
-		segLangs, segExh := stdinProgramHeadsExh(seg.argv, cwd)
+		segTargets, segExh := stdinProgramHeadsWithEnvExh(seg.argv, tracker.view(seg.scopePath), caller)
 		if segExh {
-			return []string{""}, true, true
+			return []stdinTarget{{lang: "", exhausted: true}}, true, true
 		}
-		langs = append(langs, segLangs...)
+		targets = append(targets, segTargets...)
 	}
-	return langs, len(langs) > 0, false
+	return targets, len(targets) > 0, false
 }
 
-// stdinProgramHeadsExh projects ALL non-data stdin-program targets of
-// one segment argv (R23-Reviewer-#5 / R23-Oracle-M5): the returned
-// language list covers every program consumer the projection surfaces
-// (data consumers are byte sinks, never programs), and the exhaustion
-// bit is the verdict of the WHOLE list — one exhausted target anywhere
-// in the projection means the consumer set is unknowable, so callers
-// must never re-read the surviving zero-value langs as certified POSIX
-// shells.
-func stdinProgramHeadsExh(argv []string, cwd string) (langs []string, exhausted bool) {
-	targets := stdinProgramTargetsWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"), stdinEntryCaller(cwd))
-	exhausted = false
-	for _, t := range targets {
+// stdinProgramHeadsWithEnvExh projects ALL non-data stdin-program
+// targets of one segment argv under the accumulated remote environment
+// view (R24-Reviewer-#5 / R24-Oracle-M5): the returned target list keeps
+// every program consumer the projection surfaces (data consumers are
+// byte sinks, never programs), the consuming shell's bash dialect rides
+// each target through to the body reviewer, and the exhaustion bit is
+// the verdict of the WHOLE list — one exhausted target anywhere in the
+// projection means the consumer set is unknowable, so callers must never
+// re-read the surviving zero-value langs as certified POSIX shells.
+func stdinProgramHeadsWithEnvExh(argv []string, runEnv envAssignments, caller callerIdentity) (targets []stdinTarget, exhausted bool) {
+	projected := stdinProgramTargetsWithEnv(argv, 0, runEnv, os.Getenv("PATH"), caller)
+	for _, t := range projected {
 		if t.data {
 			continue
 		}
@@ -293,9 +362,9 @@ func stdinProgramHeadsExh(argv []string, cwd string) (langs []string, exhausted 
 			exhausted = true
 			continue
 		}
-		langs = append(langs, t.lang)
+		targets = append(targets, t)
 	}
-	return langs, exhausted
+	return targets, exhausted
 }
 
 // sshNoArgShorts are OpenSSH short options that take no operand.
@@ -2455,7 +2524,7 @@ func xargsReplClusterToken(argv []string, i int) (tok string, consumed bool) {
 // is itself a stdin-program consumer (`xargs ssh dmit sh`), the precise
 // sshTunnelsStdinProgram modelling downstream owns the verdict and this
 // screen stays silent so the exact rule is not preempted (v6.2.2 MF-8).
-func xargsSSHAppendFeedsRemoteShell(h []string) bool {
+func xargsSSHAppendFeedsRemoteShell(h []string, caller callerIdentity) bool {
 	remoteCmd, hit := parseSSHInvocation(h)
 	if hit != "" {
 		return true
@@ -2463,7 +2532,11 @@ func xargsSSHAppendFeedsRemoteShell(h []string) bool {
 	if strings.TrimSpace(remoteCmd) == "" {
 		return true // empty remote command was already fail-closed upstream
 	}
-	if sshTunnelsStdinProgram(h, os.Getenv("PATH"), callerIdentity{}) {
+	// R24-Reviewer-#1 / R24-Oracle-M1: even the append-mode vehicle probe
+	// rides the request's xargs table — the caller passes the identity it
+	// already carries instead of the pre-R24 zero-value callerIdentity{}
+	// (which minted a fresh budget for every probe).
+	if sshTunnelsStdinProgram(h, os.Getenv("PATH"), caller) {
 		return false
 	}
 	return true
@@ -2642,7 +2715,11 @@ func screenStdinProgram(text, lang string, kind byte, depth int, caller callerId
 	// The inner code screen resolves under the same call cwd as the
 	// enclosing segment — the guardCall must inherit it or the process-cwd
 	// fallback would resolve differently than the head just screened.
+	// R24-Reviewer-#1 / R24-Oracle-M1: it also inherits the request's
+	// xargs memo/budget table — the inner code screen is the same analysis
+	// request, never a fresh 512-step allowance.
 	g.cwd = caller.cwd
+	g.xw = caller.xw
 	if rule, detail := g.guardCtxRunCode(lang, text); rule != "" {
 		return detail
 	}
