@@ -1693,23 +1693,31 @@ func TestGuard_V622_OracleR19Probes(t *testing.T) {
 
 	// ---- R19-S2: the eval recursion shares the peel depth budget ----
 	t.Run("R19-S2 eval nesting beyond peelChainMaxDepth stops parsing the leaf write", func(t *testing.T) {
-		// Quoting a text one eval level deeper doubles the backslashes first
-		// and then the quotes — inside double quotes \ is special before
-		// \ " $ ` only, so this reproduces exactly the nesting bash itself
-		// verifies (eval "eval \"zzleaf=1\"" really assigns zzleaf).
+		// R20-Oracle-S2: the fixture must be LINEAR in length — eval joins
+		// its operands with single spaces before re-parsing, so bare-word
+		// nesting `eval eval eval zzleaf=1` peels exactly one eval per
+		// level at 5 bytes per level instead of doubling every backslash
+		// per level (the former exponential fixture reached ~67 MB at
+		// peelChainMaxDepth+1 levels — orders of magnitude beyond
+		// maxShellCommandBytes — and every race-gate run paid the
+		// allocation cost). The leaf write still sits the same number of
+		// re-parses deep, so the shallow-exact/deep-cutoff discrimination
+		// is unchanged.
 		nestEval := func(leaf string, levels int) string {
 			inner := leaf
 			for i := 0; i < levels; i++ {
-				esc := strings.ReplaceAll(inner, `\`, `\\`)
-				esc = strings.ReplaceAll(esc, `"`, `\"`)
-				inner = `eval "` + esc + `"`
+				inner = "eval " + inner
 			}
 			return inner
 		}
 		scanLeaf := func(t *testing.T, levels int) int {
 			t.Helper()
+			src := nestEval("zzleaf=1", levels)
+			if len(src) > maxShellCommandBytes {
+				t.Fatalf("budget fixture length = %d > maxShellCommandBytes %d — the depth proof must stay inside the command-shape budget", len(src), maxShellCommandBytes)
+			}
 			p := syntax.NewParser(syntax.Variant(syntax.LangBash))
-			f, err := p.Parse(strings.NewReader(nestEval("zzleaf=1", levels)), "")
+			f, err := p.Parse(strings.NewReader(src), "")
 			if err != nil {
 				t.Fatalf("parse: %v", err)
 			}

@@ -1344,24 +1344,27 @@ func scanShellBuiltinWritesDepth(base string, args []*syntax.Word, scanWord func
 // stripBuiltinWrapperWords peels leading `command`/`builtin` wrapper chains
 // (including their own option runs and the `--` terminator) off a call's
 // argument words exactly like the preScanVarMutations CallExpr walk does,
-// returning the basename of the surviving command head and the words
-// following it. ok=false means a dynamic word sat in the wrapper zone or
-// the peel hit a pure `command -v/-V` query — either way no static head
-// can be named (the pre-scan keeps its own conservative accounting for
-// those shapes; binding replication simply skips them).
-func stripBuiltinWrapperWords(args []*syntax.Word) (base string, rest []*syntax.Word, ok bool) {
+// returning the basename of the surviving command head, the RAW head word
+// and the words following it. ok=false means a dynamic word sat in the
+// wrapper zone or the peel hit a pure `command -v/-V` query — either way no
+// static head can be named (the pre-scan keeps its own conservative
+// accounting for those shapes; binding replication simply skips them).
+// R20-Oracle-M1: the raw head matters — only a bare `eval` is the
+// same-process builtin; a path spelling like `/dev/null/eval` is an
+// EXTERNAL program that can never write the shell's variables.
+func stripBuiltinWrapperWords(args []*syntax.Word) (base, rawHead string, rest []*syntax.Word, ok bool) {
 	cur := args
 	for len(cur) > 0 {
 		h, wok := wordToArg(cur[0])
 		if !wok || isDynamicArg(h) {
-			return "", nil, false
+			return "", "", nil, false
 		}
 		b := h
 		if k := strings.LastIndexByte(b, '/'); k >= 0 {
 			b = b[k+1:]
 		}
 		if b != "builtin" && b != "command" {
-			return b, cur, true
+			return b, h, cur, true
 		}
 		cur = cur[1:]
 		optStrs := make([]string, 0, len(cur))
@@ -1373,12 +1376,12 @@ func stripBuiltinWrapperWords(args []*syntax.Word) (base string, rest []*syntax.
 			optStrs = append(optStrs, os_)
 		}
 		if isCommandQuery(optStrs) {
-			return "", nil, false
+			return "", "", nil, false
 		}
 		for len(cur) > 0 {
 			a, aok := wordToArg(cur[0])
 			if !aok || isDynamicArg(a) {
-				return "", nil, false
+				return "", "", nil, false
 			}
 			if a == "--" {
 				cur = cur[1:]
@@ -1391,7 +1394,7 @@ func stripBuiltinWrapperWords(args []*syntax.Word) (base string, rest []*syntax.
 			break
 		}
 	}
-	return "", nil, false
+	return "", "", nil, false
 }
 
 // writtenNamesInNode lists the variable names a single statement writes
@@ -1451,11 +1454,23 @@ func writtenNamesInNode(n syntax.Node) []string {
 // the conservative write scan); the replication itself mirrors the
 // collector's own assignment machinery so a static-eval write and a direct
 // write end in the same staticVars/taintedVars state.
-func (c *subCollector) bindEvalCallWrites(call *syntax.CallExpr) {
+//
+// R20-Oracle-M1: the replication is licensed ONLY for an invocation that
+// is PROVABLY the same-process builtin executing exactly once — the
+// command head must be a bare `eval` (no path component: `/dev/null/eval`
+// is an external program that can never write shell state) and the call
+// must carry NO redirections (a redirection that fails — `<
+// /dev/null/missing` — aborts the command BEFORE the builtin runs, so the
+// write never happens). When either premise fails the operand writes are
+// conservatively TAINTED instead of silently skipped: the pre-scan counts
+// them, so pretending they cannot happen would leave the collector
+// trusting values the runtime may have rewritten (pollution is always the
+// fail-closed direction).
+func (c *subCollector) bindEvalCallWrites(st *syntax.Stmt, call *syntax.CallExpr) {
 	if len(call.Args) == 0 {
 		return
 	}
-	base, rest, ok := stripBuiltinWrapperWords(call.Args)
+	base, rawHead, rest, ok := stripBuiltinWrapperWords(call.Args)
 	if !ok || base != "eval" || len(rest) < 2 {
 		return
 	}
@@ -1467,16 +1482,30 @@ func (c *subCollector) bindEvalCallWrites(call *syntax.CallExpr) {
 	if !static {
 		return
 	}
-	c.bindEvalTextWrites(strings.Join(parts, " "), 0)
+	text := strings.Join(parts, " ")
+	if strings.ContainsRune(rawHead, '/') || len(st.Redirs) > 0 {
+		// Not a provably-successful same-process builtin: never mint a
+		// bind, but never lose the write either (R20-Oracle-M1).
+		c.taintEvalTextWrites(text, 0)
+		return
+	}
+	c.bindEvalTextWrites(text, 0)
 }
 
 // bindEvalTextWrites parses one static eval operand text under the
 // collector's own dialect and replays its top-level statement writes. The
 // recursion shares the peelChainMaxDepth budget with the write pre-scan
-// (R19-Oracle-S2): beyond it the leaf text is never parsed here either —
-// the conservative scan-side accounting already covers that shape.
+// (R19-Oracle-S2). R20-Oracle-M2: the budget boundary is NOT a silent
+// skip — the scan side already counts those writes, so an unparsable or
+// budget-exhausted text conservatively taints the sentinel variables the
+// collector's placeholder proofs depend on (exactly like the scan's own
+// fallback) instead of dropping every write on the floor.
 func (c *subCollector) bindEvalTextWrites(text string, depth int) {
-	if text == "" || depth+1 >= peelChainMaxDepth {
+	if text == "" {
+		return
+	}
+	if depth+1 >= peelChainMaxDepth {
+		c.taintSentinelVars()
 		return
 	}
 	parser := syntax.NewParser(syntax.Variant(syntax.LangPOSIX), syntax.KeepComments(true))
@@ -1485,9 +1514,96 @@ func (c *subCollector) bindEvalTextWrites(text string, depth int) {
 	}
 	inner, err := parser.Parse(strings.NewReader(text), "")
 	if err != nil {
+		c.taintSentinelVars()
 		return
 	}
 	c.bindEvalStmtWrites(inner.Stmts, depth)
+}
+
+// taintSentinelVars marks every sentinelTrustVars name tainted — the
+// conservative verdict for an eval operand text the replication cannot
+// parse or must not descend into (R20-Oracle-M2): the pre-scan already
+// counts writes in exactly these cases, so dropping them would let the
+// collector keep proofs (mktemp PATH resolution, safe-HOME tilde grants)
+// the runtime may have invalidated.
+func (c *subCollector) taintSentinelVars() {
+	for name := range sentinelTrustVars {
+		c.taintVar(name)
+	}
+}
+
+// taintEvalTextWrites conservatively taints every writable name of one
+// static eval operand text WITHOUT minting any binding (R20-Oracle-M1):
+// the write may or may not happen (a non-builtin eval, a failing
+// redirection), so pollution — never a silent skip — is the sound
+// verdict. Shares the replication's depth budget and dialect.
+func (c *subCollector) taintEvalTextWrites(text string, depth int) {
+	if text == "" {
+		return
+	}
+	if depth+1 >= peelChainMaxDepth {
+		c.taintSentinelVars()
+		return
+	}
+	parser := syntax.NewParser(syntax.Variant(syntax.LangPOSIX), syntax.KeepComments(true))
+	if !c.posixNoBraces {
+		parser = syntax.NewParser(syntax.Variant(syntax.LangBash), syntax.KeepComments(true))
+	}
+	inner, err := parser.Parse(strings.NewReader(text), "")
+	if err != nil {
+		c.taintSentinelVars()
+		return
+	}
+	for _, st := range inner.Stmts {
+		if st == nil {
+			continue
+		}
+		for _, name := range writtenNamesInNode(st) {
+			c.taintVar(name)
+		}
+		c.taintHiddenEvalWrites(st, depth)
+	}
+}
+
+// taintHiddenEvalWrites taints the writes of nested static evals hidden
+// inside a statement the replication does NOT descend into (R20-Oracle-M2):
+// preScanVarMutations counts every nested-eval write of the whole inner
+// text, so a compound like `: && eval "PATH=/x"` inside a static eval
+// provably CAN write the sentinel variable in the same shell — skipping
+// the statement silently would leave the parent's original PATH standing
+// in the substitution success proofs. Walked nested eval texts recurse
+// through the same budgeted scan-and-taint path; every other write shape
+// inside the compound is already covered by writtenNamesInNode.
+func (c *subCollector) taintHiddenEvalWrites(st *syntax.Stmt, depth int) {
+	scanWord := wordToArg
+	if c.posixNoBraces {
+		scanWord = wordToArgPosix
+	}
+	syntax.Walk(st.Cmd, func(node syntax.Node) bool {
+		if node == nil {
+			return false
+		}
+		ist, isStmt := node.(*syntax.Stmt)
+		if !isStmt || ist.Cmd == nil {
+			return true
+		}
+		call, isCall := ist.Cmd.(*syntax.CallExpr)
+		if !isCall {
+			return true
+		}
+		base, rawHead, rest, ok := stripBuiltinWrapperWords(call.Args)
+		if !ok || base != "eval" || len(rest) < 2 {
+			return true
+		}
+		if strings.ContainsRune(rawHead, '/') {
+			return true // external program: cannot write shell state at all
+		}
+		parts, static := evalStaticOperandParts(rest, scanWord)
+		if static {
+			c.taintEvalTextWrites(strings.Join(parts, " "), depth+1)
+		}
+		return true
+	})
 }
 
 // bindEvalStmtWrites replays the writes of one static eval's statement
@@ -1504,9 +1620,19 @@ func (c *subCollector) bindEvalStmtWrites(stmts []*syntax.Stmt, depth int) {
 			continue
 		}
 		call, isCall := st.Cmd.(*syntax.CallExpr)
-		if isCall && !st.Background && !st.Negated && !st.Coprocess && len(call.Args) == 0 {
+		if isCall && !st.Background && !st.Negated && !st.Coprocess && len(st.Redirs) == 0 && len(call.Args) == 0 {
+			// R20-Oracle-M1: the statement must be a PROVABLY-executed bare
+			// assignment sequence — no redirections (a failing one aborts
+			// before the assignment) — and every assignment a plain `=`:
+			// bash's `+=` concatenates onto the inherited value, so the
+			// result is never the literal suffix the word carries; the
+			// conservative verdict is pollution, never a bind.
 			for _, a := range call.Assigns {
 				if a.Name == nil || a.Naked {
+					continue
+				}
+				if a.Append {
+					c.taintVar(a.Name.Value)
 					continue
 				}
 				val, stOk := c.staticAssignVal(a.Value)
@@ -1518,10 +1644,16 @@ func (c *subCollector) bindEvalStmtWrites(stmts []*syntax.Stmt, depth int) {
 			c.taintVar(name)
 		}
 		if !isCall {
+			// R20-Oracle-M2: a compound statement (AndStmt/OrStmt/if/brace
+			// group/subshell/pipeline/loop) can hide nested static evals
+			// whose writes the replication loop here never reaches — the
+			// pre-scan counts them, so they must surface as pollution.
+			c.taintHiddenEvalWrites(st, depth)
 			continue
 		}
-		base, rest, ok := stripBuiltinWrapperWords(call.Args)
+		base, rawHead, rest, ok := stripBuiltinWrapperWords(call.Args)
 		if !ok || base != "eval" || len(rest) < 2 {
+			c.taintHiddenEvalWrites(st, depth)
 			continue
 		}
 		scanWord := wordToArg
@@ -1529,9 +1661,19 @@ func (c *subCollector) bindEvalStmtWrites(stmts []*syntax.Stmt, depth int) {
 			scanWord = wordToArgPosix
 		}
 		parts, static := evalStaticOperandParts(rest, scanWord)
-		if static {
-			c.bindEvalTextWrites(strings.Join(parts, " "), depth+1)
+		if !static {
+			continue
 		}
+		text := strings.Join(parts, " ")
+		if strings.ContainsRune(rawHead, '/') || len(st.Redirs) > 0 || st.Background || st.Negated || st.Coprocess {
+			// R20-Oracle-M1 premises apply to nested evals exactly like the
+			// outer one: an external path head, a possibly-failing redirect
+			// or a child-process/conditional execution never mints a bind,
+			// and the write is pollution instead of a silent skip.
+			c.taintEvalTextWrites(text, depth+1)
+			continue
+		}
+		c.bindEvalTextWrites(text, depth+1)
 	}
 }
 
@@ -1790,6 +1932,14 @@ type subCollector struct {
 	// expand — and the blank-collector zero value keeps the conservative
 	// bash detection for pure parser probes.
 	posixNoBraces bool
+	// childScope marks statements executing in a CHILD execution scope
+	// (R20-Oracle-M3): pipeline components, `( ... )` subshells and
+	// backgrounded subtrees run in their own processes — their pure
+	// assignments die with the child and must never be accumulated into
+	// the parent shell's stdin-scan environment. Command/process
+	// substitutions inherit it through newSub (the zero value propagates
+	// false only at the real parent level).
+	childScope bool
 }
 
 func (c *subCollector) reject() {
@@ -2216,7 +2366,7 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 				c.emitNestedFromWord(r.Hdoc, feed)
 			}
 		}
-		seg := shellSegment{pipedStdin: feed.piped, backgrounded: st.Background}
+		seg := shellSegment{pipedStdin: feed.piped, backgrounded: st.Background, childScope: st.Background || c.childScope}
 		c.applyRedirs(&seg, st.Redirs, feed)
 		if len(seg.argv) > 0 || seg.redirectFile != "" || len(seg.heredocText) > 0 || seg.hereString != "" || seg.depthExceeded {
 			c.segs = append(c.segs, seg)
@@ -2291,20 +2441,28 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 		// back to the caller's original PATH and grades the substitution
 		// under a PATH the running shell no longer has. One plain hook call
 		// keeps this case's complexity untouched; the decode itself lives
-		// in bindEvalCallWrites.
-		c.bindEvalCallWrites(cmd)
+		// in bindEvalCallWrites (R20-Oracle-M1: the statement carries the
+		// redirections whose failure would prevent the builtin from ever
+		// running, so the replication needs it, not just the call).
+		c.bindEvalCallWrites(st, cmd)
 		c.emitCall(st, cmd, feed)
 	case *syntax.BinaryCmd:
 		switch cmd.Op {
 		case syntax.Pipe, syntax.PipeAll:
 			prevBind := c.allowBind
 			c.allowBind = false // no static head-bind across/inside pipelines
+			// R20-Oracle-M3: every pipeline component runs in its own child
+			// process — an assignment inside ANY of them dies with the
+			// component and never re-binds the parent shell.
+			prevScope := c.childScope
+			c.childScope = true
 			c.walkStmt(cmd.X, feed)
 			// Pipe right: fd0 becomes the upstream stream, but the rest of
 			// the descriptor table is inherited — { cat | sh 0<&9; } 9<&0
 			// still resolves fd9 to the pipe.
 			c.walkStmt(cmd.Y, stdinFeed{piped: true, fds: feed.fds})
 			c.allowBind = prevBind
+			c.childScope = prevScope
 		case syntax.AndStmt, syntax.OrStmt:
 			c.walkStmt(cmd.X, feed)
 			// SH11 MF-4.1: the right side is a conditional short-circuit
@@ -2323,9 +2481,14 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 	case *syntax.Subshell:
 		prevBind := c.allowBind
 		c.allowBind = false
+		// R20-Oracle-M3: a subshell is a child process by definition —
+		// assignments inside it never reach the parent shell.
+		prevScope := c.childScope
+		c.childScope = true
 		innerFeed := c.stmtFeed(st, feed)
 		c.walkStmtsAll(cmd.Stmts, innerFeed)
 		c.allowBind = prevBind
+		c.childScope = prevScope
 	case *syntax.Block:
 		prevBind := c.allowBind
 		c.allowBind = false
@@ -2456,7 +2619,7 @@ func (c *subCollector) emitDecl(st *syntax.Stmt, d *syntax.DeclClause, feed stdi
 			argv = append(argv, s)
 		}
 	}
-	seg := shellSegment{argv: argv, pipedStdin: feed.piped, backgrounded: st.Background, declClause: true}
+	seg := shellSegment{argv: argv, pipedStdin: feed.piped, backgrounded: st.Background, declClause: true, childScope: st.Background || c.childScope}
 	c.applyRedirs(&seg, st.Redirs, feed)
 	c.segs = append(c.segs, seg)
 }
@@ -2596,6 +2759,7 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 		backgrounded: st.Background,
 		processSubst: callHasProcSubst(call),
 		srcCode:      c.code,
+		childScope:   st.Background || c.childScope,
 	}
 	c.applyRedirs(&seg, st.Redirs, feed)
 	if len(seg.argv) > 0 || seg.redirectFile != "" || len(seg.heredocText) > 0 ||
@@ -2995,6 +3159,7 @@ func (c *subCollector) newSub() *subCollector {
 		taintedVars:   cloneBoolMap(c.taintedVars),
 		ssaBlocked:    cloneBoolMap(c.ssaBlocked),
 		allowBind:     false,
+		childScope:    true, // $(...) / <(...) run in their own child process (R20-Oracle-M3)
 		fdUnvetted:    c.fdUnvetted,
 		caller:        c.caller,        // $(pwd) binds the same screened cwd inside $(...)
 		hasCd:         c.hasCd,         // an outer cd already sighted stays sighted
@@ -3552,18 +3717,104 @@ func tildeLitShape(rawLit string, soloPart bool) int {
 		}
 		return tildeShapeLiteral
 	}
+	if endsAtSlash {
+		// The unquoted prefix ENDS at a real unquoted slash inside this
+		// very literal — no quoting can hide inside the prefix, so the
+		// login-name expansion genuinely applies (~user/notes).
+		return tildeShapeDynamic
+	}
+	// No unquoted slash inside the leading literal: the rest of the tilde
+	// prefix continues in the LATER word parts — the caller supplies
+	// whether any of them is quoted (R20-Oracle-S1).
+	if soloPart {
+		return tildeShapeDynamic
+	}
+	return tildeShapeDynamic // refined by tildeWordShape — see below
+}
+
+// tildeWordShape refines tildeLitShape with the word-level view bash's
+// tilde expansion actually uses (R20-Oracle-S1): the tilde PREFIX spans
+// every byte up to the first UNQUOTED slash (or the word end) ACROSS word
+// parts, and the expansion fires only when no byte of that prefix is
+// quoted. A login-name literal like ~ro"ot"/notes carries quoted bytes
+// inside its prefix, so bash passes the de-quoted text VERBATIM — a
+// cwd-relative literal path, never a dynamic login lookup: the shape is
+// tildeShapeLiteral (plain static text, no glob or tilde marker). The
+// genuinely unquoted ~root/notes keeps tildeShapeDynamic and its original
+// dynamic treatment.
+func tildeWordShape(w *syntax.Word, litIdx int) int {
+	if litIdx >= len(w.Parts) {
+		return tildeShapeNone
+	}
+	lit, ok := w.Parts[litIdx].(*syntax.Lit)
+	if !ok {
+		return tildeShapeNone
+	}
+	solo := len(w.Parts) == 1
+	shape := tildeLitShape(lit.Value, solo)
+	if shape != tildeShapeDynamic {
+		return shape
+	}
+	// Dynamic candidate: check whether an unquoted slash ended the prefix
+	// inside the leading literal itself. If not, scan the following parts:
+	// any quoted part (or any part at all) before the first unquoted slash
+	// poisons the expansion — quoted bytes inside the prefix make the
+	// whole word a verbatim literal.
+	prefix := lit.Value[1:]
+	unquotedSlashInLit := false
+	for i := 0; i < len(prefix); i++ {
+		if prefix[i] == '\\' {
+			i++
+			continue
+		}
+		if prefix[i] == '/' {
+			unquotedSlashInLit = true
+			break
+		}
+	}
+	if unquotedSlashInLit || solo {
+		return tildeShapeDynamic
+	}
+	// The prefix continues beyond the first literal. Adjacent unquoted
+	// literals merge inside the parser, so any further Lit/quoted/dynamic
+	// part either carries quoted bytes or is not literal text — either
+	// way the expansion cannot fire and the word is a verbatim literal.
+	// (A dynamic part already forces the dynamic encoding through its own
+	// placeholder regardless of this classification.)
+	if litIdx+1 < len(w.Parts) {
+		switch w.Parts[litIdx+1].(type) {
+		case *syntax.SglQuoted, *syntax.DblQuoted, *syntax.Lit:
+			return tildeShapeLiteral
+		default:
+			return tildeShapeDynamic
+		}
+	}
 	return tildeShapeDynamic
 }
 
 // unquotedTildeTrigger reports whether a word-start tilde literal mints a
 // glob/tilde marker: only EXPANSIBLE shapes do (R19-Oracle-M3) — a
-// verbatim literal tilde (`~\/notes`, `~` followed by more word parts)
-// produces plain static text.
+// verbatim literal tilde (`~\/notes`, `~` followed by more word parts,
+// or a login-name prefix carrying quoted bytes, R20-Oracle-S1) produces
+// plain static text.
 func unquotedTildeTrigger(rawLit string, isWordStart, soloPart bool) bool {
 	if !isWordStart {
 		return false
 	}
 	shape := tildeLitShape(rawLit, soloPart)
+	return shape == tildeShapeHome || shape == tildeShapeDynamic
+}
+
+// unquotedTildeTriggerWord is unquotedTildeTrigger refined by the
+// word-level tilde-prefix analysis (R20-Oracle-S1): the expansion shape
+// depends on parts AFTER the leading literal, so the per-part scan needs
+// the whole word and the literal's index. quoted-follows shapes are
+// verbatim literals — no expansion of any kind happens.
+func unquotedTildeTriggerWord(w *syntax.Word, litIdx int, isWordStart bool) bool {
+	if !isWordStart {
+		return false
+	}
+	shape := tildeWordShape(w, litIdx)
 	return shape == tildeShapeHome || shape == tildeShapeDynamic
 }
 
@@ -3584,6 +3835,38 @@ func litHasUnquotedGlobOrTildePart(rawLit string, isWordStart, soloPart bool, op
 		}
 		if isWordStart && i == 0 && ch == '~' {
 			if unquotedTildeTrigger(rawLit, isWordStart, soloPart) {
+				return true
+			}
+			continue
+		}
+		switch ch {
+		case '*', '?':
+			return true
+		case '[':
+			*openBracket = true
+		case ']':
+			if *openBracket {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// litHasUnquotedGlobOrTildeWord is litHasUnquotedGlobOrTildePart with the
+// whole word and the literal's part index (R20-Oracle-S1): the tilde arm
+// consults the word-level prefix scan so a login-name prefix carrying
+// quoted bytes stays the verbatim literal bash passes. The glob byte scan
+// is unchanged.
+func litHasUnquotedGlobOrTildeWord(w *syntax.Word, litIdx int, rawLit string, isWordStart bool, openBracket *bool) bool {
+	for i := 0; i < len(rawLit); i++ {
+		ch := rawLit[i]
+		if ch == '\\' {
+			i++ // escaped byte is literal
+			continue
+		}
+		if isWordStart && i == 0 && ch == '~' {
+			if unquotedTildeTriggerWord(w, litIdx, isWordStart) {
 				return true
 			}
 			continue
@@ -3717,7 +4000,7 @@ func wordToArgDialect(w *syntax.Word, posixNoBraces bool) (string, bool) {
 	for i, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
-			if litHasUnquotedGlobOrTildePart(p.Value, i == 0 && b.Len() == 0, len(w.Parts) == 1, &openBracket) {
+			if litHasUnquotedGlobOrTildeWord(w, i, p.Value, i == 0 && b.Len() == 0, &openBracket) {
 				static = false
 				b.WriteString(posixUnescapeLit(p.Value))
 				b.WriteString(cmdSubPlaceholderGlob)
@@ -3899,7 +4182,7 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 	for i, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
-			if c.writeUnquotedGlobTildeLit(&b, p.Value, i == 0 && b.Len() == 0, len(w.Parts) == 1, &openBracket) {
+			if c.writeUnquotedGlobTildeLit(&b, w, i, p.Value, i == 0 && b.Len() == 0, &openBracket) {
 				static = false
 				continue
 			}
@@ -4099,9 +4382,10 @@ func tmpdirPseudoCleanedRoot(clean string) bool {
 // stays exactly ONE argv word either way; only the concrete-path grant is
 // what a tainted HOME loses, and that grant now lives exclusively in the
 // unforgeable cmdSubPlaceholderTilde (R18-Oracle-M4). Returns false when
-// the literal carries no glob/tilde byte at all.
-func (c *subCollector) writeUnquotedGlobTildeLit(b *strings.Builder, rawLit string, wordStart, soloPart bool, openBracket *bool) bool {
-	if !litHasUnquotedGlobOrTildePart(rawLit, wordStart, soloPart, openBracket) {
+// the literal carries no glob/tilde byte at all. w/litIdx carry the whole
+// word context for the R20-Oracle-S1 login-name prefix analysis.
+func (c *subCollector) writeUnquotedGlobTildeLit(b *strings.Builder, w *syntax.Word, litIdx int, rawLit string, wordStart bool, openBracket *bool) bool {
+	if !litHasUnquotedGlobOrTildeWord(w, litIdx, rawLit, wordStart, openBracket) {
 		return false
 	}
 	b.WriteString(posixUnescapeLit(rawLit))
@@ -4109,28 +4393,20 @@ func (c *subCollector) writeUnquotedGlobTildeLit(b *strings.Builder, rawLit stri
 	// marker so the word tail of a HOME-proven tilde literal is a glob
 	// byte group — writeBraceExpansionMarkers then mints the adjacent
 	// glob+glob pair in the RAW byte stream, not only after stripping.
-	if tildeHomeProven(rawLit, wordStart, soloPart, c) {
+	if tildeHomeProvenWord(w, litIdx, rawLit, wordStart, c) {
 		b.WriteString(cmdSubPlaceholderTilde)
 	}
 	b.WriteString(cmdSubPlaceholderGlob)
 	return true
 }
 
-// tildeHomeProven reports whether this word-leading tilde literal may
-// carry the NUL-provenanced tilde marker: the collector must KNOW the HOME
-// the consuming shell will expand `~` against (R18-Oracle-M4). Only a real
-// unquoted word-start tilde encoded here can mint the marker — a NUL byte
-// can never arrive through shell text or argv — so a single-quoted literal
-// spelling of the printable glob marker can never forge the path
-// restoration. When HOME is tainted the marker is simply absent: the word
-// keeps its single-glob single-word shape (R18-Oracle-S5) while every
-// concrete-path restoration fails closed.
-func tildeHomeProven(rawLit string, wordStart, soloPart bool, c *subCollector) bool {
-	// R19-Oracle-M3: only a real $HOME tilde expansion may mint the
-	// unforgeable provenance — tildeLitShapeHome covers exactly the lone
-	// `~` whole word and the unquoted `~/` prefix; login-name expansions
-	// (~user, ~+/~-) and verbatim literal spellings never reach it.
-	return wordStart && tildeLitShape(rawLit, soloPart) == tildeShapeHome && !c.isTainted("HOME")
+// tildeHomeProvenWord is tildeHomeProven with the word-level tilde shape
+// (R20-Oracle-S1): the HOME provenance may attach only to a real word-start
+// $HOME tilde expansion — tildeWordShape covers the lone `~` whole word
+// and the unquoted `~/` prefix exactly like before, while login-name
+// shapes and quoted-prefix verbatim literals never reach it.
+func tildeHomeProvenWord(w *syntax.Word, litIdx int, rawLit string, wordStart bool, c *subCollector) bool {
+	return wordStart && tildeWordShape(w, litIdx) == tildeShapeHome && !c.isTainted("HOME")
 }
 
 // ifsClean reports whether the unquoted expansion model may assume POSIX

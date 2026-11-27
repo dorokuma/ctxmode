@@ -1382,7 +1382,7 @@ func stdinSingleShellTargetDialect(targets []stdinTarget, sshTunnel bool) (envs 
 // and share the consuming shells' single dialect — a mixed bash/dash
 // consumer set can never be rewritten under one parser honestly.
 func stdinShellTargetRewriteable(t stdinTarget, bash bool) bool {
-	return !t.data && t.lang == "" && !t.remote && t.bash == bash
+	return !t.data && !t.exhausted && t.lang == "" && !t.remote && t.bash == bash
 }
 
 // scriptAllowsLocalShellStdinPrepare reports whether a shell command string
@@ -1438,7 +1438,10 @@ func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv 
 		// accumulatePureAssignEnv folds ops only for segments whose peeled
 		// head is EMPTY: prefix ops ahead of a real command die with that
 		// child and never re-bind the running shell.
-		runEnv = accumulatePureAssignEnv(runEnv, seg.argv, caller)
+		// R20-Oracle-M3: child-scope segments (subshells, pipelines,
+		// backgrounded trees, substitutions) never re-bind the parent —
+		// their local environments die with the child process.
+		runEnv = accumulatePureAssignEnv(runEnv, seg.argv, caller, seg.childScope)
 		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 			continue
 		}

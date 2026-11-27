@@ -728,7 +728,16 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 		return "", ""
 	}
 	caller := g.callerIdentity()
+	// R20-Oracle-M4: the fallback path must carry the SAME accumulated
+	// pure-assignment environment the flat prepare scan builds — a
+	// mixed-dialect or data-target refusal reroutes the exact same bytes
+	// here, and screening each segment under a fresh empty environment
+	// would judge them against a shell state the consumers do not have
+	// (an exported HOME reassigned by an independent statement is what
+	// every later child inherits, exactly like the env-prefix spelling).
+	runEnv := envAssignments{}
 	for _, seg := range splitShellSegmentsCaller(command, caller.envTaint, caller) {
+		runEnv = accumulatePureAssignEnv(runEnv, seg.argv, caller, seg.childScope)
 		if seg.depthExceeded || seg.parseErr != "" {
 			detail := seg.parseErr
 			if seg.depthExceeded {
@@ -745,7 +754,7 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 			continue
 		}
-		targets := stdinProgramTargetsWithEnv(seg.argv, 0, envAssignments{}, os.Getenv("PATH"), caller)
+		targets := stdinProgramTargetsWithEnv(seg.argv, 0, runEnv, os.Getenv("PATH"), caller)
 		if len(targets) == 0 {
 			continue
 		}
@@ -997,6 +1006,13 @@ type stdinTarget struct {
 	// pure shell program, so scriptAllowsLocalShellStdinPrepareDialect
 	// must refuse it exactly like the flat spelling.
 	data bool
+	// exhausted marks a projection that hit the recursion budget
+	// (R20-Oracle-M5): the stream MIGHT be a program — the analysis
+	// simply could not descend deep enough to find out. It is the exact
+	// opposite of data=true: never a rewrite candidate, never an
+	// exemption from the dynamic heredoc payload screen, and never
+	// filterable into a data-only summary.
+	exhausted bool
 }
 
 func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity) []stdinTarget {
@@ -1010,8 +1026,16 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 // R16 M2); heads that spawn a FRESH shell (flock -c / script -c / watch /
 // `sh -c` unwrapping) pick their own dialect below and never inherit it.
 func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity, bash bool) []stdinTarget {
-	if len(argv) == 0 || depth >= shellSplitMaxDepth {
+	if len(argv) == 0 {
 		return nil
+	}
+	if depth >= shellSplitMaxDepth {
+		// R20-Oracle-M5: the budget boundary is an EXPLICIT exhaustion
+		// verdict, never nil — nil would ride the data-consumer fallback
+		// into a confirmed data-only summary and exempt a dynamic heredoc
+		// payload from every program screen, the exact opposite of the
+		// fail-closed direction a depth cutoff demands.
+		return []stdinTarget{{lang: "", envAs: inherited, exhausted: true}}
 	}
 	head, _, ea, exhausted := peelWrappers(argv)
 	envAs := inherited.merged(ea)
@@ -1071,7 +1095,7 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 			// before any later segment is scanned. A pipedStdin segment sits
 			// in pipeline position (subshell-scoped), but conservatively
 			// folding its ops in is the fail-closed direction.
-			runEnv = accumulatePureAssignEnv(runEnv, seg.argv, subCaller)
+			runEnv = accumulatePureAssignEnv(runEnv, seg.argv, subCaller, seg.childScope)
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
@@ -1145,11 +1169,58 @@ func collectStdinSegTargets(seg shellSegment, depth int, runEnv, envAs envAssign
 // words the peel already skipped), and its ops re-bind the exported
 // variables the NEXT segments' children inherit exactly like the flat
 // prepare scan. Segments with a real head pass through unchanged.
-func accumulatePureAssignEnv(runEnv envAssignments, argv []string, caller callerIdentity) envAssignments {
-	if peeledHead, _, _, _, _ := peelWrappersWithIndex(argv, caller); len(peeledHead) == 0 {
-		return runEnv.merged(pureAssignEnv(argv))
+//
+// R20-Oracle-M3: the accumulation is licensed ONLY for assignments the
+// RUNNING PARENT SHELL really performs —
+//   - childScope segments (subshells, pipeline components, backgrounded
+//     subtrees, command/process substitutions) die with their child
+//     process: `(PATH=B)` never re-binds the parent's exported PATH;
+//   - the RAW argv must consist of nothing but KEY=VAL assignment words
+//     (and inert no-op fragments): `/usr/bin/env PATH=B` peels to the
+//     same empty head, but env spawns its OWN process — without a child
+//     command it merely prints its environment and can never modify the
+//     calling shell, so folding its operands into the parent state would
+//     hand a later consumer an environment it never runs with. PATH is
+//     an OVERRIDE, not a monotone pollution bit: the wrong-direction
+//     error is not conservative but simply false.
+func accumulatePureAssignEnv(runEnv envAssignments, argv []string, caller callerIdentity, childScope ...bool) envAssignments {
+	if len(childScope) > 0 && childScope[0] {
+		return runEnv
 	}
+	if peeledHead, _, _, _, _ := peelWrappersWithIndex(argv, caller); len(peeledHead) != 0 {
+		return runEnv
+	}
+	if !argvIsPlainAssignRun(argv) {
+		return runEnv
+	}
+	// R20-Oracle observation: consecutive pure assignments append directly
+	// onto the running accumulator — every snapshot already handed to a
+	// target is capacity-frozen by merged, so the in-place append can
+	// never clobber it, and n consecutive assignments cost O(n) instead of
+	// the quadratic copy cascade one full merge per assignment imposes.
+	pa := pureAssignEnv(argv)
+	runEnv.ops = append(runEnv.ops, pa.ops...)
 	return runEnv
+}
+
+// argvIsPlainAssignRun reports whether every word of argv is a literal
+// KEY=VAL assignment or an inert compound-statement fragment (the
+// shellNoopWords the wrapper peel skips) — the only shape whose words
+// PROVABLY execute as assignments of the running shell itself. Anything
+// else (env/nohup/command wrapper heads, options, plain operands) either
+// spawns its own process or is not an assignment at all, so it must
+// never contribute to the parent-state accumulation (R20-Oracle-M3).
+func argvIsPlainAssignRun(argv []string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+	for _, a := range argv {
+		if isAssignWord(a) || shellNoopWords[a] {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // evalJoinOperands drops the leading `--` option terminator bash's

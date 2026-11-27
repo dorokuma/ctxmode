@@ -162,6 +162,16 @@ type shellSegment struct {
 	// like printf tag{red,blue} brace-expands into multiple argv words when
 	// bash re-parses it).
 	bashDialect bool
+	// childScope marks a segment whose command runs in a CHILD execution
+	// scope — inside a `( ... )` subshell, any pipeline component, a
+	// backgrounded (`&`) subtree or a command/process substitution — so its
+	// pure assignments can NEVER re-bind variables of the running parent
+	// shell (R20-Oracle-M3). Conditional-but-same-shell shapes (`&&`/`||`
+	// right sides, if/while/for bodies, brace groups) deliberately do NOT
+	// carry this marker: their assignments stay in the parent's scope, and
+	// the conservative direction for the stdin environment accumulation is
+	// to fold them in rather than to pretend they never happened.
+	childScope bool
 }
 
 // shellSplitMaxDepth bounds recursion into $(...)/`...`/subshell text so a
@@ -464,16 +474,26 @@ func (e *envAssignments) addAssign(word string) {
 
 // merged returns the env op list of e followed by o's ops, preserving
 // order so a nested invocation's env ops replay after the outer ones.
+// The result's backing array is always EXACTLY sized (R20-Oracle
+// observation): target snapshots handed out by the stdin scans must stay
+// immutable while the running accumulator keeps appending pure-assignment
+// ops — with len == cap every later append reallocates instead of
+// clobbering a handed-out slice's backing memory, and consecutive pure
+// assignments can append in place without the quadratic copy cost a fresh
+// full copy per merge would impose.
 func (e envAssignments) merged(o envAssignments) envAssignments {
 	if len(e.ops) == 0 {
+		o.ops = o.ops[:len(o.ops):len(o.ops)]
 		return o
 	}
 	if len(o.ops) == 0 {
+		e.ops = e.ops[:len(e.ops):len(e.ops)]
 		return e
 	}
 	out := envAssignments{ops: make([]envOp, 0, len(e.ops)+len(o.ops))}
 	out.ops = append(out.ops, e.ops...)
 	out.ops = append(out.ops, o.ops...)
+	out.ops = out.ops[:len(out.ops):len(out.ops)]
 	return out
 }
 

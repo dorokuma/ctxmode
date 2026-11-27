@@ -2455,7 +2455,15 @@ func screenStdinProgram(text, lang string, kind byte, depth int, caller callerId
 }
 
 // screenOneSegmentDepth applies the head/tail checks to one parsed segment.
-func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller callerIdentity) string {
+// runEnv (variadic, default empty) carries the accumulated pure-assignment
+// environment of the segments preceding this one in the same command list
+// (R20-Oracle-M4): the stdin/here-string program projection must resolve
+// under the shell state the consumer actually inherits.
+func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller callerIdentity, runEnvOpt ...envAssignments) string {
+	runEnv := envAssignments{}
+	if len(runEnvOpt) > 0 {
+		runEnv = runEnvOpt[0]
+	}
 	if seg.parseErr != "" {
 		return seg.parseErr
 	}
@@ -2477,7 +2485,7 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 	// model (screenSSHHead) — it returns the remote-aware roSSHWriteHit /
 	// "piped stdin to ssh" verdict.
 	if seg.pipedStdin && !seg.stdinRedir && !sshTunnelsStdinProgram(seg.argv, caller.pathEnv, caller) {
-		if lang, isProg, _, _ := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller); isProg {
+		if lang, isProg, _, _ := stdinProgramHeadWithEnv(seg.argv, 0, runEnv, caller.pathEnv, caller); isProg {
 			if lang == "" {
 				return "piped code to shell"
 			}
@@ -2504,7 +2512,7 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 		// and made the verdict depend on the branch ORDER; any single
 		// target's rejection rejects the payload, matching the per-target
 		// API stdin screen exactly.
-		targets := stdinProgramTargetsWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller)
+		targets := stdinProgramTargetsWithEnv(seg.argv, 0, runEnv, caller.pathEnv, caller)
 		if hit := screenHereStringTargetsDepth(seg.hereString, targets, kind, depth, caller); hit != "" {
 			return hit
 		}
@@ -2530,9 +2538,18 @@ func screenHereStringTargetsDepth(text string, targets []stdinTarget, kind byte,
 	}
 	return ""
 }
-func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller callerIdentity) string {
+
+// screenSegmentHeredocsDepth screens the heredoc bodies of one segment.
+// runEnv (variadic, default empty) carries the accumulated pure-assignment
+// environment of the preceding segments in the same command list
+// (R20-Oracle-M4), exactly like screenOneSegmentDepth.
+func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller callerIdentity, runEnvOpt ...envAssignments) string {
 	if len(seg.heredocText) == 0 {
 		return ""
+	}
+	runEnv := envAssignments{}
+	if len(runEnvOpt) > 0 {
+		runEnv = runEnvOpt[0]
 	}
 	// The tunnel probe runs on the UNPEELED argv against the caller's PATH
 	// BEFORE seeding: peelToSSHHead replays the argv's own env ops per
@@ -2557,7 +2574,7 @@ func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller c
 	// mutually exclusive `if …; then dash; else bash; fi` pair. Any single
 	// target's rejection rejects the payload, matching the per-target API
 	// stdin screen exactly. Data consumers are byte sinks, never programs.
-	targets := stdinProgramTargetsWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller)
+	targets := stdinProgramTargetsWithEnv(seg.argv, 0, runEnv, caller.pathEnv, caller)
 	// R19-Oracle-S1: the code-payload screens apply ONLY when at least one
 	// non-data PROGRAM consumer exists — a heredoc feeding a pure data
 	// consumer (cat, jq .) is ordinary input whose parameter expansions
@@ -2687,17 +2704,25 @@ func guardShellSubagentDepthSegs(segs []shellSegment, depth int, caller callerId
 	if depth >= peelChainMaxDepth {
 		return depthExceededHit
 	}
+	// R20-Oracle-M4: the local heredoc/here-string/pipe stdin screens
+	// must face the SAME environment accumulation the flat prepare scan
+	// builds — a pure-assignment segment re-binds the exported variables
+	// every later child inherits, so a heredoc payload parsed under a
+	// per-segment empty environment would be judged against a shell
+	// state the consumer does not run with.
+	runEnv := envAssignments{}
 	for _, seg := range segs {
+		runEnv = accumulatePureAssignEnv(runEnv, seg.argv, caller, seg.childScope)
 		if seg.parseErr != "" {
 			return seg.parseErr
 		}
 		if seg.depthExceeded {
 			return depthExceededHit
 		}
-		if hit := screenSegmentHeredocsDepth(seg, 's', depth, caller); hit != "" {
+		if hit := screenSegmentHeredocsDepth(seg, 's', depth, caller, runEnv); hit != "" {
 			return hit
 		}
-		if hit := screenOneSegmentDepth(seg, 's', depth, caller); hit != "" {
+		if hit := screenOneSegmentDepth(seg, 's', depth, caller, runEnv); hit != "" {
 			return hit
 		}
 	}
