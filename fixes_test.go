@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -10,13 +15,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// === Merged from fixes_test.go ===
 
 // ---------- #1 symlink path fence ----------
 
@@ -1224,5 +1234,1529 @@ func TestValidateURL_CanceledContext(t *testing.T) {
 	err = validateURL(ctx, "http://1.1.1.1/test")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled for IP literal, got: %v", err)
+	}
+}
+
+// === Merged from fixes2_test.go ===
+
+// ============================================================================
+// 审计修复 1：目录索引必须基于符号链接解析后的真实目标做检查
+// ============================================================================
+
+// TestToolIndex_SymlinkToSensitiveRejected: a harmless-looking link name
+// (notes.txt) pointing at a sensitive real file (.env) must be rejected by the
+// directory walk. Before the fix the sensitive/size/binary checks ran on the
+// link name and link stat, so the secret content was read and indexed.
+func TestToolIndex_SymlinkToSensitiveRejected(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+
+	envPath := filepath.Join(wd, ".env")
+	mustWrite(t, envPath, "SYMLINK_SECRET_TOKEN=1")
+	link := filepath.Join(wd, "notes.txt")
+	if err := os.Symlink(envPath, link); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(wd, "normal.txt"), "hello normal")
+
+	res, _, err := s.toolIndex(context.Background(), nil, indexArgs{Path: wd})
+	if err != nil {
+		t.Fatalf("toolIndex: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "Indexed 1 file(s)") {
+		t.Fatalf("expected 1 indexed file, got: %s", text)
+	}
+	if !strings.Contains(text, "2 skipped, 2 sensitive)") {
+		t.Fatalf("expected both .env and its link skipped as sensitive, got: %s", text)
+	}
+	// Secret content must not be searchable, and neither the link target nor
+	// the link path may be indexed.
+	if hits, _ := st.Search("SYMLINK_SECRET_TOKEN", 5); len(hits) != 0 {
+		t.Fatalf("sensitive content indexed via harmless link name: %+v", hits)
+	}
+	if doc, _ := st.Get(envPath); doc != nil {
+		t.Fatal("sensitive target must not be in store")
+	}
+}
+
+// TestToolIndex_SymlinkToSensitiveSingleFileRefused locks in the single-file
+// entry point: a link to a sensitive file is refused (resolvePath already
+// returns the real target, so the refusal comes from the real-path check).
+func TestToolIndex_SymlinkToSensitiveSingleFileRefused(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+
+	envPath := filepath.Join(wd, ".env")
+	mustWrite(t, envPath, "SINGLE_SECRET_DATA=1")
+	link := filepath.Join(wd, "notes.txt")
+	if err := os.Symlink(envPath, link); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := s.toolIndex(context.Background(), nil, indexArgs{Path: link})
+	if err == nil {
+		t.Fatal("expected refusal for single-file index through link to sensitive file")
+	}
+	if !strings.Contains(err.Error(), "sensitive") {
+		t.Fatalf("expected sensitive error, got: %v", err)
+	}
+	if doc, _ := st.Get(envPath); doc != nil {
+		t.Fatal("sensitive target must not be in store")
+	}
+}
+
+// TestToolIndex_SymlinkToHugeFileSkipped: a harmless link name pointing at a
+// >1MB real file must not be read (the old code checked the link's own size,
+// which is tiny, then slurped the whole target with os.ReadFile).
+func TestToolIndex_SymlinkToHugeFileSkipped(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+
+	big := filepath.Join(wd, "big-target.txt")
+	mustWrite(t, big, strings.Repeat("biglinecontent ", 130000)) // ~2.08MB
+	link := filepath.Join(wd, "small.txt")
+	if err := os.Symlink(big, link); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(wd, "ok.txt"), "ok content")
+
+	res, _, err := s.toolIndex(context.Background(), nil, indexArgs{Path: wd})
+	if err != nil {
+		t.Fatalf("toolIndex: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "too large") {
+		t.Fatalf("expected too-large skip reason, got: %s", text)
+	}
+	if doc, _ := st.Get(big); doc != nil {
+		t.Fatal("link target must not be read/indexed")
+	}
+	// Defense in depth: indexFile itself must refuse the link.
+	if err := s.indexFile(link); err == nil {
+		t.Fatal("indexFile must refuse a link to an oversized file")
+	}
+}
+
+// TestToolIndex_TotalBytesUsesRealLinkTargetSize: the total-byte accounting
+// must use the real target size. The old code added the link's own size
+// (~9 bytes), so a 600KB link target plus a 600KB real file fit under a 700KB
+// cap; with real sizes the second file trips the cap.
+func TestToolIndex_TotalBytesUsesRealLinkTargetSize(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+	withIndexCaps(t, 5000, 700*1024)
+
+	big := filepath.Join(wd, "bbb-real.txt")
+	mustWrite(t, big, strings.Repeat("y", 600*1024))
+	link := filepath.Join(wd, "aaa-link.txt")
+	if err := os.Symlink(big, link); err != nil {
+		t.Fatal(err)
+	}
+
+	res, _, err := s.toolIndex(context.Background(), nil, indexArgs{Path: wd})
+	if err != nil {
+		t.Fatalf("toolIndex: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "Indexed 1 file(s)") {
+		t.Fatalf("expected 1 indexed file (byte cap reached on the second), got: %s", text)
+	}
+	if !strings.Contains(text, "max total bytes") {
+		t.Fatalf("expected byte cap stop notice, got: %s", text)
+	}
+}
+
+// ============================================================================
+// 审计修复 2：run_task / batch 索引标签唯一化
+// ============================================================================
+
+func TestRunTask_DuplicateLabelsUniqueAndSearchable(t *testing.T) {
+	srv := newTestServer(t)
+	run := func() string {
+		t.Helper()
+		big := strings.Repeat("m", runTaskAutoIndexBytes+1)
+		res, _, err := srv.finishRunTaskOutput(big, 0, "go_test", "same-intent")
+		if err != nil {
+			t.Fatalf("finishRunTaskOutput: %v", err)
+		}
+		m := regexp.MustCompile(`Indexed as "([^"]+)"`).FindStringSubmatch(mcpResultText(t, res))
+		if len(m) != 2 {
+			t.Fatalf("cannot extract index label from:\n%s", mcpResultText(t, res))
+		}
+		return m[1]
+	}
+
+	l1 := run()
+	l2 := run()
+	if l1 == l2 {
+		t.Fatalf("repeated run_task with same kind/intent must get distinct labels, got %q", l1)
+	}
+	for _, l := range []string{l1, l2} {
+		if !strings.HasPrefix(l, "run_task:same-intent:") {
+			t.Fatalf("label must stay identifiable, got %q", l)
+		}
+		if doc, _ := srv.store.Get(l); doc == nil {
+			t.Fatalf("document %q missing (second run clobbered it?)", l)
+		}
+		hits, err := srv.store.Search(l, 5)
+		if err != nil || len(hits) == 0 {
+			t.Fatalf("label %q must be directly searchable (err %v)", l, err)
+		}
+	}
+}
+
+func TestBatchExecute_DuplicateLabelsUniqueAndSearchable(t *testing.T) {
+	srv := newTestServer(t)
+	srv.workdirs = []string{t.TempDir()}
+	run := func() string {
+		t.Helper()
+		res, _, err := srv.toolBatchExecute(context.Background(), nil, batchArgs{
+			Commands: []batchCommand{{Label: "same", Command: "head -c 102500 /dev/zero | tr '\\0' a"}},
+		})
+		if err != nil {
+			t.Fatalf("toolBatchExecute: %v", err)
+		}
+		var resp batchResponse
+		if err := json.Unmarshal([]byte(contentText(res)), &resp); err != nil {
+			t.Fatalf("unmarshal: %v\n%s", err, contentText(res))
+		}
+		if len(resp.Commands) != 1 || resp.Commands[0].IndexLabel == "" {
+			t.Fatalf("expected index_label in response, got: %+v", resp.Commands)
+		}
+		return resp.Commands[0].IndexLabel
+	}
+
+	l1 := run()
+	l2 := run()
+	if l1 == l2 {
+		t.Fatalf("repeated batch command label must get distinct index labels, got %q", l1)
+	}
+	for _, l := range []string{l1, l2} {
+		if !strings.HasPrefix(l, batchIndexPrefix) || !strings.Contains(l, ":same:") {
+			t.Fatalf("label must stay identifiable by command, got %q", l)
+		}
+		if doc, _ := srv.store.Get(l); doc == nil {
+			t.Fatalf("document %q missing (later batch clobbered it?)", l)
+		}
+		hits, err := srv.store.Search(l, 5)
+		if err != nil || len(hits) == 0 {
+			t.Fatalf("label %q must be directly searchable (err %v)", l, err)
+		}
+	}
+}
+
+// ============================================================================
+// 审计修复 3：纯 Go rg 超长行
+// ============================================================================
+
+// TestRgGo_LongLineSearchable: a 1.5MB single line used to blow past the 1MB
+// bufio.Scanner cap and fail the entire search. It must now be scanned as one
+// line (the token sits at the very END of the line, so only a full-line read
+// can match it) and other files must still be searchable. The existing 100KB
+// response cap still applies to the output text.
+func TestRgGo_LongLineSearchable(t *testing.T) {
+	wd, s := setupFSFixture(t)
+	long := strings.Repeat("x", 1500*1024) + "LONG_LINE_TOKEN_XYZ"
+	mustWrite(t, filepath.Join(wd, "longline.txt"), long)
+
+	text, truncated, n, err := s.rgGo(context.Background(), wd, rgArgs{Pattern: "LONG_LINE_TOKEN_XYZ", Limit: 50}, 50, 0, fsRgMaxOutputBytes)
+	if err != nil {
+		t.Fatalf("rg over a long line must not fail the whole search: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("token at the end of the 1.5MB line must match (full-line read), n=%d", n)
+	}
+	if !truncated {
+		t.Fatal("a 1.5MB matching line exceeds the 100KB output cap and must flag truncated")
+	}
+	// The final response is still capped at 100KB.
+	out := s.rgResult(text, n, truncated, "go")
+	respText := mcpResultText(t, out)
+	if !strings.Contains(respText, "output truncated at 100KB") {
+		t.Fatalf("expected response cap marker, got: %.200s", respText)
+	}
+	if len(respText) > fsRgMaxOutputBytes+256 {
+		t.Fatalf("response exceeds output cap: %d", len(respText))
+	}
+
+	// Short-line matches are unaffected: other files are still searched.
+	mustWrite(t, filepath.Join(wd, "other.txt"), "NORMAL_RG_TOKEN\n")
+	text2, truncated2, n2, err := s.rgGo(context.Background(), wd, rgArgs{Pattern: "NORMAL_RG_TOKEN", Limit: 50}, 50, 0, fsRgMaxOutputBytes)
+	if err != nil || n2 != 1 || !strings.Contains(text2, "NORMAL_RG_TOKEN") {
+		t.Fatalf("other files must still be searched: err=%v n=%d text=%q", err, n2, text2)
+	}
+	if truncated2 {
+		t.Fatalf("short-line search must not be flagged truncated: %q", text2)
+	}
+}
+
+// TestRgGo_OversizedLineSkippedNotFatal: a line beyond the explicit cap must
+// be skipped per-line (not fail the search, not be searched), the result must
+// be flagged truncated (not silent), and scanning must continue both in the
+// same file and in other files.
+func TestRgGo_OversizedLineSkippedNotFatal(t *testing.T) {
+	old := maxRgLineBytes
+	maxRgLineBytes = 4 * 1024
+	t.Cleanup(func() { maxRgLineBytes = old })
+
+	wd, s := setupFSFixture(t)
+	// First line is 100KB (> shrunk 4KB cap), second line is normal.
+	mustWrite(t, filepath.Join(wd, "huge.txt"), strings.Repeat("z", 100*1024)+"\nSAME_FILE_RG_TOKEN\n")
+	// Buried token inside the oversized line must NOT match.
+	mustWrite(t, filepath.Join(wd, "buried.txt"), strings.Repeat("q", 100*1024)+"BURIED_RG_TOKEN\n")
+	mustWrite(t, filepath.Join(wd, "normal.txt"), "VISIBLE_RG_TOKEN\n")
+
+	text, truncated, n, err := s.rgGo(context.Background(), wd, rgArgs{Pattern: "RG_TOKEN", Limit: 50}, 50, 0, fsRgMaxOutputBytes)
+	if err != nil {
+		t.Fatalf("oversized line must not fail the search: %v", err)
+	}
+	if !truncated {
+		t.Fatal("expected truncated=true: an oversized line was skipped, coverage is incomplete")
+	}
+	if strings.Contains(text, "BURIED_RG_TOKEN") {
+		t.Fatal("the skipped oversized line must not be searched")
+	}
+	if !strings.Contains(text, "SAME_FILE_RG_TOKEN") {
+		t.Fatalf("lines after the oversized one in the same file must still be searched, got: %.200s", text)
+	}
+	if !strings.Contains(text, "VISIBLE_RG_TOKEN") {
+		t.Fatalf("other files must still be searched, got: %.200s", text)
+	}
+	if n != 2 {
+		t.Fatalf("expected 2 matches, got %d", n)
+	}
+}
+
+// TestReadRgLine_BoundedAndContinues is a direct unit test of the line reader:
+// a short line, then an oversized line (drained), then another short line.
+func TestReadRgLine_BoundedAndContinues(t *testing.T) {
+	input := "first\n" + strings.Repeat("a", 1000) + "\nlast\n"
+	br := bufio.NewReaderSize(strings.NewReader(input), 16)
+
+	line, tooLong, err := readRgLine(br, 64)
+	if err != nil || tooLong || string(line) != "first" {
+		t.Fatalf("first: line=%q tooLong=%v err=%v", line, tooLong, err)
+	}
+	line, tooLong, err = readRgLine(br, 64)
+	if err != nil || !tooLong {
+		t.Fatalf("oversized line: line=%q tooLong=%v err=%v (want tooLong=true)", line, tooLong, err)
+	}
+	line, tooLong, err = readRgLine(br, 64)
+	if err != nil || tooLong || string(line) != "last" {
+		t.Fatalf("after oversized line: line=%q tooLong=%v err=%v (want \"last\")", line, tooLong, err)
+	}
+	_, _, err = readRgLine(br, 64)
+	if err != io.EOF {
+		t.Fatalf("expected io.EOF at end, got %v", err)
+	}
+
+	// CRLF handling and a final unterminated line.
+	br = bufio.NewReaderSize(strings.NewReader("a\r\nb"), 16)
+	line, _, err = readRgLine(br, 64)
+	if err != nil || string(line) != "a" {
+		t.Fatalf("crlf: line=%q err=%v", line, err)
+	}
+	line, _, err = readRgLine(br, 64)
+	if err != nil || string(line) != "b" {
+		t.Fatalf("unterminated: line=%q err=%v", line, err)
+	}
+}
+
+// ============================================================================
+// 审计修复 4：singleflight 错误分支 Truncated 状态共享
+// ============================================================================
+
+// TestFetchAndIndex_SingleflightErrorTruncatedConsistent: a fetch that
+// succeeds at the HTTP level but is truncated (>10MB) and then fails content
+// processing (format=json on garbage) goes through the singleflight ERROR
+// branch with truncated=true. Every concurrent waiter must report the same
+// Truncated value; the old closure-outer local only the executing goroutine
+// wrote left waiters with false.
+func TestFetchAndIndex_SingleflightErrorTruncatedConsistent(t *testing.T) {
+	big := strings.Repeat("j", maxBodySize+1000)
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Write slowly so all concurrent callers join the in-flight fetch.
+		const chunkSize = 64 * 1024
+		for i := 0; i < len(big); i += chunkSize {
+			end := i + chunkSize
+			if end > len(big) {
+				end = len(big)
+			}
+			_, _ = w.Write([]byte(big[i:end]))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	srv := newFetchTestServer(t, handler)
+
+	const n = 8
+	results := make([]*FetchResult, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			res, _ := srv.fetchAndIndex(context.Background(), "http://1.1.1.1/sf-error", "src", "json", false, 3600000, 60*time.Second)
+			results[idx] = res
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, r := range results {
+		if r == nil {
+			t.Fatalf("result %d is nil", i)
+		}
+		if r.Error == "" {
+			t.Fatalf("result %d: expected a processing error (truncated JSON), got success", i)
+		}
+		if !r.Truncated {
+			t.Fatalf("result %d: Truncated=false, want true — all singleflight waiters must agree (error=%s)", i, r.Error)
+		}
+	}
+}
+
+// ============================================================================
+// 审计修复 5：batch Truncated 只表示真实输出裁剪
+// ============================================================================
+
+// TestBatchExecute_TruncatedOnlyWhenReal: output between 100KB and 10MB is
+// auto-indexed but NOT truncated; output beyond 10MB is indexed AND truncated.
+// Serial and concurrent paths must agree.
+func TestBatchExecute_TruncatedOnlyWhenReal(t *testing.T) {
+	for _, conc := range []int{1, 2} {
+		srv := newTestServer(t)
+		srv.workdirs = []string{t.TempDir()}
+
+		res, _, err := srv.toolBatchExecute(context.Background(), nil, batchArgs{
+			Commands: []batchCommand{
+				{Label: "medium", Command: "head -c 200000 /dev/zero | tr '\\0' m"},
+				{Label: "huge", Command: "head -c 11000000 /dev/zero | tr '\\0' h"},
+			},
+			Concurrency: conc,
+		})
+		if err != nil {
+			t.Fatalf("toolBatchExecute (concurrency=%d): %v", conc, err)
+		}
+		var resp batchResponse
+		if err := json.Unmarshal([]byte(contentText(res)), &resp); err != nil {
+			t.Fatalf("unmarshal (concurrency=%d): %v\n%s", conc, err, contentText(res))
+		}
+		byLabel := map[string]batchResult{}
+		for _, r := range resp.Commands {
+			byLabel[r.Label] = r
+		}
+
+		medium := byLabel["medium"]
+		if !medium.Indexed {
+			t.Fatalf("concurrency=%d: 200KB output must be auto-indexed: %+v", conc, medium)
+		}
+		if medium.Truncated {
+			t.Fatalf("concurrency=%d: 200KB output (100KB-10MB) must NOT be flagged truncated: %+v", conc, medium)
+		}
+
+		huge := byLabel["huge"]
+		if !huge.Indexed {
+			t.Fatalf("concurrency=%d: >10MB output must be auto-indexed: %+v", conc, huge)
+		}
+		if !huge.Truncated {
+			t.Fatalf("concurrency=%d: >10MB output must be flagged truncated: %+v", conc, huge)
+		}
+		if huge.Size != maxCmdOutput {
+			t.Fatalf("concurrency=%d: captured size must be exactly the 10MB buffer cap, got %d", conc, huge.Size)
+		}
+		if !resp.Truncated {
+			t.Fatalf("concurrency=%d: batch-level truncated must aggregate the real truncation", conc)
+		}
+	}
+}
+
+// === Merged from fixes3_test.go ===
+
+// ============================================================================
+// 1. 自动索引敏感内容拦截测试 (execute, execute_file, batch, run_task, store)
+// ============================================================================
+
+var (
+	testPrivateKeyPayload = "-----BEGIN " + "RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Y3...\n-----END " + "RSA PRIVATE KEY-----\n"
+	testAWSAccessKey      = "AKIA" + "IOSFODNN7EXAMPLE"
+	testGitHubToken       = "ghp_" + "123456789012345678901234567890123456"
+)
+
+func TestAutoIndex_SensitiveContentRefused_Execute(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+
+	// 1. Large output (> 100KB) containing private key
+	bigSensitiveOutput := strings.Repeat("A", 105*1024) + "\n" + testPrivateKeyPayload
+	res, _, err := s.toolExecute(context.Background(), nil, executeArgs{
+		Command: "printf '%s'",
+		Argv:    []string{"printf", "%s", bigSensitiveOutput},
+	})
+	if err != nil {
+		t.Fatalf("toolExecute: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "Content was NOT indexed") || !strings.Contains(text, "private key material") {
+		t.Fatalf("expected unindexed result with private key refusal, got: %s", text)
+	}
+	if hits, _ := st.Search("RSA PRIVATE KEY", 5); len(hits) != 0 {
+		t.Fatalf("sensitive execute output was indexed to store: %+v", hits)
+	}
+
+	// 2. Large output (> 100KB) containing AWS Access Key
+	bigAWSOutput := strings.Repeat("A", 105*1024) + "\n" + testAWSAccessKey
+	res, _, err = s.toolExecute(context.Background(), nil, executeArgs{
+		Command: "printf '%s'",
+		Argv:    []string{"printf", "%s", bigAWSOutput},
+	})
+	if err != nil {
+		t.Fatalf("toolExecute AWS: %v", err)
+	}
+	text = mcpResultText(t, res)
+	if !strings.Contains(text, "Content was NOT indexed") || !strings.Contains(text, "credential / secret material") {
+		t.Fatalf("expected unindexed result with credential refusal, got: %s", text)
+	}
+	if hits, _ := st.Search(testAWSAccessKey, 5); len(hits) != 0 {
+		t.Fatalf("sensitive AWS key was indexed to store: %+v", hits)
+	}
+
+	// 3. Intent-tagged output (> 5KB) containing GitHub token
+	intentSensitiveOutput := strings.Repeat("B", 6*1024) + "\n" + testGitHubToken
+	res, _, err = s.toolExecute(context.Background(), nil, executeArgs{
+		Command: "printf '%s'",
+		Argv:    []string{"printf", "%s", intentSensitiveOutput},
+		Intent:  "leak_test",
+	})
+	if err != nil {
+		t.Fatalf("toolExecute: %v", err)
+	}
+	text = mcpResultText(t, res)
+	if !strings.Contains(text, "was NOT indexed") || !strings.Contains(text, "credential / secret material") {
+		t.Fatalf("expected intent unindexed result with credential refusal, got: %s", text)
+	}
+	if hits, _ := st.Search("leak_test", 5); len(hits) != 0 {
+		t.Fatalf("sensitive intent execute output was indexed to store: %+v", hits)
+	}
+}
+
+func TestAutoIndex_SensitiveContentRefused_ExecuteFile(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+
+	// Case 1: Target file is a sensitive file (.env). Must be refused BEFORE reading or executing.
+	envFile := filepath.Join(wd, ".env")
+	mustWrite(t, envFile, "SECRET_KEY=123456\n"+strings.Repeat("LARGE_CONF_VAL=XYZ\n", 6000))
+	_, _, err := s.toolExecuteFile(context.Background(), nil, executeFileArgs{
+		Path:     envFile,
+		Code:     "console.log(FILE_CONTENT);",
+		Language: "javascript",
+	})
+	if err == nil {
+		t.Fatal("expected error refusing execution on sensitive file (.env), got nil")
+	}
+	if !strings.Contains(err.Error(), "refusing to execute on sensitive file") {
+		t.Fatalf("expected sensitive file execution refusal message, got: %v", err)
+	}
+	if hits, _ := st.Search("SECRET_KEY", 5); len(hits) != 0 {
+		t.Fatalf("sensitive file content was indexed to store: %+v", hits)
+	}
+
+	// Case 2: Target file is normal, but code output contains private key (large output)
+	if !checkRuntime("javascript", false, "") {
+		t.Skip("skipping execute_file javascript test: node runtime not available")
+	}
+	normalFile := filepath.Join(wd, "data.txt")
+	mustWrite(t, normalFile, "hello")
+	jsCode := fmt.Sprintf(`console.log(%q + "\n" + %q);`, strings.Repeat("X", 105*1024), testPrivateKeyPayload)
+	res, _, err := s.toolExecuteFile(context.Background(), nil, executeFileArgs{
+		Path:     normalFile,
+		Code:     jsCode,
+		Language: "javascript",
+	})
+	if err != nil {
+		t.Fatalf("toolExecuteFile (sensitive output): %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "Content was NOT indexed") || !strings.Contains(text, "private key material") {
+		t.Fatalf("expected private key output index refusal, got: %s", text)
+	}
+	if hits, _ := st.Search("RSA PRIVATE KEY", 5); len(hits) != 0 {
+		t.Fatalf("sensitive output from execute_file was indexed to store: %+v", hits)
+	}
+}
+
+func TestAutoIndex_SensitiveContentRefused_Batch(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+
+	// The graded screen now hard-blocks any command string >64KiB, so build the
+	// >100KB OUTPUT from a small command (fill NUL->'C') and read the private key
+	// from a file instead of embedding it in an oversized command. The assertion
+	// under test — index-time refusal of sensitive content — is unchanged.
+	keyPath := filepath.Join(wd, "leak.key")
+	if err := os.WriteFile(keyPath, []byte(testPrivateKeyPayload), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+	resp, _, err := s.toolBatchExecute(context.Background(), nil, batchArgs{
+		Commands: []batchCommand{
+			{Label: "sensitive_cmd", Command: "head -c 110000 /dev/zero | tr '\\0' 'C'; printf '\\n'; cat \"" + keyPath + "\""},
+		},
+		CWD: wd,
+	})
+	if err != nil {
+		t.Fatalf("toolBatchExecute: %v", err)
+	}
+	text := mcpResultText(t, resp)
+	var batchResp batchResponse
+	if err := json.Unmarshal([]byte(text), &batchResp); err != nil {
+		t.Fatalf("unmarshal batch response: %v\ntext: %s", err, text)
+	}
+	if len(batchResp.Commands) != 1 {
+		t.Fatalf("expected 1 command result, got %d", len(batchResp.Commands))
+	}
+	cmdRes := batchResp.Commands[0]
+	if cmdRes.Indexed {
+		t.Fatal("sensitive batch output must NOT have Indexed=true")
+	}
+	if !strings.Contains(cmdRes.IndexError, "private key material") {
+		t.Fatalf("expected IndexError with private key refusal, got %q", cmdRes.IndexError)
+	}
+	if hits, _ := st.Search("RSA PRIVATE KEY", 5); len(hits) != 0 {
+		t.Fatalf("sensitive batch output was indexed: %+v", hits)
+	}
+}
+
+func TestAutoIndex_SensitiveContentRefused_RunTask(t *testing.T) {
+	st := newTestStore(t)
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}, store: st}
+
+	bigSensitive := strings.Repeat("D", 105*1024) + "\n" + testPrivateKeyPayload
+	res, _, err := s.toolRunTask(context.Background(), nil, runTaskArgs{
+		Kind: "custom",
+		Args: []string{"printf", "%s", bigSensitive},
+		CWD:  wd,
+	})
+	if err != nil {
+		t.Fatalf("toolRunTask: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, "Content was NOT indexed") || !strings.Contains(text, "private key material") {
+		t.Fatalf("expected run_task index refusal, got: %s", text)
+	}
+	if hits, _ := st.Search("RSA PRIVATE KEY", 5); len(hits) != 0 {
+		t.Fatalf("sensitive run_task output was indexed: %+v", hits)
+	}
+}
+
+func TestStore_Index_SensitiveContentRefused(t *testing.T) {
+	st := newTestStore(t)
+
+	// Direct Index call with private key must fail
+	err := st.Index("secrets/key.pem", testPrivateKeyPayload)
+	if err == nil {
+		t.Fatal("expected Store.Index to refuse private key")
+	}
+	if !strings.Contains(err.Error(), "private key material") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// Direct Index call with AWS key must fail
+	err = st.Index("secrets/aws.txt", "export AWS_ACCESS_KEY_ID="+testAWSAccessKey)
+	if err == nil {
+		t.Fatal("expected Store.Index to refuse AWS access key")
+	}
+	if !strings.Contains(err.Error(), "credential / secret material") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+// ============================================================================
+// 2. background jsonschema 文案一致性测试
+// ============================================================================
+
+func TestBackground_JSONSchema_ReflectsTimeoutTermination(t *testing.T) {
+	fExec, ok := reflect.TypeOf(executeArgs{}).FieldByName("Background")
+	if !ok {
+		t.Fatal("Background field missing in executeArgs")
+	}
+	tagExec := fExec.Tag.Get("jsonschema")
+	if strings.Contains(tagExec, "Keep running after timeout") {
+		t.Fatalf("executeArgs.Background tag contains outdated text: %q", tagExec)
+	}
+	if !strings.Contains(tagExec, "terminated on timeout") && !strings.Contains(tagExec, "terminated after timeout") {
+		t.Fatalf("executeArgs.Background tag must reflect timeout termination, got: %q", tagExec)
+	}
+
+	fRun, ok := reflect.TypeOf(ctxRunArgs{}).FieldByName("Background")
+	if !ok {
+		t.Fatal("Background field missing in ctxRunArgs")
+	}
+	tagRun := fRun.Tag.Get("jsonschema")
+	if strings.Contains(tagRun, "Keep running after timeout") {
+		t.Fatalf("ctxRunArgs.Background tag contains outdated text: %q", tagRun)
+	}
+	if !strings.Contains(tagRun, "terminated on timeout") && !strings.Contains(tagRun, "terminated after timeout") {
+		t.Fatalf("ctxRunArgs.Background tag must reflect timeout termination, got: %q", tagRun)
+	}
+}
+
+// ============================================================================
+// 3. batch 取消路径 stdout/stderr 合并换行测试
+// ============================================================================
+
+func TestBatchExecute_Cancellation_NewlineSeparation(t *testing.T) {
+	wd := t.TempDir()
+	s := &server{workdirs: []string{wd}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	readyFile := filepath.Join(wd, "ready.txt")
+	cmdStr := fmt.Sprintf(`printf "stdout_line"; printf "stderr_line" >&2; : > %q; sleep 10`, readyFile)
+
+	done := make(chan struct{})
+	var out string
+	var exitCode int
+	var execErr error
+
+	go func() {
+		out, exitCode, execErr, _ = s.executeCommand(ctx, cmdStr, s.workdirs[0])
+		close(done)
+	}()
+
+	// Wait until stdout and stderr have been produced before cancelling.
+	ready := false
+	for i := 0; i < 500; i++ {
+		if _, err := os.Stat(readyFile); err == nil {
+			ready = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !ready {
+		cancel()
+		<-done
+		t.Fatal("timed out waiting for command to produce output")
+	}
+
+	cancel()
+	<-done
+
+	if execErr == nil {
+		t.Fatal("expected non-nil error on cancellation")
+	}
+	if exitCode != -1 {
+		t.Fatalf("expected exitCode -1 on cancellation, got %d", exitCode)
+	}
+
+	if !strings.Contains(out, "stdout_line\nstderr_line") {
+		t.Fatalf("expected newline separation between stdout and stderr on cancellation, got %q", out)
+	}
+}
+
+// ============================================================================
+// 4. 后台启动/注册失败时 cleanups 临时文件清理测试
+// ============================================================================
+
+func TestBackground_LaunchFailure_CleanupsRemoved(t *testing.T) {
+	wd := t.TempDir()
+
+	tmpFile, err := os.CreateTemp(os.TempDir(), "test_bg_cleanup_*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+
+	cmd := exec.Command("/nonexistent/binary/for/test")
+	cmd.Dir = wd
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	_, err = runCmd(context.Background(), cmd, 5*time.Second, true, "custom", "bad_cmd", tmpPath)
+	if err == nil {
+		t.Fatal("expected error for nonexistent binary")
+	}
+
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		_ = os.Remove(tmpPath)
+		t.Fatalf("temp file %s was not cleaned up after background launch failure", tmpPath)
+	}
+}
+
+func TestBackground_RegisterFailure_Cleanup(t *testing.T) {
+	bgMu.Lock()
+	saved := bgProcs
+	bgProcs = make(map[string]*bgEntry)
+	// Fill up to maxBackgroundProcs live entries
+	for i := 0; i < maxBackgroundProcs; i++ {
+		id := fmt.Sprintf("mock-live-%d", i)
+		bgProcs[id] = &bgEntry{
+			ID:        id,
+			PID:       10000 + i,
+			StartedAt: time.Now(),
+			Done:      false,
+		}
+	}
+	bgMu.Unlock()
+
+	defer func() {
+		bgMu.Lock()
+		bgProcs = saved
+		bgMu.Unlock()
+	}()
+
+	tmpFile, err := os.CreateTemp(os.TempDir(), "test_bg_cap_*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+
+	cmd := exec.Command("sleep", "10")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	_, err = runCmd(context.Background(), cmd, 10*time.Second, true, "shell", "sleep 10", tmpPath)
+	if err == nil {
+		t.Fatal("expected error when background cap is exceeded")
+	}
+	if !strings.Contains(err.Error(), "too many concurrent background processes") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		_ = os.Remove(tmpPath)
+		t.Fatalf("temp file %s was not cleaned up when background cap was reached", tmpPath)
+	}
+}
+
+// ============================================================================
+// 5. 后台结果保留及上限修剪测试
+// ============================================================================
+
+func TestBackground_Retention_QueryableAfterCompletion(t *testing.T) {
+	s := &server{workdirs: []string{t.TempDir()}}
+
+	res, _, err := s.toolExecute(context.Background(), nil, executeArgs{
+		Command:    "echo 'background retention test output'",
+		Background: true,
+	})
+	if err != nil {
+		t.Fatalf("toolExecute background: %v", err)
+	}
+	text := mcpResultText(t, res)
+
+	var jobID string
+	for _, part := range strings.Fields(text) {
+		if strings.HasPrefix(part, "bg-") {
+			jobID = strings.Trim(part, ",.)")
+			break
+		}
+	}
+	if jobID == "" {
+		t.Fatalf("failed to extract jobID from: %s", text)
+	}
+
+	t.Cleanup(func() {
+		bgMu.Lock()
+		e, ok := bgProcs[jobID]
+		if ok {
+			delete(bgProcs, jobID)
+		}
+		bgMu.Unlock()
+		if e != nil {
+			if e.LogPath != "" {
+				unprotectTemp(e.LogPath)
+				_ = os.Remove(e.LogPath)
+			}
+			for _, tmp := range e.TempFiles {
+				unprotectTemp(tmp)
+				_ = os.Remove(tmp)
+			}
+		}
+	})
+
+	waitRes, _, err := s.toolBackgroundWait(context.Background(), nil, backgroundWaitArgs{
+		ID:        jobID,
+		TimeoutMs: 5000,
+	})
+	if err != nil {
+		t.Fatalf("toolBackgroundWait: %v", err)
+	}
+	wText := mcpResultText(t, waitRes)
+	if !strings.Contains(wText, "background retention test output") {
+		t.Fatalf("expected output in wait, got: %s", wText)
+	}
+
+	logRes, _, err := s.toolBackgroundLog(context.Background(), nil, backgroundLogArgs{
+		ID: jobID,
+	})
+	if err != nil {
+		t.Fatalf("toolBackgroundLog after completion: %v", err)
+	}
+	lText := mcpResultText(t, logRes)
+	if !strings.Contains(lText, "background retention test output") {
+		t.Fatalf("expected output in log query, got: %s", lText)
+	}
+}
+
+func TestBackground_MaxCompletedJobs_Eviction(t *testing.T) {
+	bgMu.Lock()
+	saved := bgProcs
+	bgProcs = make(map[string]*bgEntry)
+	bgMu.Unlock()
+
+	defer func() {
+		bgMu.Lock()
+		bgProcs = saved
+		bgMu.Unlock()
+	}()
+
+	var logFiles []string
+	totalJobs := maxCompletedBackgroundJobs + 10
+
+	for i := 0; i < totalJobs; i++ {
+		f, err := os.CreateTemp(os.TempDir(), "test_evict_*.log")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lp := f.Name()
+		logFiles = append(logFiles, lp)
+		_, _ = f.WriteString(fmt.Sprintf("log output %d\n", i))
+		protectTemp(lp)
+
+		id := fmt.Sprintf("evict-bg-%d", i)
+		bgMu.Lock()
+		bgProcs[id] = &bgEntry{
+			ID:        id,
+			PID:       20000 + i,
+			StartedAt: time.Now().Add(time.Duration(i) * time.Millisecond),
+			LogPath:   lp,
+			logFile:   f,
+			logWriter: &limitedFileWriter{f: f, limit: bgLogMaxBytes},
+		}
+		bgMu.Unlock()
+
+		finishBackground(id, 0)
+	}
+
+	bgMu.Lock()
+	doneCount := 0
+	for _, e := range bgProcs {
+		if e.Done {
+			doneCount++
+		}
+	}
+	bgMu.Unlock()
+
+	if doneCount > maxCompletedBackgroundJobs {
+		t.Fatalf("expected at most %d completed background jobs retained, got %d", maxCompletedBackgroundJobs, doneCount)
+	}
+
+	// Verify the oldest 10 log files were removed
+	for i := 0; i < 10; i++ {
+		if _, err := os.Stat(logFiles[i]); !os.IsNotExist(err) {
+			_ = os.Remove(logFiles[i])
+			t.Errorf("oldest log file %s should have been removed by eviction", logFiles[i])
+		}
+	}
+
+	// Clean up remaining log files
+	for i := 10; i < len(logFiles); i++ {
+		_ = os.Remove(logFiles[i])
+	}
+}
+
+// ============================================================================
+// 6. Leader 退出但子进程存活时 ctx_bg kill 进程组清理测试
+// ============================================================================
+
+func TestBackground_Kill_LeaderExitedChildSurviving(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping process group procfs test on non-linux platform")
+	}
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		t.Skip("skipping test: /proc is not available")
+	}
+
+	s := &server{workdirs: []string{t.TempDir()}}
+
+	// Launch a shell script that spawns a long-running sleep child in background and exits immediately.
+	cmdStr := "sleep 100 &"
+	res, _, err := s.toolExecute(context.Background(), nil, executeArgs{
+		Command:    cmdStr,
+		Background: true,
+	})
+	if err != nil {
+		t.Fatalf("toolExecute background: %v", err)
+	}
+	text := mcpResultText(t, res)
+
+	var jobID string
+	for _, part := range strings.Fields(text) {
+		if strings.HasPrefix(part, "bg-") {
+			jobID = strings.Trim(part, ",.)")
+			break
+		}
+	}
+	if jobID == "" {
+		t.Fatalf("failed to extract jobID from: %s", text)
+	}
+
+	entry := findBackground(jobID)
+	if entry == nil {
+		t.Fatalf("background job %s not found", jobID)
+	}
+
+	t.Cleanup(func() {
+		// 1. Attempt clean kill first
+		_, _ = killBackground(jobID)
+
+		// 2. Kill the process group directly in case killBackground failed or didn't catch everything
+		if entry.PID > 0 {
+			_ = syscall.Kill(-entry.PID, syscall.SIGKILL)
+			if entry.starttime > 0 {
+				surviving := findProcessGroupPIDs(entry.PID, entry.starttime)
+				for _, pid := range surviving {
+					_ = syscall.Kill(pid, syscall.SIGKILL)
+				}
+			}
+		}
+
+		// 3. Clean up registry entry and temporary files
+		bgMu.Lock()
+		e, ok := bgProcs[jobID]
+		if ok {
+			delete(bgProcs, jobID)
+		}
+		bgMu.Unlock()
+
+		if e != nil {
+			if e.LogPath != "" {
+				unprotectTemp(e.LogPath)
+				_ = os.Remove(e.LogPath)
+			}
+			for _, tmp := range e.TempFiles {
+				unprotectTemp(tmp)
+				_ = os.Remove(tmp)
+			}
+		}
+	})
+
+	// Poll until leader has exited
+	leaderExited := false
+	for i := 0; i < 100; i++ {
+		time.Sleep(30 * time.Millisecond)
+		if procStartTime(entry.PID) == 0 {
+			leaderExited = true
+			break
+		}
+	}
+	if !leaderExited {
+		t.Fatalf("leader process %d did not exit as expected", entry.PID)
+	}
+
+	// Poll for surviving child processes in the process group
+	var surviving []int
+	for i := 0; i < 50; i++ {
+		surviving = findProcessGroupPIDs(entry.PID, entry.starttime)
+		if len(surviving) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(surviving) == 0 {
+		t.Fatalf("expected surviving child process in process group %d, found none", entry.PID)
+	}
+
+	// Verify before kill: surviving process is alive and in the process group
+	for _, pid := range surviving {
+		if err := syscall.Kill(pid, 0); err != nil {
+			t.Fatalf("child process %d in group %d is not alive before kill: %v", pid, entry.PID, err)
+		}
+	}
+
+	// Kill background job
+	killMsg, err := killBackground(jobID)
+	if err != nil {
+		t.Fatalf("killBackground failed: %v", err)
+	}
+	if !strings.Contains(killMsg, "killed orphan background process group") {
+		t.Fatalf("unexpected kill message: %s", killMsg)
+	}
+
+	// Verify after kill: all child processes are terminated
+	remaining := findProcessGroupPIDs(entry.PID, entry.starttime)
+	if len(remaining) > 0 {
+		t.Fatalf("orphan processes %v still running in process group %d after killBackground", remaining, entry.PID)
+	}
+	for _, pid := range surviving {
+		// Confirm process is dead. A zombie still holds its PID-table entry,
+		// so kill(pid,0) returns nil for it — check the /proc state field too
+		// and treat Z/X (dead, unreaped) as dead, matching the fix that makes
+		// findProcessGroupPIDs ignore zombies in the kill loop above.
+		if err := syscall.Kill(pid, 0); err == nil && !procStatIsDead(pid) {
+			t.Fatalf("child process %d is still alive after killBackground", pid)
+		}
+	}
+}
+
+// procStatIsDead reports whether /proc/<pid>/stat marks the process in a
+// dead state (Z zombie or X/x dead) — a zombie keeps its PID-table entry so
+// kill(pid,0) returns nil even though the process no longer runs.
+func procStatIsDead(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return true // gone
+	}
+	i := bytes.LastIndexByte(data, ')')
+	if i < 0 || i+2 >= len(data) {
+		return false
+	}
+	f := strings.Fields(string(data[i+2:]))
+	if len(f) == 0 {
+		return false
+	}
+	return f[0] == "Z" || f[0] == "X" || f[0] == "x"
+}
+
+func TestBackground_Kill_UnknownIdentity_Refused(t *testing.T) {
+	bgMu.Lock()
+	saved := bgProcs
+	bgProcs = make(map[string]*bgEntry)
+	// Entry with unknown identity (starttime = 0)
+	bgProcs["bg-unknown"] = &bgEntry{
+		ID:        "bg-unknown",
+		PID:       99999,
+		starttime: 0,
+		Done:      false,
+	}
+	bgMu.Unlock()
+
+	defer func() {
+		bgMu.Lock()
+		bgProcs = saved
+		bgMu.Unlock()
+	}()
+
+	_, err := killBackground("bg-unknown")
+	if err == nil {
+		t.Fatal("expected killBackground to fail on unknown starttime")
+	}
+	if !strings.Contains(err.Error(), "process identity unknown") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// Ensure slot was NOT marked Done
+	e := findBackground("bg-unknown")
+	if e == nil || e.Done {
+		t.Fatal("entry with unknown identity must not be marked Done on failed kill")
+	}
+}
+
+// ============================================================================
+// 7. 数据库权限防护与恢复测试
+// ============================================================================
+
+func TestStore_SecureDBFiles_RestoresRelaxedPermissionsOnWrite(t *testing.T) {
+	dbDir := t.TempDir()
+	dbPath := filepath.Join(dbDir, "test.db")
+
+	st, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer st.Close()
+
+	// Initial write creates database and sidecar (WAL)
+	if err := st.Index("doc/1", "initial content"); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+
+	walPath := dbPath + "-wal"
+
+	// Relax permissions to 0644 (simulating external modification or default umask creation)
+	if err := os.Chmod(dbPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(walPath); err == nil {
+		if err := os.Chmod(walPath, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Subsequent write must detect and restore 0600 on DB and sidecars
+	if err := st.Index("doc/2", "second content"); err != nil {
+		t.Fatalf("Index 2: %v", err)
+	}
+
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("expected main DB file permissions restored to 0600, got %o", perm)
+	}
+
+	if fiWal, err := os.Stat(walPath); err == nil {
+		if perm := fiWal.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("expected WAL sidecar permissions restored to 0600, got %o", perm)
+		}
+	}
+}
+
+// ============================================================================
+// 8. finishBackground 与 shutdownBackground 并发竞态测试
+// ============================================================================
+
+func TestBackground_Concurrent_FinishAndShutdown_Race(t *testing.T) {
+	bgMu.Lock()
+	saved := bgProcs
+	bgProcs = make(map[string]*bgEntry)
+	bgMu.Unlock()
+
+	defer func() {
+		bgMu.Lock()
+		bgProcs = saved
+		bgMu.Unlock()
+	}()
+
+	for round := 0; round < 10; round++ {
+		f, err := os.CreateTemp(os.TempDir(), "test_race_bg_*.log")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lp := f.Name()
+		protectTemp(lp)
+
+		id := fmt.Sprintf("race-bg-%d", round)
+		writer := &limitedFileWriter{f: f, limit: bgLogMaxBytes}
+
+		bgMu.Lock()
+		bgProcs[id] = &bgEntry{
+			ID:        id,
+			PID:       30000 + round,
+			StartedAt: time.Now(),
+			LogPath:   lp,
+			logFile:   f,
+			logWriter: writer,
+			Done:      false,
+		}
+		bgMu.Unlock()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			finishBackground(id, 0)
+		}()
+
+		go func() {
+			defer wg.Done()
+			shutdownBackground()
+		}()
+
+		wg.Wait()
+		unprotectTemp(lp)
+		_ = os.Remove(lp)
+	}
+}
+
+// === Merged from fixes4_test.go ===
+
+// ============================================================================
+// 1. 数据库权限：VACUUM 路径恢复 0600 权限测试
+// ============================================================================
+
+func TestStore_Vacuum_Restores0600(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "vacuum_perm.db")
+
+	st, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer st.Close()
+
+	if err := st.Index("doc/1", "initial content to allocate pages"); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+
+	walPath := dbPath + "-wal"
+	shmPath := dbPath + "-shm"
+
+	// Relax permissions to 0644 (simulating external chmod or recreation during VACUUM)
+	if err := os.Chmod(dbPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(walPath); err == nil {
+		if err := os.Chmod(walPath, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(shmPath); err == nil {
+		if err := os.Chmod(shmPath, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Run VACUUM directly
+	if err := st.Vacuum(); err != nil {
+		t.Fatalf("Vacuum: %v", err)
+	}
+
+	// Permissions must be immediately restored to 0600 without needing next Index/SetCache
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("expected main DB file perm 0600 after Vacuum, got %o", perm)
+	}
+
+	if fiWal, err := os.Stat(walPath); err == nil {
+		if perm := fiWal.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("expected WAL sidecar perm 0600 after Vacuum, got %o", perm)
+		}
+	}
+	if fiShm, err := os.Stat(shmPath); err == nil {
+		if perm := fiShm.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("expected SHM sidecar perm 0600 after Vacuum, got %o", perm)
+		}
+	}
+}
+
+func TestPurgeProject_Vacuum_Restores0600(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "purge_perm.db")
+
+	st, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer st.Close()
+
+	if err := st.Index("doc/1", "initial content to purge"); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+
+	srv := &server{
+		workdirs: []string{dir},
+		store:    st,
+	}
+
+	// Relax permissions
+	if err := os.Chmod(dbPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Call purgeProject via toolPurge
+	res, _, err := srv.toolPurge(context.Background(), nil, purgeArgs{
+		Scope:         "project",
+		Confirm:       true,
+		ConfirmPhrase: filepath.Base(dir),
+	})
+	if err != nil {
+		t.Fatalf("toolPurge project: %v", err)
+	}
+	text := mcpResultText(t, res)
+	if !strings.Contains(text, `"scope": "project"`) {
+		t.Fatalf("unexpected purge response: %s", text)
+	}
+
+	// Permissions must be 0600 immediately
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("expected main DB file perm 0600 after purgeProject, got %o", perm)
+	}
+}
+
+// ============================================================================
+// 2. execute_file: 拒绝指向敏感文件 inode 的硬链接
+// ============================================================================
+
+func TestExecuteFile_HardlinkToSensitiveFile_Refused(t *testing.T) {
+	wd := t.TempDir()
+	st := newTestStore(t)
+	s := &server{workdirs: []string{wd}, store: st}
+
+	// Create a sensitive file (.env) in workdir
+	envPath := filepath.Join(wd, ".env")
+	if err := os.WriteFile(envPath, []byte("SEC"+"RET_API_"+"KEY=supersecret12345\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create harmless-named hardlink pointing to .env
+	hardlinkPath := filepath.Join(wd, "harmless_script.js")
+	if err := os.Link(envPath, hardlinkPath); err != nil {
+		t.Skipf("hard links not supported: %v", err)
+	}
+
+	// Attempt execute_file on the harmless-named hardlink
+	_, _, err := s.toolExecuteFile(context.Background(), nil, executeFileArgs{
+		Path:     hardlinkPath,
+		Language: "javascript",
+		Code:     "console.log(FILE_CONTENT);",
+	})
+	if err == nil {
+		t.Fatal("expected execute_file to refuse hardlink to .env, but got nil error")
+	}
+	if !strings.Contains(err.Error(), "sensitive file") && !strings.Contains(err.Error(), "hardlink") {
+		t.Fatalf("expected sensitive file or hardlink error, got: %v", err)
+	}
+
+	// Verify normal non-sensitive file is not blocked
+	normalPath := filepath.Join(wd, "normal.js")
+	if err := os.WriteFile(normalPath, []byte("const x = 42;"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, _, err := s.toolExecuteFile(context.Background(), nil, executeFileArgs{
+		Path:     normalPath,
+		Language: "javascript",
+		Code:     "console.log(FILE_CONTENT.length);",
+	})
+	// If node runtime is available, it should succeed; if not, language executor error is fine, but path check passed
+	if err != nil && !strings.Contains(err.Error(), "executable file not found") && !strings.Contains(err.Error(), "exec:") && !strings.Contains(err.Error(), "is not available") {
+		t.Fatalf("unexpected path error for normal file: %v", err)
+	}
+	if res != nil {
+		text := mcpResultText(t, res)
+		if !strings.Contains(text, "13") {
+			t.Logf("execute_file output: %s", text)
+		}
+	}
+}
+
+// ============================================================================
+// 3. fetch: 敏感内容检查先于 purge 且失败时保留旧索引
+// ============================================================================
+
+func TestFetchAndIndex_SensitiveContent_PreservesOldIndex(t *testing.T) {
+	const docURL = "http://1.1.1.1/docs/manual"
+	const oldContent = "This is important documentation about system architecture and components."
+	const sensitiveContent = "Here is a secret credential: " + "AKIA" + "IOSFODNN7EXAMPLE for testing."
+
+	var currentResponse string
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, currentResponse)
+	}
+
+	srv := newFetchTestServer(t, handler)
+	docPath := srv.fetchDocPath("web", "markdown", docURL)
+
+	// 1. Initial fetch: index valid content
+	currentResponse = oldContent
+	res, err := srv.fetchAndIndex(context.Background(), docURL, "web", "markdown", true, 0, 10*time.Second)
+	if err != nil {
+		t.Fatalf("initial fetch error: %v", err)
+	}
+	if res.Error != "" || res.IndexError != "" {
+		t.Fatalf("initial fetch returned error: err=%q indexErr=%q", res.Error, res.IndexError)
+	}
+
+	// Verify old content is indexed in store
+	doc, err := srv.store.Get(docPath)
+	if err != nil || doc == nil {
+		t.Fatalf("expected doc at %q after initial fetch (err=%v)", docPath, err)
+	}
+	if doc.Content != oldContent {
+		t.Fatalf("expected content %q, got %q", oldContent, doc.Content)
+	}
+
+	// Verify old content is searchable
+	hits, err := srv.store.Search("architecture", 10)
+	if err != nil || len(hits) == 0 {
+		t.Fatalf("expected search hits for 'architecture', got %d hits (err=%v)", len(hits), err)
+	}
+
+	// 2. Second fetch: server returns sensitive content (AWS key)
+	currentResponse = sensitiveContent
+	res2, err := srv.fetchAndIndex(context.Background(), docURL, "web", "markdown", true, 0, 10*time.Second)
+	if err != nil {
+		t.Fatalf("second fetch unexpected error: %v", err)
+	}
+	if res2.IndexError == "" {
+		t.Fatalf("expected IndexError for sensitive content, got none")
+	}
+	if !strings.Contains(res2.IndexError, "sensitive") && !strings.Contains(res2.IndexError, "credential") {
+		t.Fatalf("expected sensitive content error, got: %s", res2.IndexError)
+	}
+
+	// 3. Verify OLD document is STILL preserved in store!
+	docAfter, err := srv.store.Get(docPath)
+	if err != nil || docAfter == nil {
+		t.Fatalf("old doc was wiped out after sensitive fetch failure: err=%v", err)
+	}
+	if docAfter.Content != oldContent {
+		t.Fatalf("old doc content was modified, got %q, want %q", docAfter.Content, oldContent)
+	}
+
+	// 4. Verify old content is STILL searchable!
+	hitsAfter, err := srv.store.Search("architecture", 10)
+	if err != nil || len(hitsAfter) == 0 {
+		t.Fatalf("expected search hits for 'architecture' to survive, got %d hits (err=%v)", len(hitsAfter), err)
+	}
+
+	// 5. Verify sensitive content is NOT searchable
+	sensitiveHits, err := srv.store.Search("AKIA"+"IOSFODNN7EXAMPLE", 10)
+	if err != nil || len(sensitiveHits) != 0 {
+		t.Fatalf("sensitive content was indexed to store: %+v", sensitiveHits)
+	}
+}
+
+func TestIndexContentLocked_Direct_PreservesOldIndexOnFailure(t *testing.T) {
+	srv := newTestServer(t)
+	const docPath = "web:markdown:http://example.com/testdoc"
+	const oldContent = "Valid original doc content that must survive failed indexing."
+
+	// 1. Initial valid index
+	count, err := srv.indexContentLocked(docPath, oldContent)
+	if err != nil || count == 0 {
+		t.Fatalf("initial indexContentLocked failed: %v", err)
+	}
+
+	// Verify old doc exists
+	doc, err := srv.store.Get(docPath)
+	if err != nil || doc == nil || doc.Content != oldContent {
+		t.Fatalf("initial doc not stored properly: doc=%+v err=%v", doc, err)
+	}
+
+	// 2. Attempt to index private key
+	_, err = srv.indexContentLocked(docPath, testPrivateKeyPayload)
+	if err == nil {
+		t.Fatal("expected error indexing private key, got nil")
+	}
+
+	// 3. Attempt to index GitHub token
+	_, err = srv.indexContentLocked(docPath, "ghp_"+"123456789012345678901234567890123456")
+	if err == nil {
+		t.Fatal("expected error indexing github token, got nil")
+	}
+
+	// 4. Old doc must still be intact
+	docFinal, err := srv.store.Get(docPath)
+	if err != nil || docFinal == nil {
+		t.Fatalf("old doc lost after failed index: %v", err)
+	}
+	if docFinal.Content != oldContent {
+		t.Fatalf("old doc overwritten with %q", docFinal.Content)
 	}
 }
