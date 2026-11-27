@@ -1169,6 +1169,15 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 					}
 				}
 			case "printf":
+				// R14-Oracle-S1: an explicit-PATH printf (/usr/bin/printf,
+				// ./printf) execs the EXTERNAL binary in a child process —
+				// its -v/%n machinery can never write the parent shell's
+				// variables — so the builtin write scan does not apply at all.
+				// Mirroring the argv layer's screenPrintfEnvWrite path
+				// exemption, skip it before any word decoding.
+				if strings.Contains(head, "/") {
+					return true
+				}
 				// printf -v VAR writes VAR (glued -vVAR and clustered spellings
 				// included — R4-MF-1), and every '%n' conversion in the format
 				// string writes its aligned argument as a variable name
@@ -3074,6 +3083,67 @@ func litHasUnquotedGlobOrTilde(rawLit string, isWordStart bool, openBracket *boo
 	return false
 }
 
+// wordBraceExpHit reports whether w carries an unquoted BRACE EXPANSION
+// (R14-Oracle-M1). The locked parser (mvdan.cc/sh v3.14.1) keeps brace
+// expansions inside *syntax.Lit — the *syntax.BraceExp node only ever
+// materializes through syntax.SplitBraces, so the conversion must replay
+// that split on a throwaway copy of the word. Brace text can also SPAN
+// quoting boundaries ({'%n',TAR_OPTIONS} — bash still expands it), so the
+// scan walks EVERY Lit part of the word instead of trusting a per-part
+// literal scan. Bash performs brace expansion before field splitting: one
+// static word becomes MULTIPLE argv words, so any hit forces the dynamic
+// encoding even when no glob/tilde byte is present.
+func wordBraceExpHit(w *syntax.Word) bool {
+	hasBrace := false
+	for _, part := range w.Parts {
+		if lit, ok := part.(*syntax.Lit); ok && strings.Contains(lit.Value, "{") {
+			hasBrace = true
+			break
+		}
+	}
+	if !hasBrace {
+		return false
+	}
+	cp := *w
+	cp.Parts = append([]syntax.WordPart(nil), w.Parts...)
+	syntax.SplitBraces(&cp)
+	return wordSplitBraceExpHit(&cp)
+}
+
+// wordSplitBraceExpHit reports whether a SplitBraces-processed word copy
+// carries a *syntax.BraceExp node at any nesting depth. SplitBraces leaves
+// malformed expansions ({a, {1..2..3..4}) as plain literal text — exactly
+// the words bash leaves unexpanded — so they never hit. The recursive
+// split mirrors bash's nested brace expansion ({a,{b,c}}).
+func wordSplitBraceExpHit(w *syntax.Word) bool {
+	topHit := false
+	for _, part := range w.Parts {
+		if _, ok := part.(*syntax.BraceExp); ok {
+			topHit = true
+			break
+		}
+	}
+	if topHit {
+		return true
+	}
+	for _, part := range w.Parts {
+		br, ok := part.(*syntax.BraceExp)
+		if !ok {
+			continue
+		}
+		for _, elem := range br.Elems {
+			if elem == nil {
+				continue
+			}
+			syntax.SplitBraces(elem)
+			if wordSplitBraceExpHit(elem) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // wordToArg returns the static string form of w, or (prefix+placeholder, false)
 // when the word has dynamic/glob/tilde content. Static prefixes such as -c are
 // preserved so option scanners can still see the option letter.
@@ -3092,6 +3162,13 @@ func wordToArg(w *syntax.Word) (string, bool) {
 	var b strings.Builder
 	static := true
 	openBracket := false
+	// R14-Oracle-M1: brace expansion turns ONE static word into MANY argv
+	// words under bash — the encoding can never stay static. Exactly one
+	// split-safe glob placeholder marks the expansion; a leading '~' that
+	// already emitted one keeps the word single-glob (printf's pure-tilde
+	// exemption counts exactly one placeholder).
+	braceSeen := wordBraceExpHit(w)
+	hasGlobPh := false
 	for i, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
@@ -3099,6 +3176,7 @@ func wordToArg(w *syntax.Word) (string, bool) {
 				static = false
 				b.WriteString(posixUnescapeLit(p.Value))
 				b.WriteString(cmdSubPlaceholderGlob)
+				hasGlobPh = true
 				continue
 			}
 			b.WriteString(posixUnescapeLit(p.Value))
@@ -3125,9 +3203,13 @@ func wordToArg(w *syntax.Word) (string, bool) {
 					static = false
 					if paramExpSplitsInDblQuotes(ipp) {
 						b.WriteString(cmdSubPlaceholder)
-					} else if ipp.Param != nil && ipp.Param.Value == "$" && ipp.Exp == nil {
+					} else if name, ok := simpleParamName(ipp); ok && name == "$" {
 						// R13-SF-2: decimal PID — the digit prefix keeps
 						// dynWordCanSpellDashDash from a vacuous all-dash match.
+						// R14-Oracle-M3: simpleParamName, never a bare
+						// Param.Value=="$" check — derived operators
+						// (${$:0:0} zero-length slice CAN be empty) must not
+						// inherit the never-dash PID grant.
 						b.WriteString("0" + cmdSubPlaceholderQuoted)
 					} else {
 						b.WriteString(cmdSubPlaceholderQuoted)
@@ -3143,8 +3225,10 @@ func wordToArg(w *syntax.Word) (string, bool) {
 			// expand to "--" (or any dash spelling) and never starts with '-',
 			// so dynWordCanSpellDashDash must not vacuously strip the whole
 			// word. The digit prefix is a marker, not a value claim.
+			// R14-Oracle-M3: simpleParamName excludes Slice/Repl/Index/Length/
+			// Excl/Names — ${$:0:0} can expand EMPTY and spell "--".
 			static = false
-			if p.Param != nil && p.Param.Value == "$" && p.Exp == nil {
+			if name, ok := simpleParamName(p); ok && name == "$" {
 				b.WriteString("0" + cmdSubPlaceholderQuoted)
 			} else {
 				b.WriteString(cmdSubPlaceholder)
@@ -3156,6 +3240,12 @@ func wordToArg(w *syntax.Word) (string, bool) {
 		default:
 			static = false
 			b.WriteString(cmdSubPlaceholder)
+		}
+	}
+	if braceSeen {
+		static = false
+		if !hasGlobPh {
+			b.WriteString(cmdSubPlaceholderGlob)
 		}
 	}
 	if !static {
@@ -3216,6 +3306,12 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 	var b strings.Builder
 	static := true
 	openBracket := false
+	// R14-Oracle-M1: same brace-expansion encoding as the context-free
+	// wordToArg — one word becomes MANY argv words under bash, so a brace
+	// hit can never stay static and carries exactly one glob placeholder
+	// (single-glob invariant preserved when a leading '~' emitted one).
+	braceSeen := wordBraceExpHit(w)
+	hasGlobPh := false
 	for i, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
@@ -3223,6 +3319,7 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 				static = false
 				b.WriteString(posixUnescapeLit(p.Value))
 				b.WriteString(cmdSubPlaceholderGlob)
+				hasGlobPh = true
 				continue
 			}
 			b.WriteString(posixUnescapeLit(p.Value))
@@ -3282,6 +3379,12 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 		default:
 			static = false
 			b.WriteString(cmdSubPlaceholder)
+		}
+	}
+	if braceSeen {
+		static = false
+		if !hasGlobPh {
+			b.WriteString(cmdSubPlaceholderGlob)
 		}
 	}
 	if !static {
@@ -3363,7 +3466,18 @@ func (c *subCollector) dqParamPlaceholder(pe *syntax.ParamExp) (string, bool) {
 		if !c.isTainted("HOME") {
 			return safeHomeDir(), true // static absolute path text
 		}
-	case "PWD", "OLDPWD":
+	case "PWD":
+		// PWD is a bash-special variable the shell itself maintains: a
+		// running bash ALWAYS re-populates it to a non-empty absolute path
+		// (cd/pushd rewrite it, and bash re-creates it when unset), so the
+		// absolute-dir placeholder is sound as long as the script never
+		// wrote it. OLDPWD is deliberately NOT granted here (R14-Oracle-M2):
+		// the child environment only copies existing keys — when the parent
+		// process never exported a non-empty OLDPWD (no prior cd), the
+		// expansion is the EMPTY string, so a glued tail can collapse and
+		// "--"+"$OLDPWD" can spell the terminator. A script-level static
+		// bind (OLDPWD=/abs) already resolved upstream in
+		// resolveParamForSubst, and any script write taints the name anyway.
 		if !c.isTainted(name) {
 			return cmdSubPlaceholderAbsDq, false // guaranteed to start with /
 		}

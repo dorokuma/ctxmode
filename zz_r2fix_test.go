@@ -2997,6 +2997,323 @@ func TestGuard_V622_OracleR13Probes(t *testing.T) {
 		// shell write.
 		{"R13-SF3 usr bin printf dyn format", `/usr/bin/printf "label=$LABEL %s" value`},
 		{"R13-SF3 usr bin printf static format", `/usr/bin/printf 'label=%s' value`},
+		// R14-Oracle-S4: the R13 combination-script counterpart of the
+		// external-path exemption — inside bash -c the AST pre-scan must not
+		// all-taint on the external printf either, so `cmd` keeps its static
+		// bind (this is the 10th allow row the R13 closure counted).
+		{"R13-SF3-script usr bin printf dyn format in script", `bash -c 'cmd=/bin/true; /usr/bin/printf "label=$LABEL %s" value; "$cmd"'`},
+	}
+	for _, tc := range allowCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got != "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = %q, want ALLOW", tc.cmd, got)
+			}
+		})
+	}
+
+	// R14-Oracle-S4: the two R13 discriminating assertions that were never
+	// landed. `%10(%Y)T%n` proves the strftime conversion consumes exactly
+	// one non-write slot BEFORE the real '%n' write (slot shape, not just a
+	// rejection verdict), and the read cluster row pins the unknown-letter
+	// fail-closed path with a STATIC non-empty glued tail so the R13-MF-4
+	// empty-tail rule cannot produce a coincidental pass.
+	t.Run("R13-SF4 printfFmtSlots strftime width slot vector", func(t *testing.T) {
+		slots, pos := printfFmtSlots("%10(%Y)T%n")
+		if pos || len(slots) != 2 || slots[0] || !slots[1] {
+			t.Fatalf("printfFmtSlots(%%10(%%Y)T%%n) = %v positional=%v, want [false true] positional=false", slots, pos)
+		}
+	})
+	t.Run("R13-SF4 readDynClusterHit unknown letter before value letter", func(t *testing.T) {
+		if hit := readDynClusterHit("-Zptext" + cmdSubPlaceholderQuoted); hit == "" {
+			t.Fatal("readDynClusterHit(-Zptext+$P) = \"\", want non-empty (unknown option letter 'Z' fails closed even though a value letter follows)")
+		}
+	})
+}
+
+// parseBashSingleCmdWord parses src with the bash dialect and returns the
+// args-th word of its single call expression (test helper for the Oracle
+// R14 parser probes).
+func parseBashSingleCmdWord(t *testing.T, src string, arg int) *syntax.Word {
+	t.Helper()
+	p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+	f, err := p.Parse(strings.NewReader(src), "")
+	if err != nil {
+		t.Fatalf("parse %q: %v", src, err)
+	}
+	if len(f.Stmts) != 1 {
+		t.Fatalf("parse %q: %d stmts, want 1", src, len(f.Stmts))
+	}
+	call, ok := f.Stmts[0].Cmd.(*syntax.CallExpr)
+	if !ok {
+		t.Fatalf("parse %q: cmd is %T, want *syntax.CallExpr", src, f.Stmts[0].Cmd)
+	}
+	if arg >= len(call.Args) {
+		t.Fatalf("parse %q: %d args, want index %d", src, len(call.Args), arg)
+	}
+	return call.Args[arg]
+}
+
+// blankSubCollector returns a subCollector with no static binds, no script
+// writes and no env taints — the fixture state the Oracle R14 parser
+// probes pin (e.g. unbound "$OLDPWD").
+func blankSubCollector() *subCollector {
+	return &subCollector{
+		staticVars:   map[string]string{},
+		enumVars:     map[string]string{},
+		taintedVars:  map[string]bool{},
+		enumCmdWords: map[string][]string{},
+		ssaBlocked:   map[string]bool{},
+	}
+}
+
+// TestGuard_V622_OracleR14Probes pins the Oracle R14 audit closure:
+// unquoted brace expansion never encodes as a static single word
+// (R14-M1), the unbound "$OLDPWD" placeholder is no longer granted the
+// never-empty absolute-dir class (R14-M2), the two wordToArg PID
+// encoders exclude Slice/Repl-style derived expansions through
+// simpleParamName (R14-M3), explicit-path printf skips the builtin write
+// scan in the AST pre-scan (R14-S1), printf's zero-argument exemption
+// keeps pure-tilde format words while real globs/braces still fail
+// closed (R14-S2) and awk's --source= empty program fragment survives
+// collection (R14-S3). Pure-function pins reference only existing
+// production symbols plus parse helpers, so the file can be copied onto
+// the pre-fix tree 27eaccb to reproduce FAIL directly.
+func TestGuard_V622_OracleR14Probes(t *testing.T) {
+	// ---- R14-M1: brace expansion parser/encoding pins ----
+	t.Run("R14-M1 parser SplitBraces yields BraceExp", func(t *testing.T) {
+		w := parseBashSingleCmdWord(t, `echo tag{red,blue}`, 1)
+		cp := *w
+		cp.Parts = append([]syntax.WordPart(nil), w.Parts...)
+		syntax.SplitBraces(&cp)
+		found := false
+		for _, part := range cp.Parts {
+			if _, ok := part.(*syntax.BraceExp); ok {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatal("SplitBraces(tag{red,blue}): no *syntax.BraceExp in copy — dependency contract broken")
+		}
+	})
+	t.Run("R14-M1 wordToArg brace word is dynamic", func(t *testing.T) {
+		w := parseBashSingleCmdWord(t, `echo tag{red,blue}`, 1)
+		s, static := wordToArg(w)
+		if static {
+			t.Fatalf("wordToArg(tag{red,blue}) = (%q, true), want static=false (brace expansion multiplies the word)", s)
+		}
+		if !strings.Contains(s, cmdSubPlaceholderGlob) {
+			t.Fatalf("wordToArg(tag{red,blue}) = %q, want the glob placeholder encoding", s)
+		}
+		if _, dyn := printfFmtWriteSlots(s, nil); !dyn {
+			t.Fatalf("printfFmtWriteSlots(%q, nil): dyn = false, want true (brace expansion multiplies the zero-argument format word)", s)
+		}
+	})
+	t.Run("R14-M1 collector wordToArg brace word is dynamic", func(t *testing.T) {
+		w := parseBashSingleCmdWord(t, `echo tag{red,blue}`, 1)
+		s, static := blankSubCollector().wordToArg(w)
+		if static {
+			t.Fatalf("subCollector.wordToArg(tag{red,blue}) = (%q, true), want static=false", s)
+		}
+		if _, dyn := printfFmtWriteSlots(s, nil); !dyn {
+			t.Fatalf("printfFmtWriteSlots(%q, nil): dyn = false, want true", s)
+		}
+	})
+	t.Run("R14-M1-pos single-quoted brace stays static", func(t *testing.T) {
+		w := parseBashSingleCmdWord(t, `echo 'tag{red,blue}'`, 1)
+		s, static := wordToArg(w)
+		if !static || s != "tag{red,blue}" {
+			t.Fatalf("wordToArg('tag{red,blue}') = (%q, %v), want (tag{red,blue}, true) — quoting suppresses brace expansion", s, static)
+		}
+		if _, dyn := printfFmtWriteSlots(s, nil); dyn {
+			t.Fatalf("printfFmtWriteSlots(%q, nil): dyn = true, want false", s)
+		}
+		s2, static2 := blankSubCollector().wordToArg(w)
+		if !static2 || s2 != "tag{red,blue}" {
+			t.Fatalf("subCollector.wordToArg('tag{red,blue}') = (%q, %v), want (tag{red,blue}, true)", s2, static2)
+		}
+	})
+	t.Run("R14-M1 brace word spanning quotes is dynamic", func(t *testing.T) {
+		// Bash expands {'%n',TAR_OPTIONS} — the brace text spans a quoting
+		// boundary — into TWO words, so the per-literal scan alone can
+		// never suffice: the word-level copy walk must catch it.
+		w := parseBashSingleCmdWord(t, `printf {'%n',TAR_OPTIONS}`, 1)
+		s, static := wordToArg(w)
+		if static {
+			t.Fatalf("wordToArg({'%%n',TAR_OPTIONS}) = (%q, true), want static=false", s)
+		}
+	})
+
+	// ---- R14-M2: unbound "$OLDPWD" never granted the abs-dq class ----
+	t.Run("R14-M2 unbound OLDPWD placeholder can collapse empty", func(t *testing.T) {
+		w := parseBashSingleCmdWord(t, `printf "%s" "$OLDPWD"`, 2)
+		dq, ok := w.Parts[0].(*syntax.DblQuoted)
+		if !ok || len(dq.Parts) != 1 {
+			t.Fatalf("parse: word shape %T/%d parts, want one DblQuoted/one part", w.Parts[0], len(w.Parts))
+		}
+		pe, ok := dq.Parts[0].(*syntax.ParamExp)
+		if !ok {
+			t.Fatalf("parse: dq part is %T, want *syntax.ParamExp", dq.Parts[0])
+		}
+		s, staticText := blankSubCollector().dqParamPlaceholder(pe)
+		if staticText {
+			t.Fatalf("dqParamPlaceholder($OLDPWD) = (%q, true), want ok=false (unbound OLDPWD is dynamic)", s)
+		}
+		if dynGluedTailNonEmpty(s) {
+			t.Fatalf("dynGluedTailNonEmpty(%q) = true, want false (OLDPWD can be empty when never inherited)", s)
+		}
+		if !dynWordCanSpellDashDash("--" + s) {
+			t.Fatalf("dynWordCanSpellDashDash(--%q) = false, want true (an empty OLDPWD spells exactly '--')", s)
+		}
+	})
+	t.Run("R14-M2-pos PWD keeps the abs-dq class", func(t *testing.T) {
+		w := parseBashSingleCmdWord(t, `printf "%s" "$PWD"`, 2)
+		dq := w.Parts[0].(*syntax.DblQuoted)
+		pe := dq.Parts[0].(*syntax.ParamExp)
+		s, _ := blankSubCollector().dqParamPlaceholder(pe)
+		if s != cmdSubPlaceholderAbsDq {
+			t.Fatalf("dqParamPlaceholder($PWD) = %q, want the abs-dq placeholder (bash always populates PWD)", s)
+		}
+	})
+
+	// ---- R14-M3: derived $$ operators are not raw PID digits ----
+	t.Run("R14-M3 sliced PID can spell dashdash in both encoders", func(t *testing.T) {
+		w := parseBashSingleCmdWord(t, `printf "%s" "--${$:0:0}"`, 2)
+		s1, st1 := wordToArg(w)
+		if st1 {
+			t.Fatalf("wordToArg(\"--${$:0:0}\") is static, want dynamic")
+		}
+		if !dynWordCanSpellDashDash(s1) {
+			t.Fatalf("dynWordCanSpellDashDash(wordToArg) = false for %q, want true (a zero-length slice expands EMPTY)", s1)
+		}
+		s2, st2 := blankSubCollector().wordToArg(w)
+		if st2 {
+			t.Fatalf("subCollector.wordToArg(\"--${$:0:0}\") is static, want dynamic")
+		}
+		if !dynWordCanSpellDashDash(s2) {
+			t.Fatalf("dynWordCanSpellDashDash(subCollector.wordToArg) = false for %q, want true", s2)
+		}
+	})
+	t.Run("R14-M3-pos bare PID never spells dashdash", func(t *testing.T) {
+		w := parseBashSingleCmdWord(t, `printf "%s" "$$"`, 2)
+		s1, _ := wordToArg(w)
+		if dynWordCanSpellDashDash(s1) {
+			t.Fatalf("dynWordCanSpellDashDash(wordToArg bare $$) = true for %q, want false (PID digits)", s1)
+		}
+		s2, _ := blankSubCollector().wordToArg(w)
+		if dynWordCanSpellDashDash(s2) {
+			t.Fatalf("dynWordCanSpellDashDash(subCollector bare $$) = true for %q, want false", s2)
+		}
+	})
+	t.Run("R14-M3 preScanVarMutations counts getopts standby slot", func(t *testing.T) {
+		p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+		f, err := p.Parse(strings.NewReader(`getopts "--${$:0:0}" first second`), "")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		writes, allTainted := preScanVarMutations(f)
+		if allTainted {
+			t.Fatal("preScanVarMutations(getopts sliced-PID optstring): allTainted = true, want false")
+		}
+		if writes["second"] < 1 {
+			t.Fatalf("preScanVarMutations: writes[second] = %d, want >= 1 (the sliced PID can expand to exactly '--', vetting the standby NAME slot)", writes["second"])
+		}
+	})
+
+	// ---- R14-S1: explicit-path printf exempt in the AST pre-scan ----
+	t.Run("R14-S1 preScanVarMutations usr bin printf no taint", func(t *testing.T) {
+		p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+		f, err := p.Parse(strings.NewReader(`/usr/bin/printf "label=$LABEL %s" value`), "")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		_, allTainted := preScanVarMutations(f)
+		if allTainted {
+			t.Fatal("preScanVarMutations(/usr/bin/printf ...): allTainted = true, want false (an external child process cannot write shell variables)")
+		}
+	})
+
+	// ---- R14-S2: zero-argument printf pure-tilde exemption ----
+	t.Run("R14-S2 printfFmtWriteSlots pure tilde fmt is safe", func(t *testing.T) {
+		if _, dyn := printfFmtWriteSlots("~/banner"+cmdSubPlaceholderGlob, nil); dyn {
+			t.Fatal("printfFmtWriteSlots(~/banner+glob, nil): dyn = true, want false (tilde expansion yields exactly ONE path word)")
+		}
+	})
+	t.Run("R14-S2 glob and brace fmt stay dyn", func(t *testing.T) {
+		if _, dyn := printfFmtWriteSlots("~/banner*"+cmdSubPlaceholderGlob, nil); !dyn {
+			t.Fatal("printfFmtWriteSlots(~/banner*+glob, nil): dyn = false, want true (real glob metacharacter)")
+		}
+		if _, dyn := printfFmtWriteSlots("lit*"+cmdSubPlaceholderGlob, nil); !dyn {
+			t.Fatal("printfFmtWriteSlots(lit*+glob, nil): dyn = false, want true")
+		}
+		w := parseBashSingleCmdWord(t, `printf tag{red,blue}`, 1)
+		s, _ := wordToArg(w)
+		if _, dyn := printfFmtWriteSlots(s, nil); !dyn {
+			t.Fatalf("printfFmtWriteSlots(%q, nil): dyn = false, want true (brace expansion multiplies the word)", s)
+		}
+	})
+
+	// ---- R14-S3: awk --source= explicit empty program ----
+	t.Run("R14-S3 awkProgramFrags empty source parity", func(t *testing.T) {
+		F := cmdSubPlaceholderQuoted
+		prog1, sf1, hit1 := awkProgramFrags([]string{"--source=", "--", F})
+		prog2, sf2, hit2 := awkProgramFrags([]string{"-e", "", "--", F})
+		if hit1 != "" || hit2 != "" {
+			t.Fatalf("awkProgramFrags hits = (%q, %q), want both empty (the post-`--` word is input data once a program source exists)", hit1, hit2)
+		}
+		if prog1 != prog2 || sf1 != sf2 {
+			t.Fatalf("awkProgramFrags(--source=) = (%q,%v) vs (-e '') = (%q,%v), want identical", prog1, sf1, prog2, sf2)
+		}
+	})
+
+	// ---- End-to-end guard verdicts ----
+	blockCases := []struct {
+		name, cmd string
+	}{
+		// R14-M1: a brace-expanded printf format word becomes MULTIPLE argv
+		// words inside bash — match[0] is the real format string, match[1]
+		// the first write-target argument. The zero-argument exemption must
+		// not apply.
+		{"P-R14-M1-a printf brace fmt script", `bash -c 'printf tag{red,blue}'`},
+		{"P-R14-M1-b printf brace fmt script args", `bash -c 'printf a{b,c} x'`},
+		// R14-M2: an UNBOUND "$OLDPWD" can expand EMPTY at runtime, so the
+		// glued read prompt tail can collapse and swallow the next argv
+		// word — the pre-scan must fail closed instead of trusting the
+		// absolute-dir placeholder class.
+		{"P-R14-M2-a read empty-able OLDPWD prompt in script", `bash -c 'cmd=/bin/true; read -p"$OLDPWD" answer <<< ok; "$cmd"'`},
+		// R14-M3: a zero-length ${$:0:0} slice can expand EMPTY, spelling
+		// the getopts terminator and shifting the standby write target onto
+		// `second` — the pre-scan must count that write.
+		{"P-R14-M3-a getopts sliced PID in script", `bash -c 'second=/usr/bin/env; getopts "--${$:0:0}" first second; "$second"'`},
+	}
+	for _, tc := range blockCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rtGuardCwd(t, rtCase{id: tc.name, role: "worker", cmd: tc.cmd}, "")
+			if got == "ALLOW" {
+				t.Fatalf("rtGuardCwd(%q) = ALLOW, want a guard block", tc.cmd)
+			}
+		})
+	}
+	allowCases := []struct {
+		name, cmd string
+	}{
+		// R14-S1: explicit-path printf in a combination script — the child
+		// process cannot write the parent shell, so `cmd` keeps its static
+		// bind.
+		{"R14-S1-pos usr bin printf combo script", `bash -c 'cmd=/bin/true; /usr/bin/printf "label=$LABEL %s" value; "$cmd"'`},
+		// R14-S2: pure-tilde zero-argument printf format words expand to
+		// exactly one path word — nothing can be written without arguments.
+		{"R14-S2-pos printf tilde fmt", `printf ~/banner`},
+		{"R14-S2-pos printf tilde fmt script", `bash -c 'printf ~/banner'`},
+		// R14-S3: an explicitly empty awk program with input data after the
+		// terminator is inert.
+		{"R14-S3-pos gawk empty source data file", `gawk --source= -- "$F"`},
+		// R14-M1-pos: quoting suppresses brace expansion entirely.
+		{"R14-M1-pos printf quoted brace fmt", `bash -c 'printf '\''a{b,c}'\'''`},
+		// R14-M2-pos: a SEPARATE double-quoted prompt operand stays exactly
+		// one argv word even when empty — no glued-tail collapse is
+		// possible — so the unbound-OLDPWD tightening must not refuse it.
+		{"R14-M2-pos read separate OLDPWD prompt in script", `bash -c 'cmd=/bin/true; read -p "$OLDPWD" answer <<< ok; "$cmd"'`},
 	}
 	for _, tc := range allowCases {
 		t.Run(tc.name, func(t *testing.T) {

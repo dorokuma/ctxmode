@@ -209,9 +209,12 @@ const cmdSubPlaceholderQuoted = "__ctx_dq_sub__"
 const cmdSubPlaceholderGlob = "__ctx_glob__"
 
 // cmdSubPlaceholderAbsDq marks a double-quoted dynamic whose expansion is
-// GUARANTEED to begin with '/': $PWD/$OLDPWD/${PWD}/${OLDPWD}, $(pwd) and a
-// bare $(mktemp -d) with untainted TMPDIR. Word-start it is split-safe AND
-// cannot become an option flag (Q1-C: absolute-path placeholder class).
+// GUARANTEED to begin with '/': $PWD/${PWD}, $(pwd) and a bare
+// $(mktemp -d) with untainted TMPDIR — but NOT $OLDPWD (R14-Oracle-M2:
+// the shell only populates OLDPWD after the first cd, so an unbound
+// expansion can collapse to the empty string). Word-start it is
+// split-safe AND cannot become an option flag (Q1-C: absolute-path
+// placeholder class).
 const cmdSubPlaceholderAbsDq = "__ctx_abspath_dq__"
 
 // envPathSelfPlaceholder stands for a literal $PATH / ${PATH} expansion
@@ -3935,14 +3938,17 @@ func screenNodeRunnerSubagent(base string, args []string, effPath string, depth 
 // option cannot split into multiple argv words at runtime: static words,
 // split-safe dynamic words ("$HOME/...", "$PWD/..."), and pure tilde paths
 // (`~/.npmrc` — carries a single cmdSubPlaceholderGlob at leading '~' with no
-// unquoted $/cmdsub and no wildcard characters).
+// unquoted $/cmdsub and no wildcard characters). R14-Oracle-S2: brace
+// expansion and quoting bytes join the exclusion set — a `~/{a,b}` spelling
+// expands into MULTIPLE words under bash even though it carries no glob
+// metacharacter, so the pure-tilde exemption must never cover it.
 func isSingleWordOptionValue(val string) bool {
 	if !isDynamicArg(val) || isSingleWordSplitSafe(val) {
 		return true
 	}
 	if strings.HasPrefix(val, "~") &&
 		!strings.Contains(val, cmdSubPlaceholder) &&
-		!strings.ContainsAny(val, "*?[") &&
+		!strings.ContainsAny(val, "*?[{\"") &&
 		strings.Count(val, cmdSubPlaceholderGlob) == 1 {
 		return true
 	}
@@ -8796,7 +8802,14 @@ func printfFmtWriteSlots(fmtStr string, fmtArgs []string) (hits []printfWriteHit
 		// and match[1]/word[1] the first write-target argument. Only a
 		// split-safe, glob-free spelling (e.g. `printf x"$FMT"`) stays
 		// exactly one word, so with no arguments nothing is ever written.
-		if isDynamicArg(fmtStr) && !isSingleWordSplitSafe(fmtStr) {
+		// R14-Oracle-S2: reuse isSingleWordOptionValue — it is exactly this
+		// same single-runtime-word predicate PLUS the proven pure-tilde
+		// exemption: `printf ~/banner` expands to ONE path word under any
+		// normal absolute HOME (no glob metacharacters, no brace bytes), so
+		// it must not be refused as `env dynamic printf`, while a globbing
+		// or brace-expanding spelling (`printf ~/banner*`,
+		// `printf tag{red,blue}`) keeps failing closed.
+		if !isSingleWordOptionValue(fmtStr) {
 			return nil, true
 		}
 		return nil, false
@@ -10157,11 +10170,14 @@ func isStdinDevicePath(p string) bool {
 
 // awkProgramLongStep handles one `--` word of awkProgramFrags' walk
 // (extracted so the main loop stays under the complexity budget — v6.2.2
-// Oracle R4 R4-MF-4): frag carries an inline program fragment (--source),
-// sawFile marks a program-FILE source, consumed counts EXTRA argv operands
-// eaten, endOpts reports gawk --exec's end-of-options, hit is the
-// stdin/dynamic verdict.
-func awkProgramLongStep(args []string, i int, a string) (frag string, sawFile bool, consumed int, endOpts bool, hit string) {
+// Oracle R4 R4-MF-4): frags carries the inline program fragments
+// (--source — R14-Oracle-S3: a SLICE, in parity with awkClusterFragsEnd's
+// []string channel, so an explicitly EMPTY program `--source=` survives
+// the fragment collection instead of being dropped by a non-empty
+// string check), sawFile marks a program-FILE source, consumed counts
+// EXTRA argv operands eaten, endOpts reports gawk --exec's end-of-options,
+// hit is the stdin/dynamic verdict.
+func awkProgramLongStep(args []string, i int, a string) (frags []string, sawFile bool, consumed int, endOpts bool, hit string) {
 	name, val, hasEq := strings.Cut(a[2:], "=")
 	if isLongOptAbbrev(name, "exec", 1) {
 		// gawk --exec == --file plus end-of-options. GNU unique-prefix
@@ -10178,15 +10194,20 @@ func awkProgramLongStep(args []string, i int, a string) (frag string, sawFile bo
 			}
 			consumed = 1
 		}
-		return "", sawFile, consumed, endOpts, awkProgramFileHit(val)
+		return nil, sawFile, consumed, endOpts, awkProgramFileHit(val)
 	case isLongOptAbbrev(name, "source", 2):
+		// R14-Oracle-S3: `--source=` (or `--source ""`) is awk's explicit
+		// EMPTY program — semantically identical to `-e ""`. Returning the
+		// empty string in a SLICE keeps len(frags) visible to the caller, so
+		// a `--`-terminated dynamic data file (`gawk --source= -- "$F"`)
+		// is no longer misjudged as the positional program text.
 		if hasEq {
-			return val, false, 0, false, ""
+			return []string{val}, false, 0, false, ""
 		}
 		if i+1 < len(args) {
-			return args[i+1], false, 1, false, ""
+			return []string{args[i+1]}, false, 1, false, ""
 		}
-		return "", false, 0, false, ""
+		return nil, false, 0, false, ""
 	case awkLongIsDataAssign(name):
 		// --assign / --field-separator (and their GNU unique prefixes
 		// --as/--fie) consume their separate value operand so it cannot
@@ -10199,12 +10220,12 @@ func awkProgramLongStep(args []string, i int, a string) (frag string, sawFile bo
 		if !hasEq {
 			if i+1 < len(args) {
 				if sh := awkDataValSplitHit(args[i+1]); sh != "" {
-					return "", false, 0, false, sh
+					return nil, false, 0, false, sh
 				}
 			}
 			consumed = 1
 		}
-		return "", false, consumed, false, ""
+		return nil, false, consumed, false, ""
 	case isLongOptAbbrev(name, "include", 1) || isLongOptAbbrev(name, "load", 2):
 		// --include/--load supply library text/compiled files: consume the
 		// operand and apply the program-file validation to it (a stdin device
@@ -10217,11 +10238,11 @@ func awkProgramLongStep(args []string, i int, a string) (frag string, sawFile bo
 			}
 			consumed = 1
 		}
-		return "", false, consumed, endOpts, awkProgramFileHit(val)
+		return nil, false, consumed, endOpts, awkProgramFileHit(val)
 	case awkAmbiguousShortPrefix(name):
-		return "", false, 0, false, "dynamic code payload"
+		return nil, false, 0, false, "dynamic code payload"
 	}
-	return "", false, 0, false, ""
+	return nil, false, 0, false, ""
 }
 
 // awkAmbiguousShortPrefix reports whether name is a SHORT prefix of one of
@@ -10301,7 +10322,7 @@ func awkProgramFrags(args []string) (string, bool, string) {
 			continue
 		}
 		if !endOpts && strings.HasPrefix(a, "--") && a != "--" {
-			lFrag, lSawFile, consumed, lEnd, lHit := awkProgramLongStep(args, i, a)
+			lFrags, lSawFile, consumed, lEnd, lHit := awkProgramLongStep(args, i, a)
 			if lHit != "" {
 				return "", sawFile || lSawFile, lHit
 			}
@@ -10309,9 +10330,11 @@ func awkProgramFrags(args []string) (string, bool, string) {
 				endOpts = true
 			}
 			sawFile = sawFile || lSawFile
-			if lFrag != "" {
-				frags = append(frags, lFrag)
-			}
+			// R14-Oracle-S3: append unconditionally — an explicitly empty
+			// program fragment (`--source=`) counts as a program source even
+			// though its bytes are empty, exactly like `-e ""` and the
+			// cluster channel below.
+			frags = append(frags, lFrags...)
 			i += consumed
 			continue
 		}
