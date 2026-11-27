@@ -3484,7 +3484,10 @@ func TestGuard_V622_OracleR15Probes(t *testing.T) {
 		// R18-Oracle-M4: the NUL-provenanced tilde marker is pure
 		// provenance evidence, not a glob byte — the exactly-two-glob
 		// brace expansion shape is judged after stripping it.
-		stripped := strings.ReplaceAll(s, cmdSubPlaceholderTilde, "")
+		// R19-Oracle-S3: the NUL-provenanced tilde marker is referenced as
+		// its LITERAL bytes so this test file compiles verbatim on the
+		// pre-fix parent trees (which do not yet define the constant).
+		stripped := strings.ReplaceAll(s, "\x00__ctx_tilde__\x00", "")
 		if strings.Count(stripped, cmdSubPlaceholderGlob) != 2 {
 			t.Fatalf("subCollector.wordToArg(~/{red,blue}) = %q, want exactly 2 glob placeholders (tilde + brace, after stripping the NUL tilde marker)", s)
 		}
@@ -4544,6 +4547,250 @@ func TestGuard_V622_OracleR18Probes(t *testing.T) {
 		cand, rok := resolveNodeRunnerPathOpt(last.argv[1], "/opt/example")
 		if !rok || cand != "/home/user/banner" {
 			t.Fatalf("resolveNodeRunnerPathOpt(%q) = (%q, %v), want (/home/user/banner, true)", last.argv[1], cand, rok)
+		}
+	})
+}
+
+// TestGuard_V622_OracleR19Probes pins the Oracle R19 audit closure
+// (v6.2.2): the eval `--` option terminator, the static-eval PATH binding
+// replication, the tilde expansion shapes, the pure-assignment environment
+// propagation, the data-only heredoc payload exemption, the eval recursion
+// depth budget and the raw byte-level adjacent double-glob contract. Every
+// new-symbol reference uses LITERAL marker bytes so this file compiles
+// verbatim on the pre-fix parent trees (R19-Oracle-S3).
+func TestGuard_V622_OracleR19Probes(t *testing.T) {
+	ifsFixture := func(t *testing.T, script string) (string, bool) {
+		t.Helper()
+		segs, ok := parseSubagentShellASTEnv(script, 0, false, true, nil, callerIdentity{})
+		if !ok || len(segs) == 0 {
+			t.Fatalf("parse %q failed: ok=%v segs=%v", script, ok, segs)
+		}
+		last := segs[len(segs)-1]
+		if len(last.argv) < 2 {
+			t.Fatalf("parse %q: last seg argv=%v, want at least 2 words", script, last.argv)
+		}
+		return last.argv[1], isSingleWordOptionValue(last.argv[1])
+	}
+
+	// ---- R19-M1: the eval builtin consumes its own `--` terminator ----
+	t.Run("R19-M1 eval -- 'IFS=:' counts the IFS write exactly like the plain spelling", func(t *testing.T) {
+		t.Setenv("HOME", "/home/red:blue")
+		direct := "IFS=:; echo $HOME"
+		plain := "eval 'IFS=:'; echo $HOME"
+		dashdash := "eval -- 'IFS=:'; echo $HOME"
+		dEnc, dOne := ifsFixture(t, direct)
+		pEnc, pOne := ifsFixture(t, plain)
+		ddEnc, ddOne := ifsFixture(t, dashdash)
+		if dOne {
+			t.Fatalf("control broken: direct IFS=: unquoted $HOME %q is single-word, want false", dEnc)
+		}
+		if ddEnc != pEnc || ddOne != pOne {
+			t.Fatalf("eval -- 'IFS=:' encodes %q (single=%v) vs eval 'IFS=:' %q (single=%v) — bash consumes the -- terminator itself, so both spellings re-parse the SAME inner text and must agree exactly", ddEnc, ddOne, pEnc, pOne)
+		}
+		if ddOne {
+			t.Fatalf("isSingleWordOptionValue(%q) = true after eval -- 'IFS=:', want false — the IFS write must reach the collector through the terminator", ddEnc)
+		}
+	})
+
+	// ---- R19-M2: a static eval PATH write reproduces the direct binding ----
+	mkFixture := func(t *testing.T, script string) string {
+		t.Helper()
+		t.Setenv("TMPDIR", "/tmp")
+		t.Setenv("PATH", "/usr/bin:/bin")
+		segs, ok := parseSubagentShellASTEnv(script, 0, false, true, nil, callerIdentity{})
+		if !ok || len(segs) == 0 {
+			t.Fatalf("parse %q failed: ok=%v", script, ok)
+		}
+		last := segs[len(segs)-1]
+		if len(last.argv) < 2 {
+			t.Fatalf("parse %q: last seg argv=%v", script, last.argv)
+		}
+		return last.argv[1]
+	}
+	t.Run("R19-M2 eval 'PATH=<no-mktemp>' revokes the abs-dq grant exactly like the direct write", func(t *testing.T) {
+		direct := mkFixture(t, `PATH=/usr/local/sbin; echo "$(mktemp -d)"`)
+		viaEval := mkFixture(t, `eval 'PATH=/usr/local/sbin'; echo "$(mktemp -d)"`)
+		viaEvalDD := mkFixture(t, `eval -- 'PATH=/usr/local/sbin'; echo "$(mktemp -d)"`)
+		if strings.Contains(direct, "__ctx_abspath_dq__") {
+			t.Fatalf("control broken: direct PATH=/usr/local/sbin write %q keeps the abs-dq class — /usr/local/sbin is verified mktemp-less on this host", direct)
+		}
+		if viaEval != direct {
+			t.Fatalf("eval spelling %q vs direct spelling %q — eval re-parses in the SAME shell, so its single static PATH write must bind exactly like the direct assignment (the effective PATH the substitution success proof resolves against)", viaEval, direct)
+		}
+		if strings.Contains(viaEval, "__ctx_abspath_dq__") {
+			t.Fatalf("eval 'PATH=/usr/local/sbin' encoding %q carries the abs-dq class — the mktemp child cannot even exec under the eval-written PATH", viaEval)
+		}
+		if strings.Contains(viaEvalDD, "__ctx_abspath_dq__") || viaEvalDD != viaEval {
+			t.Fatalf("eval -- 'PATH=...' encoding %q disagrees with %q — the -- terminator must not change the inner binding replication", viaEvalDD, viaEval)
+		}
+	})
+	t.Run("R19-M2-pos eval 'PATH=<with-mktemp>' keeps the grant exactly like the direct write", func(t *testing.T) {
+		direct := mkFixture(t, `PATH=/usr/bin:/bin; echo "$(mktemp -d)"`)
+		viaEval := mkFixture(t, `eval 'PATH=/usr/bin:/bin'; echo "$(mktemp -d)"`)
+		if !strings.Contains(direct, "__ctx_abspath_dq__") {
+			t.Fatalf("control broken: direct PATH=/usr/bin:/bin %q lost the abs-dq class (/usr/bin/mktemp is executable)", direct)
+		}
+		if viaEval != direct {
+			t.Fatalf("eval spelling %q vs direct spelling %q — a PATH carrying mktemp keeps the grant under both spellings", viaEval, direct)
+		}
+	})
+
+	// ---- R19-M3: only real tilde expansions mint the tilde marker ----
+	tildeFixture := func(t *testing.T, word string) (string, bool, string, bool) {
+		t.Helper()
+		w := parseBashSingleCmdWord(t, word, 1)
+		s, static := blankSubCollector().wordToArg(w)
+		cand, ok := resolveNodeRunnerPathOpt(s, "/opt/r19")
+		return s, static, cand, ok
+	}
+	t.Run("R19-M3 quoted-slash tilde is a verbatim relative path, never a HOME expansion", func(t *testing.T) {
+		t.Setenv("HOME", "/home/r19")
+		expEnc, _, expCand, expOk := tildeFixture(t, `echo ~/"notes"`)
+		if !expOk || expCand != "/home/r19/notes" {
+			t.Fatalf("control broken: ~/\"notes\" resolves (%q, %v), want (/home/r19/notes, true) — the slash is UNQUOTED inside the first Lit, so bash really expands the tilde", expCand, expOk)
+		}
+		if !strings.Contains(expEnc, "\x00__ctx_tilde__\x00") {
+			t.Fatalf("control broken: ~/\"notes\" encoding %q lost the tilde provenance marker", expEnc)
+		}
+		qEnc, qStatic, qCand, qOk := tildeFixture(t, `echo ~\/notes`)
+		if strings.Contains(qEnc, "\x00__ctx_tilde__\x00") {
+			t.Fatalf("~\\/notes encoding %q mints the tilde provenance — the slash is backslash-QUOTED, so bash never expands this tilde: the word is a verbatim cwd-relative path", qEnc)
+		}
+		if strings.Contains(qEnc, "__ctx_glob__") {
+			t.Fatalf("~\\/notes encoding %q carries a glob marker — a verbatim literal tilde is plain static text (no expansion of any kind happens)", qEnc)
+		}
+		if !qStatic || qEnc != "~/notes" {
+			t.Fatalf("~\\/notes encodes (%q, static=%v), want the static literal ~/notes exactly like the shell passes it", qEnc, qStatic)
+		}
+		if !qOk || qCand != "/opt/r19/~/notes" {
+			t.Fatalf("~\\/notes resolves (%q, %v), want (/opt/r19/~/notes, true) — the verbatim word is a relative path under the caller cwd, never the service HOME", qCand, qOk)
+		}
+	})
+	t.Run("R19-M3-pos login-name tilde stays dynamic without HOME provenance", func(t *testing.T) {
+		t.Setenv("HOME", "/home/r19")
+		uEnc, uStatic, uCand, uOk := tildeFixture(t, `echo ~root/notes`)
+		if uStatic {
+			t.Fatalf("~root/notes encodes static — the login lookup is dynamic, never static text")
+		}
+		if strings.Contains(uEnc, "\x00__ctx_tilde__\x00") {
+			t.Fatalf("~root/notes encoding %q mints HOME provenance — ~user expands against the LOGIN DATABASE, never $HOME", uEnc)
+		}
+		if uOk {
+			t.Fatalf("~root/notes resolves (%q, true), want ok=false — an unproven home directory can never be restored", uCand)
+		}
+	})
+
+	// ---- R19-M4: pure-assignment segments propagate their environment ----
+	t.Run("R19-M4 HOME=/home/r19; bash taints the consumer HOME exactly like the env prefix", func(t *testing.T) {
+		t.Setenv("HOME", "/home/parent")
+		stmtEnvs, stmtOK, _ := scriptAllowsLocalShellStdinPrepareDialect("HOME=/home/r19; bash", false, envAssignments{}, "", callerIdentity{})
+		prefixEnvs, prefixOK, _ := scriptAllowsLocalShellStdinPrepareDialect("HOME=/home/r19 bash", false, envAssignments{}, "", callerIdentity{})
+		if !prefixOK || len(prefixEnvs) == 0 {
+			t.Fatalf("control broken: env-prefix spelling refuses the rewrite (ok=%v envs=%d)", prefixOK, len(prefixEnvs))
+		}
+		if !stmtOK || len(stmtEnvs) == 0 {
+			t.Fatalf("statement spelling refuses the rewrite (ok=%v envs=%d), want ok=true like X=1 — the pure assignment consumes no stdin", stmtOK, len(stmtEnvs))
+		}
+		prefixTainted := prefixEnvs[0].taintedSentinelNames()["HOME"]
+		stmtTainted := stmtEnvs[0].taintedSentinelNames()["HOME"]
+		if stmtTainted != prefixTainted {
+			t.Fatalf("HOME=/home/r19; bash env HOME-taint=%v vs HOME=/home/r19 bash %v — an exported HOME reassigned in the running shell is inherited by the consumer exactly like the env-prefix spelling", stmtTainted, prefixTainted)
+		}
+		if !stmtTainted {
+			t.Fatal("HOME=/home/r19; bash target env does not taint HOME — the rewritten payload would be graded under the OLD HOME the consumer no longer sees")
+		}
+	})
+	t.Run("R19-M4-n nested bash -c 'HOME=/home/r19; bash' propagates the assignment environment", func(t *testing.T) {
+		t.Setenv("HOME", "/home/parent")
+		targets := stdinProgramTargetsWithEnv([]string{"bash", "-c", "HOME=/home/r19; bash"}, 0, envAssignments{}, "", callerIdentity{})
+		ctrl := stdinProgramTargetsWithEnv([]string{"bash", "-c", "HOME=/home/r19 bash"}, 0, envAssignments{}, "", callerIdentity{})
+		if len(targets) == 0 || len(ctrl) == 0 {
+			t.Fatalf("target projection broken: nested=%d ctrl=%d", len(targets), len(ctrl))
+		}
+		got := targets[len(targets)-1].envAs.taintedSentinelNames()["HOME"]
+		want := ctrl[len(ctrl)-1].envAs.taintedSentinelNames()["HOME"]
+		if got != want {
+			t.Fatalf("nested statement spelling HOME-taint=%v vs nested env-prefix %v — the collectSegs skip must not drop the environment mutation", got, want)
+		}
+		if !got {
+			t.Fatal("nested HOME=/home/r19; bash does not taint HOME on the consumer target")
+		}
+	})
+	t.Run("R19-M4-pos neutral X=1; bash stays untainted and rewritable", func(t *testing.T) {
+		t.Setenv("HOME", "/home/parent")
+		envs, ok, _ := scriptAllowsLocalShellStdinPrepareDialect("X=1; bash", false, envAssignments{}, "", callerIdentity{})
+		if !ok || len(envs) == 0 {
+			t.Fatalf("X=1; bash refuses the rewrite (ok=%v), want true — neutral assignments never touch sentinel state (R18-S2 preserved)", ok)
+		}
+		if envs[0].taintedSentinelNames()["HOME"] || envs[0].taintedSentinelNames()["X"] {
+			t.Fatalf("X=1 taints sentinel state %v, want empty — X is not a sentinel variable", envs[0].taintedSentinelNames())
+		}
+	})
+
+	// ---- R19-S1: a pure-data heredoc consumer never faces the payload screen ----
+	t.Run("R19-S1 cat heredoc with a plain $HOME expansion is not a dynamic code payload", func(t *testing.T) {
+		seg := shellSegment{argv: []string{"cat"}, heredocText: []heredocBody{{text: "$HOME", dynamic: true}}}
+		if hit := screenSegmentHeredocsDepth(seg, 's', 0, callerIdentity{}); hit != "" {
+			t.Fatalf("screenSegmentHeredocsDepth(cat <<EOF $HOME) = %q, want empty — a pure data consumer reads the body as BYTES; no program target exists, so the dynamic code payload screen must not fire", hit)
+		}
+		segQ := shellSegment{argv: []string{"cat"}, heredocText: []heredocBody{{text: "just data", quoted: true}}}
+		if hit := screenSegmentHeredocsDepth(segQ, 's', 0, callerIdentity{}); hit != "" {
+			t.Fatalf("control broken: quoted data heredoc hits %q", hit)
+		}
+	})
+	t.Run("R19-S1-neg program consumers keep the dynamic payload refusal", func(t *testing.T) {
+		seg := shellSegment{argv: []string{"bash"}, heredocText: []heredocBody{{text: "$HOME", dynamic: true}}}
+		if hit := screenSegmentHeredocsDepth(seg, 's', 0, callerIdentity{}); !strings.Contains(hit, "dynamic code payload") {
+			t.Fatalf("screenSegmentHeredocsDepth(bash <<EOF $HOME) = %q, want substring %q — a shell reading its program from the stream faces the payload screen", hit, "dynamic code payload")
+		}
+	})
+
+	// ---- R19-S2: the eval recursion shares the peel depth budget ----
+	t.Run("R19-S2 eval nesting beyond peelChainMaxDepth stops parsing the leaf write", func(t *testing.T) {
+		// Quoting a text one eval level deeper doubles the backslashes first
+		// and then the quotes — inside double quotes \ is special before
+		// \ " $ ` only, so this reproduces exactly the nesting bash itself
+		// verifies (eval "eval \"zzleaf=1\"" really assigns zzleaf).
+		nestEval := func(leaf string, levels int) string {
+			inner := leaf
+			for i := 0; i < levels; i++ {
+				esc := strings.ReplaceAll(inner, `\`, `\\`)
+				esc = strings.ReplaceAll(esc, `"`, `\"`)
+				inner = `eval "` + esc + `"`
+			}
+			return inner
+		}
+		scanLeaf := func(t *testing.T, levels int) int {
+			t.Helper()
+			p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+			f, err := p.Parse(strings.NewReader(nestEval("zzleaf=1", levels)), "")
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			writes, _ := preScanVarMutations(f, false)
+			return writes["zzleaf"]
+		}
+		shallow := scanLeaf(t, 3)
+		if shallow != 1 {
+			t.Fatalf("control broken: 3-level nested static eval leaf write count = %d, want 1 — shallow nesting stays inside the budget and replays exactly", shallow)
+		}
+		deep := scanLeaf(t, peelChainMaxDepth+1)
+		if deep != 0 {
+			t.Fatalf("peelChainMaxDepth+1-level nested eval leaf write count = %d, want 0 — beyond the depth budget the leaf is never parsed and only the conservative sentinel accounting applies", deep)
+		}
+	})
+
+	// ---- R19-O1: the raw encoding carries the adjacent glob pair ----
+	t.Run("R19-O1 a HOME-proven tilde brace word ends in the RAW adjacent glob pair", func(t *testing.T) {
+		t.Setenv("HOME", "/home/user")
+		w := parseBashSingleCmdWord(t, `echo ~/{red,blue}`, 1)
+		s, _ := blankSubCollector().wordToArg(w)
+		pair := "__ctx_glob____ctx_glob__"
+		if !strings.Contains(s, pair) {
+			t.Fatalf("subCollector.wordToArg(~/{red,blue}) = %q — the RAW encoding must carry the consecutive adjacent glob pair writeBraceExpansionMarkers guarantees, not only the tilde-stripped normalized form", s)
+		}
+		if !strings.HasSuffix(s, pair) {
+			t.Fatalf("subCollector.wordToArg(~/{red,blue}) = %q — the adjacent pair must sit at the word tail (tilde provenance precedes the glob markers)", s)
 		}
 	})
 }

@@ -1421,16 +1421,31 @@ func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv 
 	sawTarget := false
 	segBash := false
 	var out []envAssignments
+	// R19-Oracle-M4: a pure-assignment segment (`HOME=/home/x`) consumes
+	// no stdin but re-binds the exported variables EVERY LATER segment's
+	// children inherit — its ops accumulate into runEnv in statement
+	// order, so `HOME=/home/x; bash` marks the bash target's HOME tainted
+	// exactly like the env-prefix spelling `HOME=/home/x bash`.
+	runEnv := outerEnv
 	for _, seg := range segs {
 		if seg.depthExceeded || seg.parseErr != "" {
 			return nil, false, false
 		}
+		// R19-Oracle-M4: the pure-assignment binding happens regardless of
+		// the segment's own redirects, so accumulation precedes every
+		// stdin-consumption skip — a `HOME=/x <<EOF` segment still rebinds
+		// the exported variables the NEXT consumers inherit.
+		// accumulatePureAssignEnv folds ops only for segments whose peeled
+		// head is EMPTY: prefix ops ahead of a real command die with that
+		// child and never re-bind the running shell.
+		runEnv = accumulatePureAssignEnv(runEnv, seg.argv, caller)
 		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 			continue
 		}
 		// Pure-assignment / no-op segments consume no stdin; a segment whose
 		// head does not survive the wrapper peel is left to the caller's
-		// guard pass (which fails closed on the same condition).
+		// guard pass (which fails closed on the same condition). Its
+		// assignment ops already accumulated into runEnv above (R19-M4).
 		if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv, caller); len(peeledHead) == 0 {
 			continue
 		}
@@ -1445,7 +1460,10 @@ func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv 
 		}
 		// R16-Oracle-M2: the segments carry their own dialect — an eval
 		// indirection inside the scan re-parses under seg.bashDialect.
-		targets := stdinProgramTargetsDialect(seg.argv, 0, outerEnv, basePath, caller, seg.bashDialect)
+		// R19-Oracle-M4: the inherited env is runEnv (outer ops plus every
+		// earlier pure-assignment segment in statement order), not bare
+		// outerEnv — the consumer runs with the assignments in force.
+		targets := stdinProgramTargetsDialect(seg.argv, 0, runEnv, basePath, caller, seg.bashDialect)
 		if len(targets) == 0 {
 			// A plain data consumer (jq ., cat, git apply) reads the stream as
 			// DATA: rewriting it into `<selfExe> --hc-gate` would turn payload

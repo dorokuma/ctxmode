@@ -4727,7 +4727,10 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		if kind == 'r' {
 			return allowlistDetail("eval")
 		}
-		text := strings.Join(head[1:], " ")
+		// R19-Oracle-M1: bash's builtin eval consumes its own leading `--`
+		// option terminator — the re-parse must not re-join it or the real
+		// command text degrades into an argument of a `--` command head.
+		text := strings.Join(evalJoinOperands(head[1:]), " ")
 		if isDynamicArg(text) {
 			return "dynamic code payload"
 		}
@@ -9744,18 +9747,50 @@ func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller c
 	// target's rejection rejects the payload, matching the per-target API
 	// stdin screen exactly. Data consumers are byte sinks, never programs.
 	targets := stdinProgramTargetsWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller)
+	// R19-Oracle-S1: the code-payload screens apply ONLY when at least one
+	// non-data PROGRAM consumer exists — a heredoc feeding a pure data
+	// consumer (cat, jq .) is ordinary input whose parameter expansions
+	// ($HOME inside the body text) are just bytes; the parent behaviour
+	// returned before judging payload dynamics in exactly this case, and
+	// any substitutions inside the body are already emitted as nested
+	// segments by the collector itself.
+	progTargets := stdinProgramNonDataTargets(targets)
+	if len(progTargets) == 0 {
+		return ""
+	}
 	for _, hb := range seg.heredocText {
 		if hb.dynamic || isDynamicArg(hb.text) {
 			return "dynamic code payload"
 		}
-		if hit := screenHeredocBodyTargetsDepth(hb.text, targets, bodyKind, depth, caller); hit != "" {
-			if sshTunnel && (kind == 'r' || callerReadonlyRole(caller)) && bodyKind == 'r' {
-				return roSSHWriteHit
-			}
-			return hit
+		if hit := screenHeredocBodyTargetsDepth(hb.text, progTargets, bodyKind, depth, caller); hit != "" {
+			return sshHeredocVerdict(hit, sshTunnel, kind, bodyKind, caller)
 		}
 	}
 	return ""
+}
+
+// stdinProgramNonDataTargets filters a stdin target list down to the real
+// PROGRAM consumers (extracted for the v6.2.2 R19 complexity budget —
+// R19-Oracle-S1): data consumers are byte sinks, never programs, and an
+// all-data list carries no code payload to screen at all.
+func stdinProgramNonDataTargets(targets []stdinTarget) []stdinTarget {
+	var out []stdinTarget
+	for _, t := range targets {
+		if !t.data {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// sshHeredocVerdict maps a heredoc body screening hit onto the ssh-tunnel
+// read-only verdict exactly like the former inline mapping (extracted for
+// the v6.2.2 R19 complexity budget — R19-Oracle-S1).
+func sshHeredocVerdict(hit string, sshTunnel bool, kind, bodyKind byte, caller callerIdentity) string {
+	if sshTunnel && (kind == 'r' || callerReadonlyRole(caller)) && bodyKind == 'r' {
+		return roSSHWriteHit
+	}
+	return hit
 }
 
 // screenHeredocBodyTargetsDepth screens one heredoc body against EVERY
@@ -20302,32 +20337,34 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 	}
 	collectSegs := func(segs []shellSegment, subEnv envAssignments, subPath string, mergeOuter bool, subCaller callerIdentity) []stdinTarget {
 		var out []stdinTarget
+		// R19-Oracle-M4: a pure-assignment segment consumes no stdin but
+		// DOES rewrite the running shell's environment — for a variable
+		// already exported (HOME, PATH, ...) the assignment keeps its
+		// export attribute and every LATER segment's child inherits the
+		// new value. Its env ops therefore accumulate into runEnv exactly
+		// like the flat prepare scan; neutral assignments (X=1) never
+		// touch a sentinel name and change nothing downstream.
+		runEnv := subEnv
 		for _, seg := range segs {
 			if seg.depthExceeded || seg.parseErr != "" {
 				out = append(out, stdinTarget{lang: "", envAs: envAs})
 				continue
 			}
+			// R19-Oracle-M4: a pure-assignment segment consumes no stdin but
+			// DOES rewrite the running shell's environment — the binding
+			// happens regardless of the segment's own redirects, so its ops
+			// accumulate into runEnv BEFORE any stdin-consumption skip and
+			// before any later segment is scanned. A pipedStdin segment sits
+			// in pipeline position (subshell-scoped), but conservatively
+			// folding its ops in is the fail-closed direction.
+			runEnv = accumulatePureAssignEnv(runEnv, seg.argv, subCaller)
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
-			sub := stdinProgramTargetsDialect(seg.argv, depth+1, subEnv, subPath, subCaller, seg.bashDialect)
-			// R17-Oracle-M6: a segment that can read the shared stream but
-			// resolves to NO program target is a plain data consumer (cat,
-			// jq .) — it must surface as such instead of silently dropping
-			// out of the nested summary, or `bash -c "cat; bash"` would
-			// earn a rewrite the flat `cat; bash` never gets.
-			// R18-Oracle-S2: EXCEPT when nothing consumes the stream at all —
-			// a pure-assignment segment (`X=1`) peels to an empty head exactly
-			// like the flat scan in scriptAllowsLocalShellStdinPrepare skips
-			// it, so `bash -c 'X=1; bash'` keeps the same verdict as the flat
-			// spelling instead of inventing a data consumer.
-			sub = stdinTargetsWithDataFallback(sub, seg, envAs, subCaller)
-			for _, t := range sub {
-				if mergeOuter {
-					t.envAs = envAs.merged(t.envAs)
-				}
-				out = append(out, t)
+			if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv, subCaller); len(peeledHead) == 0 {
+				continue
 			}
+			out = append(out, collectStdinSegTargets(seg, depth, runEnv, envAs, subPath, mergeOuter, subCaller)...)
 		}
 		return out
 	}
@@ -20359,6 +20396,60 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 	return nil
 }
 
+// collectStdinSegTargets is the per-segment projection of the
+// collectSegs loop (extracted for the v6.2.2 R19 complexity budget):
+// recursion plus the R17-Oracle-M6 data-consumer fallback and the
+// mergeOuter env overlay. runEnv already carries every earlier
+// pure-assignment segment's ops in statement order (R19-Oracle-M4).
+func collectStdinSegTargets(seg shellSegment, depth int, runEnv, envAs envAssignments, subPath string, mergeOuter bool, subCaller callerIdentity) []stdinTarget {
+	var out []stdinTarget
+	sub := stdinProgramTargetsDialect(seg.argv, depth+1, runEnv, subPath, subCaller, seg.bashDialect)
+	// R17-Oracle-M6: a segment that can read the shared stream but
+	// resolves to NO program target is a plain data consumer (cat,
+	// jq .) — it must surface as such instead of silently dropping
+	// out of the nested summary, or `bash -c "cat; bash"` would
+	// earn a rewrite the flat `cat; bash` never gets.
+	// R18-Oracle-S2: EXCEPT when nothing consumes the stream at all —
+	// a pure-assignment segment (`X=1`) peels to an empty head exactly
+	// like the flat scan in scriptAllowsLocalShellStdinPrepare skips
+	// it, so `bash -c 'X=1; bash'` keeps the same verdict as the flat
+	// spelling instead of inventing a data consumer.
+	sub = stdinTargetsWithDataFallback(sub, seg, envAs, subCaller)
+	for _, t := range sub {
+		if mergeOuter {
+			t.envAs = envAs.merged(t.envAs)
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+// accumulatePureAssignEnv folds one segment's pure-assignment ops into
+// the running stdin-scan environment (extracted for the v6.2.2 R19
+// complexity budget — R19-Oracle-M4): only a segment whose peeled head
+// is EMPTY carries nothing but prefix assignments (plus inert no-op
+// words the peel already skipped), and its ops re-bind the exported
+// variables the NEXT segments' children inherit exactly like the flat
+// prepare scan. Segments with a real head pass through unchanged.
+func accumulatePureAssignEnv(runEnv envAssignments, argv []string, caller callerIdentity) envAssignments {
+	if peeledHead, _, _, _, _ := peelWrappersWithIndex(argv, caller); len(peeledHead) == 0 {
+		return runEnv.merged(pureAssignEnv(argv))
+	}
+	return runEnv
+}
+
+// evalJoinOperands drops the leading `--` option terminator bash's
+// builtin eval consumes itself (R19-Oracle-M1) from an eval operand
+// argv: joining it into the re-parse text would demote the real command
+// to an argument of a `--` command head. Everything else passes through
+// unchanged.
+func evalJoinOperands(args []string) []string {
+	if len(args) > 0 && args[0] == "--" {
+		return args[1:]
+	}
+	return args
+}
+
 // stdinIndirectionTargets covers the eval/flock/script/watch branches of
 // stdinProgramTargetsWithEnv (extracted for the v6.2.2 complexity budget):
 // each shape either joins operands into shell text the segments screen,
@@ -20370,7 +20461,7 @@ func stdinIndirectionTargets(head []string, base string, depth int, envAs envAss
 		if len(head) < 2 {
 			return nil, true
 		}
-		inner := strings.Join(head[1:], " ")
+		inner := strings.Join(evalJoinOperands(head[1:]), " ")
 		if isDynamicArg(inner) {
 			return []stdinTarget{{lang: "", envAs: envAs}}, true
 		}
@@ -20428,6 +20519,26 @@ func stdinWatchTargets(head []string, depth int, envAs envAssignments, basePath 
 		return []stdinTarget{{lang: "", envAs: envAs}}
 	}
 	return collectSegs(splitShellSegmentsCaller(text, caller.envTaint, caller), envAs, basePath, false, caller)
+}
+
+// pureAssignEnv converts the leading KEY=VAL assignment words of a
+// command argv into env ops (R19-Oracle-M4): a segment whose peeled head
+// is EMPTY consists of exactly these prefix assignments (plus inert
+// no-op words the peel already skipped) — in the running shell they
+// re-bind the exported variables the next segment's children inherit.
+// Words carrying dynamic placeholders stay in the op verbatim exactly
+// like peelWrappers' own addAssign path records them; taintedSentinelNames
+// treats any such assignment to a sentinel name as invalidating its
+// value either way.
+func pureAssignEnv(argv []string) envAssignments {
+	var out envAssignments
+	for _, a := range argv {
+		if !isAssignWord(a) {
+			continue
+		}
+		out.addAssign(a)
+	}
+	return out
 }
 
 // stdinTargetsWithDataFallback appends the R17-Oracle-M6 data-consumer
