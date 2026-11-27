@@ -699,6 +699,20 @@ func (g guardCall) screenStdinTargets(targets []stdinTarget, argv []string, stdi
 		if t.data {
 			continue // a data consumer is not a program target (R17-Oracle-M6)
 		}
+		// R21-Oracle-M5/R21-Reviewer-4: depth exhaustion is the exact
+		// opposite of a confirmed POSIX shell — the analysis could not
+		// descend deep enough to know WHO interprets the stream, so the
+		// zero-value lang=""/bash=false must never be re-read as a known
+		// shell verdict. Every final consumption point blocks explicitly.
+		if t.exhausted {
+			if g.strictReadonly {
+				return ruleReadonlyWrite, depthExceededHit
+			}
+			if g.subagent {
+				return ruleSubagentNestedAgent, depthExceededHit
+			}
+			return "", ""
+		}
 		gSeg := g
 		if gSeg.readonly && !gSeg.strictReadonly &&
 			(t.remote || sshTunnelsStdinProgram(argv, os.Getenv("PATH"), caller)) {
@@ -735,9 +749,11 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 	// would judge them against a shell state the consumers do not have
 	// (an exported HOME reassigned by an independent statement is what
 	// every later child inherits, exactly like the env-prefix spelling).
-	runEnv := envAssignments{}
+	// R21-Oracle-M3: the accumulation is scope-aware — each segment's
+	// inherited env is the view of ITS OWN scope path.
+	tracker := &scopeEnvTracker{}
 	for _, seg := range splitShellSegmentsCaller(command, caller.envTaint, caller) {
-		runEnv = accumulatePureAssignEnv(runEnv, seg.argv, caller, seg.childScope)
+		tracker.foldSegment(seg, caller)
 		if seg.depthExceeded || seg.parseErr != "" {
 			detail := seg.parseErr
 			if seg.depthExceeded {
@@ -754,6 +770,7 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 			continue
 		}
+		runEnv := tracker.view(seg.scopePath)
 		targets := stdinProgramTargetsWithEnv(seg.argv, 0, runEnv, os.Getenv("PATH"), caller)
 		if len(targets) == 0 {
 			continue
@@ -1082,7 +1099,14 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 		// new value. Its env ops therefore accumulate into runEnv exactly
 		// like the flat prepare scan; neutral assignments (X=1) never
 		// touch a sentinel name and change nothing downstream.
-		runEnv := subEnv
+		// R21-Oracle-M3/R21-Reviewer-1: the accumulation is SCOPE-AWARE —
+		// the flat runEnv answered only "not a parent write", never
+		// "which scope does this consumer belong to". Each consumer's
+		// inherited env is the view of ITS OWN scope path: assignments
+		// inside a subshell bind for that same subshell's consumers and
+		// die with it, while conditional writes surface as uncertainty
+		// markers instead of exact overrides.
+		tracker := &scopeEnvTracker{}
 		for _, seg := range segs {
 			if seg.depthExceeded || seg.parseErr != "" {
 				out = append(out, stdinTarget{lang: "", envAs: envAs})
@@ -1091,17 +1115,16 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 			// R19-Oracle-M4: a pure-assignment segment consumes no stdin but
 			// DOES rewrite the running shell's environment — the binding
 			// happens regardless of the segment's own redirects, so its ops
-			// accumulate into runEnv BEFORE any stdin-consumption skip and
-			// before any later segment is scanned. A pipedStdin segment sits
-			// in pipeline position (subshell-scoped), but conservatively
-			// folding its ops in is the fail-closed direction.
-			runEnv = accumulatePureAssignEnv(runEnv, seg.argv, subCaller, seg.childScope)
+			// accumulate into the scope state BEFORE any stdin-consumption
+			// skip and before any later segment is scanned.
+			tracker.foldSegment(seg, subCaller)
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
 			if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv, subCaller); len(peeledHead) == 0 {
 				continue
 			}
+			runEnv := subEnv.merged(tracker.view(seg.scopePath))
 			out = append(out, collectStdinSegTargets(seg, depth, runEnv, envAs, subPath, mergeOuter, subCaller)...)
 		}
 		return out

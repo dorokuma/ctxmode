@@ -1,11 +1,7 @@
 package main
 
 import (
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -775,88 +771,13 @@ func TestGuard_V622_OracleR16Probes(t *testing.T) {
 		}
 	})
 
-	// ---- R16-S3: mechanical AST/verification of the case tables ----
-	t.Run("R16-S3 R14 allow table is exactly 6 rows disjoint from R13", func(t *testing.T) {
-		// The allow rows are (name, cmd) struct literals: the cmd is the
-		// second back-quoted string of each row — the walk extracts them
-		// positionally (every row here carries exactly two strings).
-		// The probes were migrated losslessly from zz_r2fix_test.go into the
-		// v622 split files: R14 lives in the eval file, R13 in the shell file.
-		extractRows := func(fileName, funcName string) (block int, allow int, cmds []string) {
-			fset := token.NewFileSet()
-			f, err := parser.ParseFile(fset, fileName, nil, 0)
-			if err != nil {
-				t.Fatalf("parse %s: %v", fileName, err)
-			}
-			for _, decl := range f.Decls {
-				fn, ok := decl.(*ast.FuncDecl)
-				if !ok || fn.Name.Name != funcName {
-					continue
-				}
-				ast.Inspect(fn.Body, func(n ast.Node) bool {
-					assign, ok := n.(*ast.AssignStmt)
-					if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
-						return true
-					}
-					ident, ok := assign.Lhs[0].(*ast.Ident)
-					if !ok {
-						return true
-					}
-					comp, ok := assign.Rhs[0].(*ast.CompositeLit)
-					if !ok {
-						return true
-					}
-					rowCmds := func() []string {
-						var cmdsOut []string
-						for _, el := range comp.Elts {
-							row, ok := el.(*ast.CompositeLit)
-							if !ok {
-								continue
-							}
-							var lits []string
-							for _, v := range row.Elts {
-								if bl, ok := v.(*ast.BasicLit); ok && bl.Kind == token.STRING {
-									if unq, err := strconv.Unquote(bl.Value); err == nil {
-										lits = append(lits, unq)
-									}
-								}
-							}
-							if len(lits) >= 2 {
-								cmdsOut = append(cmdsOut, lits[1])
-							}
-						}
-						return cmdsOut
-					}
-					switch ident.Name {
-					case "blockCases":
-						block = len(comp.Elts)
-					case "allowCases":
-						allow = len(comp.Elts)
-						cmds = rowCmds()
-					}
-					return true
-				})
-			}
-			return block, allow, cmds
-		}
-		block14, allow14, cmds14 := extractRows("role_guards_v622_eval_test.go", "TestGuard_V622_OracleR14Probes")
-		_, _, cmds13 := extractRows("role_guards_v622_shell_test.go", "TestGuard_V622_OracleR13Probes")
-		if block14 != 4 || allow14 != 6 {
-			t.Fatalf("R14 tables = (%d block, %d allow), want (4, 6)", block14, allow14)
-		}
-		if len(cmds14) != 6 || len(cmds13) != 10 {
-			t.Fatalf("extracted cmd counts = (%d R14, %d R13), want (6, 10)", len(cmds14), len(cmds13))
-		}
-		set13 := map[string]bool{}
-		for _, c := range cmds13 {
-			set13[c] = true
-		}
-		for _, c := range cmds14 {
-			if set13[c] {
-				t.Fatalf("R14 allow cmd %q duplicates an R13 allow row — two byte-identical rows cannot count as two independent evidences", c)
-			}
-		}
-	})
+	// R16-S3 (the Go-AST self-parse of the case tables locking fixed row
+	// counts and table variable names) was removed in the R21 closure
+	// (R21-Reviewer-9 / Oracle-SF1): it never exercised the guard — it
+	// only re-parsed the test source itself, so a behavior-preserving
+	// refactor of the table layout failed it while a behavior-breaking
+	// guard regression passed. Table dedup review is a one-time audit,
+	// not a per-commit assertion.
 }
 
 // TestGuard_V622_OracleR17Probes pins the Oracle R17 audit closure:

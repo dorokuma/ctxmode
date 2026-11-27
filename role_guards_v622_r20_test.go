@@ -29,11 +29,14 @@ import (
 //	  exhaustion / program target, never a confirmed data-only verdict.
 //	R20-S1: a login-name tilde prefix carrying quoted bytes is a verbatim
 //	  cwd-relative literal path (never dynamic glob text).
-//	R20-S2: the eval depth-budget fixture is LINEAR in length and stays
-//	  within maxShellCommandBytes.
-//	Observation: consecutive pure assignments no longer pay quadratic copy
-//	  cost — target snapshots cap their backing array so later appends
-//	  cannot mutate a handed-out ops slice.
+//	R20-S2: the linear length/budget discrimination of the eval depth
+//	  fixture — the authoritative copy lives in
+//	  role_guards_v622_eval_test.go (R19-S2); R21 deduplicated the
+//	  repeated clone that used to sit here.
+//	Observation: merged target snapshots capacity-freeze their backing
+//	  array on EVERY branch (including the empty-side passthroughs), and
+//	  consecutive pure assignments append in place instead of paying the
+//	  quadratic copy cascade.
 //
 // Every discriminating row is FAIL-first on the pre-fix merge tree: the
 // probes reference only symbols that already exist there (the collectors,
@@ -186,6 +189,20 @@ func TestGuard_V622_OracleR20Probes(t *testing.T) {
 		if len(ctrlNonData) == 0 {
 			t.Fatalf("control broken: one depth level earlier the plain bash segment yields no program target either (%v) — the projection itself regressed", ctrl)
 		}
+		// R21 reviewer #7: the boundary shape alone does not discriminate —
+		// a projection minting ordinary dash verdicts on BOTH sides passes
+		// it. The consumer verdict is the real contract: the exhausted
+		// target must face an explicit rejection at the final consumption
+		// point, distinguishable from the one-level-shallower KNOWN bash
+		// consumer's ordinary per-language screen.
+		hitExh := screenHereStringTargetsDepth("printf tag{red,blue}", targets, 's', 0, callerIdentity{})
+		if hitExh != depthExceededHit {
+			t.Fatalf("screenHereStringTargetsDepth(exhausted boundary target) = %q, want %q — exhaustion at the final consumer is an explicit depth rejection, never the zero-value POSIX-shell screen", hitExh, depthExceededHit)
+		}
+		hitCtrl := screenHereStringTargetsDepth("printf tag{red,blue}", ctrl, 's', 0, callerIdentity{})
+		if hitCtrl == "" || hitCtrl == depthExceededHit {
+			t.Fatalf("control broken: the KNOWN bash consumer one level shallower screens the brace payload with %q — the per-language dialect verdict must stay distinguishable from the exhaustion rejection", hitCtrl)
+		}
 	})
 
 	// ---- R20-S1: quoted login-name tilde prefix is a verbatim literal ----
@@ -218,79 +235,60 @@ func TestGuard_V622_OracleR20Probes(t *testing.T) {
 		}
 	})
 
-	// ---- R20-S2: the depth-budget fixture is linear and budget-sized ----
-	t.Run("R20-S2 linear-length eval nesting reproduces the shallow/deep boundary within maxShellCommandBytes", func(t *testing.T) {
-		// Bare-word nesting keeps growth strictly LINEAR: eval joins its
-		// operands with single spaces before re-parsing, so
-		// `eval eval eval zzleaf=1` peels one `eval` per level — each level
-		// costs exactly 5 bytes and the leaf write still sits N re-parses
-		// deep, reproducing the same shallow-exact/deep-cutoff boundary the
-		// exponential backslash fixture proved without ever approaching
-		// maxShellCommandBytes (25 levels = ~130 bytes vs 65536).
-		nestLinear := func(leaf string, levels int) string {
-			inner := leaf
-			for i := 0; i < levels; i++ {
-				inner = "eval " + inner
-			}
-			return inner
-		}
-		scanLeaf := func(levels int) (int, int) {
-			src := nestLinear("zzleaf=1", levels)
-			p := syntax.NewParser(syntax.Variant(syntax.LangBash))
-			f, err := p.Parse(strings.NewReader(src), "")
-			if err != nil {
-				t.Fatalf("parse %d levels: %v", levels, err)
-			}
-			writes, _ := preScanVarMutations(f, false)
-			return writes["zzleaf"], len(src)
-		}
-		shallow, shallowLen := scanLeaf(3)
-		if shallowLen > maxShellCommandBytes {
-			t.Fatalf("shallow fixture length = %d > maxShellCommandBytes %d — the budget fixture must stay a legal command text", shallowLen, maxShellCommandBytes)
-		}
-		if shallow != 1 {
-			t.Fatalf("control broken: 3-level linear nested eval leaf write count = %d, want 1 — shallow nesting replays exactly", shallow)
-		}
-		deep, deepLen := scanLeaf(peelChainMaxDepth + 1)
-		if deepLen > maxShellCommandBytes {
-			t.Fatalf("deep fixture length = %d > maxShellCommandBytes %d — the depth-budget proof must not require input sizes the command-shape gate rejects outright", deepLen, maxShellCommandBytes)
-		}
-		if deep != 0 {
-			t.Fatalf("peelChainMaxDepth+1-level nested eval leaf write count = %d, want 0 — beyond the depth budget the leaf is never parsed", deep)
-		}
-	})
-
-	// ---- Observation: consecutive pure assignments stay linear, snapshots stay immutable ----
-	t.Run("R20-OBS merged env ops cap their backing array; later appends cannot mutate snapshots", func(t *testing.T) {
-		// Production-shaped proof: accumulate consecutive pure assignments
-		// the way the stdin scans do, take the target snapshot in the
-		// middle, then keep appending — the handed-out snapshot must be
-		// capacity-frozen so no later append can mutate it, and its ops
-		// must still read exactly what it captured.
-		one := envAssignments{}
-		one.addAssign("A=1")
-		runEnv := accumulatePureAssignEnv(envAssignments{}, []string{"A=1"}, callerIdentity{})
-		if len(runEnv.ops) != 1 {
-			t.Fatalf("accumulator after 1 assignment: %d ops, want 1", len(runEnv.ops))
-		}
-		snap := runEnv.merged(one) // the shape a target receives
+	// ---- Observation: merged snapshots are capacity-frozen on every branch ----
+	t.Run("R20-OBS merged empty-side passthrough freezes capacity so appends cannot clobber shared backing", func(t *testing.T) {
+		// R21 reviewer #7: the proof must exercise the EMPTY-SIDE direct
+		// return branch — merging two non-empty slices allocates a fresh
+		// exactly-sized array on ANY implementation (even the pre-fix one),
+		// so it can never discriminate. Build a backing array with SPARE
+		// capacity directly, hand it to merged as the non-empty side with
+		// the other side empty, and verify appending onto the RETURNED
+		// snapshot cannot overwrite the spare slots of the original
+		// backing array — a passthrough without the three-index freeze
+		// shares the backing store with cap > len and the append lands in
+		// the caller's own memory.
+		backing := make([]envOp, 1, 4)
+		backing[0] = envOp{kind: 'a', key: "A", value: "1"}
+		source := envAssignments{ops: backing}
+		snap := envAssignments{}.merged(source)
 		if len(snap.ops) != cap(snap.ops) {
-			t.Fatalf("merged snapshot len %d != cap %d — a handed-out target env must be capacity-frozen so later appends reallocate instead of clobbering it", len(snap.ops), cap(snap.ops))
+			t.Fatalf("empty-side merged snapshot len %d != cap %d — the passthrough must capacity-freeze the handed-out slice or a later append writes shared memory", len(snap.ops), cap(snap.ops))
 		}
+		grown := append(snap.ops, envOp{kind: 'a', key: "B", value: "2"})
+		if len(grown) != 2 {
+			t.Fatalf("append shape broken: %d ops, want 2", len(grown))
+		}
+		// The ORIGINAL backing array's spare slot must still read zero —
+		// the append onto the returned snapshot must have reallocated
+		// instead of writing into backing[1] (read through a reslice —
+		// the backing array physically owns the memory even though the
+		// original slice length stops at 1).
+		spare := backing[:cap(backing)][1]
+		if spare.kind != 0 || spare.key != "" {
+			t.Fatalf("append onto the merged snapshot clobbered the shared backing array slot: spare=%v — the empty-side passthrough shares memory without the capacity freeze", spare)
+		}
+		// Mirror branch: non-empty LEFT side with an empty right side.
+		backing2 := make([]envOp, 1, 4)
+		backing2[0] = envOp{kind: 'a', key: "C", value: "3"}
+		snap2 := (envAssignments{ops: backing2}).merged(envAssignments{})
+		if len(snap2.ops) != cap(snap2.ops) {
+			t.Fatalf("left-side merged snapshot len %d != cap %d — the mirror passthrough must freeze capacity too", len(snap2.ops), cap(snap2.ops))
+		}
+		grown2 := append(snap2.ops, envOp{kind: 'a', key: "D", value: "4"})
+		if len(grown2) != 2 {
+			t.Fatalf("mirror append shape broken: %d ops, want 2", len(grown2))
+		}
+		spare2 := backing2[:cap(backing2)][1]
+		if spare2.kind != 0 || spare2.key != "" {
+			t.Fatalf("mirror append clobbered the shared backing array slot: spare2=%v", spare2)
+		}
+		// Cost contract: consecutive pure assignments append in place onto
+		// the running accumulator instead of paying a full copy per step.
+		runEnv := accumulatePureAssignEnv(envAssignments{}, []string{"A=1"}, callerIdentity{})
 		runEnv = accumulatePureAssignEnv(runEnv, []string{"B=2"}, callerIdentity{})
 		runEnv = accumulatePureAssignEnv(runEnv, []string{"C=3"}, callerIdentity{})
 		if len(runEnv.ops) != 3 {
-			t.Fatalf("accumulator after 3 assignments: %d ops, want 3 (linear in-place append)", len(runEnv.ops))
-		}
-		if len(snap.ops) != 2 || snap.ops[0].key != "A" || snap.ops[1].key != "A" {
-			t.Fatalf("snapshot mutated by later accumulation: ops=%v", snap.ops)
-		}
-		// A subprocess-shaped argv must never join the accumulation at all
-		// (R20-Oracle-M3 rides the same helper).
-		before := len(runEnv.ops)
-		runEnv = accumulatePureAssignEnv(runEnv, []string{"/usr/bin/env", "D=4"}, callerIdentity{})
-		if len(runEnv.ops) != before {
-			t.Fatalf("/usr/bin/env D=4 joined the parent accumulation — env spawns its own process and cannot re-bind the calling shell")
+			t.Fatalf("accumulator after 3 consecutive assignments: %d ops, want 3 (linear in-place append)", len(runEnv.ops))
 		}
 	})
 }

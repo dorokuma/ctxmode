@@ -171,7 +171,24 @@ type shellSegment struct {
 	// carry this marker: their assignments stay in the parent's scope, and
 	// the conservative direction for the stdin environment accumulation is
 	// to fold them in rather than to pretend they never happened.
+	// Retained as the boolean summary of scopePath != "" for legacy
+	// readers; scope-aware accumulation keys on scopePath itself.
 	childScope bool
+	// scopePath identifies the execution scope the segment runs in
+	// (R21-Oracle-M3/R21-Reviewer-1): "" is the parent shell's own scope
+	// and each child execution scope carries a unique dotted suffix whose
+	// PREFIX chain is the lexical nesting of the scopes that forked it.
+	// A pure assignment at scope path P is visible exactly to consumers
+	// whose scope path has P as a prefix — never to the parent scope
+	// (P != "") and never to a sibling scope.
+	scopePath string
+	// condAssign marks a segment minted inside a conditional region (the
+	// right side of `&&`/`||`, an if/case branch, a loop body or a
+	// possibly-uncalled function body): its assignment writes may or may
+	// not execute, so the control-flow merge treats every variable they
+	// touch as UNCERTAIN — never an exact environment override for later
+	// consumers (R21-Oracle-M3).
+	condAssign bool
 }
 
 // shellSplitMaxDepth bounds recursion into $(...)/`...`/subshell text so a
@@ -493,6 +510,141 @@ func (e envAssignments) merged(o envAssignments) envAssignments {
 	out := envAssignments{ops: make([]envOp, 0, len(e.ops)+len(o.ops))}
 	out.ops = append(out.ops, e.ops...)
 	out.ops = append(out.ops, o.ops...)
+	out.ops = out.ops[:len(out.ops):len(out.ops)]
+	return out
+}
+
+// scopeEnvState is one execution scope's accumulated environment view
+// (R21-Oracle-M3/R21-Reviewer-1): the pure-assignment ops performed
+// UNCONDITIONALLY inside the scope (in statement order, layered over the
+// fork-time parent clone) plus the variables whose post-merge value is
+// UNCERTAIN because a conditional region (`&&`/`||` right side, if/case
+// branch, loop body, possibly-uncalled function body) wrote them. Only
+// PATH and the sentinel trust variables are tracked — every other
+// variable is invisible to the environment model anyway.
+type scopeEnvState struct {
+	ops   []envOp
+	taint map[string]bool
+}
+
+// scopeEnvTracker is the control-flow-aware environment accumulator of
+// one segment list (R21-Oracle-M3/R21-Reviewer-1): a flat running env
+// cannot answer WHICH scope a consumer belongs to, so states are keyed
+// by the segment's scope path — a child scope forks a clone of its
+// longest-prefix ancestor state, writes bind within the child only, and
+// the parent scope's consumers keep their own exact view. Conditional
+// writes never mint exact overrides: they taint the variable, and only
+// a later UNCONDITIONAL assignment in the same scope re-establishes an
+// exact value.
+type scopeEnvTracker struct {
+	states map[string]*scopeEnvState
+}
+
+// envTrackTaintedVar reports whether a variable name matters to the
+// environment model: PATH (head resolution) or a sentinel trust variable
+// (placeholder grant premises). Other conditional writes need no taint
+// tracking — the model never reads their values.
+func envTrackTaintedVar(name string) bool {
+	return name == "PATH" || sentinelTrustVars[name]
+}
+
+// stateFor returns the accumulated state of one scope path, materializing
+// it as a clone of the longest-prefix ancestor when the scope has not been
+// touched yet (the fork-time environment of a child scope is exactly its
+// parent's state at fork time — emission order guarantees the ancestor
+// rows already hold every op visible then).
+func (t *scopeEnvTracker) stateFor(path string) *scopeEnvState {
+	if t.states == nil {
+		t.states = map[string]*scopeEnvState{}
+	}
+	if st, ok := t.states[path]; ok {
+		return st
+	}
+	// Longest proper prefix ancestor, or the root state.
+	best := ""
+	for p := range t.states {
+		if len(p) > len(best) && p != path && strings.HasPrefix(path, p+"/") {
+			best = p
+		}
+	}
+	if best != "" || len(path) > 0 {
+		if _, ok := t.states[best]; !ok && best == "" {
+			t.states[""] = &scopeEnvState{}
+		}
+	}
+	base := t.states[best]
+	clone := &scopeEnvState{}
+	if base != nil {
+		clone.ops = append([]envOp(nil), base.ops...)
+		if len(base.taint) > 0 {
+			clone.taint = map[string]bool{}
+			for k, v := range base.taint {
+				clone.taint[k] = v
+			}
+		}
+	}
+	if clone.ops != nil {
+		clone.ops = clone.ops[:len(clone.ops):len(clone.ops)] // capacity-freeze the fork clone
+	}
+	t.states[path] = clone
+	return clone
+}
+
+// foldSegment folds one segment's pure-assignment writes into its own
+// scope's state (R21-Oracle-M3): conditional segments never mint exact
+// ops — they taint every tracked variable they touch — while
+// unconditional assignments append their ops and clear the variable's
+// uncertainty (a definite re-write re-establishes the exact value).
+// Segments that are not pure parent/child-shell assignments (a real
+// command head, an env-spawned subprocess shape) fold nothing.
+func (t *scopeEnvTracker) foldSegment(seg shellSegment, caller callerIdentity) {
+	if len(seg.argv) == 0 {
+		return
+	}
+	if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv, caller); len(peeledHead) != 0 {
+		return
+	}
+	if !argvIsPlainAssignRun(seg.argv) {
+		return
+	}
+	st := t.stateFor(seg.scopePath)
+	for _, a := range seg.argv {
+		if !isAssignWord(a) {
+			continue
+		}
+		k := strings.IndexByte(a, '=')
+		if k <= 0 {
+			continue
+		}
+		name := a[:k]
+		if seg.condAssign {
+			if envTrackTaintedVar(name) {
+				if st.taint == nil {
+					st.taint = map[string]bool{}
+				}
+				st.taint[name] = true
+			}
+			continue
+		}
+		st.ops = append(st.ops, envOp{kind: 'a', key: name, value: a[k+1:]})
+		if st.taint != nil {
+			delete(st.taint, name)
+		}
+	}
+}
+
+// view returns the environment op view one consumer scope runs with:
+// the scope's exact unconditional ops followed by one uncertainty marker
+// op per tainted tracked variable (R21-Oracle-M3). The taint ops ride at
+// the tail because they shadow every earlier exact op of the same name —
+// a conditional write anywhere in the scope's history makes the merged
+// value unknowable unless a later unconditional write cleared it.
+func (t *scopeEnvTracker) view(path string) envAssignments {
+	st := t.stateFor(path)
+	out := envAssignments{ops: append([]envOp(nil), st.ops...)}
+	for name := range st.taint {
+		out.ops = append(out.ops, envOp{kind: 't', key: name})
+	}
 	out.ops = out.ops[:len(out.ops):len(out.ops)]
 	return out
 }

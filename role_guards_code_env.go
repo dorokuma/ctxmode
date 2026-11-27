@@ -5,7 +5,9 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 // ---------- end additional head screens ----------
@@ -3379,12 +3381,73 @@ func xargsFeedsCodeFlag(inner, full []string, pathEnv string, caller callerIdent
 // replTokenInExecSlotDepth so the two feeds cannot drift, and a dangling
 // wrapper or wrapper-only target (xargs env) fails closed — the stdin words
 // would become the command head itself.
+// R21-Reviewer-5: every entry recomputes NOTHING — a normalized state
+// cache keys (depth, inner argv, replacement-token context) so a repeated
+// descent returns the memoized verdict instead of redoing the same
+// peel/LookPath cascade, and a single-request step budget caps the total
+// number of distinct nodes evaluated (fail-closed once exceeded): the
+// append-mode merge in xargsNestedFeedsCodeSlot already removes the
+// per-level doubling, but replacement-token branch shapes can still fan
+// out, so the budget is the hard ceiling the depth cap alone never was.
+// The cache and counter live in package-level state because the recursion
+// signatures are frozen by existing callers; entries are evicted lazily
+// per request depth class so a long-lived process cannot grow the table
+// without bound.
+var xargsWorkState = struct {
+	sync.Mutex
+	memo  map[string]bool
+	steps int
+}{memo: map[string]bool{}}
+
+// xargsWorkMemoKey normalizes one recursion state: the depth, the inner
+// argv and the replacement token the outer invocation carries (the ONLY
+// input outerXargs contributes to the recursion).
+func xargsWorkMemoKey(depth int, inner, outerXargs []string) string {
+	return strconv.Itoa(depth) + "\x00" + strings.Join(inner, "\x01") +
+		"\x00" + xargsReplToken(outerXargs)
+}
+
+const xargsWorkBudget = 512
+
 func xargsFeedsCodeFlagDepth(inner, outerXargs []string, pathEnv string, caller callerIdentity, depth int) bool {
 	if len(inner) == 0 {
 		return false
 	}
 	if depth >= peelChainMaxDepth {
 		return true
+	}
+	key := xargsWorkMemoKey(depth, inner, outerXargs)
+	xargsWorkState.Lock()
+	if depth == 0 {
+		// A fresh request: reset the per-request work table — every
+		// top-level entry passes through depth 0, nested descents never
+		// do, so the memo and step counter are exactly one request's
+		// state and can never accumulate across the process lifetime.
+		xargsWorkState.memo = map[string]bool{}
+		xargsWorkState.steps = 0
+	}
+	if v, ok := xargsWorkState.memo[key]; ok {
+		xargsWorkState.Unlock()
+		return v
+	}
+	if xargsWorkState.steps >= xargsWorkBudget {
+		// Single-request budget ceiling: fail closed rather than pay an
+		// attacker-shaped re-peel cascade.
+		xargsWorkState.Unlock()
+		return true
+	}
+	xargsWorkState.steps++
+	xargsWorkState.Unlock()
+	verdict := xargsFeedsCodeFlagWork(inner, outerXargs, pathEnv, caller, depth)
+	xargsWorkState.Lock()
+	xargsWorkState.memo[key] = verdict
+	xargsWorkState.Unlock()
+	return verdict
+}
+
+func xargsFeedsCodeFlagWork(inner, outerXargs []string, pathEnv string, caller callerIdentity, depth int) bool {
+	if len(inner) == 0 {
+		return false
 	}
 	repl := xargsReplToken(outerXargs)
 	if repl != "" && replTokenInExecSlotDepth(inner, repl, pathEnv, caller, depth, false) {
@@ -3481,6 +3544,20 @@ func xargsSSHFeedsCodeSlot(h []string, repl string, outerXargs []string, outerCa
 // xargsNestedFeedsCodeSlot descends into a nested xargs target: the inner
 // xargs consumes its OWN stdin words, and the outer feed reaches its target
 // only when the outer xargs appends operands (no -I token).
+// R21-Reviewer-5: the two continuation recursions are merged whenever they
+// are provably EQUIVALENT. The outer-xargs context contributes exactly one
+// input to the recursion — the -I replacement token of outerXargs — so when
+// both invocations run in append mode (repl == "" and the INNER xargs
+// itself carries no replacement token), xargsReplToken(h) and
+// xargsReplToken(outerXargs) are both empty and the two calls pass
+// byte-identical state: the second call is a pure duplicate of the first.
+// Merging them removes the per-level doubling of the no-hit walk — the
+// former shape paid 2^depth LookPath resolutions (each redoing the same
+// executable lookups) for a linear chain of nested xargs. When the inner
+// xargs DOES carry its own -I token the two continuations genuinely
+// diverge (the replace-token analysis depends on which invocation's token
+// applies), so both branches are kept — exactly the necessary split the
+// equivalence argument does not cover.
 func xargsNestedFeedsCodeSlot(h, outerXargs []string, effPath string, outerCaller callerIdentity, depth int) bool {
 	repl := xargsReplToken(outerXargs)
 	k := xargsTargetIndex(h)
@@ -3496,6 +3573,13 @@ func xargsNestedFeedsCodeSlot(h, outerXargs []string, effPath string, outerCalle
 		return true
 	}
 	if repl == "" {
+		if xargsReplToken(h) == "" {
+			// Both continuations are append-mode with an empty replacement
+			// token: the recursion state is identical, so the outer-context
+			// replay is a pure duplicate of the inner one above — running it
+			// again would only double the same work (R21-Reviewer-5).
+			return false
+		}
 		return xargsFeedsCodeFlagDepth(h[k:], outerXargs, effPath, outerCaller, depth+1)
 	}
 	return false

@@ -1085,6 +1085,15 @@ func isSafeIFSValue(val string) bool {
 // matching runtime scoping — nested replays therefore accumulate instead
 // of re-reading the process PATH (R7). An unset/empty result is returned
 // verbatim so lookup treats it as ".".
+// R21-Reviewer-6: two untrusted-input shapes NEVER yield a resolvable
+// PATH — the expansion-budget overflow (a self-referencing chain whose
+// replayed size crosses maxShellCommandBytes: expanding it would either
+// allocate an attacker-sized string or truncate into a DIFFERENT valid
+// short PATH) and the control-flow uncertainty marker 't' (a conditional
+// write makes the merged value unknowable). Both return a
+// placeholder-carrying non-path string: no directory resolution can ever
+// succeed against it, and callers that gate rewrites detect the marker
+// through effectivePATHUntrusted.
 func (e envAssignments) effectivePATHFrom(base string) string {
 	path := base
 	for _, op := range e.ops {
@@ -1095,9 +1104,18 @@ func (e envAssignments) effectivePATHFrom(base string) string {
 			if op.key == "PATH" {
 				path = ""
 			}
+		case 't':
+			if op.key == "PATH" {
+				path = cmdSubPlaceholder
+			}
 		case 'a':
 			if op.key == "PATH" {
-				path = expandPathSelfRefs(op.value, path)
+				expanded, ok := expandPathSelfRefs(op.value, path)
+				if !ok {
+					path = cmdSubPlaceholder
+					continue
+				}
+				path = expanded
 			}
 		}
 	}
@@ -1108,8 +1126,35 @@ func (e envAssignments) effectivePATHFrom(base string) string {
 // (the PATH in force at assignment time) so alias resolution sees the same
 // search list the runtime would (a sentinel value never reaches here
 // unexpanded: it only exists in PATH= values the guard already admitted).
-func expandPathSelfRefs(val, base string) string {
-	return strings.ReplaceAll(val, envPathSelfPlaceholder, base)
+// R21-Reviewer-6: the substitution is budget-checked BEFORE any allocation
+// — a cross-statement self-reference chain (PATH=$PATH$x PATH=$PATH$x …)
+// materializes the previous expansion repeatedly, so the output size is
+// estimated first; once it crosses maxShellCommandBytes the assignment
+// verdict is UNTRUSTED (ok=false) instead of a giant allocation or a
+// truncated short PATH the shell never computes.
+func expandPathSelfRefs(val, base string) (string, bool) {
+	if strings.Contains(base, cmdSubPlaceholder) {
+		// The accumulator already degenerated to the untrusted marker:
+		// expanding further ops against it could materialize a
+		// VALID-looking short PATH (placeholder-shaped segments are not
+		// real directories, but a later op may drop the sentinel entirely
+		// and re-install an exact value the chain never computed).
+		// Untrusted is sticky across the rest of the replay.
+		return "", false
+	}
+	n := strings.Count(val, envPathSelfPlaceholder)
+	if n == 0 {
+		return val, len(val) <= maxShellCommandBytes
+	}
+	est := len(val) - n*len(envPathSelfPlaceholder) + n*len(base)
+	if est > maxShellCommandBytes {
+		return "", false
+	}
+	out := strings.ReplaceAll(val, envPathSelfPlaceholder, base)
+	if len(out) > maxShellCommandBytes {
+		return "", false
+	}
+	return out, true
 }
 
 // taintedSentinelNames returns the names whose expansion semantics this
@@ -1128,6 +1173,17 @@ func (e envAssignments) taintedSentinelNames() map[string]bool {
 				out[name] = true
 			}
 		case 'u', 'a':
+			if sentinelTrustVars[op.key] {
+				if out == nil {
+					out = map[string]bool{}
+				}
+				out[op.key] = true
+			}
+		case 't':
+			// R21-Oracle-M3: a control-flow uncertainty marker invalidates
+			// the variable's expansion semantics exactly like an overwrite —
+			// the merged value is unknowable, so the placeholder grants must
+			// not trust it.
 			if sentinelTrustVars[op.key] {
 				if out == nil {
 					out = map[string]bool{}
@@ -2532,6 +2588,14 @@ func screenHereStringTargetsDepth(text string, targets []stdinTarget, kind byte,
 		if t.data {
 			continue
 		}
+		// R21-Oracle-M5/R21-Reviewer-4: an exhausted target is not a
+		// known POSIX shell — the projection gave up before identifying
+		// the consumer, so the payload faces an explicit depth block
+		// instead of a dash-shaped re-parse of bytes that may belong to
+		// an entirely different interpreter.
+		if t.exhausted {
+			return depthExceededHit
+		}
 		if hit := screenStdinProgram(text, t.lang, kind, depth, caller.seededWith(t.envAs), t.bash); hit != "" {
 			return hit
 		}
@@ -2633,6 +2697,13 @@ func screenHeredocBodyTargetsDepth(text string, targets []stdinTarget, bodyKind 
 		if t.data {
 			continue
 		}
+		// R21-Oracle-M5/R21-Reviewer-4: an exhausted target is an
+		// UNIDENTIFIED consumer, never a confirmed POSIX shell — the
+		// heredoc body faces an explicit depth block rather than a
+		// dash-default re-parse.
+		if t.exhausted {
+			return depthExceededHit
+		}
 		// R17-Oracle-M2: the heredoc re-parse inherits the consuming
 		// shell's dialect — a local bash heredoc brace-expands exactly
 		// like `bash -c`.
@@ -2710,15 +2781,20 @@ func guardShellSubagentDepthSegs(segs []shellSegment, depth int, caller callerId
 	// every later child inherits, so a heredoc payload parsed under a
 	// per-segment empty environment would be judged against a shell
 	// state the consumer does not run with.
-	runEnv := envAssignments{}
+	// R21-Oracle-M3: the accumulation is scope-aware — each segment's
+	// heredoc/here-string/pipe projection resolves under the view of ITS
+	// OWN scope path, and conditional writes surface as uncertainty
+	// markers (pollution) instead of exact overrides.
+	tracker := &scopeEnvTracker{}
 	for _, seg := range segs {
-		runEnv = accumulatePureAssignEnv(runEnv, seg.argv, caller, seg.childScope)
+		tracker.foldSegment(seg, caller)
 		if seg.parseErr != "" {
 			return seg.parseErr
 		}
 		if seg.depthExceeded {
 			return depthExceededHit
 		}
+		runEnv := tracker.view(seg.scopePath)
 		if hit := screenSegmentHeredocsDepth(seg, 's', depth, caller, runEnv); hit != "" {
 			return hit
 		}

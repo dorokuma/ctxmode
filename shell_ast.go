@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -1341,105 +1342,222 @@ func scanShellBuiltinWritesDepth(base string, args []*syntax.Word, scanWord func
 	}
 }
 
-// stripBuiltinWrapperWords peels leading `command`/`builtin` wrapper chains
-// (including their own option runs and the `--` terminator) off a call's
-// argument words exactly like the preScanVarMutations CallExpr walk does,
-// returning the basename of the surviving command head, the RAW head word
-// and the words following it. ok=false means a dynamic word sat in the
-// wrapper zone or the peel hit a pure `command -v/-V` query — either way no
-// static head can be named (the pre-scan keeps its own conservative
-// accounting for those shapes; binding replication simply skips them).
-// R20-Oracle-M1: the raw head matters — only a bare `eval` is the
-// same-process builtin; a path spelling like `/dev/null/eval` is an
-// EXTERNAL program that can never write the shell's variables.
-func stripBuiltinWrapperWords(args []*syntax.Word) (base, rawHead string, rest []*syntax.Word, ok bool) {
+// evalChainVerdict classifies one call's wrapper chain ending (or not) in
+// a same-process eval builtin (R21-Oracle-M1 / R21-Reviewer-2).
+type evalChainVerdict int
+
+const (
+	// evalChainNone: the surviving head is not eval at all (or the chain
+	// runs dry — a bare `command`/`builtin` never reaches a command).
+	evalChainNone evalChainVerdict = iota
+	// evalChainQuery: a provable pure `command -v/-V` resolution query —
+	// nothing executes, so the operand text can never write.
+	evalChainQuery
+	// evalChainBind: EVERY layer of the chain is a provably-executed real
+	// builtin of the script's own dialect carrying only legal non-query
+	// options, and the final head is the bare word `eval`.
+	evalChainBind
+	// evalChainTaint: eval-shaped, but the same-process successful-execution
+	// premises fail somewhere along the chain — a slash-carrying wrapper or
+	// eval head (an external program can never write shell state), a
+	// dialect-foreign builtin (dash has no `builtin`), an unknown or
+	// malformed option, or a dynamic/unvettable word in the wrapper zone.
+	evalChainTaint
+)
+
+// peelEvalBuiltinChain validates the COMPLETE wrapper chain of one call
+// targeting eval (R21-Oracle-M1 / R21-Reviewer-2): the binding replication
+// licenses only an invocation PROVABLY executing the same-process builtin
+// exactly once —
+//
+//   - no word in the chain may carry a `/` path component (`/dev/null/command`
+//     execs an external program even when its basename spells a builtin);
+//   - `command` may carry only POSIX's non-query `-p` clusters: `-v`/`-V`
+//     shapes are pure resolution queries (nothing executes), and any other
+//     `-…` option is an error under the real builtin contract — neither
+//     may license a trust peel;
+//   - `builtin` is a bash-only builtin taking NO options: under the dash
+//     dialect the word is not a builtin at all, and any option spelling
+//     fails the invocation;
+//   - the final surviving head must be the bare word `eval` exactly.
+//
+// Dynamic/unparseable words in the wrapper zone make the chain unknowable:
+// the conservative verdict is evalChainTaint because preScanVarMutations
+// already accounts the operand writes — pretending the invocation cannot
+// reach eval would lose them. The returned rest slice (bind/taint verdicts
+// only) still CARRIES the eval head word itself, matching the operand
+// decoder's expectations (rest[0] == eval, operands at rest[1:]).
+func peelEvalBuiltinChain(args []*syntax.Word, posixNoBraces bool) (evalChainVerdict, []*syntax.Word) {
 	cur := args
 	for len(cur) > 0 {
 		h, wok := wordToArg(cur[0])
 		if !wok || isDynamicArg(h) {
-			return "", "", nil, false
+			return evalChainTaint, nil
 		}
-		b := h
-		if k := strings.LastIndexByte(b, '/'); k >= 0 {
-			b = b[k+1:]
+		if h == "eval" {
+			return evalChainBind, cur
 		}
-		if b != "builtin" && b != "command" {
-			return b, h, cur, true
+		if h != "command" && h != "builtin" {
+			if strings.ContainsRune(h, '/') {
+				b := h[strings.LastIndexByte(h, '/')+1:]
+				if b == "eval" || b == "command" || b == "builtin" {
+					// A path spelling never invokes the shell builtin —
+					// yet the pre-scan counts the operand writes, so the
+					// sound verdict is pollution, never a silent skip.
+					return evalChainTaint, nil
+				}
+			}
+			return evalChainNone, nil
 		}
 		cur = cur[1:]
-		optStrs := make([]string, 0, len(cur))
-		for _, w := range cur {
-			os_, ook := wordToArg(w)
-			if !ook {
-				os_ = cmdSubPlaceholder
+		if h == "builtin" {
+			v, rest, ok := peelBuiltinLayer(cur, posixNoBraces)
+			if !ok {
+				return v, nil
 			}
-			optStrs = append(optStrs, os_)
+			cur = rest
+			continue
 		}
-		if isCommandQuery(optStrs) {
-			return "", "", nil, false
+		v, rest, ok := peelCommandLayer(cur)
+		if v != evalChainBind {
+			return v, nil
 		}
-		for len(cur) > 0 {
-			a, aok := wordToArg(cur[0])
-			if !aok || isDynamicArg(a) {
-				return "", "", nil, false
-			}
-			if a == "--" {
-				cur = cur[1:]
-				break
-			}
-			if strings.HasPrefix(a, "-") && a != "-" {
-				cur = cur[1:]
-				continue
-			}
-			break
-		}
+		cur = rest
+		_ = ok
 	}
-	return "", "", nil, false
+	return evalChainNone, nil
 }
 
-// writtenNamesInNode lists the variable names a single statement writes
-// (plain assigns, for-loop variables, ${x:=...} default assigns and
-// arithmetic mutations) — the same write shapes preScanVarMutations counts,
-// but as a NAME SET for conservative tainting instead of a count. Writes
-// hidden inside eval operand words or builtin invocations are invisible
-// here exactly like they are in the count scan; the eval recursion handles
-// its own operand text.
-func writtenNamesInNode(n syntax.Node) []string {
-	names := map[string]bool{}
-	syntax.Walk(n, func(node syntax.Node) bool {
-		if node == nil {
-			return false
-		}
-		switch x := node.(type) {
-		case *syntax.Assign:
-			if x.Name != nil {
-				names[x.Name.Value] = true
-			}
-		case *syntax.ForClause:
-			if wi, ok := x.Loop.(*syntax.WordIter); ok && wi.Name != nil {
-				names[wi.Name.Value] = true
-			}
-		case *syntax.ParamExp:
-			if x.Param != nil && x.Exp != nil &&
-				(x.Exp.Op == syntax.AssignUnset || x.Exp.Op == syntax.AssignUnsetOrNull) {
-				names[x.Param.Value] = true
-			}
-		case *syntax.BinaryArithm:
-			if isArithAssignOp(x.Op) {
-				names[arithmTargetName(x.X)] = true
-			}
-		case *syntax.UnaryArithm:
-			if x.Op == syntax.Inc || x.Op == syntax.Dec {
-				names[arithmTargetName(x.X)] = true
-			}
-		}
-		return true
-	})
-	out := make([]string, 0, len(names))
-	for name := range names {
-		out = append(out, name)
+// peelBuiltinLayer validates the remainder of a bash `builtin` invocation
+// (R21-Oracle-M1): bash builtin accepts NO options of its own, and under
+// the dash dialect the word is not a builtin at all. A dash-dialect
+// invocation fails before eval can ever execute — the operand writes
+// never bind, so the sound verdict is evalChainNone, NOT taint. An
+// option spelling (or an undecodable word) errors at runtime too, but
+// the dash judgment cannot be repeated for bash: POSIX offers no stable
+// contract for `builtin -x` — it may fail or strip one dash layer — so
+// the sound verdict there is taint. ok=false means the caller must
+// return v verbatim; ok=true means rest continues the chain.
+func peelBuiltinLayer(cur []*syntax.Word, posixNoBraces bool) (evalChainVerdict, []*syntax.Word, bool) {
+	if posixNoBraces {
+		return evalChainNone, nil, false
 	}
-	return out
+	if len(cur) == 0 {
+		return evalChainNone, nil, false
+	}
+	a, aok := wordToArg(cur[0])
+	if !aok || isDynamicArg(a) {
+		return evalChainTaint, nil, false
+	}
+	if strings.HasPrefix(a, "-") && a != "-" {
+		return evalChainTaint, nil, false
+	}
+	return evalChainBind, cur, true
+}
+
+// peelCommandLayer validates the remainder of a `command` invocation
+// (R21-Oracle-M1): -v/-V shapes are pure resolution queries that execute
+// nothing (evalChainQuery), and only POSIX's legal execution options —
+// `-p` clusters and the `--` terminator — may precede the utility word.
+// Any unknown `-…` option is an invocation error: `command -x eval`
+// never runs eval, yet the pre-scan counts the operand writes, so the
+// sound verdict is pollution, never a silent skip. ok=true means the
+// remaining words continue the chain walk.
+func peelCommandLayer(cur []*syntax.Word) (evalChainVerdict, []*syntax.Word, bool) {
+	optStrs := make([]string, 0, len(cur))
+	for _, w := range cur {
+		os_, ook := wordToArg(w)
+		if !ook {
+			os_ = cmdSubPlaceholder
+		}
+		optStrs = append(optStrs, os_)
+	}
+	if isCommandQuery(optStrs) {
+		return evalChainQuery, nil, false
+	}
+	for len(cur) > 0 {
+		a, aok := wordToArg(cur[0])
+		if !aok || isDynamicArg(a) {
+			return evalChainTaint, nil, false
+		}
+		if a == "--" {
+			cur = cur[1:]
+			break
+		}
+		if strings.HasPrefix(a, "-") && a != "-" {
+			for j := 1; j < len(a); j++ {
+				if a[j] != 'p' {
+					return evalChainTaint, nil, false
+				}
+			}
+			cur = cur[1:]
+			continue
+		}
+		break
+	}
+	return evalChainBind, cur, true
+}
+
+// writeNamesInStmt lists the variable names a single statement writes
+// according to EXACTLY the pre-scan definition (R21-Oracle-M2 /
+// R21-Reviewer-3): the two collectors can no longer fork — replaying a
+// statement feeds a one-statement pseudo-file through preScanVarMutations
+// itself, so plain assigns, for-loop variables, ${x:=...} default assigns,
+// arithmetic mutations, nested static eval operand writes AND the Bash
+// builtin named-write targets (`printf -v`/`%n`, `read`/`REPLY`, `getopts`
+// OPTIND/OPTARG/NAME, `unset`/`export`/`declare` families, cd-PDPWD chain)
+// all surface in one shared set. allUnvettable reports the pre-scan's
+// give-up signal: the collector then taints its wildcard entry exactly
+// like the parse-level allTainted seeding does. evalOperandBase reports
+// the surviving command head of the statement's root call when it is a
+// static eval invocation (or an eval-shaped chain whose writes the caller
+// binds through its own path) — those writes are EXCLUDED from the name
+// set because bindEvalCallWrites/taintHiddenEvalWrites own the eval
+// replication for them.
+func writeNamesInStmt(st *syntax.Stmt, posixNoBraces bool) (names []string, allUnvettable bool) {
+	if st == nil {
+		return nil, false
+	}
+	// The eval replication owns the writes of a ROOT static eval call
+	// (bind/taint verdicts are its own chain analysis): counting them here
+	// as well would taint away the very bindings the replication mints.
+	// Nested evals inside compound subtrees (or behind non-eval heads)
+	// stay inside the shared scan — their writes surface in the name set.
+	rootEval := false
+	if call, isCall := st.Cmd.(*syntax.CallExpr); isCall {
+		v, _ := peelEvalBuiltinChain(call.Args, posixNoBraces)
+		if v == evalChainBind || v == evalChainTaint {
+			rootEval = true
+		}
+	}
+	var counts map[string]int
+	var at bool
+	if rootEval {
+		// Rescan a clone with the root eval call's arguments truncated to
+		// the bare head word: the builtin write scan only descends operand
+		// texts when len(args) >= 2, so this truncated scan counts every
+		// write EXCEPT the root eval's operand replication — exactly the
+		// set this function must return (the eval replication owns the
+		// operand writes). The eval head's own conservative PWD/OLDPWD
+		// sighting noise is identical on both shapes, so it survives.
+		cp := *st
+		if call, isCall := st.Cmd.(*syntax.CallExpr); isCall && len(call.Args) > 0 {
+			cpCall := *call
+			cpCall.Args = cpCall.Args[:1]
+			cp.Cmd = &cpCall
+		}
+		counts, at = preScanVarMutationsDepth(&syntax.File{Stmts: []*syntax.Stmt{&cp}}, posixNoBraces, 0)
+	} else {
+		counts, at = preScanVarMutationsDepth(&syntax.File{Stmts: []*syntax.Stmt{st}}, posixNoBraces, 0)
+	}
+	seen := map[string]bool{}
+	for name, n := range counts {
+		if n > 0 && !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	return names, at
 }
 
 // bindEvalCallWrites replicates the variable BINDINGS of a static eval
@@ -1470,8 +1588,15 @@ func (c *subCollector) bindEvalCallWrites(st *syntax.Stmt, call *syntax.CallExpr
 	if len(call.Args) == 0 {
 		return
 	}
-	base, rawHead, rest, ok := stripBuiltinWrapperWords(call.Args)
-	if !ok || base != "eval" || len(rest) < 2 {
+	verdict, rest := peelEvalBuiltinChain(call.Args, c.posixNoBraces)
+	if verdict == evalChainNone || verdict == evalChainQuery {
+		// Not eval at all, or a provable pure resolution query that
+		// executes nothing — the pre-scan does not count such writes
+		// either, so the replication can skip them precisely.
+		return
+	}
+	if len(rest) < 2 {
+		// A bare eval-shaped head with no operand text re-parses nothing.
 		return
 	}
 	scanWord := wordToArg
@@ -1480,10 +1605,15 @@ func (c *subCollector) bindEvalCallWrites(st *syntax.Stmt, call *syntax.CallExpr
 	}
 	parts, static := evalStaticOperandParts(rest, scanWord)
 	if !static {
+		// A dynamic operand makes the re-parse unknowable; the pre-scan
+		// conservatively counts every sentinel variable as written in
+		// exactly this case, so the replay must match the definition
+		// (R21-Oracle-M2 — counted writes may never vanish).
+		c.taintSentinelVars()
 		return
 	}
 	text := strings.Join(parts, " ")
-	if strings.ContainsRune(rawHead, '/') || len(st.Redirs) > 0 {
+	if verdict != evalChainBind || len(st.Redirs) > 0 {
 		// Not a provably-successful same-process builtin: never mint a
 		// bind, but never lose the write either (R20-Oracle-M1).
 		c.taintEvalTextWrites(text, 0)
@@ -1558,10 +1688,25 @@ func (c *subCollector) taintEvalTextWrites(text string, depth int) {
 		if st == nil {
 			continue
 		}
-		for _, name := range writtenNamesInNode(st) {
-			c.taintVar(name)
-		}
+		c.taintStmtSharedWrites(st)
 		c.taintHiddenEvalWrites(st, depth)
+	}
+}
+
+// taintStmtSharedWrites taints every name of one statement according to
+// the SHARED pre-scan write definition (R21-Oracle-M2/R21-Reviewer-3):
+// the Bash named-write builtins (`printf -v PATH`, `read`, `getopts`,
+// `unset`, the declare family) surface exactly like syntax assignments,
+// and an unvettable statement shape taints the wildcard entry so no
+// sentinel grant survives. eval-bindable root writes are excluded — the
+// replication's own chain analysis owns them.
+func (c *subCollector) taintStmtSharedWrites(st *syntax.Stmt) {
+	names, allUnv := writeNamesInStmt(st, c.posixNoBraces)
+	if allUnv {
+		c.taintedVars["*"] = true
+	}
+	for _, name := range names {
+		c.taintVar(name)
 	}
 }
 
@@ -1579,6 +1724,14 @@ func (c *subCollector) taintHiddenEvalWrites(st *syntax.Stmt, depth int) {
 	if c.posixNoBraces {
 		scanWord = wordToArgPosix
 	}
+	// R21-Reviewer-3: the statement itself IS a statement node — walking
+	// only from st.Cmd matches descendant *syntax.Stmt nodes but silently
+	// skips a ROOT static eval call (`eval 'X=1'` as the whole compound
+	// operand). The root call is checked from the statement itself first,
+	// then the descendants share the same depth-limited taint walk.
+	if call, isCall := st.Cmd.(*syntax.CallExpr); isCall {
+		c.taintOneEvalCallWrites(call, scanWord, depth+1)
+	}
 	syntax.Walk(st.Cmd, func(node syntax.Node) bool {
 		if node == nil {
 			return false
@@ -1591,19 +1744,29 @@ func (c *subCollector) taintHiddenEvalWrites(st *syntax.Stmt, depth int) {
 		if !isCall {
 			return true
 		}
-		base, rawHead, rest, ok := stripBuiltinWrapperWords(call.Args)
-		if !ok || base != "eval" || len(rest) < 2 {
-			return true
-		}
-		if strings.ContainsRune(rawHead, '/') {
-			return true // external program: cannot write shell state at all
-		}
-		parts, static := evalStaticOperandParts(rest, scanWord)
-		if static {
-			c.taintEvalTextWrites(strings.Join(parts, " "), depth+1)
-		}
+		c.taintOneEvalCallWrites(call, scanWord, depth+1)
 		return true
 	})
+}
+
+// taintOneEvalCallWrites taints the writes of ONE eval-shaped invocation
+// (extracted for the v6.2.2 R21 complexity budget): a bindable chain's
+// static operand text taints recursively through the shared budget path,
+// a failing chain premises keeps the same conservative verdict (the
+// pre-scan counts the write either way), and a dynamic operand taints
+// the sentinel set exactly like the pre-scan's own fallback. Pure
+// resolution queries and non-eval heads are skipped precisely.
+func (c *subCollector) taintOneEvalCallWrites(call *syntax.CallExpr, scanWord func(*syntax.Word) (string, bool), depth int) {
+	verdict, rest := peelEvalBuiltinChain(call.Args, c.posixNoBraces)
+	if verdict == evalChainNone || verdict == evalChainQuery || len(rest) < 2 {
+		return
+	}
+	parts, static := evalStaticOperandParts(rest, scanWord)
+	if !static {
+		c.taintSentinelVars()
+		return
+	}
+	c.taintEvalTextWrites(strings.Join(parts, " "), depth)
 }
 
 // bindEvalStmtWrites replays the writes of one static eval's statement
@@ -1623,15 +1786,18 @@ func (c *subCollector) bindEvalStmtWrites(stmts []*syntax.Stmt, depth int) {
 		if isCall && !st.Background && !st.Negated && !st.Coprocess && len(st.Redirs) == 0 && len(call.Args) == 0 {
 			// R20-Oracle-M1: the statement must be a PROVABLY-executed bare
 			// assignment sequence — no redirections (a failing one aborts
-			// before the assignment) — and every assignment a plain `=`:
-			// bash's `+=` concatenates onto the inherited value, so the
-			// result is never the literal suffix the word carries; the
-			// conservative verdict is pollution, never a bind.
+			// before the assignment) — and every assignment a plain
+			// unsubscripted scalar `=`: bash's `+=` concatenates onto the
+			// inherited value, so the result is never the literal suffix
+			// the word carries, and an array-subscript write `a[1]=/x`
+			// leaves every other element of the array intact, so the
+			// scalar is never the exact bind either (R21-Reviewer-2).
+			// The conservative verdict for both is pollution, never a bind.
 			for _, a := range call.Assigns {
 				if a.Name == nil || a.Naked {
 					continue
 				}
-				if a.Append {
+				if a.Append || a.Index != nil {
 					c.taintVar(a.Name.Value)
 					continue
 				}
@@ -1640,9 +1806,7 @@ func (c *subCollector) bindEvalStmtWrites(stmts []*syntax.Stmt, depth int) {
 			}
 			continue
 		}
-		for _, name := range writtenNamesInNode(st) {
-			c.taintVar(name)
-		}
+		c.taintStmtSharedWrites(st)
 		if !isCall {
 			// R20-Oracle-M2: a compound statement (AndStmt/OrStmt/if/brace
 			// group/subshell/pipeline/loop) can hide nested static evals
@@ -1651,8 +1815,8 @@ func (c *subCollector) bindEvalStmtWrites(stmts []*syntax.Stmt, depth int) {
 			c.taintHiddenEvalWrites(st, depth)
 			continue
 		}
-		base, rawHead, rest, ok := stripBuiltinWrapperWords(call.Args)
-		if !ok || base != "eval" || len(rest) < 2 {
+		verdict, rest := peelEvalBuiltinChain(call.Args, c.posixNoBraces)
+		if verdict == evalChainNone || verdict == evalChainQuery || len(rest) < 2 {
 			c.taintHiddenEvalWrites(st, depth)
 			continue
 		}
@@ -1662,10 +1826,11 @@ func (c *subCollector) bindEvalStmtWrites(stmts []*syntax.Stmt, depth int) {
 		}
 		parts, static := evalStaticOperandParts(rest, scanWord)
 		if !static {
+			c.taintSentinelVars()
 			continue
 		}
 		text := strings.Join(parts, " ")
-		if strings.ContainsRune(rawHead, '/') || len(st.Redirs) > 0 || st.Background || st.Negated || st.Coprocess {
+		if verdict != evalChainBind || len(st.Redirs) > 0 || st.Background || st.Negated || st.Coprocess {
 			// R20-Oracle-M1 premises apply to nested evals exactly like the
 			// outer one: an external path head, a possibly-failing redirect
 			// or a child-process/conditional execution never mints a bind,
@@ -1731,6 +1896,11 @@ func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVarian
 	}
 
 	col := &subCollector{code: code, depth: depth, staticVars: map[string]string{}, enumVars: map[string]string{}, taintedVars: map[string]bool{}, enumCmdWords: map[string][]string{}, allowBind: true, caller: caller, posixNoBraces: !useBashVariant}
+	// R21-Oracle-M3: mint the shared scope-id counter EAGERLY — substitution
+	// sub-collectors copy the pointer through newSub, and a lazily-created
+	// per-sub counter would collide sibling scope ids.
+	zeroScopeCounter := 0
+	col.scopeCounter = &zeroScopeCounter
 	for name := range envTaint {
 		col.taintedVars[name] = true
 	}
@@ -1940,6 +2110,54 @@ type subCollector struct {
 	// substitutions inherit it through newSub (the zero value propagates
 	// false only at the real parent level).
 	childScope bool
+	// scopePath identifies the execution scope the current subtree runs
+	// in (R21-Oracle-M3 / R21-Reviewer-1): "" is the parent shell's own
+	// scope, and every child execution scope (subshell body, each
+	// pipeline component, backgrounded subtree, command/process
+	// substitution) receives a UNIQUE dotted suffix. Pure assignments
+	// inside a child scope bind within that same child environment —
+	// visible to the SAME child's later consumers, dead the moment the
+	// scope pops — instead of being dropped wholesale (the R20 flat
+	// boolean) or smuggled into the parent (the pre-R20 behavior).
+	scopePath string
+	// scopeCounter is the per-parse unique scope id source shared by the
+	// root collector and every substitution sub-collector so no two
+	// child scopes ever collide (sibling scopes MUST diverge: two
+	// subshells each fork their own environment).
+	scopeCounter *int
+	// condDepth counts enclosing conditional regions (the right side of
+	// `&&`/`||`, if/case branches, loop bodies, uncalled function bodies):
+	// assignments minted while condDepth > 0 may or may not execute, so
+	// the control-flow JOIN must treat every variable they touch as
+	// uncertain (R21-Oracle-M3) — never an exact override of the outer
+	// shell's environment.
+	condDepth int
+}
+
+// enterChildScope switches the collector into a freshly minted child
+// execution scope, returning the restore closure (R21-Oracle-M3): every
+// scope id is unique within the parse via the shared counter, so two
+// sibling subshells or pipeline components never alias each other.
+func (c *subCollector) enterChildScope() func() {
+	if c.scopeCounter == nil {
+		n := 0
+		c.scopeCounter = &n
+	}
+	*c.scopeCounter = *c.scopeCounter + 1
+	prevPath, prevScope := c.scopePath, c.childScope
+	id := *c.scopeCounter
+	c.scopePath = c.scopePath + "/" + strconv.Itoa(id)
+	c.childScope = true
+	return func() { c.scopePath, c.childScope = prevPath, prevScope }
+}
+
+// enterConditional switches the collector into one conditional region
+// (R21-Oracle-M3): assignments minted inside may or may not execute, so
+// the accumulation treats them as control-flow-merge taint instead of
+// exact environment overrides.
+func (c *subCollector) enterConditional() func() {
+	c.condDepth++
+	return func() { c.condDepth-- }
 }
 
 func (c *subCollector) reject() {
@@ -2350,11 +2568,18 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 	// R6: a `cmd &` subtree runs in a subshell — nothing inside it binds in
 	// the parent. Closing bind on the whole Background subtree (not only on
 	// the leaf CallExpr) keeps `x=v && true &` from arming "$x".
+	// R21-Oracle-M3: the whole backgrounded subtree runs in its OWN child
+	// execution scope — including compound shapes like `{ x=v; sh; } &`
+	// whose inner statements otherwise carry the parent's scope — so the
+	// scope marker must propagate DOWNWARD through the subtree, not just
+	// ride the leaf segment's background bit.
 	prevBind := c.allowBind
+	restoreScope := func() {}
 	if st.Background {
 		c.allowBind = false
+		restoreScope = c.enterChildScope()
 	}
-	defer func() { c.allowBind = prevBind }()
+	defer func() { restoreScope(); c.allowBind = prevBind }()
 	if st.Cmd == nil {
 		// bare redirects — still record if they write; unquoted heredoc bodies
 		// can contain $(...) that dash expands (must emit nested CallExprs).
@@ -2366,7 +2591,7 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 				c.emitNestedFromWord(r.Hdoc, feed)
 			}
 		}
-		seg := shellSegment{pipedStdin: feed.piped, backgrounded: st.Background, childScope: st.Background || c.childScope}
+		seg := shellSegment{pipedStdin: feed.piped, backgrounded: st.Background, childScope: st.Background || c.childScope, scopePath: c.scopePath, condAssign: c.condDepth > 0}
 		c.applyRedirs(&seg, st.Redirs, feed)
 		if len(seg.argv) > 0 || seg.redirectFile != "" || len(seg.heredocText) > 0 || seg.hereString != "" || seg.depthExceeded {
 			c.segs = append(c.segs, seg)
@@ -2445,24 +2670,36 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 		// redirections whose failure would prevent the builtin from ever
 		// running, so the replication needs it, not just the call).
 		c.bindEvalCallWrites(st, cmd)
+		// R21-Oracle-M2/R21-Reviewer-3: the Bash named-write builtins
+		// (`printf -v`, `read`, `getopts`, `unset`, the declare family)
+		// write shell variables the pre-scan already counts — the replay
+		// must surface those writes as taint under the SHARED write
+		// definition, or a single counted write falls back to the parent
+		// shell's environment in the substitution success proofs. eval
+		// root writes are excluded inside writeNamesInStmt — the chain
+		// replication above owns them.
+		c.noteBuiltinWrites(st, cmd)
 		c.emitCall(st, cmd, feed)
 	case *syntax.BinaryCmd:
 		switch cmd.Op {
 		case syntax.Pipe, syntax.PipeAll:
 			prevBind := c.allowBind
 			c.allowBind = false // no static head-bind across/inside pipelines
-			// R20-Oracle-M3: every pipeline component runs in its own child
-			// process — an assignment inside ANY of them dies with the
-			// component and never re-binds the parent shell.
-			prevScope := c.childScope
-			c.childScope = true
+			// R20-Oracle-M3/R21-Oracle-M3: every pipeline component runs in
+			// its OWN child process — the two sides fork sibling scopes (two
+			// distinct ids off the same parent prefix): an assignment inside
+			// either component binds within THAT component's environment
+			// only, never the sibling's and never the parent's.
+			restoreX := c.enterChildScope()
 			c.walkStmt(cmd.X, feed)
+			restoreX()
 			// Pipe right: fd0 becomes the upstream stream, but the rest of
 			// the descriptor table is inherited — { cat | sh 0<&9; } 9<&0
 			// still resolves fd9 to the pipe.
+			restoreY := c.enterChildScope()
 			c.walkStmt(cmd.Y, stdinFeed{piped: true, fds: feed.fds})
+			restoreY()
 			c.allowBind = prevBind
-			c.childScope = prevScope
 		case syntax.AndStmt, syntax.OrStmt:
 			c.walkStmt(cmd.X, feed)
 			// SH11 MF-4.1: the right side is a conditional short-circuit
@@ -2471,9 +2708,14 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 			// feed the left side saw — `true && sh` fed by a pipe runs the
 			// piped bytes as sh's program (R13), and { true && sh 0<&9; }
 			// 9<&0 resolves fd9 through the inherited descriptor table.
+			// R21-Oracle-M3: the conditional region is tracked — the
+			// control-flow merge after the branch treats every variable
+			// the right side writes as uncertain, never an exact override.
 			prevBind := c.allowBind
 			c.allowBind = false
+			restoreCond := c.enterConditional()
 			c.walkStmt(cmd.Y, feed)
+			restoreCond()
 			c.allowBind = prevBind
 		default:
 			c.reject()
@@ -2481,14 +2723,15 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 	case *syntax.Subshell:
 		prevBind := c.allowBind
 		c.allowBind = false
-		// R20-Oracle-M3: a subshell is a child process by definition —
-		// assignments inside it never reach the parent shell.
-		prevScope := c.childScope
-		c.childScope = true
+		// R20-Oracle-M3/R21-Oracle-M3: a subshell is a child process by
+		// definition — assignments inside it bind within its OWN freshly
+		// cloned scope environment (visible to the same subshell's later
+		// consumers) and never reach the parent shell.
+		restoreScope := c.enterChildScope()
 		innerFeed := c.stmtFeed(st, feed)
 		c.walkStmtsAll(cmd.Stmts, innerFeed)
+		restoreScope()
 		c.allowBind = prevBind
-		c.childScope = prevScope
 	case *syntax.Block:
 		prevBind := c.allowBind
 		c.allowBind = false
@@ -2500,8 +2743,12 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 		c.allowBind = false
 		innerFeed := c.stmtFeed(st, feed)
 		for ic := cmd; ic != nil; ic = ic.Else {
+			// The condition list executes unconditionally exactly once;
+			// only the Then bodies are conditional (R21-Oracle-M3).
 			c.walkStmtsAll(ic.Cond, innerFeed)
+			restoreCond := c.enterConditional()
 			c.walkStmtsAll(ic.Then, innerFeed)
+			restoreCond()
 		}
 		c.allowBind = prevBind
 	case *syntax.WhileClause:
@@ -2509,7 +2756,11 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 		c.allowBind = false
 		innerFeed := c.stmtFeed(st, feed)
 		c.walkStmtsAll(cmd.Cond, innerFeed)
+		// R21-Oracle-M3: the loop body may run zero times — its writes
+		// are conditional across the merge.
+		restoreCond := c.enterConditional()
 		c.walkStmtsAll(cmd.Do, innerFeed)
+		restoreCond()
 		c.allowBind = prevBind
 	case *syntax.ForClause:
 		prevBind := c.allowBind
@@ -2526,11 +2777,15 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 				c.emitNestedFromWord(w, innerFeed)
 			}
 			if loopName != "" {
+				restoreCond := c.enterConditional()
 				enumDone = c.forEnumSubst(loopName, wi.Items, cmd.Do, innerFeed)
+				restoreCond()
 			}
 		}
 		if !enumDone {
+			restoreCond := c.enterConditional()
 			c.walkStmtsAll(cmd.Do, innerFeed)
+			restoreCond()
 		}
 		c.allowBind = prevBind
 	case *syntax.CaseClause:
@@ -2542,7 +2797,10 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 			for _, pat := range item.Patterns {
 				c.emitNestedFromWord(pat, innerFeed)
 			}
+			// R21-Oracle-M3: each case arm is a conditional branch.
+			restoreCond := c.enterConditional()
 			c.walkStmtsAll(item.Stmts, innerFeed)
+			restoreCond()
 		}
 		c.allowBind = prevBind
 	case *syntax.FuncDecl:
@@ -2561,8 +2819,13 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 			// file (R18 MF-1). Only st.Redirs replay over the fresh base —
 			// `f() { sh; } </dev/null` (or 9<f / 9<&-) still applies at
 			// call time exactly like the enclosing stmt's redirects do.
+			// R21-Oracle-M3: the body runs in the caller's SAME shell (no
+			// child scope) but possibly zero times — every write inside is
+			// conditional across the control-flow merge.
+			restoreCond := c.enterConditional()
 			inner := c.stmtFeed(st, stdinFeed{piped: true})
 			c.walkStmt(cmd.Body, inner)
+			restoreCond()
 		}
 		c.fdUnvetted = prevUnvetted
 		c.allowBind = prevBind
@@ -2576,9 +2839,13 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 	case *syntax.CoprocClause:
 		prevBind := c.allowBind
 		c.allowBind = false
+		// A coprocess runs in its own child process — assignments inside
+		// never reach the parent shell (R21-Oracle-M3).
+		restoreScope := c.enterChildScope()
 		if cmd.Stmt != nil {
 			c.walkStmt(cmd.Stmt, stdinFeed{})
 		}
+		restoreScope()
 		c.allowBind = prevBind
 	case *syntax.DeclClause:
 		c.emitDecl(st, cmd, feed)
@@ -2619,7 +2886,7 @@ func (c *subCollector) emitDecl(st *syntax.Stmt, d *syntax.DeclClause, feed stdi
 			argv = append(argv, s)
 		}
 	}
-	seg := shellSegment{argv: argv, pipedStdin: feed.piped, backgrounded: st.Background, declClause: true, childScope: st.Background || c.childScope}
+	seg := shellSegment{argv: argv, pipedStdin: feed.piped, backgrounded: st.Background, declClause: true, childScope: st.Background || c.childScope, scopePath: c.scopePath, condAssign: c.condDepth > 0}
 	c.applyRedirs(&seg, st.Redirs, feed)
 	c.segs = append(c.segs, seg)
 }
@@ -2760,11 +3027,66 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 		processSubst: callHasProcSubst(call),
 		srcCode:      c.code,
 		childScope:   st.Background || c.childScope,
+		scopePath:    c.scopePath,
+		condAssign:   c.condDepth > 0,
 	}
 	c.applyRedirs(&seg, st.Redirs, feed)
 	if len(seg.argv) > 0 || seg.redirectFile != "" || len(seg.heredocText) > 0 ||
 		seg.hereString != "" || seg.processSubst || seg.depthExceeded {
 		c.segs = append(c.segs, seg)
+	}
+}
+
+// noteBuiltinWrites taints the shell variables a NON-eval command call
+// writes through the Bash named-write builtins (R21-Oracle-M2 /
+// R21-Reviewer-3 — the replay side of the unified write definition):
+// `printf -v PATH ...`, `read PATH`, `getopts x PATH`, `unset PATH`,
+// `declare PATH=...` in the POSIX-parsed CallExpr shape and every other
+// write shape the pre-scan counts. Pure-assignment statements
+// (len(call.Args) == 0) bind through noteStaticAssign instead, and prefix
+// assignments die with the child exactly like emitCall already models.
+// Writes hidden inside nested conditional subtrees of the same statement
+// taint conservatively — their execution is uncertain, which is precisely
+// the pollution direction.
+func (c *subCollector) noteBuiltinWrites(st *syntax.Stmt, cmd *syntax.CallExpr) {
+	if len(cmd.Args) == 0 {
+		return
+	}
+	names, allUnv := writeNamesInStmt(st, c.posixNoBraces)
+	if allUnv {
+		c.taintedVars["*"] = true
+	}
+	bound := map[string]bool{}
+	for _, a := range cmd.Assigns {
+		if a.Name != nil {
+			bound[a.Name.Value] = true
+		}
+	}
+	// The export/readonly/declare/typeset/local family is the SHARED scan's
+	// KEY=VAL write shape, but the collector binds exactly those writes
+	// through noteDeclCallBinds/emitDecl — tainting them here would revoke
+	// the binds before they are even minted. A bare `export X` (no value)
+	// changes nothing the runtime state did not already carry, so the
+	// whole family's operand writes stay out of the taint pass; unset,
+	// read, getopts and printf keep theirs.
+	exportFamily := false
+	if len(cmd.Args) > 0 {
+		scanWord := wordToArg
+		if c.posixNoBraces {
+			scanWord = wordToArgPosix
+		}
+		if h, ok := scanWord(cmd.Args[0]); ok {
+			switch h {
+			case "export", "readonly", "declare", "typeset", "local":
+				exportFamily = true
+			}
+		}
+	}
+	for _, name := range names {
+		if bound[name] || exportFamily {
+			continue // emitCall/noteDeclCallBinds already model these writes
+		}
+		c.taintVar(name)
 	}
 }
 
@@ -3148,8 +3470,11 @@ func (c *subCollector) emitNestedFromNode(n syntax.Node, feed stdinFeed) {
 // snapshots of the outer static/enum/taint binds (W11-4): `$(find $d/...)`
 // sees the enclosing for-loop's enum value and the outer top-level
 // staticVars, while the child's own writes never leak back (allowBind=false).
+// R21-Oracle-M3: the substitution is its own child execution scope — a
+// freshly minted unique id off the current scope path — so assignments
+// inside bind within this substitution's environment only.
 func (c *subCollector) newSub() *subCollector {
-	return &subCollector{
+	sub := &subCollector{
 		code:          c.code,
 		depth:         c.depth + 1,
 		staticVars:    cloneStringMap(c.staticVars),
@@ -3159,12 +3484,21 @@ func (c *subCollector) newSub() *subCollector {
 		taintedVars:   cloneBoolMap(c.taintedVars),
 		ssaBlocked:    cloneBoolMap(c.ssaBlocked),
 		allowBind:     false,
-		childScope:    true, // $(...) / <(...) run in their own child process (R20-Oracle-M3)
+		childScope:    true,           // $(...) / <(...) run in their own child process (R20-Oracle-M3)
+		scopeCounter:  c.scopeCounter, // R21-Oracle-M3: share the unique scope id space
 		fdUnvetted:    c.fdUnvetted,
 		caller:        c.caller,        // $(pwd) binds the same screened cwd inside $(...)
 		hasCd:         c.hasCd,         // an outer cd already sighted stays sighted
 		posixNoBraces: c.posixNoBraces, // R18-Oracle-S4: the $(...) re-parse runs in the SAME shell — dash never brace-expands there either, so the dialect must ride into the substitution collector or echo $(printf tag{red,blue}) under dash encodes a brace word the runtime never produces
 	}
+	// Mint this substitution's own child scope id once: the sub-collector
+	// is single-use, so the scope never pops (the restore closure is
+	// deliberately discarded).
+	if c.scopePath != "" || c.childScope {
+		sub.scopePath = c.scopePath
+	}
+	sub.enterChildScope()
+	return sub
 }
 
 func cloneStringMap(m map[string]string) map[string]string {

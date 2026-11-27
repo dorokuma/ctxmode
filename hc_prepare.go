@@ -1426,7 +1426,12 @@ func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv 
 	// children inherit — its ops accumulate into runEnv in statement
 	// order, so `HOME=/home/x; bash` marks the bash target's HOME tainted
 	// exactly like the env-prefix spelling `HOME=/home/x bash`.
-	runEnv := outerEnv
+	// R21-Oracle-M3/R21-Reviewer-1: the accumulation is SCOPE-AWARE —
+	// each consumer's inherited env is the view of ITS OWN scope path:
+	// subshell assignments bind inside the same subshell and die with it,
+	// sibling scopes never alias each other, and conditional writes
+	// surface as uncertainty markers rather than exact overrides.
+	tracker := &scopeEnvTracker{}
 	for _, seg := range segs {
 		if seg.depthExceeded || seg.parseErr != "" {
 			return nil, false, false
@@ -1435,13 +1440,7 @@ func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv 
 		// the segment's own redirects, so accumulation precedes every
 		// stdin-consumption skip — a `HOME=/x <<EOF` segment still rebinds
 		// the exported variables the NEXT consumers inherit.
-		// accumulatePureAssignEnv folds ops only for segments whose peeled
-		// head is EMPTY: prefix ops ahead of a real command die with that
-		// child and never re-bind the running shell.
-		// R20-Oracle-M3: child-scope segments (subshells, pipelines,
-		// backgrounded trees, substitutions) never re-bind the parent —
-		// their local environments die with the child process.
-		runEnv = accumulatePureAssignEnv(runEnv, seg.argv, caller, seg.childScope)
+		tracker.foldSegment(seg, caller)
 		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 			continue
 		}
@@ -1463,9 +1462,10 @@ func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv 
 		}
 		// R16-Oracle-M2: the segments carry their own dialect — an eval
 		// indirection inside the scan re-parses under seg.bashDialect.
-		// R19-Oracle-M4: the inherited env is runEnv (outer ops plus every
-		// earlier pure-assignment segment in statement order), not bare
-		// outerEnv — the consumer runs with the assignments in force.
+		// R19-Oracle-M4/R21-Oracle-M3: the inherited env is outerEnv plus
+		// the consumer's OWN scope view — the assignments in force when
+		// THAT scope runs.
+		runEnv := outerEnv.merged(tracker.view(seg.scopePath))
 		targets := stdinProgramTargetsDialect(seg.argv, 0, runEnv, basePath, caller, seg.bashDialect)
 		if len(targets) == 0 {
 			// A plain data consumer (jq ., cat, git apply) reads the stream as
@@ -1482,6 +1482,15 @@ func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv 
 		if !ok {
 			return nil, false, false
 		}
+		// R21-Oracle-M3/R21-Reviewer-6: a consumer whose effective
+		// environment carries control-flow uncertainty (a conditional
+		// write marker) or a PATH the expansion budget gave up on can
+		// never be rewritten under an exact environment — the shell may
+		// run with a DIFFERENT value, so the rewrite is refused and the
+		// caller falls back to the conservative per-target screen.
+		if envsUntrustedForRewrite(envs, basePath) {
+			return nil, false, false
+		}
 		// R16-Oracle-M2: the consuming shells of different segments must
 		// agree on one dialect — a `sh ; bash` mixture reading the same
 		// stream can never be prepared under a single parser honestly.
@@ -1495,6 +1504,27 @@ func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv 
 		return nil, false, false
 	}
 	return out, true, segBash
+}
+
+// envsUntrustedForRewrite reports whether any per-target environment
+// slice carries a state the rewrite cannot prove (R21-Oracle-M3 /
+// R21-Reviewer-6): a control-flow uncertainty marker op ('t' — a
+// conditional write makes the merged value unknowable) or an effective
+// PATH that degenerated to the unresolvable placeholder because the
+// self-reference expansion budget gave up. Either one means the shell
+// may run with a DIFFERENT environment than the rewrite assumes.
+func envsUntrustedForRewrite(envs []envAssignments, basePath string) bool {
+	for _, env := range envs {
+		for _, op := range env.ops {
+			if op.kind == 't' {
+				return true
+			}
+		}
+		if strings.Contains(env.effectivePATHFrom(basePath), cmdSubPlaceholder) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g guardCall) prepareCtxRunShellAndStdin(command, stdin string) preparedShell {
