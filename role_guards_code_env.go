@@ -3408,15 +3408,29 @@ type xargsWorkState struct {
 	steps int
 }
 
-// xargsWork returns the request-scoped memo/budget state of one caller
-// identity, allocating it lazily. A zero caller (direct unit screening
-// that never went through a guard entry) mints a FRESH state per call —
-// correct if occasionally under-shared, never cross-request.
-func xargsWork(c callerIdentity) *xargsWorkState {
-	if c.xw != nil {
-		return c.xw
+// xargsEnsureWork is xargsWork plus the write-back: the minted table is
+// installed on the returned caller so every recursion layer this caller
+// spawns shares the SAME memo and step budget (R23-Reviewer-#1). The
+// caller is passed by value throughout the projection, so the write-back
+// must happen BEFORE the first recursion consumes the identity.
+func xargsEnsureWork(c callerIdentity) (callerIdentity, *xargsWorkState) {
+	if c.xw == nil {
+		c.xw = &xargsWorkState{}
 	}
-	return &xargsWorkState{}
+	return c, c.xw
+}
+
+// xargsBudgetSpent reports whether the shared single-request work budget
+// is exhausted (R23-Reviewer-#5): the cutoff is sticky per request — a
+// spent table means every subsequent analysis verdict in the same
+// request is the fail-closed fallback, never a positively identified
+// classification, so stdin target projections must read it as an
+// exhaustion verdict distinct from a confirmed code-slot hit.
+func xargsBudgetSpent(ws *xargsWorkState) bool {
+	ws.mu.Lock()
+	spent := ws.steps >= xargsWorkBudget
+	ws.mu.Unlock()
+	return spent
 }
 
 // xargsWorkMemoKey normalizes one recursion state. R22-Reviewer-#1: the
@@ -3441,7 +3455,11 @@ func xargsFeedsCodeFlagDepth(inner, outerXargs []string, pathEnv string, caller 
 	if depth >= peelChainMaxDepth {
 		return true
 	}
-	ws := xargsWork(caller)
+	// R23-Reviewer-#1 / R23-Oracle-M5: a caller carrying no request table
+	// mints it NOW and keeps it — every recursion below (and every later
+	// projection stage of the same request) must share this one 512-node
+	// budget instead of each layer minting a private table.
+	caller, ws := xargsEnsureWork(caller)
 	key := xargsWorkMemoKey(depth, inner, outerXargs, pathEnv, caller.cwd)
 	ws.mu.Lock()
 	if ws.memo == nil {

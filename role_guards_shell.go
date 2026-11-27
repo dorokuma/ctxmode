@@ -198,6 +198,15 @@ type shellSegment struct {
 	// command) is a command invocation, never an assignment of the
 	// running shell, so the argv shape alone must never mint this flag.
 	pureAssign bool
+	// assignFlags is parallel to argv and carries the assignment
+	// OPERATOR provenance the serialization into KEY=VAL text destroys
+	// (R23-Reviewer-#2 / R23-Oracle-M3): bit 1 marks a `+=` append write
+	// (the result concatenates onto the unknowable old value), bit 2 an
+	// array-subscript write (`name[i]=v` never overwrites the whole
+	// scalar). Only genuinely independent plain `=` scalar writes may
+	// clear a conditional-write uncertainty in the tracker — the fold
+	// consults exactly these bits.
+	assignFlags []byte
 }
 
 // shellSplitMaxDepth bounds recursion into $(...)/`...`/subshell text so a
@@ -584,22 +593,27 @@ func (t *scopeEnvTracker) stateFor(path string) *scopeEnvState {
 	if st, ok := t.states[path]; ok {
 		return st
 	}
-	// Longest proper prefix ancestor, or the root state.
-	best := ""
-	for p := range t.states {
-		if len(p) > len(best) && p != path && strings.HasPrefix(path, p+"/") {
-			best = p
-		}
-	}
 	if path == "" {
 		st := &scopeEnvState{}
 		t.states[path] = st
 		return st
 	}
-	// A scope with no registered ancestor forks off the ROOT state, so
-	// even a detached path sees the root's accumulated unconditional ops
-	// exactly like the former eager clone did.
-	base := t.stateFor(best)
+	// R23-Reviewer-#7 / R23-Oracle-SF2: the scope path's construction is
+	// STRICTLY hierarchical — enterChildScope mints each id as
+	// parentPath + "/" + id — so the longest-prefix ancestor is exactly
+	// the direct parent, reachable in ONE table lookup by trimming the
+	// trailing id element. The pre-R23 scan walked the entire states map
+	// on every new scope: n sibling scopes under one root paid quadratic
+	// discovery cost even at constant depth. A detached path (no
+	// registered parent at all) forks off the root state exactly like
+	// the former best-prefix fallback resolved to "".
+	parentPath := path
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		parentPath = path[:i]
+	} else {
+		parentPath = ""
+	}
+	base := t.stateFor(parentPath)
 	fork := &scopeEnvState{parent: base, baseLen: len(base.ops)}
 	if len(base.taint) > 0 {
 		// The uncertainty map is mutable on both sides (new conditional
@@ -643,9 +657,19 @@ func (t *scopeEnvTracker) foldSegment(seg shellSegment, caller callerIdentity) {
 		return
 	}
 	st := t.stateFor(seg.scopePath)
-	for _, a := range seg.argv {
-		t.foldAssignWord(st, a, seg.condAssign)
+	for i, a := range seg.argv {
+		t.foldAssignWord(st, a, seg.condAssign, assignFlagAt(seg.assignFlags, i))
 	}
+}
+
+// assignFlagAt reads the assignment operator provenance parallel to one
+// argv index, tolerating segments assembled outside the AST collector
+// that carry no parallel slice at all (R23 complexity budget extraction).
+func assignFlagAt(flags []byte, i int) byte {
+	if i < len(flags) {
+		return flags[i]
+	}
+	return 0
 }
 
 // foldAssignWord folds one assignment word into the scope state
@@ -653,8 +677,11 @@ func (t *scopeEnvTracker) foldSegment(seg shellSegment, caller callerIdentity) {
 // extra nesting): a conditional write taints every tracked variable it
 // touches, while an unconditional write appends its op and clears the
 // variable's uncertainty — UNLESS the new value depends on the
-// unknowable old one.
-func (t *scopeEnvTracker) foldAssignWord(st *scopeEnvState, a string, cond bool) {
+// unknowable old one, and NEVER for a non-scalar write operator
+// (R23-Reviewer-#2 / R23-Oracle-M3): flags carries the AST assignment
+// operator provenance (bit 1 `+=` append, bit 2 array subscript) the
+// KEY=VAL serialization cannot express.
+func (t *scopeEnvTracker) foldAssignWord(st *scopeEnvState, a string, cond bool, flags byte) {
 	if !isAssignWord(a) {
 		return
 	}
@@ -664,15 +691,22 @@ func (t *scopeEnvTracker) foldAssignWord(st *scopeEnvState, a string, cond bool)
 	}
 	name := a[:k]
 	if cond {
-		if envTrackTaintedVar(name) {
-			if st.taint == nil {
-				st.taint = map[string]bool{}
-			}
-			st.taint[name] = true
-		}
+		taintTrackedVar(st, name)
 		return
 	}
 	value := a[k+1:]
+	if flags&2 != 0 {
+		// R23-Oracle-M3: an array-subscript write `name[i]=v` touches ONE
+		// element of the array — every other element keeps its inherited
+		// value, so the scalar is never overwritten: no exact op stands,
+		// and a tracked variable turns uncertain outright.
+		taintTrackedVar(st, name)
+		return
+	}
+	if flags&1 != 0 {
+		foldAppendWrite(st, name, value)
+		return
+	}
 	st.ops = append(st.ops, envOp{kind: 'a', key: name, value: value})
 	if !st.taint[name] {
 		return
@@ -688,6 +722,39 @@ func (t *scopeEnvTracker) foldAssignWord(st *scopeEnvState, a string, cond bool)
 		return
 	}
 	delete(st.taint, name)
+}
+
+// taintTrackedVar marks one variable uncertain in the scope state when
+// the environment model tracks it at all (extracted from foldAssignWord
+// so the conditional/subscript write shapes carry no extra nesting —
+// the R23 complexity budget).
+func taintTrackedVar(st *scopeEnvState, name string) {
+	if !envTrackTaintedVar(name) {
+		return
+	}
+	if st.taint == nil {
+		st.taint = map[string]bool{}
+	}
+	st.taint[name] = true
+}
+
+// foldAppendWrite folds one bash `+=` append assignment (R23-Oracle-M3 /
+// R23-Reviewer-#2): the operator concatenates the suffix onto the OLD
+// value, so the result is never the independent constant the serialized
+// KEY=VAL word spells. PATH keeps its exact self-reference form when the
+// old value is certain (the expansion machinery replays it honestly);
+// once the old value is uncertain the concatenation depends on it and
+// the uncertainty MUST survive — clearing it here would launder the
+// conditional write into an exact constant exactly like the
+// plain-overwrite self-reference the R22 model already refuses. Every
+// other tracked variable has no self-expansion model at all, so the
+// append is uncertainty outright.
+func foldAppendWrite(st *scopeEnvState, name, value string) {
+	if name == "PATH" && !st.taint[name] {
+		st.ops = append(st.ops, envOp{kind: 'a', key: name, value: envPathSelfPlaceholder + value})
+		return
+	}
+	taintTrackedVar(st, name)
 }
 
 // view returns the environment op view one consumer scope runs with:

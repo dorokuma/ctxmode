@@ -13,6 +13,14 @@ import (
 // ---------- entry points used by the handlers ----------
 
 // guardCall is the per-role view computed once per tool call.
+// R23-Reviewer-#1 / R23-Oracle-M5: the xargs memo/budget table is
+// PRE-INITIALIZED on the struct (currentGuardCall mints it once per
+// request), so the one guardCall of a request shares ONE table across
+// all 12 callerIdentity call sites (head screening, prepare projection,
+// stdin fallback) instead of minting a fresh 512-node budget per stage —
+// the budget denominator is exactly one tool request. Copies of the
+// struct share the minted pointer, so a copy can never restart the
+// budget either.
 type guardCall struct {
 	subagent       bool
 	readonly       bool
@@ -22,6 +30,11 @@ type guardCall struct {
 	// screenCwd=="" semantics: resolution falls back to the process
 	// working directory (unit tests and unguarded call sites).
 	cwd string
+	// xw is the request-scoped xargs memo/budget table this call's
+	// identities share — pre-initialized by currentGuardCall; a zero-value
+	// hand-assembled struct (unit screening only) keeps the per-identity
+	// fallback table.
+	xw *xargsWorkState
 }
 
 func currentGuardCall() guardCall {
@@ -30,6 +43,12 @@ func currentGuardCall() guardCall {
 		subagent:       auditCallerIsSubagent(),
 		readonly:       ro,
 		strictReadonly: auditCallerIsStrictReadonly(),
+		// R23-Reviewer-#1 / R23-Oracle-M5: the xargs memo/budget table is
+		// PRE-INITIALIZED once per request object — every callerIdentity
+		// of this guardCall inherits the same pointer, so all twelve
+		// identity lookups of one tool request share the single 512-node
+		// budget while two concurrent requests naturally never share it.
+		xw: &xargsWorkState{},
 	}
 }
 
@@ -554,32 +573,33 @@ func hasInterpScriptExt(a string) bool {
 	return false
 }
 
-// stdinProgramHeadCwd is stdinProgramHead with the screening call's
-// resolution base pinned: callers that already hold a callerIdentity pass
-// its cwd so relative heads inside the argv resolve against the call's
-// directory, not the process cwd the zero caller would fall back to.
-func stdinProgramHeadCwd(argv []string, cwd string) (lang string, isInterp bool) {
-	lang, isProg, _, _ := stdinProgramHeadWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"), callerIdentity{cwd: cwd})
-	return lang, isProg
+// The former stdinProgramHeadCwd projection wrapper is gone
+// (R23-Reviewer-#5 / R23-Oracle-M5): its last consumer was the
+// first-non-data-target lookup inside the remote language projection,
+// which the multi-target rewrite replaced with the full-list iteration
+// — a partial lookup can never certify or reject correctly when one
+// segment projects several targets.
+
+// stdinEntryCaller mints the caller identity of one headless stdin
+// projection entry (R23-Reviewer-#1 / R23-Oracle-M5): with no enclosing
+// request identity to inherit, the entry itself pre-installs the xargs
+// memo/budget table so the ENTIRE projection chain below shares the one
+// 512-node budget — xargsEnsureWork's write-back then has nothing to
+// repair at intermediate layers.
+func stdinEntryCaller(cwd string) callerIdentity {
+	return callerIdentity{cwd: cwd, xw: &xargsWorkState{}}
 }
 
-// stdinProgramHeadCwdExh is stdinProgramHeadCwd plus the projection's
-// exhaustion state (R22-Oracle-M5 / R22-Reviewer-#5): the narrow
-// (lang,isProg) projection drops the exhausted bit, so callers that use
-// the verdict as a CONFIRMATION — the remote pure-shell exemption
-// certifies a known pure shell — must consult the explicit bit instead
-// of re-reading lang=="" as a POSIX shell. Rejection paths keep the
-// plain two-value projection: an exhausted consumer is never cleaner
-// than a shell there, so treating it as a program-shaped target is the
+// The former narrow stdinProgramHeadCwdExh projection is gone
+// (R23-Reviewer-#5 / R23-Oracle-M5): the remote pure-shell exemption is
+// a CERTIFICATION path, and a first-non-data-target lookup can launder
+// an exhausted sibling target behind a positively identified shell —
+// certification must iterate the projection's entire non-data list
+// (isPureRemoteStdinVehicleCwd does exactly that), so the two-value
+// narrow helper has no legitimate consumer left. Rejection paths keep
+// the plain projection: an exhausted consumer is never cleaner than a
+// shell there, so treating it as a program-shaped target is the
 // conservative direction already.
-func stdinProgramHeadCwdExh(argv []string, cwd string) (lang string, isInterp, exhausted bool) {
-	targets := stdinProgramTargetsWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"), callerIdentity{cwd: cwd})
-	t, has := firstProgramTarget(targets)
-	if !has {
-		return "", false, false
-	}
-	return t.lang, true, t.exhausted
-}
 
 // stdinProgramHeadWithEnv is stdinProgramHeadDepth carrying the env ops
 // accumulated above this recursion level: a peeled `PATH=...` prefix (or an
@@ -731,6 +751,10 @@ func (g guardCall) screenStdinTargets(targets []stdinTarget, argv []string, stdi
 			}
 			return "", ""
 		}
+		// The per-target copy preserves the original value semantics (the
+		// strict-escalation must never mutate the caller's own guardCall);
+		// xw is a shared pointer either way, so the request budget carries
+		// into the copy exactly like the direct identity.
 		gSeg := g
 		if gSeg.readonly && !gSeg.strictReadonly &&
 			(t.remote || sshTunnelsStdinProgram(argv, os.Getenv("PATH"), caller)) {
@@ -1077,39 +1101,13 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 // R16 M2); heads that spawn a FRESH shell (flock -c / script -c / watch /
 // `sh -c` unwrapping) pick their own dialect below and never inherit it.
 func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity, bash bool) []stdinTarget {
-	if len(argv) == 0 {
-		return nil
-	}
-	if depth >= shellSplitMaxDepth {
-		// R20-Oracle-M5: the budget boundary is an EXPLICIT exhaustion
-		// verdict, never nil — nil would ride the data-consumer fallback
-		// into a confirmed data-only summary and exempt a dynamic heredoc
-		// payload from every program screen, the exact opposite of the
-		// fail-closed direction a depth cutoff demands.
-		return []stdinTarget{{lang: "", envAs: inherited, exhausted: true}}
-	}
-	head, _, ea, exhausted := peelWrappers(argv)
-	envAs := inherited.merged(ea)
-	if exhausted {
-		// R22-Oracle-M5 / R22-Reviewer-#5: the wrapper-peel budget is an
-		// EXPLICIT exhaustion verdict exactly like the recursion-depth
-		// cutoff above — a zero-value lang:"" target would re-read as a
-		// KNOWN POSIX shell downstream, certifying bytes nobody identified.
-		return []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
+	head, envAs, caller, prologue := stdinTargetsPeelPrologue(argv, depth, inherited, caller)
+	if prologue != nil {
+		return prologue
 	}
 	if len(head) == 0 {
 		return nil
 	}
-	// Seed only THIS level's freshly-peeled ops BEFORE any early-return
-	// recursion: `inherited` already rode in on `caller` (the recursion
-	// seeds each layer as it descends), so seeding the merged envAs again
-	// would re-apply an outer `env -C` relative dir onto the already-
-	// chdir'd cwd — a doubled join (R4 MF-1). envAs itself is still
-	// recorded whole on the returned stdinTarget so every peeled op stays
-	// visible to the caller. seeding also covers envTaint/pathEnv — a
-	// canon-rewritten recursion (`env -C sub genv ./mysh`) must keep the
-	// -C re-anchor and the `u`/`a` taints it peeled (R5 MF-4).
-	caller = caller.seededWith(ea)
 	base := filepath.Base(head[0])
 	if canon := canonicalResolvedBase(base); canon != base {
 		if isPeeledWrapperBase(canon) {
@@ -1119,6 +1117,14 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 		base = canon
 	}
 	effPath := envAs.effectivePATHFrom(basePath)
+	// R23-Reviewer-#6 / R23-Oracle-#6: a bare (slash-free) command head
+	// owes its ENTIRE identity to PATH resolution — including a name the
+	// static head tables recognize (sh/dash/ash/bash/cat/…). When the
+	// effective PATH is untrusted the lookup answer is unknowable BEFORE
+	// any static spelling or symlink resolution may be adopted.
+	if bareHeadUntrustedPATH(head[0], envAs, basePath, caller) {
+		return []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
+	}
 	if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath, caller.screenCwd())); rb != "" && rb != base {
 		if isPeeledWrapperBase(rb) {
 			return stdinProgramTargetsDialect(append([]string{rb}, head[1:]...), depth+1, envAs, basePath, caller, bash)
@@ -1178,6 +1184,39 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 	return stdinUnknownHeadTargets(head[0], envAs, basePath, caller)
 }
 
+// stdinTargetsPeelPrologue is the entry prologue of
+// stdinProgramTargetsDialect (extracted for the R23 complexity budget):
+// the recursion-depth cutoff (R20-Oracle-M5) and the wrapper-peel budget
+// (R22-Oracle-M5 / R22-Reviewer-#5) are both EXPLICIT exhaustion
+// verdicts, never nil — nil would ride the data-consumer fallback into
+// a confirmed data-only summary and a zero-value lang:"" target would
+// re-read as a KNOWN POSIX shell downstream, certifying bytes nobody
+// identified. A non-nil prologue result IS the final verdict; otherwise
+// the caller proceeds with the peeled head, the merged env ops and the
+// level-seeded caller. Seeding covers only THIS level's freshly-peeled
+// ops BEFORE any early-return recursion: `inherited` already rode in on
+// `caller` (the recursion seeds each layer as it descends), so seeding
+// the merged envAs again would re-apply an outer `env -C` relative dir
+// onto the already-chdir'd cwd — a doubled join (R4 MF-1). envAs itself
+// is still recorded whole on the returned stdinTarget so every peeled
+// op stays visible to the caller; seeding also covers envTaint/pathEnv
+// — a canon-rewritten recursion (`env -C sub genv ./mysh`) must keep
+// the -C re-anchor and the `u`/`a` taints it peeled (R5 MF-4).
+func stdinTargetsPeelPrologue(argv []string, depth int, inherited envAssignments, caller callerIdentity) ([]string, envAssignments, callerIdentity, []stdinTarget) {
+	if len(argv) == 0 || depth >= shellSplitMaxDepth {
+		if len(argv) == 0 {
+			return nil, inherited, caller, nil
+		}
+		return nil, inherited, caller, []stdinTarget{{lang: "", envAs: inherited, exhausted: true}}
+	}
+	head, _, ea, exhausted := peelWrappers(argv)
+	envAs := inherited.merged(ea)
+	if exhausted {
+		return nil, envAs, caller, []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
+	}
+	return head, envAs, caller.seededWith(ea), nil
+}
+
 // stdinUnknownHeadTargets is the tail verdict of
 // stdinProgramTargetsDialect for an unrecognized head (R22-Oracle-#6 /
 // R22-Reviewer-#6): an unrecognized BARE name carries no static
@@ -1206,6 +1245,22 @@ func stdinUnknownHeadTargets(head string, envAs envAssignments, basePath string,
 	return nil
 }
 
+// bareHeadUntrustedPATH reports whether a command head is a bare
+// (slash-free) name whose resolution depends on an untrusted PATH
+// (R23-Reviewer-#6 / R23-Oracle-#6, extracted so the interception inside
+// stdinProgramTargetsDialect carries no extra nesting): the same bare
+// `sh` can be dash, bash, or an attacker-placed program once the search
+// list is unknowable, so neither a static spelling nor a later
+// PATH-segment hit may be adopted — the consumer is UNIDENTIFIED. Fixed
+// absolute spellings (/bin/sh, ./x) carry their own resolution and stay
+// unaffected exactly like stdinUnknownHeadTargets.
+func bareHeadUntrustedPATH(head string, envAs envAssignments, basePath string, caller callerIdentity) bool {
+	if strings.ContainsRune(head, '/') {
+		return false
+	}
+	return envAs.pathUntrusted(basePath) || caller.pathUntrusted()
+}
+
 // collectOneStdinSeg projects one nested segment inside the collectSegs
 // loop (extracted so the closure carries no per-segment branching — the
 // R22 complexity budget): an unparsed or depth-exhausted segment is an
@@ -1225,10 +1280,19 @@ func collectOneStdinSeg(tracker *scopeEnvTracker, seg shellSegment, depth int, s
 	if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 		return nil
 	}
-	if !seg.pureAssign {
-		if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv, subCaller); len(peeledHead) == 0 {
-			return nil
-		}
+	// R23-Reviewer-#7 / R23-Oracle-SF2: a pure-assignment segment consumes
+	// NO stdin — its ops already folded into the tracker above — so it
+	// must skip BEFORE any view materialization exactly like the flat
+	// prepare scan. The pre-R23 condition guarded only the empty-head
+	// peel, letting every real assignment reach tracker.view: n
+	// consecutive nested assignments copied 1+2+…+n ops of quota the
+	// parent tree never paid, and the projection could even mint phantom
+	// depth exhaustion for a segment that never reads the stream.
+	if seg.pureAssign {
+		return nil
+	}
+	if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv, subCaller); len(peeledHead) == 0 {
+		return nil
 	}
 	runEnv := subEnv.merged(tracker.view(seg.scopePath))
 	return collectStdinSegTargets(seg, depth, runEnv, envAs, subPath, mergeOuter, subCaller)
@@ -1440,30 +1504,60 @@ func stdinXargsTargets(head []string, depth int, envAs envAssignments, basePath,
 	if k >= len(head) {
 		return nil
 	}
-	if !xargsFeedsCodeFlag(head[k:], head, effPath, caller) {
-		return stdinProgramTargetsWithEnv(head[k:], depth+1, envAs, basePath, caller)
-	}
-	innerHead, innerEnv, innerEffPath, innerExhausted := peelWrappersAndWrapperAliases(head[k:], effPath, caller)
-	envAs = envAs.merged(innerEnv)
-	if innerExhausted {
-		// R22-Oracle-M5 / R22-Reviewer-#5: the xargs inner target's own
-		// wrapper peel exhausted its budget — the consumer identity is
-		// UNKNOWABLE, so the target must carry the exhaustion verdict
-		// exactly like the recursion cutoff instead of posing as a known
-		// POSIX shell.
+	// R23-Reviewer-#5 / R23-Oracle-M5: the xargs analysis's bool conflates
+	// "the stdin words provably feed an open code slot" with "the shared
+	// single-request work budget gave up" — both fail closed inside the
+	// analysis, but the TARGET projection must distinguish them: a budget
+	// cutoff means the consumer identity is UNKNOWABLE (an exhaustion
+	// verdict), never the zero-value POSIX shell an ordinary cat inner
+	// target would project. The budget is sticky per request, so the
+	// caller's table carries the exhausted state across the analysis call.
+	caller, ws := xargsEnsureWork(caller)
+	feedsCode := xargsFeedsCodeFlag(head[k:], head, effPath, caller)
+	if xargsBudgetSpent(ws) {
 		return []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
 	}
-	if len(innerHead) > 0 {
-		innerCaller := caller.seededWith(innerEnv)
-		ib := filepath.Base(innerHead[0])
-		if rb := canonicalResolvedBase(resolveHeadBase(innerHead[0], innerEffPath, innerCaller.screenCwd())); rb != "" {
-			ib = rb
-		}
-		if l, ok := heredocInterpLang(ib); ok {
-			return []stdinTarget{{lang: l, envAs: envAs}}
-		}
+	if !feedsCode {
+		return stdinProgramTargetsWithEnv(head[k:], depth+1, envAs, basePath, caller)
+	}
+	return stdinXargsInnerTarget(head[k:], depth+1, envAs, effPath, caller)
+}
+
+// stdinXargsInnerTarget projects the inner target of an xargs invocation
+// whose stdin words provably feed its open code slot (extracted for the
+// R23 complexity budget): the target resolves under its own peeled env
+// (the `env -C sub` re-anchor inside the xargs operand), so a symlink
+// alias like ./myruby -> <real ruby> yields its language, never the
+// POSIX-shell re-review lang:"" (R6 MF-1). The inner target's own
+// wrapper-peel budget is an exhaustion verdict exactly like the
+// recursion cutoff (R22-Oracle-M5 / R22-Reviewer-#5) — the consumer
+// identity is UNKNOWABLE, never a known POSIX shell.
+func stdinXargsInnerTarget(argv []string, depth int, envAs envAssignments, effPath string, caller callerIdentity) []stdinTarget {
+	innerHead, innerEnv, innerEffPath, innerExhausted := peelWrappersAndWrapperAliases(argv, effPath, caller)
+	envAs = envAs.merged(innerEnv)
+	if innerExhausted {
+		return []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
+	}
+	if lang, hit := stdinInnerHeadLang(innerHead, innerEffPath, caller.seededWith(innerEnv)); hit {
+		return []stdinTarget{{lang: lang, envAs: envAs}}
 	}
 	return []stdinTarget{{lang: "", envAs: envAs}}
+}
+
+// stdinInnerHeadLang classifies one peeled inner target head by its
+// resolved basename (extracted for the R23 complexity budget): the typed
+// name and the PATH/symlink-resolved name both decide the interpreter
+// language exactly like the flat projection. The second return is false
+// for an empty head or a non-interpreter resolution.
+func stdinInnerHeadLang(head []string, effPath string, caller callerIdentity) (string, bool) {
+	if len(head) == 0 {
+		return "", false
+	}
+	ib := filepath.Base(head[0])
+	if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath, caller.screenCwd())); rb != "" {
+		ib = rb
+	}
+	return heredocInterpLang(ib)
 }
 
 // stdinShellTargetsScan is the shell-head tail of

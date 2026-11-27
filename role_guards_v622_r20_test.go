@@ -714,9 +714,16 @@ func TestGuard_V622_OracleR22Probes(t *testing.T) {
 		}
 		// Positive control: a completely INDEPENDENT constant overwrite
 		// re-establishes the exact value — the taint clears.
+		// R23-Reviewer-#2 / R23-Oracle-M3: the control must assert the
+		// SUCCESS and the EXACT value, not merely tolerate a vacuous pass
+		// — a probe that never grants the rewrite proves nothing about
+		// the overwrite's independence.
 		indep, indepOK := probe("x=1 && PATH=" + pathB + "; PATH=/usr/bin:/bin; /bin/bash")
-		if indepOK && indep != "/usr/bin:/bin" && indep != "" {
-			t.Fatalf("control broken: independent constant overwrite PATH = %q, want /usr/bin:/bin — a constant overwrite does not depend on the old value", indep)
+		if !indepOK {
+			t.Fatalf("control broken: independent constant overwrite rewrite REFUSED — a constant overwrite does not depend on the old value and must re-establish the exact PATH")
+		}
+		if indep != "/usr/bin:/bin" {
+			t.Fatalf("control broken: independent constant overwrite PATH = %q, want exactly /usr/bin:/bin — a constant overwrite does not depend on the old value", indep)
 		}
 	})
 	t.Run("R22-M3 a quoted command word spelling KEY=VAL is never folded as an assignment", func(t *testing.T) {
@@ -972,6 +979,418 @@ func TestGuard_V622_OracleR22Probes(t *testing.T) {
 		}
 		if late > early*3/2 {
 			t.Fatalf("marginal allocation of a fixed-width pure-assignment window GROWS with the prefix length: %d bytes for segments 1-8 vs %d for segments 57-64 (ratio %.2f, want ≤ 1.5) — the production traversal still materializes one prefix-snapshot copy per segment even with no stdin consumer (quadratic copy cascade), instead of folding ops only", early, late, float64(late)/float64(early))
+		}
+	})
+}
+
+// TestGuard_V622_OracleR23Probes pins the Oracle R23 / Reviewer R23
+// closure — one discriminating subtest per intersecting finding:
+//
+//	R23-1: one guardCall shares ONE xargs memo/budget table across every
+//	  callerIdentity lookup of the request, while a second guardCall owns
+//	  an independent full budget (Reviewer #1 / Oracle M5-xargs).
+//	R23-2: the assignment operator provenance survives serialization — a
+//	  `+=` append or array-subscript overwrite of a conditionally tainted
+//	  tracked variable never launders the uncertainty into the serialized
+//	  KEY=VAL constant, and the independent plain `=` overwrite still
+//	  re-establishes the exact value (Reviewer #2 / Oracle M3).
+//	R23-3: function definitions inside same-process compound blocks of a
+//	  static eval text register into the process shadowing track, child-
+//	  process definitions never leak into the parent, and PIPESTATUS/`_`
+//	  can never hold an assigned value across the next command
+//	  (Reviewer #3 / Oracle M1).
+//	R23-4: the bind root-eval truncation drops no operand-evaluation AST
+//	  write — `${X=v}` inside an eval operand word taints exactly the
+//	  counted write — and a nested tainted chain without a confirmable
+//	  operand boundary faces the uniform maximal pollution verdict
+//	  (Reviewer #4 / Oracle M2).
+//	R23-5: the remote pure-shell exemption consults EVERY non-data
+//	  projection target, and the xargs work-budget cutoff is an explicit
+//	  exhaustion verdict distinct from a confirmed code-slot hit
+//	  (Reviewer #5 / Oracle M5).
+//	R23-6: a bare PATH-dependent command head — including the dialect-
+//	  ambiguous bare `sh` — is unknowable under an untrusted PATH before
+//	  any static spelling or lookup result is adopted, and both prepare
+//	  entries share the stdinRewriteableTarget refusal (Reviewer #6 /
+//	  Oracle #6).
+//	R23-7: the nested collectOneStdinSeg loop skips pure-assignment
+//	  segments BEFORE any view materialization exactly like the flat
+//	  scan (Reviewer #7 / Oracle SF2).
+//
+// Every discriminating row is FAIL-first on the pre-fix tree b9d481e:
+// the probes reference only symbols that already exist there (the
+// collectors, the projection helpers, xargsWorkState/xargsWorkBudget)
+// so the file compiles verbatim on the parent tree and the failures
+// reproduce the audit findings directly.
+func TestGuard_V622_OracleR23Probes(t *testing.T) {
+	// lastOperand encodes the last segment's second argv word of a script —
+	// the substitution/binding result the replication state decides.
+	lastOperand := func(t *testing.T, script string) string {
+		t.Helper()
+		segs, ok := parseSubagentShellASTEnv(script, 0, false, true, nil, callerIdentity{})
+		if !ok || len(segs) == 0 {
+			t.Fatalf("parse %q failed: ok=%v segs=%v", script, ok, segs)
+		}
+		last := segs[len(segs)-1]
+		if len(last.argv) < 2 {
+			t.Fatalf("parse %q: last seg argv=%v, want at least 2 words", script, last.argv)
+		}
+		return last.argv[1]
+	}
+
+	// ---- R23-1: one request, one xargs budget table ----
+	t.Run("R23-1 a single guardCall shares one xargs budget across every stage identity", func(t *testing.T) {
+		// The production request mints its guardCall once per tool call;
+		// the head screening, prepare projection and fallback stages all
+		// derive their callerIdentity from it. Exhausting the first
+		// stage's table must be visible in the second stage's identity —
+		// the 512-node ceiling denominates the REQUEST, not one stage.
+		g := currentGuardCall()
+		c1 := g.callerIdentity()
+		c2 := g.callerIdentity()
+		if c1.xw == nil || c2.xw == nil {
+			t.Fatalf("guardCall identities carry no xargs work state (c1.xw nil=%v, c2.xw nil=%v) — the per-request table must ride every stage identity", c1.xw == nil, c2.xw == nil)
+		}
+		if c1.xw != c2.xw {
+			t.Fatalf("two callerIdentity lookups of the SAME guardCall carry distinct xargs tables (%p vs %p) — the budget denominator is a stage, not the request", c1.xw, c2.xw)
+		}
+		c1.xw.mu.Lock()
+		c1.xw.steps = xargsWorkBudget
+		c1.xw.mu.Unlock()
+		c2.xw.mu.Lock()
+		steps2 := c2.xw.steps
+		c2.xw.mu.Unlock()
+		if steps2 != xargsWorkBudget {
+			t.Fatalf("exhausted first-stage budget invisible in second-stage identity (steps=%d, want %d) — the request ceiling is per stage", steps2, xargsWorkBudget)
+		}
+		// A second request owns an independent full budget.
+		g2 := currentGuardCall()
+		c3 := g2.callerIdentity()
+		if c3.xw == c1.xw {
+			t.Fatalf("two distinct guardCalls share one xargs table — cross-request isolation regressed")
+		}
+		c3.xw.mu.Lock()
+		steps3 := c3.xw.steps
+		c3.xw.mu.Unlock()
+		if steps3 != 0 {
+			t.Fatalf("independent request's budget starts at %d, want 0 — the other request's exhaustion must never cross the boundary", steps3)
+		}
+	})
+
+	// foldViewOps parses one bash script, folds its segments into a fresh
+	// tracker in statement order and returns the root scope view — the
+	// direct fold/view pair of the environment model (the prepare-level
+	// probe cannot discriminate these rows: the POSIX secondary tree
+	// parses `PATH+=x`/`PATH[1]=x` as plain command words and refuses the
+	// rewrite for an unrelated reason on BOTH trees).
+	foldViewOps := func(t *testing.T, scripts ...string) []envOp {
+		t.Helper()
+		tracker := &scopeEnvTracker{}
+		for _, script := range scripts {
+			segs, ok := parseSubagentShellASTEnv(script, 0, false, true, nil, callerIdentity{})
+			if !ok || len(segs) == 0 {
+				t.Fatalf("parse %q failed: ok=%v segs=%v", script, ok, segs)
+			}
+			for _, seg := range segs {
+				tracker.foldSegment(seg, callerIdentity{})
+			}
+		}
+		return tracker.view("").ops
+	}
+
+	// ---- R23-2: append/subscript writes never launder conditional uncertainty ----
+	t.Run("R23-2 a += append overwrite of a tainted PATH never mints the suffix-only exact value", func(t *testing.T) {
+		// The conditional write may or may not execute, so PATH is
+		// uncertain; bash's append operator concatenates onto that
+		// unknowable OLD value — the serialized KEY=VAL suffix must never
+		// clear the uncertainty marker.
+		ops := foldViewOps(t, "x=1 && PATH=/usr/local/sbin", "PATH+=/suffix")
+		hasTaint, hasSuffixOverride := false, false
+		for _, op := range ops {
+			if op.kind == 't' && op.key == "PATH" {
+				hasTaint = true
+			}
+			if op.kind == 'a' && op.key == "PATH" && op.value == "/suffix" {
+				hasSuffixOverride = true
+			}
+		}
+		if hasSuffixOverride && !hasTaint {
+			t.Fatalf("conditional-write then PATH+=/suffix view = %v — the append concatenates onto the unknowable old value, so the serialized suffix-only constant cannot stand without the uncertainty marker", ops)
+		}
+		if !hasTaint {
+			t.Fatalf("conditional-write then PATH+=/suffix view = %v carries NO PATH uncertainty — the conditional write's taint must survive the append", ops)
+		}
+		// Positive control: a plain `=` INDEPENDENT constant overwrite
+		// clears the uncertainty and re-establishes the exact value —
+		// the operator distinction must not degrade the plain spelling.
+		indep := foldViewOps(t, "x=1 && PATH=/usr/local/sbin", "PATH=/usr/bin:/bin")
+		exact, tainted := false, false
+		for _, op := range indep {
+			if op.kind == 't' && op.key == "PATH" {
+				tainted = true
+			}
+			if op.kind == 'a' && op.key == "PATH" && op.value == "/usr/bin:/bin" {
+				exact = true
+			}
+		}
+		if !exact || tainted {
+			t.Fatalf("control broken: independent plain constant overwrite view = %v — want the exact /usr/bin:/bin op with NO surviving taint", indep)
+		}
+	})
+	t.Run("R23-2 an array-subscript overwrite never mints the scalar exact value", func(t *testing.T) {
+		// PATH[1]=/x writes ONE array element — element 0 (the scalar
+		// expansion) keeps its inherited value, so the write can never
+		// clear the conditional uncertainty with the serialized constant.
+		ops := foldViewOps(t, "x=1 && PATH=/usr/local/sbin", "PATH[1]=/x")
+		hasTaint, hasExactX := false, false
+		for _, op := range ops {
+			if op.kind == 't' && op.key == "PATH" {
+				hasTaint = true
+			}
+			if op.kind == 'a' && op.key == "PATH" && op.value == "/x" {
+				hasExactX = true
+			}
+		}
+		if hasExactX && !hasTaint {
+			t.Fatalf("conditional-write then PATH[1]=/x view = %v — the subscript write never overwrites the scalar, so the serialized /x constant cannot stand without the uncertainty marker", ops)
+		}
+		if hasExactX && hasTaint {
+			t.Fatalf("conditional-write then PATH[1]=/x view = %v — even shadowed by the taint, minting the exact /x op pretends a scalar overwrite that never happens; the subscript write must not serialize as a plain override at all", ops)
+		}
+	})
+
+	// ---- R23-3: scope-aware shadowing registration + volatile variables ----
+	t.Run("R23-3 a function definition inside a brace block of a static eval shadows later eval", func(t *testing.T) {
+		// Top-level control: the direct definition shadows exactly like
+		// the R22 premise.
+		top := lastOperand(t, `eval() { :; }; eval 'R23_V=/after'; echo "$R23_V"`)
+		if top == "/after" {
+			t.Fatalf("control broken: top-level shadowed eval binding query = %q — the direct shadowing registration itself regressed", top)
+		}
+		// The same definition inside a brace block of the eval TEXT is a
+		// same-process definition: eval re-parses `{ eval() { :; }; }` in
+		// the running shell, so the second eval resolves to the function
+		// and the exact binding is impossible.
+		brace := lastOperand(t, `eval '{ eval() { :; }; }'; eval 'R23_V=/after'; echo "$R23_V"`)
+		if brace == "/after" {
+			t.Fatalf("brace-block eval-shadowing binding query = %q — the definition inside the same-process compound block never registered, so the replication minted a builtin binding the shadowed runtime can never perform", brace)
+		}
+		// Positive control: without the inner definition the replication
+		// binds exactly like before.
+		plain := lastOperand(t, `eval '{ :; }'; eval 'R23_V=/after'; echo "$R23_V"`)
+		if plain != "/after" {
+			t.Fatalf("control broken: unshadowed brace-block eval binding query = %q, want /after", plain)
+		}
+	})
+	t.Run("R23-3 a subshell function definition never shadows the parent shell", func(t *testing.T) {
+		// ( eval() { :; } ) dies with the subshell — the parent's later
+		// bare eval still resolves to the real builtin, so the exact
+		// binding is sound. A leaking child-process registration would
+		// taint it instead.
+		got := lastOperand(t, `( eval() { :; } ); eval 'R23_V=/after'; echo "$R23_V"`)
+		if got != "/after" {
+			t.Fatalf("subshell-scoped shadowing binding query = %q, want /after — the child process's definition must die with it; the parent's positional track must restore at the boundary", got)
+		}
+		// A backgrounded definition dies with its child process exactly
+		// like the subshell spelling. (A bare `eval() { :; } | cat` is no
+		// fixture: bash parses the pipeline as the function's BODY, so the
+		// definition itself genuinely takes effect in the parent shell.)
+		bg := lastOperand(t, `{ eval() { :; }; } & eval 'R23_V=/after'; echo "$R23_V"`)
+		if bg != "/after" {
+			t.Fatalf("background-scoped shadowing binding query = %q, want /after — the backgrounded subtree is a child process exactly like the subshell", bg)
+		}
+	})
+	t.Run("R23-3 PIPESTATUS never holds an assigned value across the next command", func(t *testing.T) {
+		// bash rewrites PIPESTATUS after EVERY foreground pipeline — the
+		// assigned /after is discarded by the intervening `:` long before
+		// the echo expands the variable, so the exact bind is impossible.
+		got := lastOperand(t, `eval "PIPESTATUS=/after"; :; echo "$PIPESTATUS"`)
+		if got == "/after" {
+			t.Fatalf("PIPESTATUS binding query = %q — the shell-maintained pipeline status array can never hold an assigned value across the next simple command", got)
+		}
+		underscore := lastOperand(t, `eval "_=/after"; :; echo "$_"`)
+		if underscore == "/after" {
+			t.Fatalf("underscore binding query = %q — the shell re-binds _ at every command start", underscore)
+		}
+	})
+
+	// ---- R23-4: operand-evaluation writes survive the bind truncation ----
+	t.Run("R23-4 an eval operand parameter-assignment expansion lands as pollution", func(t *testing.T) {
+		// eval ${AUDIT_MARK=/val}: the outer script carries exactly ONE
+		// AST write of the marker (the operand word's := expansion), the
+		// pre-scan counts it, and the bind-truncated statement scan drops
+		// the whole operand list — the replication must own the
+		// operand-evaluation write explicitly.
+		p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+		f, err := p.Parse(strings.NewReader(`eval ${AUDIT_MARK=/val}`), "")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(f.Stmts) != 1 {
+			t.Fatalf("fixture broken: %d statements", len(f.Stmts))
+		}
+		writes, _ := preScanVarMutations(f, false)
+		if writes["AUDIT_MARK"] != 1 {
+			t.Fatalf("pre-scan AUDIT_MARK write count = %d, want 1 — the operand expansion write is exactly the counted shape (this assertion pins the scanner half of the invariant)", writes["AUDIT_MARK"])
+		}
+		call, isCall := f.Stmts[0].Cmd.(*syntax.CallExpr)
+		if !isCall {
+			t.Fatalf("fixture broken: root cmd is %T, want CallExpr", f.Stmts[0].Cmd)
+		}
+		c := blankSubCollector()
+		c.allowBind = true
+		c.bindEvalCallWrites(f.Stmts[0], call)
+		if !c.taintedVars["AUDIT_MARK"] {
+			t.Fatalf("bindEvalCallWrites left AUDIT_MARK untouched (taintedVars=%v staticVars=%v) — the counted write vanished between the truncated scan and the replication: neither bound nor polluted", c.taintedVars, c.staticVars)
+		}
+		if c.staticVars["AUDIT_MARK"] == "/val" {
+			t.Fatalf("AUDIT_MARK minted the exact /val bind — a default-assign expansion is conditional at runtime, so pollution is the only sound verdict")
+		}
+	})
+
+	// ---- R23-5: full-list remote certification + xargs budget distinction ----
+	t.Run("R23-5 the remote exemption consults every non-data projection target", func(t *testing.T) {
+		if !isPureRemoteStdinVehicleCwd("sh", "/tmp") {
+			t.Fatalf("control broken: isPureRemoteStdinVehicleCwd(sh) = false — the plain remote shell vehicle keeps its exemption eligibility")
+		}
+		longSeg := "cat"
+		for i := 0; i < peelWrapperMaxSteps+4; i++ {
+			longSeg = "env " + longSeg
+		}
+		// One outer vehicle segment projects TWO non-data targets: the
+		// positively identified inner shell AND the wrapper-exhausted
+		// sibling. Certification keyed on the first target alone launder
+		// the exhausted one — both orders must refuse.
+		first := "bash -c 'sh; " + longSeg + "'"
+		if isPureRemoteStdinVehicleCwd(first, "/tmp") {
+			t.Fatalf("isPureRemoteStdinVehicleCwd(shell-first multi-target vehicle) = true — the first non-data target is a positively identified shell, but the exhausted sibling certifies nothing; the exemption must consult the ENTIRE projection")
+		}
+		second := "bash -c '" + longSeg + "; sh'"
+		if isPureRemoteStdinVehicleCwd(second, "/tmp") {
+			t.Fatalf("isPureRemoteStdinVehicleCwd(exhausted-first multi-target vehicle) = true — even the favourable order must never certify an unidentified consumer")
+		}
+	})
+	t.Run("R23-5 an xargs budget cutoff is exhaustion, never a confirmed shell target", func(t *testing.T) {
+		// Pre-install a fully spent budget on the caller: the analysis
+		// fails closed (true) inside xargsFeedsCodeFlag, but a plain cat
+		// inner target has no open code slot — the budget cutoff must
+		// surface as an EXPLICIT exhaustion verdict, never the zero-value
+		// lang:"" pseudo-POSIX-shell target the control produces.
+		caller := callerIdentity{xw: &xargsWorkState{steps: xargsWorkBudget}}
+		targets := stdinProgramTargetsDialect([]string{"xargs", "cat"}, 0, envAssignments{}, "/usr/bin:/bin", caller, false)
+		hasExhausted := false
+		for _, tg := range targets {
+			if tg.exhausted {
+				hasExhausted = true
+			}
+		}
+		if !hasExhausted {
+			t.Fatalf("stdinProgramTargetsDialect(budget-exhausted xargs cat) = %v targets with NO exhaustion marker — the budget cutoff means the consumer identity is unknowable, never a confirmed data or shell verdict", targets)
+		}
+		// Control: a fresh budget over the same argv keeps the ordinary
+		// non-exhausted projection — the budget state itself is the
+		// discriminator.
+		fresh := stdinProgramTargetsDialect([]string{"xargs", "cat"}, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{xw: &xargsWorkState{}}, false)
+		for _, tg := range fresh {
+			if tg.exhausted {
+				t.Fatalf("control broken: fresh-budget xargs cat = %v carries an exhaustion marker — the ordinary data projection regressed", fresh)
+			}
+		}
+	})
+
+	// ---- R23-6: bare heads are unknowable under an untrusted PATH ----
+	t.Run("R23-6 a bare sh under an untrusted PATH never certifies one dialect", func(t *testing.T) {
+		var runEnv envAssignments
+		runEnv.ops = append(runEnv.ops, envOp{kind: 't', key: "PATH"})
+		targets := stdinProgramTargetsDialect([]string{"sh"}, 0, runEnv, "/usr/bin:/bin", callerIdentity{}, false)
+		hasExhausted := false
+		for _, tg := range targets {
+			if tg.exhausted {
+				hasExhausted = true
+			}
+			if !tg.exhausted && tg.lang == "" && !tg.bash {
+				t.Fatalf("bare sh under untrusted PATH = %+v — the zero-value confirmed-POSIX verdict certifies a dialect nobody resolved: the same bare name can be dash, bash or an attacker-placed program", tg)
+			}
+		}
+		if !hasExhausted {
+			t.Fatalf("bare sh under untrusted PATH = %v targets with NO exhaustion marker — a PATH-dependent identity under an unanswerable PATH is unknowable", targets)
+		}
+		// Positive controls: the same bare head under a TRUSTED PATH
+		// keeps its ordinary projection, and a fixed absolute spelling
+		// never depends on PATH at all.
+		trusted := stdinProgramTargetsDialect([]string{"sh"}, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+		trustedProg := false
+		for _, tg := range trusted {
+			if !tg.data && !tg.exhausted {
+				trustedProg = true
+			}
+			if tg.exhausted {
+				t.Fatalf("control broken: trusted-PATH bare sh = %v carries exhaustion — the interception must not fire on a resolvable PATH", trusted)
+			}
+		}
+		if !trustedProg {
+			t.Fatalf("control broken: trusted-PATH bare sh yields no program target (%v) — the shell projection itself regressed", trusted)
+		}
+		abs := stdinProgramTargetsDialect([]string{"/bin/sh"}, 0, runEnv, "/usr/bin:/bin", callerIdentity{}, false)
+		for _, tg := range abs {
+			if tg.exhausted {
+				t.Fatalf("control broken: absolute /bin/sh under untrusted PATH = %v carries exhaustion — a fixed absolute spelling never depends on PATH resolution", abs)
+			}
+		}
+		// The joint rewrite refusal is the shared helper itself: an
+		// env slice carrying the uncertainty marker is never rewrite-
+		// eligible, while the same target list without it is.
+		var badEnv, goodEnv envAssignments
+		badEnv.ops = append(badEnv.ops, envOp{kind: 't', key: "PATH"})
+		badTargets := []stdinTarget{{lang: "", envAs: badEnv}}
+		if _, ok, _ := stdinRewriteableTarget(badTargets, false, "/usr/bin:/bin"); ok {
+			t.Fatalf("stdinRewriteableTarget(uncertainty-marker target env) = ok — the joint refusal both prepare entries share regressed")
+		}
+		goodTargets := []stdinTarget{{lang: "", envAs: goodEnv}}
+		if _, ok, _ := stdinRewriteableTarget(goodTargets, false, "/usr/bin:/bin"); !ok {
+			t.Fatalf("control broken: stdinRewriteableTarget(clean target env) = refused — the ordinary rewrite eligibility regressed")
+		}
+	})
+
+	// ---- R23-7: the nested loop skips pure assignments before any view ----
+	t.Run("R23-7 the nested collectOneStdinSeg loop pays zero view copies for pure assignments", func(t *testing.T) {
+		// Mirror of the R22-SF2 byte-window discrimination, but for the
+		// NESTED collectSegs loop: the pre-fix condition guarded only the
+		// empty-head peel, so every real nested assignment reached
+		// tracker.view and copied the accumulated prefix (1+..+n ops).
+		mkSegs := func(n int) []shellSegment {
+			var sb strings.Builder
+			for i := 0; i < n; i++ {
+				sb.WriteString("R23X")
+				sb.WriteByte(byte('a' + i%26))
+				sb.WriteByte(byte('a' + i/26))
+				sb.WriteString("=1; ")
+			}
+			return splitShellSegments(sb.String())
+		}
+		measure := func(n int) uint64 {
+			segs := mkSegs(n)
+			if len(segs) != n {
+				t.Fatalf("fixture broken: %d segments for %d assignments", len(segs), n)
+			}
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			tracker := &scopeEnvTracker{}
+			for _, seg := range segs {
+				collectOneStdinSeg(tracker, seg, 0, envAssignments{}, envAssignments{}, "/usr/bin:/bin", false, callerIdentity{})
+			}
+			runtime.ReadMemStats(&after)
+			return after.TotalAlloc - before.TotalAlloc
+		}
+		b8, b56, b64 := measure(8), measure(56), measure(64)
+		early := b8       // segments 1-8
+		late := b64 - b56 // segments 57-64
+		if early == 0 {
+			t.Fatalf("fixture broken: zero marginal bytes for segments 1-8 (b8=%d)", b8)
+		}
+		if late > early*3/2 {
+			t.Fatalf("nested collectOneStdinSeg marginal allocation GROWS with the prefix length: %d bytes for segments 1-8 vs %d for segments 57-64 (ratio %.2f, want ≤ 1.5) — the nested loop still materializes one view copy per pure-assignment segment instead of skipping before the view", early, late, float64(late)/float64(early))
 		}
 	})
 }

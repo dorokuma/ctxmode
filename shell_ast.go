@@ -1652,6 +1652,36 @@ func writeNamesInStmtFuncs(st *syntax.Stmt, posixNoBraces bool, funcNames map[st
 	return names, at
 }
 
+// taintOperandParamAssigns taints every variable a word list's
+// parameter-expansion ASSIGNMENT operators write (R23-Reviewer-#4 /
+// R23-Oracle-M2): `${X=v}` and `${X:=v}` inside an eval OPERAND word
+// expand when the shell evaluates the operand — BEFORE eval re-parses
+// anything — so the write is neither part of the re-parse text (the
+// replication's subject) nor visible in the truncated root-call scan
+// writeNamesInStmtFuncs performs for a bind verdict. The pre-scan counts
+// exactly these AST nodes, so the replication must own them explicitly:
+// pollution (never a silent skip) is the sound verdict for a write the
+// operand evaluation performs unconditionally — a default-assign
+// expansion is conditional at runtime on X being unset, which is
+// precisely the uncertainty direction.
+func (c *subCollector) taintOperandParamAssigns(words []*syntax.Word) {
+	for _, w := range words {
+		if w == nil {
+			continue
+		}
+		syntax.Walk(w, func(node syntax.Node) bool {
+			if node == nil {
+				return false
+			}
+			if pe, isPe := node.(*syntax.ParamExp); isPe && pe.Param != nil && pe.Exp != nil &&
+				(pe.Exp.Op == syntax.AssignUnset || pe.Exp.Op == syntax.AssignUnsetOrNull) {
+				c.taintVar(pe.Param.Value)
+			}
+			return true
+		})
+	}
+}
+
 // bindEvalCallWrites replicates the variable BINDINGS of a static eval
 // invocation into this collector (R19-Oracle-M2): eval re-parses its
 // operand text in the SAME shell process, so `eval 'PATH=/custom/dir'`
@@ -1680,6 +1710,14 @@ func (c *subCollector) bindEvalCallWrites(st *syntax.Stmt, call *syntax.CallExpr
 	if len(call.Args) == 0 {
 		return
 	}
+	// R23-Reviewer-#4 / R23-Oracle-M2: the parameter-expansion writes of
+	// the OPERAND WORDS belong to the operand's own evaluation, never to
+	// the re-parse — and the root-call truncation the statement write
+	// scan performs for a bind verdict drops exactly these AST nodes, so
+	// the replication must own them explicitly for every chain verdict.
+	// Skip them only when the chain provably never executes anything
+	// (non-eval head / pure resolution query): the pre-scan counts no
+	// eval operand writes in exactly those cases either.
 	verdict, rest := peelEvalBuiltinChainShadowed(call.Args, c.posixNoBraces, c.funcNames)
 	if verdict == evalChainNone || verdict == evalChainQuery {
 		// Not eval at all, or a provable pure resolution query that
@@ -1687,6 +1725,7 @@ func (c *subCollector) bindEvalCallWrites(st *syntax.Stmt, call *syntax.CallExpr
 		// either, so the replication can skip them precisely.
 		return
 	}
+	c.taintOperandParamAssigns(call.Args)
 	if rest == nil {
 		// R22-Oracle-M2 / R22-Reviewer-#4: a TAINTED chain without a
 		// confirmable operand boundary (no statically visible bare eval
@@ -1696,23 +1735,34 @@ func (c *subCollector) bindEvalCallWrites(st *syntax.Stmt, call *syntax.CallExpr
 		return
 	}
 	if len(rest) < 2 {
-		// A bare eval-shaped head with no operand text re-parses nothing.
+		// R23-Reviewer-#4 / R23-Oracle-M2: a TAINTED chain whose visible
+		// operand text is absent still carries the unconfirmable boundary
+		// — the uniform maximal pollution verdict applies exactly like
+		// the rest==nil shape; a proven bind chain with no operands
+		// genuinely re-parses nothing.
+		c.taintShortRestBoundary(verdict, call.Args)
 		return
 	}
+	c.replayEvalOperandTail(verdict, rest, len(st.Redirs) > 0)
+}
+
+// replayEvalOperandTail is the static-operand decode and replay
+// dispatch shared by bindEvalCallWrites (extracted for the R23
+// complexity budget): a dynamic operand makes the re-parse unknowable,
+// and the pre-scan conservatively counts every sentinel variable as
+// written in exactly this case, so the replay must match the definition
+// (R21-Oracle-M2 — counted writes may never vanish).
+func (c *subCollector) replayEvalOperandTail(verdict evalChainVerdict, rest []*syntax.Word, hasRedirs bool) {
 	scanWord := wordToArg
 	if c.posixNoBraces {
 		scanWord = wordToArgPosix
 	}
 	parts, static := evalStaticOperandParts(rest, scanWord)
 	if !static {
-		// A dynamic operand makes the re-parse unknowable; the pre-scan
-		// conservatively counts every sentinel variable as written in
-		// exactly this case, so the replay must match the definition
-		// (R21-Oracle-M2 — counted writes may never vanish).
 		c.taintSentinelVars()
 		return
 	}
-	c.replayEvalTextWrites(verdict, strings.Join(parts, " "), len(st.Redirs) > 0)
+	c.replayEvalTextWrites(verdict, strings.Join(parts, " "), hasRedirs)
 }
 
 // replayEvalTextWrites dispatches the replication of one statically
@@ -1794,9 +1844,28 @@ func (c *subCollector) taintEvalTextWrites(text string, depth int) {
 		if st == nil {
 			continue
 		}
+		// R23-Reviewer-#3 / R23-Oracle-M1: the taint replay shares the
+		// shadowing registration with the bind replay — a definition
+		// inside the tainted text MAY still execute at runtime (the
+		// taint verdict means uncertainty, never impossibility), and
+		// the fail-closed direction for the positional tracks is to
+		// register it exactly like the certain replication does.
+		c.noteEvalStmtFuncDefs(st)
 		c.taintStmtSharedWrites(st)
 		c.taintHiddenEvalWrites(st, depth)
 	}
+}
+
+// noteEvalStmtFuncDefs registers the same-process function definitions
+// of one eval-text statement (extracted for the R23 complexity budget):
+// a top-level FuncDecl registers directly, every other statement shape
+// is scanned for definitions inside its same-process compound blocks.
+func (c *subCollector) noteEvalStmtFuncDefs(st *syntax.Stmt) {
+	if fd, isFd := st.Cmd.(*syntax.FuncDecl); isFd {
+		c.noteFuncDef(fd)
+		return
+	}
+	c.noteSameProcessFuncDefs(st)
 }
 
 // taintStmtSharedWrites taints every name of one statement according to
@@ -1884,7 +1953,16 @@ func (c *subCollector) taintEvalBoundary(verdict evalChainVerdict, args []*synta
 // resolution queries and non-eval heads are skipped precisely.
 func (c *subCollector) taintOneEvalCallWrites(call *syntax.CallExpr, scanWord func(*syntax.Word) (string, bool), depth int) {
 	verdict, rest := peelEvalBuiltinChainShadowed(call.Args, c.posixNoBraces, c.funcNames)
-	if verdict == evalChainNone || verdict == evalChainQuery || len(rest) < 2 {
+	if evalChainSkippable(verdict) {
+		return
+	}
+	// R23-Reviewer-#4 / R23-Oracle-M2: operand-expansion writes and the
+	// uniform taint boundary apply to the nested walk exactly like the
+	// root replication — a short or absent rest of a TAINTED chain is
+	// pollution, never a silent skip.
+	c.taintOperandParamAssigns(call.Args)
+	if len(rest) < 2 {
+		c.taintShortRestBoundary(verdict, call.Args)
 		return
 	}
 	parts, static := evalStaticOperandParts(rest, scanWord)
@@ -1893,6 +1971,25 @@ func (c *subCollector) taintOneEvalCallWrites(call *syntax.CallExpr, scanWord fu
 		return
 	}
 	c.taintEvalTextWrites(strings.Join(parts, " "), depth)
+}
+
+// evalChainSkippable reports whether one eval chain verdict carries no
+// replication subject at all (extracted for the R23 complexity budget):
+// a non-eval head or a provable pure resolution query executes nothing
+// the pre-scan counts, so the replication can skip it precisely.
+func evalChainSkippable(verdict evalChainVerdict) bool {
+	return verdict == evalChainNone || verdict == evalChainQuery
+}
+
+// taintShortRestBoundary applies the uniform maximal pollution verdict
+// for a chain whose rest is too short to carry operand text (extracted
+// for the R23 complexity budget — R23-Reviewer-#4): only a TAINTED
+// chain carries the unconfirmable boundary; a proven bind chain with no
+// operands genuinely re-parses nothing.
+func (c *subCollector) taintShortRestBoundary(verdict evalChainVerdict, args []*syntax.Word) {
+	if verdict == evalChainTaint {
+		c.taintEvalBoundary(verdict, args)
+	}
 }
 
 // bindEvalStmtWrites replays the writes of one static eval's statement
@@ -1921,9 +2018,12 @@ func (c *subCollector) bindEvalOneStmt(st *syntax.Stmt, depth int) {
 	// definition inside the eval text takes effect for every LATER
 	// same-process re-parse exactly like one written directly, so it
 	// registers before the statement's own write accounting.
-	if fd, isFd := st.Cmd.(*syntax.FuncDecl); isFd {
-		c.noteFuncDef(fd)
-	}
+	// R23-Reviewer-#3 / R23-Oracle-M1: same-process COMPOUND blocks
+	// ({ ...; }, if/while/for/case bodies) register their definitions
+	// exactly like a top-level FuncDecl — name resolution in the real
+	// shell does not distinguish where inside the same process the
+	// definition executed.
+	c.noteEvalStmtFuncDefs(st)
 	call, isCall := st.Cmd.(*syntax.CallExpr)
 	if isCall && !st.Background && !st.Negated && !st.Coprocess && len(st.Redirs) == 0 && len(call.Args) == 0 {
 		// R20-Oracle-M1: the statement must be a PROVABLY-executed bare
@@ -1962,7 +2062,20 @@ func (c *subCollector) bindEvalOneStmt(st *syntax.Stmt, depth int) {
 		return
 	}
 	verdict, rest := peelEvalBuiltinChainShadowed(call.Args, c.posixNoBraces, c.funcNames)
-	if verdict == evalChainNone || verdict == evalChainQuery || len(rest) < 2 {
+	if verdict == evalChainNone || verdict == evalChainQuery {
+		c.taintHiddenEvalWrites(st, depth)
+		return
+	}
+	// R23-Reviewer-#4 / R23-Oracle-M2: the operand-expansion writes belong
+	// to the nested operand evaluation exactly like the root call's — the
+	// replication owns them for every surviving chain verdict.
+	c.taintOperandParamAssigns(call.Args)
+	if len(rest) < 2 {
+		// R23-Reviewer-#4: a TAINTED chain without a confirmable operand
+		// boundary (including a rest too short to carry operand text)
+		// faces the uniform maximal pollution verdict — the nested replay
+		// must not silently drop what the root call already refuses.
+		c.taintShortRestBoundary(verdict, call.Args)
 		c.taintHiddenEvalWrites(st, depth)
 		return
 	}
@@ -1976,7 +2089,7 @@ func (c *subCollector) bindEvalOneStmt(st *syntax.Stmt, depth int) {
 		return
 	}
 	text := strings.Join(parts, " ")
-	if verdict != evalChainBind || len(st.Redirs) > 0 || st.Background || st.Negated || st.Coprocess {
+	if c.nestedEvalMustTaint(verdict, st) {
 		// R20-Oracle-M1 premises apply to nested evals exactly like the
 		// outer one: an external path head, a possibly-failing redirect
 		// or a child-process/conditional execution never mints a bind,
@@ -1985,6 +2098,15 @@ func (c *subCollector) bindEvalOneStmt(st *syntax.Stmt, depth int) {
 		return
 	}
 	c.bindEvalTextWrites(text, depth+1)
+}
+
+// nestedEvalMustTaint reports whether one nested eval statement fails
+// the exact-binding premises (extracted for the R23 complexity budget —
+// the R20-Oracle-M1 premises apply to nested evals exactly like the
+// outer one): a non-bind chain verdict, a possibly-failing redirection
+// or a child-process/conditional execution never mints a bind.
+func (c *subCollector) nestedEvalMustTaint(verdict evalChainVerdict, st *syntax.Stmt) bool {
+	return verdict != evalChainBind || len(st.Redirs) > 0 || st.Background || st.Negated || st.Coprocess
 }
 
 // parseSubagentShellAST parses code into shellSegments for subagent guards.
@@ -2332,6 +2454,12 @@ var shellNonBindableVars = map[string]bool{
 	"LINENO": true, "RANDOM": true, "SECONDS": true, "SRANDOM": true,
 	"EPOCHSECONDS": true, "EPOCHREALTIME": true, "HISTCMD": true,
 	"BASH_SUBSHELL": true, "BASH_VERSINFO": true,
+	// R23-Reviewer-#3 / R23-Oracle-M1: PIPESTATUS is re-written by bash
+	// after EVERY foreground pipeline — even a successful write to
+	// PIPESTATUS[0] is discarded by the very next simple command — and
+	// `_` is re-bound at every command start, so neither can ever hold
+	// the value an assignment word spells across the next expansion.
+	"PIPESTATUS": true, "_": true,
 }
 
 // enterChildScope switches the collector into a freshly minted child
@@ -2358,6 +2486,66 @@ func (c *subCollector) enterChildScope() func() {
 func (c *subCollector) enterConditional() func() {
 	c.condDepth++
 	return func() { c.condDepth-- }
+}
+
+// snapshotProcessRegs copies the positional process-state tracks
+// (funcNames/readonlyVars — R23-Reviewer-#3 / R23-Oracle-M1) and returns
+// the restore closure: entering a CHILD-PROCESS boundary (subshell,
+// pipeline component, backgrounded subtree, coprocess) snapshots first
+// so definitions minted inside the child never leak into the parent's
+// later name resolution. The maps are copy-on-enter: child-side
+// additions mutate the clone the child walks with, and restoring the
+// parent's originals discards them exactly like the runtime does. The
+// snapshot is nil-preserving — neither nil map is materialized for a
+// subtree that never uses the feature.
+func (c *subCollector) snapshotProcessRegs() func() {
+	funcs, readonly := c.funcNames, c.readonlyVars
+	if c.funcNames != nil {
+		c.funcNames = cloneBoolMap(c.funcNames)
+	}
+	if c.readonlyVars != nil {
+		c.readonlyVars = cloneBoolMap(c.readonlyVars)
+	}
+	return func() {
+		c.funcNames, c.readonlyVars = funcs, readonly
+	}
+}
+
+// noteSameProcessFuncDefs registers every shell function definition
+// statement of one eval-text statement that runs in the SAME shell
+// process (R23-Reviewer-#3 / R23-Oracle-M1): the eval replication and
+// the taint replay both re-parse operand text top-level only, but a
+// definition inside a same-process compound block ({ ...; }, if/while/
+// for/case bodies) is exactly as visible to the shell's later name
+// resolution as a top-level one — the pre-R23 replay never registered
+// it, so a following bare eval in the enclosing script minted the
+// builtin binding a shadowed runtime can never perform. Definitions
+// inside child-process shapes (pipes, command substitutions, process
+// substitutions, subshells) die with the child and are skipped; the
+// background bit of the statement itself is the caller's boundary,
+// already handled at the outer scope level.
+func (c *subCollector) noteSameProcessFuncDefs(st *syntax.Stmt) {
+	if st == nil || st.Cmd == nil {
+		return
+	}
+	syntax.Walk(st.Cmd, func(node syntax.Node) bool {
+		if node == nil {
+			return false
+		}
+		switch x := node.(type) {
+		case *syntax.FuncDecl:
+			c.noteFuncDef(x)
+			return true
+		case *syntax.BinaryCmd:
+			if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
+				return false // pipeline components are child processes
+			}
+			return true
+		case *syntax.CmdSubst, *syntax.ProcSubst, *syntax.Subshell:
+			return false // child processes: definitions die with them
+		}
+		return true
+	})
 }
 
 // noteFuncDef records a shell function definition (R22-Oracle-M1 /
@@ -2820,11 +3008,19 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 	// ride the leaf segment's background bit.
 	prevBind := c.allowBind
 	restoreScope := func() {}
+	restoreRegs := func() {}
 	if st.Background {
 		c.allowBind = false
 		restoreScope = c.enterChildScope()
+		// R23-Reviewer-#3 / R23-Oracle-M1: the whole backgrounded subtree
+		// runs in a CHILD PROCESS — function definitions and readonly
+		// declarations inside it die with the child exactly like its
+		// assignments, so the parent's positional tracks restore when
+		// the subtree finishes: a `(eval(){ :; }) &` must never shadow
+		// the parent's later bare eval.
+		restoreRegs = c.snapshotProcessRegs()
 	}
-	defer func() { restoreScope(); c.allowBind = prevBind }()
+	defer func() { restoreRegs(); restoreScope(); c.allowBind = prevBind }()
 	if st.Cmd == nil {
 		// bare redirects — still record if they write; unquoted heredoc bodies
 		// can contain $(...) that dash expands (must emit nested CallExprs).
@@ -2930,6 +3126,13 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 		case syntax.Pipe, syntax.PipeAll:
 			prevBind := c.allowBind
 			c.allowBind = false // no static head-bind across/inside pipelines
+			// R23-Reviewer-#3: the child-process boundary covers the
+			// positional tracks too — a function defined inside either
+			// component never shadows the parent shell's later calls. The
+			// snapshot must precede BOTH component walks: definitions
+			// minted while walking either side mutate the cloned maps the
+			// boundary discards.
+			restoreRegs := c.snapshotProcessRegs()
 			// R20-Oracle-M3/R21-Oracle-M3: every pipeline component runs in
 			// its OWN child process — the two sides fork sibling scopes (two
 			// distinct ids off the same parent prefix): an assignment inside
@@ -2944,6 +3147,7 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 			restoreY := c.enterChildScope()
 			c.walkStmt(cmd.Y, stdinFeed{piped: true, fds: feed.fds})
 			restoreY()
+			restoreRegs()
 			c.allowBind = prevBind
 		case syntax.AndStmt, syntax.OrStmt:
 			c.walkStmt(cmd.X, feed)
@@ -2972,10 +3176,17 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 		// definition — assignments inside it bind within its OWN freshly
 		// cloned scope environment (visible to the same subshell's later
 		// consumers) and never reach the parent shell.
+		// R23-Reviewer-#3 / R23-Oracle-M1: function definitions and
+		// readonly declarations inside the subshell die with it exactly
+		// like its assignments — the parent's positional tracks restore
+		// at the boundary, so `(eval(){ :; }); eval 'X=1'` keeps the
+		// builtin binding premise a leaking definition would revoke.
+		restoreRegs := c.snapshotProcessRegs()
 		restoreScope := c.enterChildScope()
 		innerFeed := c.stmtFeed(st, feed)
 		c.walkStmtsAll(cmd.Stmts, innerFeed)
 		restoreScope()
+		restoreRegs()
 		c.allowBind = prevBind
 	case *syntax.Block:
 		prevBind := c.allowBind
@@ -3083,11 +3294,13 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 		c.allowBind = false
 		// A coprocess runs in its own child process — assignments inside
 		// never reach the parent shell (R21-Oracle-M3).
+		restoreRegs := c.snapshotProcessRegs()
 		restoreScope := c.enterChildScope()
 		if cmd.Stmt != nil {
 			c.walkStmt(cmd.Stmt, stdinFeed{})
 		}
 		restoreScope()
+		restoreRegs()
 		c.allowBind = prevBind
 	case *syntax.DeclClause:
 		c.emitDecl(st, cmd, feed)
@@ -3161,12 +3374,18 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 
 	argv := make([]string, 0, len(call.Assigns)+len(call.Args))
 	argWords := make([]*syntax.Word, 0, len(call.Assigns)+len(call.Args))
+	// R23-Reviewer-#2 / R23-Oracle-M3: parallel to argv — the assignment
+	// OPERATOR provenance (`+=` append, array subscript) the KEY=VAL
+	// serialization destroys. The tracker folds pure-assignment segments
+	// through these bits; every non-assignment word carries zero.
+	assignFlags := make([]byte, 0, len(call.Assigns)+len(call.Args))
 	// SH11 F9: a backgrounded statement runs in a subshell — its assigns
 	// never bind in the parent shell (walkStmt already closed allowBind on
 	// the whole subtree).
 	for _, a := range call.Assigns {
 		argv = append(argv, c.assignToPrefix(a))
 		argWords = append(argWords, nil) // prefix assigns have no command Word
+		assignFlags = append(assignFlags, assignOpFlag(a))
 		if a.Name != nil && !a.Naked {
 			if len(call.Args) == 0 {
 				// Pure assignment statement — eligible for staticVars.
@@ -3192,6 +3411,7 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 						argv = append(argv, words...)
 						for range words {
 							argWords = append(argWords, nil) // expanded; no 1:1 Word
+							assignFlags = append(assignFlags, 0)
 						}
 						enumHeadExpanded = true
 						continue
@@ -3205,6 +3425,7 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 				if ok && isSafeAbsPathVal(s) {
 					argv = append(argv, s)
 					argWords = append(argWords, w)
+					assignFlags = append(assignFlags, 0)
 					continue
 				}
 				saved := c.enumVars
@@ -3213,12 +3434,14 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 				c.enumVars = saved
 				argv = append(argv, s)
 				argWords = append(argWords, w)
+				assignFlags = append(assignFlags, 0)
 				continue
 			}
 		}
 		s, _ := c.wordToArg(w)
 		argv = append(argv, s)
 		argWords = append(argWords, w)
+		assignFlags = append(assignFlags, 0)
 	}
 	// POSIX parses `export NAME=VAL` as CallExpr (bash uses DeclClause).
 	c.noteDeclCallBinds(argv)
@@ -3284,12 +3507,33 @@ func (c *subCollector) emitCall(st *syntax.Stmt, call *syntax.CallExpr, feed std
 		childScope:   st.Background || c.childScope,
 		scopePath:    c.scopePath,
 		condAssign:   c.condDepth > 0,
+		assignFlags:  assignFlags,
 	}
 	c.applyRedirs(&seg, st.Redirs, feed)
 	if len(seg.argv) > 0 || seg.redirectFile != "" || len(seg.heredocText) > 0 ||
 		seg.hereString != "" || seg.processSubst || seg.depthExceeded {
 		c.segs = append(c.segs, seg)
 	}
+}
+
+// assignOpFlag encodes the assignment-operator provenance of one syntax
+// Assign for shellSegment.assignFlags (R23-Reviewer-#2 / R23-Oracle-M3):
+// bit 1 (`+=`) means the write concatenates onto the unknowable inherited
+// value, bit 2 (array subscript) means the write touches one element and
+// never overwrites the whole scalar. Only a zero flag is a genuinely
+// independent plain scalar overwrite.
+func assignOpFlag(a *syntax.Assign) byte {
+	if a == nil {
+		return 0
+	}
+	var f byte
+	if a.Append {
+		f |= 1
+	}
+	if a.Index != nil {
+		f |= 2
+	}
+	return f
 }
 
 // isPureAssignCall reports whether a call expression is a genuine

@@ -1490,17 +1490,16 @@ func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv 
 		// accumulator: `out` would drop outerEnv's PATH= on the first
 		// segment and smuggle an earlier segment's local PATH= into a later
 		// one.
-		envs, ok, tBash := stdinSingleShellTargetDialect(targets, sshTunnelsStdinProgram(seg.argv, outerEnv.effectivePATHFrom(basePath), caller))
+		// R23-Reviewer-#6 / R23-Oracle-#6: the script entry shares the
+		// plain-argv entry's joint rewrite-eligibility test EXACTLY —
+		// stdinRewriteableTarget owns both halves (the local-shell
+		// target dialect agreement AND the untrusted-environment
+		// refusal of R21-Oracle-M3/R21-Reviewer-6: a control-flow
+		// uncertainty marker or an over-budget PATH can never be
+		// rewritten under an exact environment), so neither entry can
+		// drift from the other again.
+		envs, ok, tBash := stdinRewriteableTarget(targets, sshTunnelsStdinProgram(seg.argv, outerEnv.effectivePATHFrom(basePath), caller), basePath)
 		if !ok {
-			return nil, false, false
-		}
-		// R21-Oracle-M3/R21-Reviewer-6: a consumer whose effective
-		// environment carries control-flow uncertainty (a conditional
-		// write marker) or a PATH the expansion budget gave up on can
-		// never be rewritten under an exact environment — the shell may
-		// run with a DIFFERENT value, so the rewrite is refused and the
-		// caller falls back to the conservative per-target screen.
-		if envsUntrustedForRewrite(envs, basePath) {
 			return nil, false, false
 		}
 		// R16-Oracle-M2: the consuming shells of different segments must

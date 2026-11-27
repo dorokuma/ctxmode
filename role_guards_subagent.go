@@ -1829,6 +1829,19 @@ func (c callerIdentity) seededCwdWith(envAs envAssignments) callerIdentity {
 	return c
 }
 
+// pickRequestXargsWork selects the xargs memo/budget table one derived
+// identity carries (extracted for the R23 complexity budget —
+// R23-Reviewer-#1): the guardCall's pre-initialized request table wins
+// whenever it exists; a zero-value hand-assembled guardCall keeps the
+// per-identity table currentCallerIdentity already minted, which is
+// occasionally under-shared but never cross-request.
+func pickRequestXargsWork(gxw, minted *xargsWorkState) *xargsWorkState {
+	if gxw != nil {
+		return gxw
+	}
+	return minted
+}
+
 // callerIdentity returns a callerIdentity consistent with g's role flags so
 // direct unit-test guardCall structs (e.g. guardCall{subagent: true} run
 // under `CTXMODE_ROLE=verifier go test`) never inherit a conflicting role
@@ -1838,6 +1851,16 @@ func (c callerIdentity) seededCwdWith(envAs envAssignments) callerIdentity {
 func (g guardCall) callerIdentity() callerIdentity {
 	c := currentCallerIdentity()
 	c.cwd = g.cwd
+	// R23-Reviewer-#1 / R23-Oracle-M5: the identity inherits THIS
+	// guardCall's pre-initialized xargs memo/budget table (minted in
+	// currentGuardCall), so the per-request 512-node ceiling spans head
+	// screening, prepare projection, fallback and every other stage of
+	// the request instead of restarting per callerIdentity call. A
+	// hand-assembled zero-value guardCall (unit screening only — no
+	// production path builds one) falls back to the per-identity table
+	// currentCallerIdentity mints: occasionally under-shared, never
+	// cross-request.
+	c.xw = pickRequestXargsWork(g.xw, c.xw)
 	if !g.readonly && !g.strictReadonly {
 		c.readonly = ""
 		if auditRoleIsReadonly(c.role) {

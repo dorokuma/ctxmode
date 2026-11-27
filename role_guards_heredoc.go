@@ -26,7 +26,10 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 			return h
 		}
 	}
-	langs, stdinIsProg := remoteStdinProgramLangsCwd(remoteCmd, caller.screenCwd())
+	langs, stdinIsProg, remoteExhausted := remoteStdinProgramLangsCwd(remoteCmd, caller.screenCwd())
+	if hit := sshExhaustedStdinHit(seg, kind, stdinIsProg, remoteExhausted, caller); hit != "" {
+		return hit
+	}
 	if seg.pipedStdin && stdinIsProg {
 		if kind == 'r' || callerReadonlyRole(caller) {
 			return roSSHWriteHit
@@ -39,64 +42,14 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 		}
 		return "file stdin to ssh stdin-program"
 	}
-	if stdinIsProg {
-		if len(langs) > 1 && (seg.hereString != "" || len(seg.heredocText) > 0) {
-			return "ssh multi-stage stdin program"
-		}
-		screenBody := func(body string) string {
-			if isDynamicArg(body) {
-				return "dynamic code payload"
-			}
-			if body == "" {
-				return ""
-			}
-			if len(langs) == 0 {
-				langs = []string{""}
-			}
-			bodyKind := kind
-			if kind == 's' && callerReadonlyRole(caller) {
-				bodyKind = 'r'
-			}
-			for _, lang := range langs {
-				if h := screenStdinProgram(body, lang, bodyKind, depth, caller, false); h != "" {
-					if kind == 'r' || callerReadonlyRole(caller) {
-						return roSSHWriteHit
-					}
-					return h
-				}
-			}
-			return ""
-		}
-		if seg.hereString != "" {
-			if h := screenBody(seg.hereString); h != "" {
-				return h
-			}
-		}
-		for _, hb := range seg.heredocText {
-			if hb.dynamic {
-				return "dynamic code payload"
-			}
-			if h := screenBody(hb.text); h != "" {
-				return h
-			}
-		}
+	if h := sshStdinProgramBodiesHit(langs, seg, kind, depth, stdinIsProg, caller); h != "" {
+		return h
 	}
 	vehicleOnly := stdinIsProg &&
 		(seg.hereString != "" || len(seg.heredocText) > 0) &&
 		isPureRemoteStdinVehicleCwd(remoteCmd, caller.screenCwd())
 
-	remoteCaller := caller
-	remoteCaller.envTaint = nil
-	remoteCaller.pathEnv = ""
-	// Remote commands resolve under the remote login env — the remote
-	// PATH base above — but the old shared screenCwd was still the
-	// resolution base for relative heads inside remote segments
-	// (`ssh host ./bin/mytool`, find/xargs replace-tokens landing in an
-	// exec slot, bare-interp stdin detection). Dropping it here would
-	// silently fall back to the process cwd and change every such
-	// verdict, so the call cwd rides along (it is a resolution base,
-	// not identity: role/envTaint/pathEnv stay remote, cleared above).
-	remoteCaller.cwd = caller.cwd
+	remoteCaller := sshRemoteCallerIdentity(caller)
 	if kind == 's' {
 		if h := guardShellSubagentDepthEnv(remoteCmd, depth+1, remoteCaller, nil); h != "" {
 			return h
@@ -114,6 +67,98 @@ func screenSSHHead(head []string, seg shellSegment, kind byte, depth int, caller
 		}
 	}
 	return ""
+}
+
+// sshStdinProgramBodiesHit screens the heredoc/here-string bodies of
+// an ssh stdin-program flow (extracted for the R23 complexity budget):
+// several projected consumer languages over one body are the
+// multi-stage verdict, a dynamic body is the payload verdict, and every
+// static body is screened under EACH projected language with the
+// readonly escalation a subagent kind 's' caller owes (the ssh stdin
+// program runs the bytes as a program the remote side never typed).
+func sshStdinProgramBodiesHit(langs []string, seg shellSegment, kind byte, depth int, stdinIsProg bool, caller callerIdentity) string {
+	if !stdinIsProg {
+		return ""
+	}
+	if len(langs) > 1 && (seg.hereString != "" || len(seg.heredocText) > 0) {
+		return "ssh multi-stage stdin program"
+	}
+	screenBody := func(body string) string {
+		if isDynamicArg(body) {
+			return "dynamic code payload"
+		}
+		if body == "" {
+			return ""
+		}
+		if len(langs) == 0 {
+			langs = []string{""}
+		}
+		bodyKind := kind
+		if kind == 's' && callerReadonlyRole(caller) {
+			bodyKind = 'r'
+		}
+		for _, lang := range langs {
+			if h := screenStdinProgram(body, lang, bodyKind, depth, caller, false); h != "" {
+				if kind == 'r' || callerReadonlyRole(caller) {
+					return roSSHWriteHit
+				}
+				return h
+			}
+		}
+		return ""
+	}
+	if seg.hereString != "" {
+		if h := screenBody(seg.hereString); h != "" {
+			return h
+		}
+	}
+	for _, hb := range seg.heredocText {
+		if hb.dynamic {
+			return "dynamic code payload"
+		}
+		if h := screenBody(hb.text); h != "" {
+			return h
+		}
+	}
+	return ""
+}
+
+// sshRemoteCallerIdentity derives the caller identity the remote
+// command recursion screens under (extracted for the R23 complexity
+// budget): remote commands resolve under the remote login env — the
+// role, envTaint and pathEnv all reset — but the old shared screenCwd
+// was still the resolution base for relative heads inside remote
+// segments (`ssh host ./bin/mytool`, find/xargs replace-tokens landing
+// in an exec slot, bare-interp stdin detection). Dropping it would
+// silently fall back to the process cwd and change every such verdict,
+// so the call cwd rides along (it is a resolution base, not identity:
+// role/envTaint/pathEnv stay remote).
+func sshRemoteCallerIdentity(caller callerIdentity) callerIdentity {
+	remote := caller
+	remote.envTaint = nil
+	remote.pathEnv = ""
+	remote.cwd = caller.cwd
+	return remote
+}
+
+// sshExhaustedStdinHit is the exhaustion gate of screenSSHHead
+// (extracted for the R23 complexity budget): the remote consumer
+// identity is UNKNOWABLE when the language-list projection carries the
+// exhaustion bit — it can never certify a POSIX shell body reviewer for
+// bytes nobody identified, so a heredoc/here-string stdin-program body
+// flow fails closed exactly like a depth verdict (piped/redirect-fed
+// flows are already blocked by the unconditional stdin-program rules).
+func sshExhaustedStdinHit(seg shellSegment, kind byte, stdinIsProg, remoteExhausted bool, caller callerIdentity) string {
+	if !stdinIsProg || !remoteExhausted {
+		return ""
+	}
+	if seg.hereString == "" && len(seg.heredocText) == 0 {
+		return ""
+	}
+	if kind == 'r' || callerReadonlyRole(caller) {
+		return roSSHWriteHit
+	}
+	return depthExceededHit
 }
 
 // isPureRemoteStdinVehicle reports whether remoteCmd parses (under the
@@ -155,8 +200,34 @@ func isPureRemoteStdinVehicleCwd(remoteCmd, cwd string) bool {
 	// pure shell, so an exhausted projection (the analysis gave up before
 	// identifying the consumer) must never qualify — lang == "" on an
 	// exhausted target is the zero value of unknowable, not POSIX sh.
-	lang, isProg, exhausted := stdinProgramHeadCwdExh(s.argv, cwd)
-	return isProg && !exhausted && lang == ""
+	// R23-Reviewer-#5 / R23-Oracle-M5: the certification must consult the
+	// ENTIRE projection, not the first non-data target — one outer segment
+	// can project several targets (a nested `bash -c` script inside the
+	// vehicle shape), and whichever target sits first must never launder
+	// an exhausted sibling: certification iterates every non-data target
+	// and requires EACH one to be a positively identified pure shell.
+	targets := stdinProgramTargetsWithEnv(s.argv, 0, envAssignments{}, os.Getenv("PATH"), stdinEntryCaller(cwd))
+	return stdinTargetsAllPureShell(targets)
+}
+
+// stdinTargetsAllPureShell is the full-list certification of
+// isPureRemoteStdinVehicleCwd (extracted for the R23 complexity budget):
+// at least one non-data PROGRAM target must exist, and EVERY non-data
+// target must be a positively identified pure shell — one exhausted or
+// foreign-language sibling anywhere in the projection defeats the
+// certification regardless of its position in the list.
+func stdinTargetsAllPureShell(targets []stdinTarget) bool {
+	sawProg := false
+	for _, t := range targets {
+		if t.data {
+			continue
+		}
+		if t.exhausted || t.lang != "" {
+			return false
+		}
+		sawProg = true
+	}
+	return sawProg
 }
 
 // remoteReadsProgramFromStdin reports whether the remote command string
@@ -164,7 +235,7 @@ func isPureRemoteStdinVehicleCwd(remoteCmd, cwd string) bool {
 // `sh`/`python3 -` with no inline code). Only then are piped bytes
 // unaudited remote CODE rather than data for the remote command.
 func remoteReadsProgramFromStdinCwd(remoteCmd, cwd string) bool {
-	_, reads := remoteStdinProgramLangsCwd(remoteCmd, cwd)
+	_, reads, _ := remoteStdinProgramLangsCwd(remoteCmd, cwd)
 	return reads
 }
 
@@ -173,20 +244,58 @@ func remoteReadsProgramFromStdinCwd(remoteCmd, cwd string) bool {
 // against the process working directory — the base the old empty screenCwd
 // had; the Cwd variant carries the screening call's own cwd so relative
 // remote heads resolve like the outer caller just resolved them.
-func remoteStdinProgramLangsCwd(remoteCmd, cwd string) (langs []string, readsProg bool) {
+// R23-Reviewer-#5 / R23-Oracle-M5: the language list projection now
+// additionally propagates the exhaustion verdict — the list feeds the
+// remote stdin-program BODY screens, and an exhausted segment projection
+// means the consumer identity is UNKNOWABLE: the zero-value lang="" must
+// never be re-read as a certified POSIX shell body reviewer there, so
+// callers fail closed on the explicit bit instead of screening bytes
+// under a shell grammar nobody confirmed.
+func remoteStdinProgramLangsCwd(remoteCmd, cwd string) (langs []string, readsProg, exhausted bool) {
 	for _, seg := range splitShellSegments(remoteCmd) {
 		if seg.depthExceeded || seg.parseErr != "" {
-			return []string{""}, true
+			return []string{""}, true, true
 		}
 		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || seg.backgrounded ||
 			len(seg.heredocText) > 0 || seg.hereString != "" {
 			continue
 		}
-		if lang, isProg := stdinProgramHeadCwd(seg.argv, cwd); isProg {
-			langs = append(langs, lang)
+		// R23-Reviewer-#5: the per-segment projection must exhaustively
+		// check EVERY non-data target — one outer segment can project
+		// several (a nested `bash -c` script), and an exhausted target
+		// hiding behind a positively identified shell head is exactly
+		// the laundering shape the certification order forbids.
+		segLangs, segExh := stdinProgramHeadsExh(seg.argv, cwd)
+		if segExh {
+			return []string{""}, true, true
 		}
+		langs = append(langs, segLangs...)
 	}
-	return langs, len(langs) > 0
+	return langs, len(langs) > 0, false
+}
+
+// stdinProgramHeadsExh projects ALL non-data stdin-program targets of
+// one segment argv (R23-Reviewer-#5 / R23-Oracle-M5): the returned
+// language list covers every program consumer the projection surfaces
+// (data consumers are byte sinks, never programs), and the exhaustion
+// bit is the verdict of the WHOLE list — one exhausted target anywhere
+// in the projection means the consumer set is unknowable, so callers
+// must never re-read the surviving zero-value langs as certified POSIX
+// shells.
+func stdinProgramHeadsExh(argv []string, cwd string) (langs []string, exhausted bool) {
+	targets := stdinProgramTargetsWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"), stdinEntryCaller(cwd))
+	exhausted = false
+	for _, t := range targets {
+		if t.data {
+			continue
+		}
+		if t.exhausted {
+			exhausted = true
+			continue
+		}
+		langs = append(langs, t.lang)
+	}
+	return langs, exhausted
 }
 
 // sshNoArgShorts are OpenSSH short options that take no operand.
@@ -2845,10 +2954,23 @@ func guardShellSubagentDepthSegs(segs []shellSegment, depth int, caller callerId
 // regardless of stdin), and the AST's own assignment verdict decides
 // the view need without any per-segment wrapper peel.
 func consumerViewEnv(tracker *scopeEnvTracker, seg shellSegment) envAssignments {
-	if len(seg.heredocText) > 0 || seg.hereString != "" || seg.pipedStdin || !seg.pureAssign {
-		return tracker.view(seg.scopePath)
+	if !segNeedsConsumerView(seg) {
+		return envAssignments{}
 	}
-	return envAssignments{}
+	return tracker.view(seg.scopePath)
+}
+
+// segNeedsConsumerView reports whether the screens below actually read
+// runEnv for this segment (extracted for the R23 complexity budget —
+// R23-Reviewer-#7 / R23-Oracle-SF2): a consumer of the shared stream or
+// of a heredoc/here-string. An empty pure-assignment segment never
+// consumes anything, so even a heredoc-carrying spelling (`X=1 <<EOF`)
+// pays nothing: the heredoc bytes are dead input no program ever reads.
+func segNeedsConsumerView(seg shellSegment) bool {
+	if seg.pureAssign || len(seg.argv) == 0 {
+		return false
+	}
+	return len(seg.heredocText) > 0 || seg.hereString != "" || seg.pipedStdin
 }
 
 // ---------- rule 2: read-only write guard ----------
