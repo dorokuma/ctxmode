@@ -3481,8 +3481,12 @@ func TestGuard_V622_OracleR15Probes(t *testing.T) {
 			t.Fatal("wordBraceExpHit(~/{red,blue}) = false, want true")
 		}
 		s, _ := blankSubCollector().wordToArg(w)
-		if strings.Count(s, cmdSubPlaceholderGlob) != 2 {
-			t.Fatalf("subCollector.wordToArg(~/{red,blue}) = %q, want exactly 2 glob placeholders (tilde + brace)", s)
+		// R18-Oracle-M4: the NUL-provenanced tilde marker is pure
+		// provenance evidence, not a glob byte — the exactly-two-glob
+		// brace expansion shape is judged after stripping it.
+		stripped := strings.ReplaceAll(s, cmdSubPlaceholderTilde, "")
+		if strings.Count(stripped, cmdSubPlaceholderGlob) != 2 {
+			t.Fatalf("subCollector.wordToArg(~/{red,blue}) = %q, want exactly 2 glob placeholders (tilde + brace, after stripping the NUL tilde marker)", s)
 		}
 		if _, dyn := printfFmtWriteSlots(s, nil); !dyn {
 			t.Fatalf("printfFmtWriteSlots(%q, nil): dyn = false, want true", s)
@@ -4198,6 +4202,348 @@ func TestGuard_V622_OracleR17Probes(t *testing.T) {
 			if inheritedTmpdirValid() {
 				t.Fatalf("inheritedTmpdirValid() = true under TMPDIR=%s, want false", td)
 			}
+		}
+	})
+}
+
+// TestGuard_V622_OracleR18Probes pins the Oracle R18 audit closure:
+// PATH lookups must reproduce the kernel's per-component resolution
+// instead of lexically cleaning `..` away (R18-M1), local heredoc and
+// here-string payloads are screened against EVERY program target in an
+// order-independent way (R18-M2), a static eval's variable writes ride
+// back into the enclosing collector's write scan (R18-M3), the tilde
+// restoration requires the unforgeable NUL-provenanced marker while the
+// word-count proof survives a tainted HOME independently (R18-M4/S5),
+// the TMPDIR pseudo-root review is component-exact plus symlink-resolved
+// (R18-M5/S3), the -c slot scanner keeps a pending -c across a later
+// independent cluster (R18-S1), nested pure-assignment segments consume
+// no stdin and never mint a data consumer (R18-S2), and the dash dialect
+// rides into command-substitution collectors (R18-S4). Pure-function pins
+// reference only production symbols that exist verbatim on the pre-fix
+// tree 8c9447a (pathHasExecutable, the screen*Depth helpers,
+// parseSubagentShellASTEnv, isSingleWordOptionValue,
+// resolveNodeRunnerPathOpt, printfFmtWriteSlots, inheritedTmpdirValid,
+// tmpdirPseudoRoot, locateShellCSlot, stdinProgramTargetsWithEnv and
+// stdinSingleShellTargetDialect), so the discriminating rows reproduce
+// FAIL directly there.
+func TestGuard_V622_OracleR18Probes(t *testing.T) {
+	// ---- R18-M1: the PATH lookup must not lexically clean `..` ----
+	t.Run("R18-M1 /usr/bin/true/.. can never yield mktemp", func(t *testing.T) {
+		// Host preconditions from the Oracle R18 read-only metadata check:
+		// /usr/bin/true is a regular file and /usr/bin/mktemp is an
+		// executable regular file, so /usr/bin/true/../mktemp CANNOT be
+		// traversed by the kernel (ENOTDIR at the true component) even
+		// though the lexically cleaned /usr/bin/mktemp exists.
+		if st, err := os.Stat("/usr/bin/true"); err != nil || st.IsDir() {
+			t.Skipf("/usr/bin/true not a regular file: %v", err)
+		}
+		if st, err := os.Stat("/usr/bin/mktemp"); err != nil || st.IsDir() || st.Mode()&0111 == 0 {
+			t.Skipf("/usr/bin/mktemp not executable: %v", err)
+		}
+		if pathHasExecutable("/usr/bin/true/..", "mktemp") {
+			t.Fatal("pathHasExecutable(/usr/bin/true/.., mktemp) = true, want false — the kernel resolves true as a regular file and rejects the traversal with ENOTDIR; a lexical filepath.Join must never launder it into /usr/bin")
+		}
+	})
+	t.Run("R18-M1-pos genuine PATH directories keep resolving executables", func(t *testing.T) {
+		if !pathHasExecutable("/usr/bin", "mktemp") {
+			t.Fatal("pathHasExecutable(/usr/bin, mktemp) = false, want true")
+		}
+		if !pathHasExecutable("/usr/bin/", "mktemp") {
+			t.Fatal("pathHasExecutable(/usr/bin/, mktemp) = false, want true — a trailing slash is the same directory")
+		}
+	})
+
+	// ---- R18-M2: every program target of a heredoc / here-string is screened ----
+	t.Run("R18-M2 here-string verdict is branch-order independent", func(t *testing.T) {
+		// Both shells share the same here-string; either of them may consume
+		// it (mutually exclusive branches), so the bash target must face the
+		// bash dialect screen regardless of which target sorts first.
+		for _, inner := range []string{"dash; bash", "bash; dash"} {
+			seg := shellSegment{
+				argv:       []string{"sh", "-c", inner},
+				hereString: "printf tag{red,blue}",
+			}
+			hit := screenOneSegmentDepth(seg, 's', 0, callerIdentity{})
+			if !strings.Contains(hit, "env dynamic printf") {
+				t.Fatalf("screenOneSegmentDepth(sh -c %q <<< printf tag{red,blue}) = %q, want substring %q — either shell may consume the stream and bash brace-expands it", inner, hit, "env dynamic printf")
+			}
+		}
+	})
+	t.Run("R18-M2-pos pure dash here-string consumers keep the POSIX literal", func(t *testing.T) {
+		seg := shellSegment{
+			argv:       []string{"sh", "-c", "dash; dash"},
+			hereString: "printf tag{red,blue}",
+		}
+		if hit := screenOneSegmentDepth(seg, 's', 0, callerIdentity{}); hit != "" {
+			t.Fatalf("screenOneSegmentDepth(sh -c 'dash; dash' <<< printf tag{red,blue}) = %q, want no hit — dash performs no brace expansion", hit)
+		}
+	})
+	t.Run("R18-M2-hd heredoc verdict is branch-order independent", func(t *testing.T) {
+		for _, inner := range []string{"dash; bash", "bash; dash"} {
+			seg := shellSegment{
+				argv: []string{"sh", "-c", inner},
+				heredocText: []heredocBody{
+					{text: "printf tag{red,blue}", quoted: true},
+				},
+			}
+			hit := screenSegmentHeredocsDepth(seg, 's', 0, callerIdentity{})
+			if !strings.Contains(hit, "env dynamic printf") {
+				t.Fatalf("screenSegmentHeredocsDepth(sh -c %q <<EOF printf tag{red,blue}) = %q, want substring %q", inner, hit, "env dynamic printf")
+			}
+		}
+	})
+	t.Run("R18-M2-hd-pos pure dash heredoc consumers keep the POSIX literal", func(t *testing.T) {
+		seg := shellSegment{
+			argv: []string{"sh", "-c", "dash; dash"},
+			heredocText: []heredocBody{
+				{text: "printf tag{red,blue}", quoted: true},
+			},
+		}
+		if hit := screenSegmentHeredocsDepth(seg, 's', 0, callerIdentity{}); hit != "" {
+			t.Fatalf("screenSegmentHeredocsDepth(sh -c 'dash; dash' <<EOF printf tag{red,blue}) = %q, want no hit", hit)
+		}
+	})
+
+	// ---- R18-M3: a static eval's IFS write rides back into the collector ----
+	ifsFixture := func(t *testing.T, script string, argIdx int) string {
+		t.Helper()
+		segs, ok := parseSubagentShellASTEnv(script, 0, false, true, nil, callerIdentity{})
+		if !ok || len(segs) == 0 {
+			t.Fatalf("parse %q failed: ok=%v segs=%v", script, ok, segs)
+		}
+		last := segs[len(segs)-1]
+		if argIdx >= len(last.argv) {
+			t.Fatalf("parse %q: last seg argv=%v, want index %d", script, last.argv, argIdx)
+		}
+		return last.argv[argIdx]
+	}
+	t.Run("R18-M3 eval IFS write degrades the unquoted HOME exactly like the direct assignment", func(t *testing.T) {
+		t.Setenv("HOME", "/home/red:blue")
+		direct := ifsFixture(t, "IFS=:; echo $HOME", 1)
+		viaEval := ifsFixture(t, "eval 'IFS=:'; echo $HOME", 1)
+		if isSingleWordOptionValue(direct) {
+			t.Fatalf("control broken: direct IFS=: unquoted $HOME %q is single-word, want false", direct)
+		}
+		if isSingleWordOptionValue(viaEval) != isSingleWordOptionValue(direct) {
+			t.Fatalf("isSingleWordOptionValue(eval spelling %q) = %v vs direct spelling %q = %v — eval re-parses in the SAME shell, so its IFS write must reach the outer collector", viaEval, isSingleWordOptionValue(viaEval), direct, isSingleWordOptionValue(direct))
+		}
+		if isSingleWordOptionValue(viaEval) {
+			t.Fatalf("isSingleWordOptionValue(%q) = true after eval 'IFS=:', want false — unquoted $HOME field-splits on ':' at runtime", viaEval)
+		}
+	})
+	t.Run("R18-M3-pos double-quoted HOME is unaffected by the eval IFS write", func(t *testing.T) {
+		t.Setenv("HOME", "/home/red:blue")
+		quo := ifsFixture(t, "eval 'IFS=:'; echo \"$HOME\"", 1)
+		if !isSingleWordOptionValue(quo) {
+			t.Fatalf("isSingleWordOptionValue(%q) = false, want true — double quotes suppress field splitting entirely regardless of IFS", quo)
+		}
+	})
+	t.Run("R18-M3-dyn dynamic eval operands conservatively pollute IFS", func(t *testing.T) {
+		t.Setenv("HOME", "/home/red:blue")
+		unq := ifsFixture(t, "eval \"$X\"; echo $HOME", 1)
+		if isSingleWordOptionValue(unq) {
+			t.Fatalf("isSingleWordOptionValue(%q) = true after a dynamic eval, want false — the re-parsed text is unknowable, so IFS may be polluted", unq)
+		}
+	})
+
+	// ---- R18-M4: the tilde restoration demands unforgeable provenance ----
+	t.Run("R18-M4 a literal spelling of the printable marker never resolves to the service HOME", func(t *testing.T) {
+		t.Setenv("HOME", "/home/parent")
+		w := parseBashSingleCmdWord(t, "echo '~__ctx_glob__/notes'", 1)
+		s, _ := blankSubCollector().wordToArg(w)
+		cand, ok := resolveNodeRunnerPathOpt(s, "/opt/example")
+		if ok && cand == "/home/parent/notes" {
+			t.Fatalf("resolveNodeRunnerPathOpt(%q) = (%q, true) — the bytes arrived as a single-quoted LITERAL, not a tilde expansion, so the service HOME must never be restored into them", s, cand)
+		}
+		if ok {
+			t.Fatalf("resolveNodeRunnerPathOpt(%q) = (%q, true), want ok=false — the printable glob marker is forgeable evidence, never provenance", s, cand)
+		}
+	})
+	t.Run("R18-M4-pos a real untainted tilde expansion keeps the restoration", func(t *testing.T) {
+		t.Setenv("HOME", "/home/user")
+		w := parseBashSingleCmdWord(t, `echo ~/notes`, 1)
+		s, _ := blankSubCollector().wordToArg(w)
+		cand, ok := resolveNodeRunnerPathOpt(s, "/opt/example")
+		if !ok || cand != "/home/user/notes" {
+			t.Fatalf("resolveNodeRunnerPathOpt(%q) = (%q, %v), want (/home/user/notes, true) — a genuine word-start tilde under a known HOME mints the unforgeable marker", s, cand, ok)
+		}
+	})
+	t.Run("R18-M4-b tainted-HOME tilde keeps failing path restoration closed", func(t *testing.T) {
+		t.Setenv("HOME", "/home/parent")
+		w := parseBashSingleCmdWord(t, `echo ~/notes`, 1)
+		col := blankSubCollector()
+		col.taintedVars["HOME"] = true
+		s, _ := col.wordToArg(w)
+		cand, ok := resolveNodeRunnerPathOpt(s, "/opt/example")
+		if ok {
+			t.Fatalf("resolveNodeRunnerPathOpt(%q) = (%q, true), want ok=false under a tainted HOME (R17-M4-b is preserved)", s, cand)
+		}
+	})
+
+	// ---- R18-M5: the TMPDIR exception is judged on the resolved object ----
+	t.Run("R18-M5 the /dev/shm spellings of /dev and /dev/mqueue are rejected", func(t *testing.T) {
+		st, err := os.Stat("/dev/mqueue")
+		if err != nil || !st.IsDir() || st.Mode().Perm() != 0o777 {
+			t.Skipf("/dev/mqueue not a 1777 directory on this host: %v", err)
+		}
+		for _, td := range []string{"/dev/mqueue", "/dev/shm/..", "/dev/shm/../mqueue"} {
+			t.Setenv("TMPDIR", td)
+			if inheritedTmpdirValid() {
+				t.Fatalf("inheritedTmpdirValid() = true under TMPDIR=%s, want false — %s resolves to a non-tmpfs pseudo filesystem regardless of how it is spelled", td, td)
+			}
+		}
+	})
+	t.Run("R18-M5-pos TMPDIR=/dev/shm itself keeps the tmpfs validity", func(t *testing.T) {
+		st, err := os.Stat("/dev/shm")
+		if err != nil || !st.IsDir() || st.Mode().Perm() != 0o777 || st.Mode()&os.ModeSticky == 0 {
+			t.Skipf("/dev/shm not a 1777 tmpfs directory on this host: %v", err)
+		}
+		t.Setenv("TMPDIR", "/dev/shm")
+		if !inheritedTmpdirValid() {
+			t.Fatal("inheritedTmpdirValid() = false under TMPDIR=/dev/shm, want true (R17-S2 preserved)")
+		}
+	})
+
+	// ---- R18-S1: a pending -c survives an independent later cluster ----
+	t.Run("R18-S1 locateShellCSlot keeps the pending -c across -e", func(t *testing.T) {
+		argv := []string{"bash", "-c", "-e", "echo ok"}
+		idx, rawScript, glued, ok := locateShellCSlot(argv)
+		text, has := unwrapShellArgv(argv)
+		if !has || text != "echo ok" {
+			t.Fatalf("unwrapShellArgv(%v) = (%q, %v), want (echo ok, true)", argv, text, has)
+		}
+		if !ok || glued || idx != 3 || rawScript != "echo ok" {
+			t.Fatalf("locateShellCSlot(%v) = (%d, %q, glued=%v, ok=%v), want (3, echo ok, false, true) — the -e cluster must not drop the pending -c state", argv, idx, rawScript, glued, ok)
+		}
+	})
+	t.Run("R18-S1-pos plain spellings keep locating the same word", func(t *testing.T) {
+		for _, argv := range [][]string{
+			{"sh", "-c", "echo ok"},
+			{"bash", "-c", "--", "echo ok"},
+		} {
+			idx, rawScript, glued, ok := locateShellCSlot(argv)
+			text, has := unwrapShellArgv(argv)
+			if !ok || glued || !has || rawScript != text || argv[idx] != rawScript {
+				t.Fatalf("locateShellCSlot(%v) = (%d, %q, glued=%v, ok=%v) vs unwrap=(%q,%v), want the same clean script word", argv, idx, rawScript, glued, ok, text, has)
+			}
+		}
+	})
+
+	// ---- R18-S2: nested pure-assignment segments consume no stdin ----
+	t.Run("R18-S2 nested and flat X=1; bash agree on the pure shell rewrite", func(t *testing.T) {
+		targets := stdinProgramTargetsWithEnv([]string{"bash", "-c", "X=1; bash"}, 0, envAssignments{}, "", callerIdentity{})
+		_, nestedOK, nestedBash := stdinSingleShellTargetDialect(targets, false)
+		if !nestedOK {
+			t.Fatalf("nested 'bash -c \"X=1; bash\"' refuses the stdin rewrite, want ok=true — a pure assignment consumes no stdin exactly like the flat spelling")
+		}
+		flatEnvs, flatOK, flatBash := scriptAllowsLocalShellStdinPrepareDialect("X=1; bash", false, envAssignments{}, "", callerIdentity{})
+		if !flatOK || len(flatEnvs) == 0 {
+			t.Fatalf("flat 'X=1; bash' control broken: (envs=%d, ok=%v)", len(flatEnvs), flatOK)
+		}
+		if nestedBash != flatBash {
+			t.Fatalf("nested bash=%v vs flat bash=%v — the two spellings must agree", nestedBash, flatBash)
+		}
+	})
+	t.Run("R18-S2-neg nested real data consumers still refuse the rewrite", func(t *testing.T) {
+		targets := stdinProgramTargetsWithEnv([]string{"bash", "-c", "cat; bash"}, 0, envAssignments{}, "", callerIdentity{})
+		if _, nestedOK, _ := stdinSingleShellTargetDialect(targets, false); nestedOK {
+			t.Fatal("nested 'bash -c \"cat; bash\"' permits a stdin rewrite, want ok=false — the inner cat consumes the stream as data (R17-M6 preserved)")
+		}
+	})
+
+	// ---- R18-S3: /dev-adjacent ordinary directories are not pseudo roots ----
+	t.Run("R18-S3 /development/cache is not a pseudo filesystem root", func(t *testing.T) {
+		if tmpdirPseudoRoot("/development/cache") {
+			t.Fatal("tmpdirPseudoRoot(/development/cache) = true, want false — sharing the /dev prefix does not make an ordinary development directory a device tree")
+		}
+		for _, td := range []string{"/dev", "/dev/mqueue", "/proc", "/proc/x", "/sys", "/dev/null"} {
+			if !tmpdirPseudoRoot(td) {
+				t.Fatalf("control broken: tmpdirPseudoRoot(%s) = false, want true", td)
+			}
+		}
+		if tmpdirPseudoRoot("/dev/shm") || tmpdirPseudoRoot("/dev/shm/x") {
+			t.Fatal("control broken: /dev/shm[/x] must stay out of the pseudo roots (R17-S2)")
+		}
+	})
+
+	// ---- R18-S4: dash dialect rides into command substitutions ----
+	t.Run("R18-S4 dash command substitution keeps the printf format word static", func(t *testing.T) {
+		segs, ok := parseSubagentShellASTEnv("echo $(printf tag{red,blue})", 0, false, false, nil, callerIdentity{})
+		if !ok || len(segs) == 0 {
+			t.Fatalf("parse failed: ok=%v segs=%v", ok, segs)
+		}
+		found := false
+		for _, seg := range segs {
+			if len(seg.argv) == 2 && seg.argv[0] == "printf" {
+				found = true
+				if isDynamicArg(seg.argv[1]) {
+					t.Fatalf("dash substitution printf format %q is dynamic, want the static literal tag{red,blue} — dash performs no brace expansion inside $(...) either", seg.argv[1])
+				}
+				if _, dyn := printfFmtWriteSlots(seg.argv[1], nil); dyn {
+					t.Fatalf("printfFmtWriteSlots(%q, nil) dyn=true, want false (dash literal)", seg.argv[1])
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("no printf segment in %v — the substitution was not walked", segs)
+		}
+	})
+	t.Run("R18-S4-neg bash command substitution keeps the brace encoding", func(t *testing.T) {
+		segs, ok := parseSubagentShellASTEnv("echo $(printf tag{red,blue})", 0, false, true, nil, callerIdentity{})
+		if !ok {
+			t.Fatal("bash parse failed")
+		}
+		found := false
+		for _, seg := range segs {
+			if len(seg.argv) == 2 && seg.argv[0] == "printf" {
+				found = true
+				if _, dyn := printfFmtWriteSlots(seg.argv[1], nil); !dyn {
+					t.Fatalf("printfFmtWriteSlots(%q, nil) dyn=false under bash, want true — bash really brace-expands inside $(...)", seg.argv[1])
+				}
+			}
+		}
+		if !found {
+			t.Fatal("no printf segment under bash parse")
+		}
+	})
+
+	// ---- R18-S5: the tainted-HOME tilde keeps its single-word proof ----
+	t.Run("R18-S5 printf ~/banner under a rewritten HOME stays dyn=false", func(t *testing.T) {
+		t.Setenv("HOME", "/home/parent")
+		segs, ok := parseSubagentShellASTEnv("HOME=/custom/home; printf ~/banner", 0, false, true, nil, callerIdentity{})
+		if !ok {
+			t.Fatal("parse failed")
+		}
+		last := segs[len(segs)-1]
+		if len(last.argv) != 2 || last.argv[0] != "printf" {
+			t.Fatalf("last seg argv=%v, want [printf <tilde-word>]", last.argv)
+		}
+		if !isSingleWordOptionValue(last.argv[1]) {
+			t.Fatalf("isSingleWordOptionValue(%q) = false, want true — bash tilde expansion never field-splits, so the word stays exactly one argv word even when its concrete path is unknowable", last.argv[1])
+		}
+		if _, dyn := printfFmtWriteSlots(last.argv[1], nil); dyn {
+			t.Fatalf("printfFmtWriteSlots(%q, nil) dyn=true, want false — losing the concrete-path proof must not revoke the word-count proof", last.argv[1])
+		}
+		if _, ok := resolveNodeRunnerPathOpt(last.argv[1], "/opt/example"); ok {
+			t.Fatalf("resolveNodeRunnerPathOpt(%q) ok=true, want false — the service HOME must never stand in for the consuming shell's tainted HOME (R17-M4-b preserved)", last.argv[1])
+		}
+	})
+	t.Run("R18-S5-pos untainted printf ~/banner keeps both proofs", func(t *testing.T) {
+		t.Setenv("HOME", "/home/user")
+		segs, ok := parseSubagentShellASTEnv("printf ~/banner", 0, false, true, nil, callerIdentity{})
+		if !ok {
+			t.Fatal("parse failed")
+		}
+		last := segs[len(segs)-1]
+		if len(last.argv) != 2 {
+			t.Fatalf("last seg argv=%v, want [printf <tilde-word>]", last.argv)
+		}
+		if _, dyn := printfFmtWriteSlots(last.argv[1], nil); dyn {
+			t.Fatalf("printfFmtWriteSlots(%q, nil) dyn=true, want false (R14-S2 positive preserved)", last.argv[1])
+		}
+		cand, rok := resolveNodeRunnerPathOpt(last.argv[1], "/opt/example")
+		if !rok || cand != "/home/user/banner" {
+			t.Fatalf("resolveNodeRunnerPathOpt(%q) = (%q, %v), want (/home/user/banner, true)", last.argv[1], cand, rok)
 		}
 	})
 }

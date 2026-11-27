@@ -803,6 +803,11 @@ func locateShellCSlot(argv []string) (scriptIdx int, rawScript string, glued boo
 // 'c' marks the slot glued. ni is the argv index the caller continues
 // from, dynName reports a dynamic option-name operand after a pending -c.
 func scanShellCClusterWord(argv []string, i int, sawC bool) (newSawC bool, ni int, dynName, glued bool) {
+	// R18-Oracle-S1: the pending -c state must survive a cluster that does
+	// not itself carry a 'c' — `bash -c -e 'echo ok'` keeps sawC armed
+	// across the -e word exactly like unwrapShellArgv's caller-side
+	// tracking, so the positional command string is still located.
+	newSawC = sawC
 	a := argv[i]
 	plus := a[0] == '+'
 	for j := 1; j < len(a); j++ {
@@ -1355,19 +1360,29 @@ func stdinSingleShellTargetDialect(targets []stdinTarget, sshTunnel bool) (envs 
 	if sshTunnel || len(targets) == 0 {
 		return nil, false, false
 	}
-	first, hasFirst := firstProgramTarget(targets)
-	if !hasFirst {
-		return nil, false, false
-	}
 	envs = make([]envAssignments, 0, len(targets))
-	bash = first.bash
+	// R18-Oracle-S2/v6.2.2 complexity budget: the data check inside the
+	// loop already refuses every target list with a leading data consumer,
+	// so targets[0] IS the first program target whenever the loop can
+	// succeed — the separate firstProgramTarget projection was redundant.
+	bash = targets[0].bash
 	for _, t := range targets {
-		if t.data || t.lang != "" || t.remote || t.bash != bash {
+		if !stdinShellTargetRewriteable(t, bash) {
 			return nil, false, false
 		}
 		envs = append(envs, t.envAs)
 	}
 	return envs, true, bash
+}
+
+// stdinShellTargetRewriteable reports whether one stdin target may take
+// part in the local shell-program rewrite (extracted for the v6.2.2 R18
+// complexity budget): it must consume the stream as PROGRAM (never data),
+// run on THIS host, be a shell rather than a foreign-language interpreter
+// and share the consuming shells' single dialect — a mixed bash/dash
+// consumer set can never be rewritten under one parser honestly.
+func stdinShellTargetRewriteable(t stdinTarget, bash bool) bool {
+	return !t.data && t.lang == "" && !t.remote && t.bash == bash
 }
 
 // scriptAllowsLocalShellStdinPrepare reports whether a shell command string

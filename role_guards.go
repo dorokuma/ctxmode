@@ -214,7 +214,21 @@ const cmdSubPlaceholderQuoted = "__ctx_dq_sub__"
 // cmdSubPlaceholderGlob marks an UNQUOTED glob/tilde literal (* ? [...] ~):
 // pathname expansion happens after field splitting and each match is one
 // argv word, so the word can never inject extra options — but it IS dynamic.
+// It is a PRINTABLE string by design (the glob part of a word is public
+// knowledge) — R18-Oracle-M4: never key provenance on it alone, because a
+// single-quoted literal can carry the same bytes verbatim.
 const cmdSubPlaceholderGlob = "__ctx_glob__"
+
+// cmdSubPlaceholderTilde marks a REAL unquoted word-start tilde whose
+// expansion HOME is known to the encoding collector (R18-Oracle-M4). The
+// embedded NUL bytes make it impossible to produce from shell text or argv
+// (exec rejects NUL) — exactly like envPathSelfPlaceholder — so only the
+// word encoder itself can mint it, and a single-quoted literal spelling of
+// the printable glob marker can never forge the HOME restoration. When the
+// collector's HOME is tainted the marker is simply absent: the concrete
+// path grant is lost, while the word-count proof survives independently
+// (R18-Oracle-S5 — bash tilde expansion never field-splits).
+const cmdSubPlaceholderTilde = "\x00__ctx_tilde__\x00"
 
 // cmdSubPlaceholderAbsDq marks a double-quoted dynamic whose expansion is
 // GUARANTEED to begin with '/': $PWD/${PWD}, $(pwd) and a bare
@@ -3978,6 +3992,13 @@ func screenNodeRunnerSubagent(base string, args []string, effPath string, depth 
 // expands into MULTIPLE words under bash even though it carries no glob
 // metacharacter, so the pure-tilde exemption must never cover it.
 func isSingleWordOptionValue(val string) bool {
+	// R18-Oracle-S5: the NUL-provenanced tilde marker is pure provenance —
+	// it never changes how many argv words the expansion produces (bash's
+	// tilde expansion never field-splits), so it is stripped before the
+	// dynamic grading: an untainted `~/banner` AND a tainted one both stay
+	// exactly one word, while the path-restoration proof they differ on is
+	// judged independently in resolveNodeRunnerPathOpt.
+	val = strings.ReplaceAll(val, cmdSubPlaceholderTilde, "")
 	if !isDynamicArg(val) || isSingleWordSplitSafe(val) {
 		return true
 	}
@@ -9662,13 +9683,38 @@ func screenOneSegmentDepth(seg shellSegment, kind byte, depth int, caller caller
 		// R17-Oracle-M2: the bash dialect of the consuming shell rides
 		// the projection into the screen — the dash default must not
 		// re-parse a bash-consumed program.
-		if lang, isProg, envAs, bash := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller); isProg {
-			if hit := screenStdinProgram(seg.hereString, lang, kind, depth, caller.seededWith(envAs), bash); hit != "" {
-				return hit
-			}
+		// R18-Oracle-M2: EVERY program target is screened — a mutual-
+		// exclusion branch pair (`if …; then dash; else bash; fi`) may
+		// consume the same stream through either of two shells, so
+		// projecting only the first target both missed the bash dialect
+		// and made the verdict depend on the branch ORDER; any single
+		// target's rejection rejects the payload, matching the per-target
+		// API stdin screen exactly.
+		targets := stdinProgramTargetsWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller)
+		if hit := screenHereStringTargetsDepth(seg.hereString, targets, kind, depth, caller); hit != "" {
+			return hit
 		}
 	}
 	return peelResolvedSegDepth(seg.argv, seg, kind, depth, caller)
+}
+
+// screenHereStringTargetsDepth screens one here-string payload against
+// EVERY program target of the consuming argv (extracted for the v6.2.2
+// R18 complexity budget — R18-Oracle-M2): data consumers are byte sinks
+// and never programs, and each real consumer is judged under its own env
+// ops and dialect. The first rejection wins, which — because rejection
+// never depends on position — makes `[dash, bash]` and `[bash, dash]`
+// agree exactly.
+func screenHereStringTargetsDepth(text string, targets []stdinTarget, kind byte, depth int, caller callerIdentity) string {
+	for _, t := range targets {
+		if t.data {
+			continue
+		}
+		if hit := screenStdinProgram(text, t.lang, kind, depth, caller.seededWith(t.envAs), t.bash); hit != "" {
+			return hit
+		}
+	}
+	return ""
 }
 func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller callerIdentity) string {
 	if len(seg.heredocText) == 0 {
@@ -9684,11 +9730,6 @@ func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller c
 	if seg.stdinRedir {
 		return ""
 	}
-	lang, isProg, envAs, bash := stdinProgramHeadWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller)
-	if !isProg {
-		return ""
-	}
-	caller = caller.seededWith(envAs)
 	// When the heredoc tunnels through ssh (directly or behind wrappers like
 	// flock) to a remote stdin-program head, a read-only caller (verifier /
 	// CTXMODE_READONLY=1) loses its local /tmp write exemption at the wire.
@@ -9696,17 +9737,43 @@ func screenSegmentHeredocsDepth(seg shellSegment, kind byte, depth int, caller c
 	if kind == 's' && callerReadonlyRole(caller) && sshTunnel {
 		bodyKind = 'r'
 	}
+	// R18-Oracle-M2: EVERY program target is screened per body — projecting
+	// only the first one missed a second possible consuming shell (and its
+	// bash dialect) and made the verdict depend on the branch order of a
+	// mutually exclusive `if …; then dash; else bash; fi` pair. Any single
+	// target's rejection rejects the payload, matching the per-target API
+	// stdin screen exactly. Data consumers are byte sinks, never programs.
+	targets := stdinProgramTargetsWithEnv(seg.argv, 0, envAssignments{}, caller.pathEnv, caller)
 	for _, hb := range seg.heredocText {
 		if hb.dynamic || isDynamicArg(hb.text) {
 			return "dynamic code payload"
 		}
-		// R17-Oracle-M2: the heredoc re-parse inherits the consuming
-		// shell's dialect — a local bash heredoc brace-expands exactly
-		// like `bash -c`.
-		if hit := screenStdinProgram(hb.text, lang, bodyKind, depth, caller, bash); hit != "" {
+		if hit := screenHeredocBodyTargetsDepth(hb.text, targets, bodyKind, depth, caller); hit != "" {
 			if sshTunnel && (kind == 'r' || callerReadonlyRole(caller)) && bodyKind == 'r' {
 				return roSSHWriteHit
 			}
+			return hit
+		}
+	}
+	return ""
+}
+
+// screenHeredocBodyTargetsDepth screens one heredoc body against EVERY
+// program target of the consuming argv (extracted for the v6.2.2 R18
+// complexity budget — R18-Oracle-M2): each real consumer is judged under
+// its own env ops and dialect, and the first rejection wins — because
+// rejection never depends on position, `[dash, bash]` and `[bash, dash]`
+// agree exactly, and the verdict aligns with the per-target API stdin
+// screen (R17-Oracle-M6 data consumers are byte sinks, never programs).
+func screenHeredocBodyTargetsDepth(text string, targets []stdinTarget, bodyKind byte, depth int, caller callerIdentity) string {
+	for _, t := range targets {
+		if t.data {
+			continue
+		}
+		// R17-Oracle-M2: the heredoc re-parse inherits the consuming
+		// shell's dialect — a local bash heredoc brace-expands exactly
+		// like `bash -c`.
+		if hit := screenStdinProgram(text, t.lang, bodyKind, depth, caller.seededWith(t.envAs), t.bash); hit != "" {
 			return hit
 		}
 	}
@@ -20244,15 +20311,17 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 				continue
 			}
 			sub := stdinProgramTargetsDialect(seg.argv, depth+1, subEnv, subPath, subCaller, seg.bashDialect)
-			if len(sub) == 0 {
-				// R17-Oracle-M6: a segment that can read the shared stream but
-				// resolves to NO program target is a plain data consumer (cat,
-				// jq .) — it must surface as such instead of silently dropping
-				// out of the nested summary, or `bash -c "cat; bash"` would
-				// earn a rewrite the flat `cat; bash` never gets.
-				out = append(out, stdinTarget{data: true, envAs: envAs})
-				continue
-			}
+			// R17-Oracle-M6: a segment that can read the shared stream but
+			// resolves to NO program target is a plain data consumer (cat,
+			// jq .) — it must surface as such instead of silently dropping
+			// out of the nested summary, or `bash -c "cat; bash"` would
+			// earn a rewrite the flat `cat; bash` never gets.
+			// R18-Oracle-S2: EXCEPT when nothing consumes the stream at all —
+			// a pure-assignment segment (`X=1`) peels to an empty head exactly
+			// like the flat scan in scriptAllowsLocalShellStdinPrepare skips
+			// it, so `bash -c 'X=1; bash'` keeps the same verdict as the flat
+			// spelling instead of inventing a data consumer.
+			sub = stdinTargetsWithDataFallback(sub, seg, envAs, subCaller)
 			for _, t := range sub {
 				if mergeOuter {
 					t.envAs = envAs.merged(t.envAs)
@@ -20359,6 +20428,23 @@ func stdinWatchTargets(head []string, depth int, envAs envAssignments, basePath 
 		return []stdinTarget{{lang: "", envAs: envAs}}
 	}
 	return collectSegs(splitShellSegmentsCaller(text, caller.envTaint, caller), envAs, basePath, false, caller)
+}
+
+// stdinTargetsWithDataFallback appends the R17-Oracle-M6 data-consumer
+// marker to a target-less recursion result ONLY when the segment really
+// consumes the shared stream (extracted for the v6.2.2 R18 complexity
+// budget — R18-Oracle-S2): a pure-assignment / no-op segment peels to an
+// EMPTY command head, reads nothing and vanishes from the summary exactly
+// like the flat prepare scan already skips it. Any segment with a real
+// non-program head (cat, echo, jq .) stays a data consumer.
+func stdinTargetsWithDataFallback(sub []stdinTarget, seg shellSegment, envAs envAssignments, subCaller callerIdentity) []stdinTarget {
+	if len(sub) != 0 {
+		return sub
+	}
+	if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv, subCaller); len(peeledHead) == 0 {
+		return sub
+	}
+	return append(sub, stdinTarget{data: true, envAs: envAs})
 }
 
 // stdinSegCollectFunc is the collectSegs closure shape shared by the
@@ -20596,39 +20682,23 @@ func resolveNodeRunnerPathOpt(val string, cwd string) (string, bool) {
 	if val == "" || !isSingleWordOptionValue(val) {
 		return "", false
 	}
+	// R18-Oracle-M4: any glob-placeholder byte WITHOUT the unforgeable
+	// tilde provenance fails closed outright — the value is either an
+	// ordinary pathname glob (matches unenumerable) or a tilde whose HOME
+	// is tainted / a verbatim literal that only SPELLS the printable
+	// marker. Neither may reach the dynamic-path or tilde restoration
+	// branches below.
+	if globTildePathUnproven(val) {
+		return "", false
+	}
 	var cand string
 	switch {
 	case tildeExpansionSpelling(val):
-		// R17-Oracle-M4 criterion A: the HOME restoration applies ONLY to a
-		// word that genuinely carries the shell's tilde-expansion marker —
-		// a bare leading `~` byte (direct argv, or a single-quoted shell
-		// word) reaches the consumer VERBATIM and is a relative path
-		// segment, never an expansion site. Inside this branch the sole
-		// glob marker IS the unquoted word-start tilde's: isSingleWordOptionValue
-		// already forced exactly one marker and ruled out every other
-		// glob/tilde source byte.
-		raw := strings.Replace(val, cmdSubPlaceholderGlob, "", 1)
-		if isDynamicArg(raw) || strings.ContainsAny(raw, "*?[") {
+		restored, rok := restoreTildePathOpt(val)
+		if !rok {
 			return "", false
 		}
-		if raw != "~" && !strings.HasPrefix(raw, "~/") {
-			return "", false // ~otheruser: untrusted home directory
-		}
-		// R16-Oracle-M4: restoring the shell's `~/...` expansion must use
-		// the shell-visible inherited HOME (inheritedHomeDir), never the
-		// config-search fallback of safeHomeDir — a relative or empty
-		// inherited HOME must not fabricate "/root/notes" the running
-		// shell never expands to. Failing closed is the sound outcome when
-		// the inherited value cannot anchor an absolute path.
-		h, ok := inheritedHomeDir()
-		if !ok {
-			return "", false
-		}
-		home := filepath.Clean(h)
-		if home == "" || home == "." || !filepath.IsAbs(home) {
-			return "", false
-		}
-		cand = filepath.Clean(home + raw[1:])
+		cand = restored
 	case isDynamicArg(val):
 		for _, seg := range strings.Split(filepath.ToSlash(val), "/") {
 			if seg == ".." {
@@ -20658,14 +20728,62 @@ func resolveNodeRunnerPathOpt(val string, cwd string) (string, bool) {
 	return cand, true
 }
 
+// restoreTildePathOpt is the tilde branch of resolveNodeRunnerPathOpt
+// (extracted for the v6.2.2 R18 complexity budget): the word carries the
+// unforgeable tilde provenance (tildeExpansionSpelling already fired), so
+// stripping BOTH markers yields the raw ~/... spelling the consuming shell
+// expands. Inside this branch the sole glob marker IS the unquoted
+// word-start tilde's: isSingleWordOptionValue already forced exactly one
+// marker and ruled out every other glob/tilde source byte.
+func restoreTildePathOpt(val string) (string, bool) {
+	raw := strings.Replace(val, cmdSubPlaceholderGlob, "", 1)
+	raw = strings.ReplaceAll(raw, cmdSubPlaceholderTilde, "")
+	if isDynamicArg(raw) || strings.ContainsAny(raw, "*?[") {
+		return "", false
+	}
+	if raw != "~" && !strings.HasPrefix(raw, "~/") {
+		return "", false // ~otheruser: untrusted home directory
+	}
+	// R16-Oracle-M4: restoring the shell's `~/...` expansion must use
+	// the shell-visible inherited HOME (inheritedHomeDir), never the
+	// config-search fallback of safeHomeDir — a relative or empty
+	// inherited HOME must not fabricate "/root/notes" the running
+	// shell never expands to. Failing closed is the sound outcome when
+	// the inherited value cannot anchor an absolute path.
+	h, ok := inheritedHomeDir()
+	if !ok {
+		return "", false
+	}
+	home := filepath.Clean(h)
+	if home == "" || home == "." || !filepath.IsAbs(home) {
+		return "", false
+	}
+	return filepath.Clean(home + raw[1:]), true
+}
+
 // tildeExpansionSpelling reports whether a value carries the shell's
-// real tilde-expansion marker at a leading `~` (extracted for the v6.2.2
-// R17 complexity budget — R17-Oracle-M4 criterion A): the marker never
-// sits adjacent to the `~` byte itself because the encoder appends it
-// after the whole unquoted literal part, so a bare leading `~` without
-// any glob marker is a VERBATIM relative-path byte, never an expansion.
+// real tilde-expansion PROVENANCE at a leading `~` (extracted for the
+// v6.2.2 R17 complexity budget — R17-Oracle-M4 criterion A, hardened in
+// R18-Oracle-M4): provenance is now the NUL-carrying cmdSubPlaceholderTilde
+// only the collector's word encoder can mint — the printable glob marker
+// is no longer evidence, because a single-quoted literal can carry the
+// same bytes verbatim (`'~__ctx_glob__/notes'`). A bare leading `~`
+// without the unforgeable marker is a VERBATIM relative-path byte (direct
+// argv, single-quoted word, or a tilde whose HOME is tainted), never an
+// expansion the service HOME may stand in for.
 func tildeExpansionSpelling(val string) bool {
-	return strings.HasPrefix(val, "~") && strings.Contains(val, cmdSubPlaceholderGlob)
+	return strings.HasPrefix(val, "~") && strings.Contains(val, cmdSubPlaceholderTilde)
+}
+
+// globTildePathUnproven reports a value carrying the glob placeholder whose
+// concrete path can never be proven (R18-Oracle-M4/R18-Oracle-S5 split):
+// either a genuine tilde whose HOME is tainted (no tilde marker — the
+// service process HOME must never stand in for the consuming shell's) or
+// an ordinary pathname glob (`docs/*.txt`) whose matches the npx/bunx path
+// option model cannot enumerate. Both shapes must fail closed as path
+// operands while INDEPENDENTLY keeping their word-count proofs elsewhere.
+func globTildePathUnproven(val string) bool {
+	return !tildeExpansionSpelling(val) && strings.Contains(val, cmdSubPlaceholderGlob)
 }
 
 func trimByteAligned(raw, mask string) (string, string) {

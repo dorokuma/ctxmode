@@ -256,7 +256,12 @@ func namesFromGoArgvs(argvs [][]string) []string {
 	var names []string
 	for _, a := range argvs {
 		if len(a) > 0 {
-			names = append(names, a[0])
+			// R18-Oracle-M4: the NUL-provenanced tilde marker
+			// (\x00__ctx_tilde__\x00) is internal encoding evidence, never
+			// executable text — argv bytes can never carry NUL — so it is
+			// stripped before the placeholder name is shaped into a symlink
+			// fixture exactly like the runtime argv it models.
+			names = append(names, strings.ReplaceAll(a[0], "\x00", ""))
 		}
 	}
 	return names

@@ -988,6 +988,7 @@ func preScanVarMutations(f *syntax.File, posixNoBracesOpt ...bool) (writeCount m
 			if i := strings.LastIndex(base, "/"); i >= 0 {
 				base = base[i+1:]
 			}
+			scanShellBuiltinWrites(base, args, scanWord, inc, posixNoBraces)
 			switch base {
 			case "cd", "chdir", "pushd", "popd", "eval", "source", ".":
 				// Every directory-switch builtin (cd/chdir/pushd/popd) rewrites
@@ -1239,6 +1240,65 @@ func preScanVarMutations(f *syntax.File, posixNoBracesOpt ...bool) (writeCount m
 		return true
 	})
 	return writeCount, allTainted
+}
+
+// scanShellBuiltinWrites replays the variable writes of a STATIC eval
+// operand into the outer write scan (R18-Oracle-M3): eval re-parses its
+// arguments in the SAME shell process, so `eval 'IFS=:'` mutates the very
+// collector state the enclosing script's later words are graded under —
+// yet the R3 model only conservatively tainted the directory variables
+// and dropped every other write on the floor. Static operands are joined
+// with spaces exactly like eval does, re-parsed under the script's own
+// dialect and fed through preScanVarMutations itself (recursing into
+// nested static evals); every inner write count ADDS onto the outer count
+// so a write split between the script and its eval text is still seen as
+// multi-assignment. A dynamic operand, an unparseable operand or an
+// all-tainted inner scan leaves the state unknowable: every sentinel name
+// the collector's placeholder grants depend on is conservatively counted
+// as written. Everything else (cd/read/printf/getopts heads) is untouched.
+func scanShellBuiltinWrites(base string, args []*syntax.Word, scanWord func(*syntax.Word) (string, bool), inc func(string), posixNoBraces bool) {
+	if base != "eval" || len(args) < 2 {
+		return
+	}
+	parts := make([]string, 0, len(args)-1)
+	static := true
+	for _, w := range args[1:] {
+		s, ok := scanWord(w)
+		if !ok || isDynamicArg(s) {
+			static = false
+			break
+		}
+		parts = append(parts, s)
+	}
+	if !static {
+		for name := range sentinelTrustVars {
+			inc(name)
+		}
+		return
+	}
+	parser := syntax.NewParser(syntax.Variant(syntax.LangPOSIX), syntax.KeepComments(true))
+	if !posixNoBraces {
+		parser = syntax.NewParser(syntax.Variant(syntax.LangBash), syntax.KeepComments(true))
+	}
+	inner, err := parser.Parse(strings.NewReader(strings.Join(parts, " ")), "")
+	if err != nil {
+		for name := range sentinelTrustVars {
+			inc(name)
+		}
+		return
+	}
+	innerWrites, innerAll := preScanVarMutations(inner, posixNoBraces)
+	if innerAll {
+		for name := range sentinelTrustVars {
+			inc(name)
+		}
+		return
+	}
+	for name, n := range innerWrites {
+		for i := 0; i < n; i++ {
+			inc(name)
+		}
+	}
 }
 
 // parseSubagentShellAST parses code into shellSegments for subagent guards.
@@ -2683,18 +2743,19 @@ func (c *subCollector) emitNestedFromNode(n syntax.Node, feed stdinFeed) {
 // staticVars, while the child's own writes never leak back (allowBind=false).
 func (c *subCollector) newSub() *subCollector {
 	return &subCollector{
-		code:         c.code,
-		depth:        c.depth + 1,
-		staticVars:   cloneStringMap(c.staticVars),
-		litVars:      cloneStringMap(c.litVars),
-		enumVars:     cloneStringMap(c.enumVars),
-		enumCmdWords: cloneStringsMap(c.enumCmdWords),
-		taintedVars:  cloneBoolMap(c.taintedVars),
-		ssaBlocked:   cloneBoolMap(c.ssaBlocked),
-		allowBind:    false,
-		fdUnvetted:   c.fdUnvetted,
-		caller:       c.caller, // $(pwd) binds the same screened cwd inside $(...)
-		hasCd:        c.hasCd,  // an outer cd already sighted stays sighted
+		code:          c.code,
+		depth:         c.depth + 1,
+		staticVars:    cloneStringMap(c.staticVars),
+		litVars:       cloneStringMap(c.litVars),
+		enumVars:      cloneStringMap(c.enumVars),
+		enumCmdWords:  cloneStringsMap(c.enumCmdWords),
+		taintedVars:   cloneBoolMap(c.taintedVars),
+		ssaBlocked:    cloneBoolMap(c.ssaBlocked),
+		allowBind:     false,
+		fdUnvetted:    c.fdUnvetted,
+		caller:        c.caller,        // $(pwd) binds the same screened cwd inside $(...)
+		hasCd:         c.hasCd,         // an outer cd already sighted stays sighted
+		posixNoBraces: c.posixNoBraces, // R18-Oracle-S4: the $(...) re-parse runs in the SAME shell — dash never brace-expands there either, so the dialect must ride into the substitution collector or echo $(printf tag{red,blue}) under dash encodes a brace word the runtime never produces
 	}
 }
 
@@ -2998,15 +3059,36 @@ func (c *subCollector) canResolveMktempInPath() bool {
 // value) contains a non-directory entry `name` with any execute bit. Empty
 // (the PATH "current directory" entry) and relative segments can never
 // prove a lookup — the resolution base is the child's cwd, not ours.
+// R18-Oracle-M1: the lookup must reproduce the KERNEL's per-component
+// resolution exactly — filepath.Join would lexically clean a `..` segment
+// away before Stat, turning `/usr/bin/true/..` (which the kernel rejects
+// with ENOTDIR because /usr/bin/true is a regular file) into `/usr/bin`.
+// The candidate path is therefore concatenated WITHOUT any cleaning and
+// dir itself must stat as a real directory first.
 func pathHasExecutable(dir, name string) bool {
-	if dir == "" || !filepath.IsAbs(dir) {
+	if dir == "" || !filepath.IsAbs(dir) || !pathIsRealDirectory(dir) {
 		return false
 	}
-	st, err := os.Stat(filepath.Join(dir, name))
-	if err != nil || st.IsDir() {
-		return false
-	}
-	return st.Mode()&0111 != 0
+	return statExecutableFile(strings.TrimRight(dir, "/") + "/" + name)
+}
+
+// pathIsRealDirectory reports whether dir stats as a real directory
+// (extracted for the v6.2.2 R18 complexity budget). Because the path is
+// stat'd VERBATIM, a `/usr/bin/true/..` spelling fails here with ENOTDIR
+// exactly like the kernel's per-component lookup rejects it — no lexical
+// `..` cleanup may ever launder it into a usable PATH directory.
+func pathIsRealDirectory(dir string) bool {
+	dfi, err := os.Stat(dir)
+	return err == nil && dfi.IsDir()
+}
+
+// statExecutableFile reports whether p stats as a non-directory entry
+// with any execute bit (extracted for the v6.2.2 R18 complexity budget).
+// The path is concatenated WITHOUT cleaning by the caller and passed to
+// Stat verbatim, so the kernel performs its own per-component resolution.
+func statExecutableFile(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir() && st.Mode()&0111 != 0
 }
 
 // pwdSwitchTainted reports whether the whole-script mutation pre-scan saw a
@@ -3417,7 +3499,12 @@ func writeCtxFreeDqParts(b *strings.Builder, p *syntax.DblQuoted) bool {
 // data operand while {docs/a,-blue} and ~/{red,blue} both end in the
 // adjacent __ctx_glob____ctx_glob__ pair the consumers key on.
 func writeBraceExpansionMarkers(b *strings.Builder) {
-	if !strings.HasSuffix(b.String(), cmdSubPlaceholderGlob) {
+	// R18-Oracle-M4: the NUL-provenanced tilde marker is provenance, not
+	// a glob byte — it sits between the tilde literal's own glob marker
+	// and this tail, so the suffix check must see through it or a tilde
+	// brace word (~/{red,blue}) would mint a phantom third glob marker
+	// instead of the required adjacent pair.
+	if !strings.HasSuffix(strings.ReplaceAll(b.String(), cmdSubPlaceholderTilde, ""), cmdSubPlaceholderGlob) {
 		b.WriteString(cmdSubPlaceholderGlob)
 	}
 	b.WriteString(cmdSubPlaceholderGlob)
@@ -3658,41 +3745,62 @@ func (c *subCollector) unquotedHomePlaceholder() string {
 // device tree mktemp can never create a subdirectory in (extracted for the
 // v6.2.2 R17 complexity budget). /dev/shm — a real 1777 tmpfs the
 // repository itself lists as an allowed scratch root — is the sole /dev
-// exception (R17-Oracle-S2).
+// exception (R17-Oracle-S2). R18-Oracle-S3: the comparison is strictly by
+// path COMPONENT — /development/cache shares the /dev prefix but is an
+// ordinary directory, so a blind HasPrefix must never match it.
 func tmpdirPseudoRoot(td string) bool {
+	return tmpdirPseudoCleanedRoot(filepath.Clean(td))
+}
+
+// tmpdirPseudoCleanedRoot is the component-exact pseudo-root predicate of
+// tmpdirPseudoRoot applied to an already-cleaned path: /proc and /sys are
+// pseudo roots outright, while under /dev only /dev/shm (and its children)
+// escape — /dev/mqueue is a POSIX message queue filesystem, never a tmpfs.
+func tmpdirPseudoCleanedRoot(clean string) bool {
 	for _, pseudo := range []string{"/proc", "/sys"} {
-		if td == pseudo || strings.HasPrefix(td, pseudo+"/") {
+		if clean == pseudo || strings.HasPrefix(clean, pseudo+"/") {
 			return true
 		}
 	}
-	return strings.HasPrefix(td, "/dev") && td != "/dev/shm" && !strings.HasPrefix(td, "/dev/shm/")
+	if clean != "/dev" && !strings.HasPrefix(clean, "/dev/") {
+		return false
+	}
+	return clean != "/dev/shm" && !strings.HasPrefix(clean, "/dev/shm/")
 }
 
 // writeUnquotedGlobTildeLit encodes one unquoted literal that carries a
 // glob or tilde metacharacter (extracted for the v6.2.2 R17 complexity
 // budget): the text plus its glob marker — and, for a word-leading tilde
-// whose expansion HOME is unknowable, the exemption-revoking second
-// marker. Returns false when the literal carries no glob/tilde byte at all.
+// whose expansion HOME is KNOWN, the NUL-provenanced tilde marker.
+// R18-Oracle-S5: the tilde word-count proof no longer collapses under a
+// tainted HOME — bash's tilde expansion never field-splits, so the word
+// stays exactly ONE argv word either way; only the concrete-path grant is
+// what a tainted HOME loses, and that grant now lives exclusively in the
+// unforgeable cmdSubPlaceholderTilde (R18-Oracle-M4). Returns false when
+// the literal carries no glob/tilde byte at all.
 func (c *subCollector) writeUnquotedGlobTildeLit(b *strings.Builder, rawLit string, wordStart bool, openBracket *bool) bool {
 	if !litHasUnquotedGlobOrTilde(rawLit, wordStart, openBracket) {
 		return false
 	}
 	b.WriteString(posixUnescapeLit(rawLit))
 	b.WriteString(cmdSubPlaceholderGlob)
-	if tildeGrantRevoked(rawLit, wordStart, c) {
-		b.WriteString(cmdSubPlaceholderGlob)
+	if tildeHomeProven(rawLit, wordStart, c) {
+		b.WriteString(cmdSubPlaceholderTilde)
 	}
 	return true
 }
 
-// tildeGrantRevoked reports whether this word-leading tilde literal lost
-// its single-path exemption because the collector cannot know the HOME the
-// consuming shell will expand it against (R17-Oracle-M4 criterion B):
-// resolveNodeRunnerPathOpt restores `~` against the SERVICE process HOME,
-// so a tainted HOME must mint a second glob marker that revokes the
-// exemption outright instead of substituting the wrong environment.
-func tildeGrantRevoked(rawLit string, wordStart bool, c *subCollector) bool {
-	return wordStart && strings.HasPrefix(rawLit, "~") && c.isTainted("HOME")
+// tildeHomeProven reports whether this word-leading tilde literal may
+// carry the NUL-provenanced tilde marker: the collector must KNOW the HOME
+// the consuming shell will expand `~` against (R18-Oracle-M4). Only a real
+// unquoted word-start tilde encoded here can mint the marker — a NUL byte
+// can never arrive through shell text or argv — so a single-quoted literal
+// spelling of the printable glob marker can never forge the path
+// restoration. When HOME is tainted the marker is simply absent: the word
+// keeps its single-glob single-word shape (R18-Oracle-S5) while every
+// concrete-path restoration fails closed.
+func tildeHomeProven(rawLit string, wordStart bool, c *subCollector) bool {
+	return wordStart && strings.HasPrefix(rawLit, "~") && !c.isTainted("HOME")
 }
 
 // ifsClean reports whether the unquoted expansion model may assume POSIX
@@ -3865,6 +3973,26 @@ func inheritedTmpdirValid() bool {
 	if tmpdirPseudoRoot(td) {
 		return false
 	}
+	// R18-Oracle-M5: the lexical check above judges the SPELLING, but the
+	// Stat/Access probes below act on the RESOLVED object — `/dev/shm/..`
+	// spells the tmpfs exception yet resolves to /dev, and
+	// `/dev/shm/../mqueue` resolves to the mqueue pseudo filesystem (never
+	// a tmpfs a mktemp child could create a directory in). The symlink
+	// resolution must pass AND its result must pass the same component-exact
+	// pseudo-root review before any metadata proof can stand.
+	resolved, err := filepath.EvalSymlinks(td)
+	if err != nil || tmpdirPseudoRoot(resolved) {
+		return false
+	}
+	return tmpdirChildCreatable(td)
+}
+
+// tmpdirChildCreatable is the Stat/perm/access tail of
+// inheritedTmpdirValid (extracted for the v6.2.2 R18 complexity budget):
+// the directory entry must exist as a directory, carry a write permission
+// bit and survive a real write/search access probe — together approximating
+// "a subdirectory could be created here".
+func tmpdirChildCreatable(td string) bool {
 	fi, err := os.Stat(td)
 	if err != nil || !fi.IsDir() {
 		return false
