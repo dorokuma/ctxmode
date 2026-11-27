@@ -7,6 +7,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"golang.org/x/sys/unix"
 	"mvdan.cc/sh/v3/syntax"
 )
 
@@ -859,10 +860,24 @@ func rawHasLineContAfterDollar(raw string) bool {
 
 // preScanVarMutations counts variable write/bind sites across the whole AST
 // (G3 SSA-like invariant). Names with writeCount > 1 are tainted before walk.
-func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted bool) {
+// posixNoBraces (variadic, default false) marks the POSIX/dash dialect of
+// the file being scanned (v6.2.2 Oracle R16 S2): dash performs NO brace
+// expansion, so a literal format word like printf tag{red,blue} is static
+// text there — encoding it with the bash brace-expansion rules would blind
+// the whole-script write scan on perfectly ordinary dash scripts.
+func preScanVarMutations(f *syntax.File, posixNoBracesOpt ...bool) (writeCount map[string]int, allTainted bool) {
+	posixNoBraces := len(posixNoBracesOpt) > 0 && posixNoBracesOpt[0]
 	writeCount = map[string]int{}
 	if f == nil {
 		return writeCount, false
+	}
+	// scanWord is the dialect-aware word conversion of this scan: the
+	// context-free wordToArg always assumes bash brace expansion, which is
+	// correct for the bash primary/secondary trees but wrong for a dash
+	// script — under posixNoBraces the brace scan is skipped entirely.
+	scanWord := wordToArg
+	if posixNoBraces {
+		scanWord = wordToArgPosix
 	}
 	inc := func(name string) {
 		if name != "" {
@@ -907,7 +922,7 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 			args := x.Args
 			sawWrapper := false
 			for len(args) > 0 {
-				h, ok := wordToArg(args[0])
+				h, ok := scanWord(args[0])
 				if !ok || isDynamicArg(h) {
 					// A dynamic word is not literally command/builtin. When it
 					// appears AFTER a real command/builtin it could still be
@@ -937,7 +952,7 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 				// unknown option is conservatively consumed the same way).
 				optStrs := make([]string, 0, len(args))
 				for _, w := range args {
-					os_, ook := wordToArg(w)
+					os_, ook := scanWord(w)
 					if !ook {
 						os_ = cmdSubPlaceholder
 					}
@@ -948,7 +963,7 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 					break
 				}
 				for len(args) > 0 {
-					a, aok := wordToArg(args[0])
+					a, aok := scanWord(args[0])
 					if !aok || isDynamicArg(a) {
 						allTainted = true
 						return false
@@ -967,7 +982,7 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 			if len(args) == 0 {
 				return true
 			}
-			head, _ := wordToArg(args[0])
+			head, _ := scanWord(args[0])
 			base := head
 			if i := strings.LastIndex(base, "/"); i >= 0 {
 				base = base[i+1:]
@@ -997,7 +1012,7 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 				// slot at args[3] as a write target.
 				opIdx := 0
 				if len(args) > 1 {
-					s1, ok1 := wordToArg(args[1])
+					s1, ok1 := scanWord(args[1])
 					if !ok1 && s1 == "" {
 						allTainted = true
 						return false
@@ -1013,7 +1028,7 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 					} else {
 						opIdx = 1
 						if isDynamicArg(s1) && len(args) > 3 && dynWordCanSpellDashDash(s1) {
-							s3, ok3 := wordToArg(args[3])
+							s3, ok3 := scanWord(args[3])
 							if !ok3 || isDynamicArg(s3) {
 								allTainted = true
 								return false
@@ -1028,7 +1043,7 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 					}
 				}
 				if opIdx > 0 && opIdx+1 < len(args) {
-					s, ok := wordToArg(args[opIdx+1])
+					s, ok := scanWord(args[opIdx+1])
 					if !ok || isDynamicArg(s) {
 						allTainted = true
 						return false
@@ -1046,7 +1061,7 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 				sawDashDash := false
 				j := 1
 				for j < len(args) {
-					s, ok := wordToArg(args[j])
+					s, ok := scanWord(args[j])
 					if !ok || isDynamicArg(s) {
 						// R13-SF-1/R13-MF-4: delegate to the SAME readDynClusterHit
 						// the argv layer uses — a dynamic word whose static letters
@@ -1092,7 +1107,7 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 								if k+1 < len(s) {
 									arrName = s[k+1:]
 								} else if j+1 < len(args) {
-									an, aok := wordToArg(args[j+1])
+									an, aok := scanWord(args[j+1])
 									if !aok || isDynamicArg(an) {
 										allTainted = true
 										return false
@@ -1133,7 +1148,7 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 							// unquoted here — isDynamicArg && !isSingleWordSplitSafe
 							// is the discriminating condition, matching the argv
 							// layer's envDynSlotHit exactly.
-							vn, _ := wordToArg(args[j+1])
+							vn, _ := scanWord(args[j+1])
 							if isDynamicArg(vn) && !isSingleWordSplitSafe(vn) {
 								allTainted = true
 								return false
@@ -1155,7 +1170,7 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 				}
 			case "unset", "export", "readonly", "declare", "typeset", "local":
 				for _, w := range args[1:] {
-					s, ok := wordToArg(w)
+					s, ok := scanWord(w)
 					if !ok {
 						allTainted = true
 						return false
@@ -1194,7 +1209,7 @@ func preScanVarMutations(f *syntax.File) (writeCount map[string]int, allTainted 
 				// whole-script write scan.
 				words := make([]string, 0, len(args)-1)
 				for _, w := range args[1:] {
-					s, ok := wordToArg(w)
+					s, ok := scanWord(w)
 					if !ok && s == "" {
 						allTainted = true
 						return false
@@ -1313,7 +1328,7 @@ func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVarian
 	}
 
 	col.ssaBlocked = map[string]bool{}
-	writes, allTainted := preScanVarMutations(primary)
+	writes, allTainted := preScanVarMutations(primary, !useBashVariant)
 	if allTainted {
 		for name := range writes {
 			col.taintedVars[name] = true
@@ -1368,6 +1383,15 @@ func parseSubagentShellASTEnv(code string, depth int, pipeIn bool, useBashVarian
 		}
 		col.segs = dedupeSegTail(col.segs, pre)
 		markSecondaryDialect(col.segs, pre)
+	}
+	// R16-Oracle-M2: every segment this parse produced was encoded under
+	// ONE interpreter dialect — the same collector's posixNoBraces applies
+	// to the secondary-tree walk too, so the whole result shares the
+	// dialect. Mark it so a same-process re-parse (eval / trap action)
+	// re-enters the guard under the interpreter that will actually
+	// consume the text instead of falling back to the dash default.
+	for i := range col.segs {
+		col.segs[i].bashDialect = useBashVariant
 	}
 	return col.segs, true
 }
@@ -2891,7 +2915,13 @@ func (c *subCollector) staticAssignVal(w *syntax.Word) (string, bool) {
 				}
 				return "", false
 			}
-			if !c.isTainted("TMPDIR") && isMktempDashDCallStmts(cs.Stmts) {
+			// R16-Oracle-M1: the assignment-binding grant must carry the SAME
+			// inheritedTmpdirValid() proof as the direct double-quoted
+			// substitution path (dqSubstPlaceholder) — a TMPDIR=/dev/null or
+			// TMPDIR=/proc makes mktemp fail with EMPTY stdout, so a variable
+			// bound here must not pose as the non-empty absolute mktemp
+			// directory either.
+			if !c.isTainted("TMPDIR") && inheritedTmpdirValid() && isMktempDashDCallStmts(cs.Stmts) {
 				return mktempDirPlaceholder, true
 			}
 		}
@@ -3167,6 +3197,28 @@ func wordBraceExpHit(w *syntax.Word) bool {
 // collector method c.wordToArg is taint-aware and upgrades $HOME / $PATH /
 // $PWD / $$ / $(pwd) / $(mktemp -d).
 func wordToArg(w *syntax.Word) (string, bool) {
+	return wordToArgDialect(w, false)
+}
+
+// wordToArgPosix is wordToArg under the POSIX/dash dialect (v6.2.2 Oracle
+// R16 S2): dash performs NO brace expansion, so the brace scan is skipped
+// and printf tag{red,blue} stays the static literal dash really passes.
+func wordToArgPosix(w *syntax.Word) (string, bool) {
+	return wordToArgDialect(w, true)
+}
+
+// wordBraceExpHitDialect is wordBraceExpHit gated on the dialect
+// (v6.2.2 Oracle R16 S2): dash performs NO brace expansion at all, so the
+// scan is skipped outright under posixNoBraces instead of paying the
+// budget scan for a multiplication the runtime never performs.
+func wordBraceExpHitDialect(w *syntax.Word, posixNoBraces bool) bool {
+	if posixNoBraces {
+		return false
+	}
+	return wordBraceExpHit(w)
+}
+
+func wordToArgDialect(w *syntax.Word, posixNoBraces bool) (string, bool) {
 	if w == nil || len(w.Parts) == 0 {
 		return "", false
 	}
@@ -3180,7 +3232,7 @@ func wordToArg(w *syntax.Word) (string, bool) {
 	// TWO markers, which is exactly what denies `~/{red,blue}` (but not the
 	// single-glob `~/x` or the quoted-literal `~/'{red,blue}'`) the
 	// pure-tilde single-path exemption in isSingleWordOptionValue.
-	braceSeen := wordBraceExpHit(w)
+	braceSeen := wordBraceExpHitDialect(w, posixNoBraces)
 	for i, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
@@ -3204,31 +3256,8 @@ func wordToArg(w *syntax.Word) (string, bool) {
 				b.WriteString(cmdSubPlaceholderQuoted)
 				break
 			}
-			for _, ip := range p.Parts {
-				switch ipp := ip.(type) {
-				case *syntax.Lit:
-					b.WriteString(decodeDblQuotedLit(ipp.Value))
-				case *syntax.ParamExp:
-					// "$@"/"${arr[@]}"/"${!prefix@}"/"${x:-$@}" still
-					// field-split inside double quotes -> NOT split-safe.
-					static = false
-					if paramExpSplitsInDblQuotes(ipp) {
-						b.WriteString(cmdSubPlaceholder)
-					} else if name, ok := simpleParamName(ipp); ok && name == "$" {
-						// R13-SF-2: decimal PID — the digit prefix keeps
-						// dynWordCanSpellDashDash from a vacuous all-dash match.
-						// R14-Oracle-M3: simpleParamName, never a bare
-						// Param.Value=="$" check — derived operators
-						// (${$:0:0} zero-length slice CAN be empty) must not
-						// inherit the never-dash PID grant.
-						b.WriteString("0" + cmdSubPlaceholderQuoted)
-					} else {
-						b.WriteString(cmdSubPlaceholderQuoted)
-					}
-				default:
-					static = false
-					b.WriteString(cmdSubPlaceholderQuoted)
-				}
+			if !writeCtxFreeDqParts(&b, p) {
+				static = false
 			}
 		case *syntax.ParamExp:
 			// Context-free: only $$ (a decimal PID) is known split-safe.
@@ -3255,7 +3284,7 @@ func wordToArg(w *syntax.Word) (string, bool) {
 	}
 	if braceSeen {
 		static = false
-		b.WriteString(cmdSubPlaceholderGlob)
+		writeBraceExpansionMarkers(&b)
 	}
 	if !static {
 		if b.Len() == 0 {
@@ -3264,6 +3293,56 @@ func wordToArg(w *syntax.Word) (string, bool) {
 		return b.String(), false
 	}
 	return b.String(), true
+}
+
+// writeCtxFreeDqParts encodes the parts of one non-dollar double-quoted
+// segment for the context-free wordToArgDialect (extracted for the v6.2.2
+// R16 complexity budget). Returns false when any part is dynamic.
+func writeCtxFreeDqParts(b *strings.Builder, p *syntax.DblQuoted) bool {
+	static := true
+	for _, ip := range p.Parts {
+		switch ipp := ip.(type) {
+		case *syntax.Lit:
+			b.WriteString(decodeDblQuotedLit(ipp.Value))
+		case *syntax.ParamExp:
+			// "$@"/"${arr[@]}"/"${!prefix@}"/"${x:-$@}" still
+			// field-split inside double quotes -> NOT split-safe.
+			static = false
+			if paramExpSplitsInDblQuotes(ipp) {
+				b.WriteString(cmdSubPlaceholder)
+			} else if name, ok := simpleParamName(ipp); ok && name == "$" {
+				// R13-SF-2: decimal PID — the digit prefix keeps
+				// dynWordCanSpellDashDash from a vacuous all-dash match.
+				// R14-Oracle-M3: simpleParamName, never a bare
+				// Param.Value=="$" check — derived operators
+				// (${$:0:0} zero-length slice CAN be empty) must not
+				// inherit the never-dash PID grant.
+				b.WriteString("0" + cmdSubPlaceholderQuoted)
+			} else {
+				b.WriteString(cmdSubPlaceholderQuoted)
+			}
+		default:
+			static = false
+			b.WriteString(cmdSubPlaceholderQuoted)
+		}
+	}
+	return static
+}
+
+// writeBraceExpansionMarkers emits the glob markers a real brace expansion
+// word carries (R16-Oracle-S1): the encoding must hold AT LEAST TWO glob
+// placeholders so the consumer can distinguish a true brace expansion (the
+// word multiplied into several argv words — every one of them carrying the
+// literal '{' bytes of the source spelling) from a plain pathname glob that
+// merely passes through a QUOTED literal '{' (docs/'{v1}'/*.txt carries
+// exactly ONE marker). Topping up to two markers keeps `~/{red,blue}` at
+// exactly two (tilde marker + brace marker) while `{docs/a,-blue}` — no
+// glob metacharacter of its own — also reaches two.
+func writeBraceExpansionMarkers(b *strings.Builder) {
+	b.WriteString(cmdSubPlaceholderGlob)
+	if strings.Count(b.String(), cmdSubPlaceholderGlob) < 2 {
+		b.WriteString(cmdSubPlaceholderGlob)
+	}
 }
 
 func (c *subCollector) wordToArg(w *syntax.Word) (string, bool) {
@@ -3400,7 +3479,7 @@ func (c *subCollector) wordToArgWithSubst(w *syntax.Word) (string, bool) {
 	}
 	if braceSeen {
 		static = false
-		b.WriteString(cmdSubPlaceholderGlob)
+		writeBraceExpansionMarkers(&b)
 	}
 	if !static {
 		if b.Len() == 0 {
@@ -3450,8 +3529,23 @@ func (c *subCollector) unquotedParamPlaceholder(pe *syntax.ParamExp) string {
 		// re-populates HOME) makes "$HOME" expand EMPTY, so the word must
 		// fall back to the plain splittable placeholder instead of
 		// fabricating a "/root" the shell never received.
+		// R16-Oracle-M3: a legal absolute HOME is still not safe as UNQUOTED
+		// static text when it carries whitespace or glob bytes — unquoted
+		// expansion field-splits on whitespace and glob-expands on *?[ at
+		// runtime, so the word is NEVER a single static operand then. The
+		// static-literal grant is restricted to whitespace/glob-free values;
+		// everything else degrades to an absolute-path-prefixed DYNAMIC
+		// multi-word encoding (the dq-sub placeholder carries the
+		// never-dash, never-'-'-start properties of the leading '/', the
+		// plain cmdsub marks it non-split-safe, and the glob marker models
+		// the potential pathname expansion), so isSingleWordOptionValue and
+		// the zero-argument printf review can no longer treat HOME="/home/
+		// Team Blue" as one operand slot.
 		if !c.isTainted("HOME") {
 			if h, ok := inheritedHomeDir(); ok {
+				if strings.ContainsAny(h, " \t\n\r*?[") {
+					return cmdSubPlaceholderAbsDq + cmdSubPlaceholder + cmdSubPlaceholderGlob
+				}
 				return h
 			}
 		}
@@ -3600,8 +3694,25 @@ func inheritedTmpdirValid() bool {
 	if !strings.HasPrefix(td, "/") || strings.Contains(td, "\x00") {
 		return false
 	}
+	// R16-Oracle-M1: a directory entry is not enough — pseudo filesystems
+	// like /proc are real directories (mode 0555) on which mktemp can never
+	// create a subdirectory, so TMPDIR=/proc must fail closed exactly like
+	// the non-directory TMPDIR=/dev/null. The perm-bit check plus a real
+	// write/search access probe together approximate "a subdirectory could
+	// be created here"; both must pass.
+	for _, pseudo := range []string{"/proc", "/sys", "/dev"} {
+		if td == pseudo || strings.HasPrefix(td, pseudo+"/") {
+			return false
+		}
+	}
 	fi, err := os.Stat(td)
-	return err == nil && fi.IsDir()
+	if err != nil || !fi.IsDir() {
+		return false
+	}
+	if fi.Mode().Perm()&0222 == 0 {
+		return false
+	}
+	return unix.Access(td, unix.W_OK|unix.X_OK) == nil
 }
 
 func callHasProcSubst(call *syntax.CallExpr) bool {

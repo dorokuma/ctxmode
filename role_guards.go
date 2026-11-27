@@ -162,6 +162,14 @@ type shellSegment struct {
 	// CallExpr, so all other paths rely on peelPreludeHasNonAssign's word-shape
 	// verification instead (v6.2.2 Oracle R11 R11-MF-2).
 	declClause bool
+	// bashDialect marks a segment whose enclosing script was parsed under a
+	// bash-family interpreter dialect (v6.2.2 Oracle R16 M2). A same-process
+	// re-parse — eval operand or trap action — runs in the SAME interpreter,
+	// so the recursive guard must re-enter under this dialect instead of
+	// falling back to the dash POSIX default (a dash-only static literal
+	// like printf tag{red,blue} brace-expands into multiple argv words when
+	// bash re-parses it).
+	bashDialect bool
 }
 
 // shellSplitMaxDepth bounds recursion into $(...)/`...`/subshell text so a
@@ -316,7 +324,14 @@ func isSafeDynamicDataOperand(a string) bool {
 	// merged encoding, so brace words can never be proven safe data
 	// operands here (ordinary pathname globs like docs/*.txt carry no
 	// '{' byte and are unaffected).
-	if strings.Contains(a, cmdSubPlaceholderGlob) && strings.Contains(a, "{") {
+	// R16-Oracle-S1: a REAL brace expansion encodes at least two glob
+	// placeholders (writeBraceExpansionMarkers), so the refusal keys on the
+	// two-marker brace shape instead of the mere co-occurrence of one glob
+	// marker and a literal '{'. A QUOTED literal brace inside an ordinary
+	// pathname glob — docs/'{v1}'/*.txt — carries exactly ONE marker and
+	// stays a safe data operand: every match shares the fixed docs/ prefix
+	// and {v1} is a literal directory, never an expansion branch.
+	if strings.Contains(a, "{") && strings.Count(a, cmdSubPlaceholderGlob) >= 2 {
 		return false
 	}
 	if strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+") {
@@ -4689,7 +4704,10 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 			return "dynamic code payload"
 		}
 		if kind == 's' {
-			return guardShellSubagentDepth(text, depth+1, caller)
+			// R16-Oracle-M2: eval re-parses in the SAME shell — a segment of a
+			// bash payload must face the bash dialect (brace expansion), not
+			// the dash POSIX default.
+			return guardShellSubagentDepthDialect(text, depth+1, caller, seg.bashDialect)
 		}
 		return guardShellReadonlyDepth(text, depth+1, caller)
 	}
@@ -4742,7 +4760,7 @@ func peelResolvedSegDepth(argv []string, seg shellSegment, kind byte, depth int,
 		return screenFindArgsSeg(head[1:], seg, kind, depth+1, caller)
 	}
 	if base == "trap" {
-		return screenTrapArgs(head[1:], kind, depth+1, caller)
+		return screenTrapArgs(head[1:], kind, depth+1, caller, seg)
 	}
 	if base == "unset" {
 		return screenUnsetArgs(head[1:], kind)
@@ -9076,8 +9094,11 @@ func callerReadonlyRole(c callerIdentity) bool {
 
 // screenTrapArgs screens trap's action argument as shell text. Print modes
 // (-p, -l) and signal-name operands are allowed; the first non-option,
-// non-"-" operand is the action.
-func screenTrapArgs(args []string, kind byte, depth int, caller callerIdentity) string {
+// non-"-" operand is the action. R16-Oracle-M2: the action re-parses in the
+// SAME interpreter as the enclosing script, so seg carries the enclosing
+// dialect — a bash payload's trap action faces the bash brace-expansion
+// rules, never the dash POSIX default.
+func screenTrapArgs(args []string, kind byte, depth int, caller callerIdentity, seg shellSegment) string {
 	for _, a := range args {
 		if isDynamicArg(a) {
 			return "dynamic code payload"
@@ -9097,7 +9118,7 @@ func screenTrapArgs(args []string, kind byte, depth int, caller callerIdentity) 
 			continue
 		}
 		if kind == 's' {
-			return guardShellSubagentDepth(a, depth, caller)
+			return guardShellSubagentDepthDialect(a, depth, caller, seg.bashDialect)
 		}
 		return guardShellReadonlyDepth(a, depth, caller)
 	}
@@ -9720,6 +9741,17 @@ func guardShellSubagentDepthEnv(code string, depth int, caller callerIdentity, e
 
 func guardShellSubagentDepthBash(code string, depth int, caller callerIdentity) string {
 	return guardShellSubagentDepthSegs(splitShellSegmentsBashCaller(code, caller.envTaint, caller), depth, caller)
+}
+
+// guardShellSubagentDepthDialect is the dialect-selected re-entry used by
+// same-process re-parses (eval operand, trap action): bash=true picks the
+// bash-family parser exactly like guardShellSubagentDepthBash, false keeps
+// the dash POSIX default (v6.2.2 Oracle R16 M2).
+func guardShellSubagentDepthDialect(code string, depth int, caller callerIdentity, bash bool) string {
+	if bash {
+		return guardShellSubagentDepthBash(code, depth, caller)
+	}
+	return guardShellSubagentDepth(code, depth, caller)
 }
 
 func guardShellSubagentDepthSegs(segs []shellSegment, depth int, caller callerIdentity) string {
@@ -19203,12 +19235,20 @@ func (g guardCall) guardCtxRunShell(code string) (rule, detail string) {
 // the stdin program text with HOME already tainted — a `$HOME` inside the
 // payload is then a dynamic placeholder, never the trusted abs-dir grant.
 func (g guardCall) guardCtxRunShellEnv(code string, envAs envAssignments) (rule, detail string) {
+	return g.guardCtxRunShellEnvDialect(code, envAs, false)
+}
+
+// guardCtxRunShellEnvDialect is guardCtxRunShellEnv under an explicit shell
+// dialect (v6.2.2 Oracle R16 M2): a bash-family shell reading its program
+// from stdin re-parses brace expansion exactly like `bash -c` — the stdin
+// entry can no longer judge the same program text as dash POSIX.
+func (g guardCall) guardCtxRunShellEnvDialect(code string, envAs envAssignments, bash bool) (rule, detail string) {
 	if !g.subagent && !g.strictReadonly {
 		return "", "" // main agent: never enters the sub-agent parser
 	}
 	caller := g.callerIdentity().seededWith(envAs)
 	if g.subagent {
-		if hit := guardShellSubagentDepth(code, 0, caller); hit != "" {
+		if hit := guardShellSubagentDepthDialect(code, 0, caller, bash); hit != "" {
 			if hit == "ctxmode index" || hit == roSSHWriteHit {
 				return ruleReadonlyWrite, hit
 			}
@@ -19802,7 +19842,7 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 			gSeg.strictReadonly = true
 		}
 		if t.lang == "" {
-			if r, d := gSeg.guardCtxRunShellEnv(stdin, t.envAs); r != "" {
+			if r, d := gSeg.guardCtxRunShellEnvDialect(stdin, t.envAs, t.bash); r != "" {
 				return r, d
 			}
 			continue
@@ -19851,7 +19891,7 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 				gSeg.strictReadonly = true
 			}
 			if t.lang == "" {
-				if r, d := gSeg.guardCtxRunShellEnv(stdin, t.envAs); r != "" {
+				if r, d := gSeg.guardCtxRunShellEnvDialect(stdin, t.envAs, t.bash); r != "" {
 					return r, d
 				}
 				continue
@@ -20084,6 +20124,11 @@ func pythonHasBareOpenIdent(masked string) bool {
 type stdinTarget struct {
 	lang  string
 	envAs envAssignments
+	// bash marks a shell target whose interpreter is a bash-family shell
+	// (v6.2.2 Oracle R16 M2): the stdin program text must be re-parsed
+	// under the bash dialect (brace expansion) instead of the dash POSIX
+	// default — the consuming process is never a top-level /bin/sh.
+	bash bool
 	// remote marks a target whose stdin program runs on a REMOTE host: it
 	// is minted only by the ssh branch below (an ssh remote command that
 	// itself reads a program from stdin) and rides collectSegs up through
@@ -20095,6 +20140,16 @@ type stdinTarget struct {
 }
 
 func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity) []stdinTarget {
+	return stdinProgramTargetsDialect(argv, depth, inherited, basePath, caller, false)
+}
+
+// stdinProgramTargetsDialect is stdinProgramTargetsWithEnv plus the dialect
+// of the SHELL that produced argv (bash=true for segments of a bash payload).
+// Same-process re-parses — the eval indirection joining operands back into
+// shell text — must re-enter the parser under that dialect (v6.2.2 Oracle
+// R16 M2); heads that spawn a FRESH shell (flock -c / script -c / watch /
+// `sh -c` unwrapping) pick their own dialect below and never inherit it.
+func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity, bash bool) []stdinTarget {
 	if len(argv) == 0 || depth >= shellSplitMaxDepth {
 		return nil
 	}
@@ -20119,7 +20174,7 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 	base := filepath.Base(head[0])
 	if canon := canonicalResolvedBase(base); canon != base {
 		if isPeeledWrapperBase(canon) {
-			return stdinProgramTargetsWithEnv(append([]string{canon}, head[1:]...), depth+1, envAs, basePath, caller)
+			return stdinProgramTargetsDialect(append([]string{canon}, head[1:]...), depth+1, envAs, basePath, caller, bash)
 		}
 		head = append([]string{canon}, head[1:]...)
 		base = canon
@@ -20127,7 +20182,7 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 	effPath := envAs.effectivePATHFrom(basePath)
 	if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath, caller.screenCwd())); rb != "" && rb != base {
 		if isPeeledWrapperBase(rb) {
-			return stdinProgramTargetsWithEnv(append([]string{rb}, head[1:]...), depth+1, envAs, basePath, caller)
+			return stdinProgramTargetsDialect(append([]string{rb}, head[1:]...), depth+1, envAs, basePath, caller, bash)
 		}
 		if !isStructuralGuardHead(base) {
 			head = append([]string{rb}, head[1:]...)
@@ -20144,7 +20199,7 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 				continue
 			}
-			for _, t := range stdinProgramTargetsWithEnv(seg.argv, depth+1, subEnv, subPath, subCaller) {
+			for _, t := range stdinProgramTargetsDialect(seg.argv, depth+1, subEnv, subPath, subCaller, seg.bashDialect) {
 				if mergeOuter {
 					t.envAs = envAs.merged(t.envAs)
 				}
@@ -20165,11 +20220,15 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 	if base == "xargs" {
 		return stdinXargsTargets(head, depth, envAs, basePath, effPath, caller)
 	}
-	if targets, handled := stdinIndirectionTargets(head, base, depth, envAs, basePath, caller, collectSegs); handled {
+	if targets, handled := stdinIndirectionTargets(head, base, depth, envAs, basePath, caller, collectSegs, bash); handled {
 		return targets
 	}
 	if shellHeads[base] {
-		return stdinShellTargetsScan(head, envAs)
+		// R16-Oracle-M2: a bash-family shell reading its program from stdin
+		// marks the target bash — the stream re-parses under brace-expansion
+		// rules. The resolution mirrors the explicit -c path: both the typed
+		// name and the PATH/symlink-resolved name decide.
+		return stdinShellTargetsScan(head, envAs, hcShellDialectBash(head[0], effPath, caller))
 	}
 	if lang, ok := heredocInterpLang(base); ok {
 		return stdinInterpTargetsScan(head, base, lang, envAs)
@@ -20182,7 +20241,7 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 // each shape either joins operands into shell text the segments screen,
 // recurses into a positional inner argv, or reports the stream is data,
 // not program. handled reports the base matched one of the four heads.
-func stdinIndirectionTargets(head []string, base string, depth int, envAs envAssignments, basePath string, caller callerIdentity, collectSegs stdinSegCollectFunc) (targets []stdinTarget, handled bool) {
+func stdinIndirectionTargets(head []string, base string, depth int, envAs envAssignments, basePath string, caller callerIdentity, collectSegs stdinSegCollectFunc, bash bool) (targets []stdinTarget, handled bool) {
 	switch base {
 	case "eval":
 		if len(head) < 2 {
@@ -20191,6 +20250,11 @@ func stdinIndirectionTargets(head []string, base string, depth int, envAs envAss
 		inner := strings.Join(head[1:], " ")
 		if isDynamicArg(inner) {
 			return []stdinTarget{{lang: "", envAs: envAs}}, true
+		}
+		// R16-Oracle-M2: eval re-parses in the SAME shell — the enclosing
+		// script's dialect rides in on the bash parameter.
+		if bash {
+			return collectSegs(splitShellSegmentsBashCaller(inner, caller.envTaint, caller), envAs, basePath, false, caller), true
 		}
 		return collectSegs(splitShellSegmentsCaller(inner, caller.envTaint, caller), envAs, basePath, false, caller), true
 	case "flock":
@@ -20326,21 +20390,21 @@ func stdinXargsTargets(head []string, depth int, envAs envAssignments, basePath,
 // bash's --rcfile/--init-file consume a file operand that must never pose
 // as the first script word (v6.2.2 MF-4b). Verdict encoding: -1 keep
 // scanning, 0 not-a-stdin-program (nil), 1 stdin-program target.
-func stdinShellTargetsScan(head []string, envAs envAssignments) []stdinTarget {
+func stdinShellTargetsScan(head []string, envAs envAssignments, bash bool) []stdinTarget {
 	sawDashDash := false
 	forceStdin := false
 	for i := 1; i < len(head); {
 		v, ni, nf := stdinShellWordVerdict(head, i, sawDashDash, forceStdin)
 		if v >= 0 {
 			if v == 1 {
-				return []stdinTarget{{lang: "", envAs: envAs}}
+				return []stdinTarget{{lang: "", envAs: envAs, bash: bash}}
 			}
 			return nil
 		}
 		sawDashDash, forceStdin = sawDashDash || head[i] == "--", nf
 		i = ni
 	}
-	return []stdinTarget{{lang: "", envAs: envAs}}
+	return []stdinTarget{{lang: "", envAs: envAs, bash: bash}}
 }
 
 // stdinShellWordVerdict decides one word of the shell option zone for
@@ -20488,7 +20552,17 @@ func resolveNodeRunnerPathOpt(val string, cwd string) (string, bool) {
 		if raw != "~" && !strings.HasPrefix(raw, "~/") {
 			return "", false // ~otheruser: untrusted home directory
 		}
-		home := filepath.Clean(safeHomeDir())
+		// R16-Oracle-M4: restoring the shell's `~/...` expansion must use
+		// the shell-visible inherited HOME (inheritedHomeDir), never the
+		// config-search fallback of safeHomeDir — a relative or empty
+		// inherited HOME must not fabricate "/root/notes" the running
+		// shell never expands to. Failing closed is the sound outcome when
+		// the inherited value cannot anchor an absolute path.
+		h, ok := inheritedHomeDir()
+		if !ok {
+			return "", false
+		}
+		home := filepath.Clean(h)
 		if home == "" || home == "." || !filepath.IsAbs(home) {
 			return "", false
 		}

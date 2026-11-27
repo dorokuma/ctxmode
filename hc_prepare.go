@@ -1182,7 +1182,15 @@ func (g guardCall) prepareCtxRunShellWithTaint(code string, envTaint map[string]
 // guardPreparedShellEnv pass reuses, so caller.pathEnv / envTaint reflect
 // the exact env the rewritten payload runs under (a peeled PATH= must
 // drive alias resolution inside the payload too).
-func (g guardCall) prepareCtxRunShellTargets(code string, targetEnvs []envAssignments) preparedShell {
+// prepareCtxRunShellTargets prepares a stdin program payload that feeds
+// local shell targets. bash (variadic, default false) is the shared dialect
+// of the consuming shells (v6.2.2 Oracle R16 M2): a bash-family shell reading
+// its program from stdin brace-expands exactly like `bash -c`, so the edit
+// walk AND the prov-aware guard pass must face the same dialect or the
+// `printf tag{red,blue}`-shaped format words the -c path blocks would pass
+// as dash static literals.
+func (g guardCall) prepareCtxRunShellTargets(code string, targetEnvs []envAssignments, bashOpt ...bool) preparedShell {
+	bash := len(bashOpt) > 0 && bashOpt[0]
 	caller := g.callerIdentity()
 	out := preparedShell{rawCode: code, execStdin: ""}
 	if !g.subagent && !g.strictReadonly {
@@ -1205,16 +1213,16 @@ func (g guardCall) prepareCtxRunShellTargets(code string, targetEnvs []envAssign
 	// then blesses (R4 MF-1). Every target env whose seeded edit walk
 	// yields a rule rejects the whole prepare.
 	for _, te := range targetEnvs {
-		if _, erule, edetail := collectHcGateEdits(code, selfExe, envTaint, false, g.strictReadonly, caller.seededWith(te)); erule != "" {
+		if _, erule, edetail := collectHcGateEdits(code, selfExe, envTaint, bash, g.strictReadonly, caller.seededWith(te)); erule != "" {
 			out.rule, out.detail = erule, edetail
 			return out
 		}
 	}
 	var edits []byteEdit
 	if len(targetEnvs) > 0 {
-		edits, _, _ = collectHcGateEdits(code, selfExe, envTaint, false, g.strictReadonly, caller.seededWith(targetEnvs[0]))
+		edits, _, _ = collectHcGateEdits(code, selfExe, envTaint, bash, g.strictReadonly, caller.seededWith(targetEnvs[0]))
 	} else {
-		edits, _, _ = collectHcGateEdits(code, selfExe, envTaint, false, g.strictReadonly, caller)
+		edits, _, _ = collectHcGateEdits(code, selfExe, envTaint, bash, g.strictReadonly, caller)
 	}
 	// Order-independent fail-closed (R6 SF-1): when the stdin stream feeds
 	// MORE THAN ONE local shell target, the rewrite decision must not
@@ -1228,7 +1236,7 @@ func (g guardCall) prepareCtxRunShellTargets(code string, targetEnvs []envAssign
 	if len(edits) > 0 && len(targetEnvs) > 1 {
 		want := len(edits)
 		for i := 1; i < len(targetEnvs); i++ {
-			teEdits, _, _ := collectHcGateEdits(code, selfExe, envTaint, false, g.strictReadonly, caller.seededWith(targetEnvs[i]))
+			teEdits, _, _ := collectHcGateEdits(code, selfExe, envTaint, bash, g.strictReadonly, caller.seededWith(targetEnvs[i]))
 			if len(teEdits) != want {
 				edits = nil
 				break
@@ -1264,7 +1272,7 @@ func (g guardCall) prepareCtxRunShellTargets(code string, targetEnvs []envAssign
 		// screenCtxmodeGateHead with hcProv == nil and self-block every
 		// legal prepared `<selfExe> --hc-gate` call (the stdin rewrite
 		// self-lock).
-		if rule, detail := g.guardPreparedShellEnv(execCode, ea, nil, prov); rule != "" {
+		if rule, detail := g.guardPreparedShellEnvDialect(execCode, ea, nil, prov, bash); rule != "" {
 			out.rule, out.detail = rule, detail
 			return out
 		}
@@ -1284,18 +1292,24 @@ func (g guardCall) prepareCtxRunShellTargets(code string, targetEnvs []envAssign
 // remote: true and must likewise stay data. The per-target envAs slices are
 // kept separate (never merged): a later target's PATH= must not rewrite the
 // PATH view an earlier target's heads are audited under.
-func stdinSingleShellTarget(targets []stdinTarget, sshTunnel bool) ([]envAssignments, bool) {
+// stdinSingleShellTargetDialect additionally returns the shared
+// consuming-shell dialect (v6.2.2 Oracle R16 M2). Every target must agree
+// on the dialect: a MIXED bash/dash consumer set can never be rewritten
+// under one parser honestly, so the rewrite is refused (ok=false) and the
+// caller falls back to the verbatim per-target stdin screen.
+func stdinSingleShellTargetDialect(targets []stdinTarget, sshTunnel bool) (envs []envAssignments, ok bool, bash bool) {
 	if sshTunnel || len(targets) == 0 {
-		return nil, false
+		return nil, false, false
 	}
-	envs := make([]envAssignments, 0, len(targets))
+	envs = make([]envAssignments, 0, len(targets))
+	bash = targets[0].bash
 	for _, t := range targets {
-		if t.lang != "" || t.remote {
-			return nil, false
+		if t.lang != "" || t.remote || t.bash != bash {
+			return nil, false, false
 		}
 		envs = append(envs, t.envAs)
 	}
-	return envs, true
+	return envs, true, bash
 }
 
 // scriptAllowsLocalShellStdinPrepare reports whether a shell command string
@@ -1310,7 +1324,16 @@ func stdinSingleShellTarget(targets []stdinTarget, sshTunnel bool) ([]envAssignm
 // with guardCtxRunStdin / guardCtxRunStdinForCommand. Segments that never
 // see the stream (pipe-fed, redirect-fed, heredoc / here-string fed, empty
 // or pure-assignment commands) are skipped.
+// scriptAllowsLocalShellStdinPrepareDialect additionally returns the shared
+// consuming-shell dialect (v6.2.2 Oracle R16 M2): the caller must parse the
+// prepared stdin payload under the bash dialect when a bash-family shell
+// consumes it.
 func scriptAllowsLocalShellStdinPrepare(code string, bash bool, outerEnv envAssignments, basePath string, caller callerIdentity) ([]envAssignments, bool) {
+	envs, ok, _ := scriptAllowsLocalShellStdinPrepareDialect(code, bash, outerEnv, basePath, caller)
+	return envs, ok
+}
+
+func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv envAssignments, basePath string, caller callerIdentity) ([]envAssignments, bool, bool) {
 	// Seed the outer env ONCE here: every segment, wrapper peel and stdin
 	// target below resolves under the env ops the prepared -c argv installs
 	// (an outer `env -C sub` re-anchors inner heads exactly once — never a
@@ -1323,10 +1346,11 @@ func scriptAllowsLocalShellStdinPrepare(code string, bash bool, outerEnv envAssi
 		segs = splitShellSegmentsCaller(code, caller.envTaint, caller)
 	}
 	sawTarget := false
+	segBash := false
 	var out []envAssignments
 	for _, seg := range segs {
 		if seg.depthExceeded || seg.parseErr != "" {
-			return nil, false
+			return nil, false, false
 		}
 		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 			continue
@@ -1343,31 +1367,40 @@ func scriptAllowsLocalShellStdinPrepare(code string, bash bool, outerEnv envAssi
 		// guard pass judge the argv verbatim.
 		if _, hasC := unwrapShellArgv(seg.argv); hasC {
 			if _, _, glued, slotOK := locateShellCSlot(seg.argv); glued || !slotOK {
-				return nil, false
+				return nil, false, false
 			}
 		}
-		targets := stdinProgramTargetsWithEnv(seg.argv, 0, outerEnv, basePath, caller)
+		// R16-Oracle-M2: the segments carry their own dialect — an eval
+		// indirection inside the scan re-parses under seg.bashDialect.
+		targets := stdinProgramTargetsDialect(seg.argv, 0, outerEnv, basePath, caller, seg.bashDialect)
 		if len(targets) == 0 {
 			// A plain data consumer (jq ., cat, git apply) reads the stream as
 			// DATA: rewriting it into `<selfExe> --hc-gate` would turn payload
 			// bytes into a host-local send.
-			return nil, false
+			return nil, false, false
 		}
 		sawTarget = true
 		// The ssh baseline is the OUTER env, never the cross-segment
 		// accumulator: `out` would drop outerEnv's PATH= on the first
 		// segment and smuggle an earlier segment's local PATH= into a later
 		// one.
-		envs, ok := stdinSingleShellTarget(targets, sshTunnelsStdinProgram(seg.argv, outerEnv.effectivePATHFrom(basePath), caller))
+		envs, ok, tBash := stdinSingleShellTargetDialect(targets, sshTunnelsStdinProgram(seg.argv, outerEnv.effectivePATHFrom(basePath), caller))
 		if !ok {
-			return nil, false
+			return nil, false, false
 		}
+		// R16-Oracle-M2: the consuming shells of different segments must
+		// agree on one dialect — a `sh ; bash` mixture reading the same
+		// stream can never be prepared under a single parser honestly.
+		if len(out) > 0 && tBash != segBash {
+			return nil, false, false
+		}
+		segBash = tBash
 		out = append(out, envs...)
 	}
 	if !sawTarget {
-		return nil, false
+		return nil, false, false
 	}
-	return out, true
+	return out, true, segBash
 }
 
 func (g guardCall) prepareCtxRunShellAndStdin(command, stdin string) preparedShell {
@@ -1383,7 +1416,7 @@ func (g guardCall) prepareCtxRunShellAndStdin(command, stdin string) preparedShe
 	// prepared command resolves to a local shell reading its PROGRAM from
 	// this stream. Otherwise the payload stays data and is screened by the
 	// real language / remote rules.
-	targetEnvs, ok := scriptAllowsLocalShellStdinPrepare(prep.execCode, false, envAssignments{}, os.Getenv("PATH"), g.callerIdentity())
+	targetEnvs, ok, stdinBash := scriptAllowsLocalShellStdinPrepareDialect(prep.execCode, false, envAssignments{}, os.Getenv("PATH"), g.callerIdentity())
 	if !ok {
 		if rule, detail := g.guardCtxRunStdinForCommand(prep.execCode, stdin); rule != "" {
 			prep.rule, prep.detail = rule, detail
@@ -1394,7 +1427,7 @@ func (g guardCall) prepareCtxRunShellAndStdin(command, stdin string) preparedShe
 	// The rewrite and its per-target prov-aware guard passes happen inside
 	// prepareCtxRunShellTargets; re-screening the rewritten bytes through a
 	// pure-check stdin guard would self-lock on hcProv == nil.
-	sp := g.prepareCtxRunShellTargets(stdin, targetEnvs)
+	sp := g.prepareCtxRunShellTargets(stdin, targetEnvs, stdinBash)
 	if sp.rule != "" {
 		prep.rule, prep.detail = sp.rule, sp.detail
 		prep.execCode = ""
@@ -1499,8 +1532,8 @@ func (g guardCall) prepareCtxRunArgv(argv []string, stdin string) preparedArgv {
 				// (caller.seededWith(outerEnv)), and stdinProgramTargetsWithEnv
 				// applies each level's OWN peeled ops — a double seed here would
 				// replay the outer env -C twice (R4 MF-1).
-				if targetEnvs, ok := scriptAllowsLocalShellStdinPrepare(execText, isBash, envAs, os.Getenv("PATH"), caller); ok {
-					sp := g.prepareCtxRunShellTargets(stdin, targetEnvs)
+				if targetEnvs, ok, stdinBash := scriptAllowsLocalShellStdinPrepareDialect(execText, isBash, envAs, os.Getenv("PATH"), caller); ok {
+					sp := g.prepareCtxRunShellTargets(stdin, targetEnvs, stdinBash)
 					if sp.rule != "" {
 						out.rule, out.detail = sp.rule, sp.detail
 						return out
@@ -1543,8 +1576,8 @@ func (g guardCall) prepareCtxRunArgv(argv []string, stdin string) preparedArgv {
 			caller := g.callerIdentity()
 			targets := stdinProgramTargetsWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"), caller)
 			if len(targets) > 0 {
-				if targetEnvs, ok := stdinSingleShellTarget(targets, sshTunnelsStdinProgram(argv, os.Getenv("PATH"), caller)); ok {
-					sp := g.prepareCtxRunShellTargets(stdin, targetEnvs)
+				if targetEnvs, ok, stdinBash := stdinSingleShellTargetDialect(targets, sshTunnelsStdinProgram(argv, os.Getenv("PATH"), caller)); ok {
+					sp := g.prepareCtxRunShellTargets(stdin, targetEnvs, stdinBash)
 					if sp.rule != "" {
 						out.rule, out.detail = sp.rule, sp.detail
 						return out
