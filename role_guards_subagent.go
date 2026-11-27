@@ -645,26 +645,54 @@ func lookPathIn(name, pathEnv, cwd string) (string, bool, error) {
 		pathEnv = os.Getenv("PATH")
 	}
 	for _, dir := range strings.Split(pathEnv, ":") {
-		dot := false
-		switch {
-		case dir == "":
-			dot = true
-			dir = "."
-		case !filepath.IsAbs(dir):
-			dot = true // relative segment resolves against the call cwd
-		}
-		if !filepath.IsAbs(dir) {
-			if cwd == "" {
-				continue
-			}
-			dir = filepath.Join(cwd, dir)
-		}
-		p := filepath.Join(dir, name)
-		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0111 != 0 {
+		if p, dot, ok := lookPathOneSeg(name, dir, cwd); ok {
 			return p, dot, nil
 		}
 	}
 	return "", false, exec.ErrNotFound
+}
+
+// lookPathOneSeg resolves name inside one PATH segment (extracted from
+// lookPathIn so the untrusted-marker skip and the cwd re-anchoring carry
+// no extra nesting): a segment carrying the command-substitution
+// placeholder is the UNTRUSTED-PATH marker, never a real directory
+// (R22-Oracle-#6 / R22-Reviewer-#6) — probing the filesystem for it
+// would treat an unknowable PATH as an ordinary lookup failure, or
+// worse, resolve inside a directory literally named after the marker —
+// so it skips to not-found exactly like a missing directory and the
+// caller's untrusted-PATH classification decides the verdict. Relative
+// and empty segments re-anchor against the call cwd; a missing cwd or
+// a non-executable entry reports not-found.
+func lookPathOneSeg(name, dir, cwd string) (string, bool, bool) {
+	if pathSegUnvettable(dir) {
+		return "", false, false
+	}
+	dot := false
+	switch {
+	case dir == "":
+		dot = true
+		dir = "."
+	case !filepath.IsAbs(dir):
+		dot = true // relative segment resolves against the call cwd
+	}
+	if !filepath.IsAbs(dir) {
+		if cwd == "" {
+			return "", false, false
+		}
+		dir = filepath.Join(cwd, dir)
+	}
+	p := filepath.Join(dir, name)
+	if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0111 != 0 {
+		return p, dot, true
+	}
+	return "", false, false
+}
+
+// pathSegUnvettable reports whether a PATH segment can never be a real
+// lookup directory: the command-substitution placeholder anywhere in it
+// marks an unknowable PATH fragment (R22-Oracle-#6).
+func pathSegUnvettable(dir string) bool {
+	return strings.Contains(dir, cmdSubPlaceholder)
 }
 
 // canonicalResolvedBase maps a symlink-resolved executable basename to the
@@ -1712,6 +1740,14 @@ type callerIdentity struct {
 	// working directory, the same semantics the global empty value had
 	// (unit screening).
 	cwd string
+	// xw is the request-scoped xargs memo/budget table (R22-Reviewer-#1 /
+	// R22-Oracle-M5): minted once per top-level guard entry, it threads
+	// through every recursion of the SAME analysis request so all xargs
+	// descents share the single 512-node budget, while two parallel
+	// requests can never share a verdict or a step count. nil means no
+	// request scope exists (direct unit screening) — xargsWork then
+	// mints a fresh table per entry.
+	xw *xargsWorkState
 }
 
 // effectivePATH returns the PATH the identity resolves against: pathEnv
@@ -1731,6 +1767,10 @@ func currentCallerIdentity() callerIdentity {
 		role:     strings.TrimSpace(os.Getenv(auditEnvRole)),
 		readonly: os.Getenv(auditEnvReadonly),
 		pathEnv:  os.Getenv("PATH"),
+		// R22-Reviewer-#1: one xargs memo/budget table per top-level guard
+		// request — every recursion of this analysis shares the 512-node
+		// budget, and a concurrent request can never observe or reset it.
+		xw: &xargsWorkState{},
 	}
 }
 

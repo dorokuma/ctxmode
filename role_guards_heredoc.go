@@ -151,8 +151,12 @@ func isPureRemoteStdinVehicleCwd(remoteCmd, cwd string) bool {
 	// A lang == "" verdict resolves the remote vehicle head under the
 	// same screen cwd the outer caller used (process-cwd fallback when
 	// unset): the old shared screenCwd reached this recursion too.
-	lang, isProg := stdinProgramHeadCwd(s.argv, cwd)
-	return isProg && lang == ""
+	// R22-Oracle-M5 / R22-Reviewer-#5: the exemption CERTIFIES a known
+	// pure shell, so an exhausted projection (the analysis gave up before
+	// identifying the consumer) must never qualify — lang == "" on an
+	// exhausted target is the zero value of unknowable, not POSIX sh.
+	lang, isProg, exhausted := stdinProgramHeadCwdExh(s.argv, cwd)
+	return isProg && !exhausted && lang == ""
 }
 
 // remoteReadsProgramFromStdin reports whether the remote command string
@@ -1120,6 +1124,32 @@ func (e envAssignments) effectivePATHFrom(base string) string {
 		}
 	}
 	return path
+}
+
+// pathUntrusted reports whether the effective PATH these env ops produce
+// over base can never resolve a command head honestly (R22-Oracle-#6 /
+// R22-Reviewer-#6): a control-flow uncertainty marker op ('t' — a
+// conditional write makes the merged value unknowable), or a
+// self-reference expansion the byte budget refused (the replay
+// degenerates to the unresolvable placeholder rather than materializing
+// an attacker-sized string or a truncated DIFFERENT short PATH). Either
+// shape means a bare command name resolved against it is UNKNOWABLE —
+// never a proven data consumer and never a rewrite candidate.
+func (e envAssignments) pathUntrusted(base string) bool {
+	for _, op := range e.ops {
+		if op.kind == 't' && op.key == "PATH" {
+			return true
+		}
+	}
+	return strings.Contains(e.effectivePATHFrom(base), cmdSubPlaceholder)
+}
+
+// pathUntrusted reports whether this caller identity's effective PATH is
+// already degenerated to the unresolvable placeholder (R22-Oracle-#6):
+// the untrusted verdict is sticky across every seeding replay, so once
+// any env layer failed the budget the identity carries it forward.
+func (c callerIdentity) pathUntrusted() bool {
+	return strings.Contains(c.pathEnv, cmdSubPlaceholder)
 }
 
 // expandPathSelfRefs substitutes the unforgeable $PATH sentinel with base
@@ -2794,7 +2824,7 @@ func guardShellSubagentDepthSegs(segs []shellSegment, depth int, caller callerId
 		if seg.depthExceeded {
 			return depthExceededHit
 		}
-		runEnv := tracker.view(seg.scopePath)
+		runEnv := consumerViewEnv(tracker, seg)
 		if hit := screenSegmentHeredocsDepth(seg, 's', depth, caller, runEnv); hit != "" {
 			return hit
 		}
@@ -2803,6 +2833,22 @@ func guardShellSubagentDepthSegs(segs []shellSegment, depth int, caller callerId
 		}
 	}
 	return ""
+}
+
+// consumerViewEnv materializes the scope environment view ONLY for a
+// segment that can consume stdin (R22-Reviewer-#7 / R22-Oracle-SF2): a
+// heredoc/here-string/pipe-fed consumer or a command head the stream
+// may reach. A run of consecutive pure assignments folds its ops and
+// copies NOTHING — the pre-R22 loops paid a full prefix copy per
+// segment whether or not any consumer existed — while the head
+// screening itself NEVER skips (the screens vet every command
+// regardless of stdin), and the AST's own assignment verdict decides
+// the view need without any per-segment wrapper peel.
+func consumerViewEnv(tracker *scopeEnvTracker, seg shellSegment) envAssignments {
+	if len(seg.heredocText) > 0 || seg.hereString != "" || seg.pipedStdin || !seg.pureAssign {
+		return tracker.view(seg.scopePath)
+	}
+	return envAssignments{}
 }
 
 // ---------- rule 2: read-only write guard ----------

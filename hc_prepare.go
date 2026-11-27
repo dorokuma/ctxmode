@@ -1356,6 +1356,18 @@ func (g guardCall) prepareCtxRunShellTargets(code string, targetEnvs []envAssign
 // `bash -c "cat; bash"` unwrap that surfaced the plain cat) refuses the
 // rewrite exactly like the flat `cat; bash` — the shared stream is partly
 // DATA and must never be rewritten into a shell program.
+// stdinRewriteableTarget is stdinSingleShellTargetDialect plus the
+// untrusted-environment refusal both prepare entries share
+// (R22-Oracle-#6): the joint test is extracted so neither entry point
+// carries the extra boolean operator.
+func stdinRewriteableTarget(targets []stdinTarget, sshTunnel bool, basePath string) (envs []envAssignments, ok bool, bash bool) {
+	envs, ok, bash = stdinSingleShellTargetDialect(targets, sshTunnel)
+	if !ok || envsUntrustedForRewrite(envs, basePath) {
+		return nil, false, false
+	}
+	return envs, ok, bash
+}
+
 func stdinSingleShellTargetDialect(targets []stdinTarget, sshTunnel bool) (envs []envAssignments, ok bool, bash bool) {
 	if sshTunnel || len(targets) == 0 {
 		return nil, false, false
@@ -1700,7 +1712,10 @@ func (g guardCall) prepareCtxRunArgv(argv []string, stdin string) preparedArgv {
 			caller := g.callerIdentity()
 			targets := stdinProgramTargetsWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"), caller)
 			if len(targets) > 0 {
-				if targetEnvs, ok, stdinBash := stdinSingleShellTargetDialect(targets, sshTunnelsStdinProgram(argv, os.Getenv("PATH"), caller)); ok {
+				// R22-Oracle-#6 / R22-Reviewer-#6: the plain-argv entry
+				// shares the script entry's untrusted-environment refusal
+				// exactly — stdinRewriteableTarget owns the joint test.
+				if targetEnvs, ok, stdinBash := stdinRewriteableTarget(targets, sshTunnelsStdinProgram(argv, os.Getenv("PATH"), caller), os.Getenv("PATH")); ok {
 					sp := g.prepareCtxRunShellTargets(stdin, targetEnvs, stdinBash)
 					if sp.rule != "" {
 						out.rule, out.detail = sp.rule, sp.detail

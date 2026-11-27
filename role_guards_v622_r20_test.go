@@ -1,13 +1,18 @@
 package main
 
 import (
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 
 	"mvdan.cc/sh/v3/syntax"
 )
 
-// role_guards_v622_r20_test.go — Oracle R20 audit regression tests.
+// role_guards_v622_r20_test.go — Oracle R20/R21/R22 audit regression tests.
+// R22 merge note: role_guards_v622_r21_test.go is folded into this file
+// (the suites share the probe fixtures and helper imports; the R20/R21
+// overlap the R21 header documented is de-duplicated inside the R21 func).
 //
 // Coverage contract (one discriminating test per Must-Fix / Should-Fix,
 // mirroring the R20 report's acceptance criteria):
@@ -37,6 +42,25 @@ import (
 //	  array on EVERY branch (including the empty-side passthroughs), and
 //	  consecutive pure assignments append in place instead of paying the
 //	  quadratic copy cascade.
+//
+// R21 coverage lives in TestGuard_V622_OracleR21Probes (merged from the
+//   former role_guards_v622_r21_test.go).
+//
+// R22 adds: special/declared-readonly variables never mint the static
+//   binding and shell function shadowing of eval/command/builtin refuses
+//   the exact eval replication (M1); eval operand writes outside the
+//   replication's shape taint the exact variables, and an unknown-option
+//   or shadowed chain revokes the single-write PATH pollution exemption
+//   (M2); elif-condition writes never land as exact overrides,
+//   self-referencing overwrites preserve conditional uncertainty and a
+//   quoted KEY=VAL command word is never folded as an assignment (M3);
+//   stdin program-target exhaustion propagates end to end — wrapper-peel
+//   budget cutoff, nested parse failure, xargs inner exhaustion and the
+//   remote exemption's zero-value re-read (M5); a bare unknown name under
+//   an untrusted PATH is an explicit unknown target (M6); concurrent
+//   xargs analyses stay isolated per request (L1); and pure-assignment
+//   runs pay zero environment snapshot copies in the production
+//   traversal (SF2).
 //
 // Every discriminating row is FAIL-first on the pre-fix merge tree: the
 // probes reference only symbols that already exist there (the collectors,
@@ -282,13 +306,672 @@ func TestGuard_V622_OracleR20Probes(t *testing.T) {
 		if spare2.kind != 0 || spare2.key != "" {
 			t.Fatalf("mirror append clobbered the shared backing array slot: spare2=%v", spare2)
 		}
-		// Cost contract: consecutive pure assignments append in place onto
-		// the running accumulator instead of paying a full copy per step.
-		runEnv := accumulatePureAssignEnv(envAssignments{}, []string{"A=1"}, callerIdentity{})
-		runEnv = accumulatePureAssignEnv(runEnv, []string{"B=2"}, callerIdentity{})
-		runEnv = accumulatePureAssignEnv(runEnv, []string{"C=3"}, callerIdentity{})
-		if len(runEnv.ops) != 3 {
-			t.Fatalf("accumulator after 3 consecutive assignments: %d ops, want 3 (linear in-place append)", len(runEnv.ops))
+	})
+}
+
+func TestGuard_V622_OracleR21Probes(t *testing.T) {
+	// lastOperand encodes the last segment's second argv word of a script —
+	// the substitution/query result the replication state decides.
+	lastOperand := func(t *testing.T, script string) string {
+		t.Helper()
+		segs, ok := parseSubagentShellASTEnv(script, 0, false, true, nil, callerIdentity{})
+		if !ok || len(segs) == 0 {
+			t.Fatalf("parse %q failed: ok=%v segs=%v", script, ok, segs)
+		}
+		last := segs[len(segs)-1]
+		if len(last.argv) < 2 {
+			t.Fatalf("parse %q: last seg argv=%v, want at least 2 words", script, last.argv)
+		}
+		return last.argv[1]
+	}
+
+	// ---- R21-M1: the complete wrapper chain must validate ----
+
+	t.Run("R21-M1 slash-carrying wrapper and unknown command option never mint the static binding", func(t *testing.T) {
+		plain := lastOperand(t, `eval 'R21_V=/after'; echo "$R21_V"`)
+		if plain != "/after" {
+			t.Fatalf("control broken: builtin eval binding query = %q, want /after — the eval replication itself regressed", plain)
+		}
+		viaSlashWrapper := lastOperand(t, `/dev/null/command eval 'R21_V=/after'; echo "$R21_V"`)
+		if viaSlashWrapper == "/after" {
+			t.Fatalf("/dev/null/command eval binding query = %q — the wrapper word carries a path component, so it execs an EXTERNAL program that can never invoke the shell builtin; no exact /after bind may stand", viaSlashWrapper)
+		}
+		viaUnknownOpt := lastOperand(t, `command -x eval 'R21_V=/after'; echo "$R21_V"`)
+		if viaUnknownOpt == "/after" {
+			t.Fatalf("command -x eval binding query = %q — an unknown non-query option is outside the real builtin's contract (the invocation errors before eval can run), so the operand write must never replicate as an exact bind", viaUnknownOpt)
+		}
+		// Positive control for the legal non-query option: `command -p` is
+		// POSIX's documented execution option, so the replication premise
+		// holds exactly like the bare builtin spelling.
+		viaDashP := lastOperand(t, `command -p eval 'R21_V=/after'; echo "$R21_V"`)
+		if viaDashP != "/after" {
+			t.Fatalf("control broken: command -p eval binding query = %q, want /after — -p is the legal non-query execution option of the real builtin", viaDashP)
+		}
+	})
+
+	t.Run("R21-M1 array-subscript write inside a static eval never mints the scalar binding", func(t *testing.T) {
+		// `arr[1]=/after` writes ONE element of the array arr — every other
+		// element keeps its inherited value, so the scalar expansion "$arr"
+		// (element 0) is never the literal /after the replication would
+		// record: the write must surface as pollution, never a bind.
+		got := lastOperand(t, `eval 'R21_V[1]=/after'; echo "$R21_V"`)
+		if got == "/after" {
+			t.Fatalf("eval 'R21_V[1]=/after' binding query = %q — the array-subscript write leaves element 0 untouched, so the scalar expansion is never the written suffix; the replication must treat it as pollution/unknown", got)
+		}
+	})
+
+	// ---- R21-M2: the unified write definition covers builtin writes ----
+
+	t.Run("R21-M2 printf -v write inside a static eval revokes the parent PATH proof", func(t *testing.T) {
+		t.Setenv("TMPDIR", "/tmp")
+		t.Setenv("PATH", "/usr/bin:/bin")
+		script := `eval 'printf -v PATH %s /usr/local/sbin'; echo "$(mktemp -d)"`
+		// Pre-scan MUST count the write — printf -v VAR is the pre-scan's
+		// named-write builtin shape, exactly like a syntax assignment.
+		p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+		f, err := p.Parse(strings.NewReader(script), "")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		writes, _ := preScanVarMutations(f, false)
+		if writes["PATH"] != 1 {
+			t.Fatalf("pre-scan PATH write count = %d, want 1 — the scanner sees the printf -v write exactly like the direct spelling (this assertion pins the scanner half of the invariant)", writes["PATH"])
+		}
+		enc := lastOperand(t, script)
+		if strings.Contains(enc, "__ctx_abspath_dq__") {
+			t.Fatalf("eval 'printf -v PATH ...' substitution encoding %q carries the abs-dq class — the printf builtin provably CAN write PATH in the same shell, and a write the pre-scan counts must never fall back to the parent's ORIGINAL PATH in the mktemp success proof", enc)
+		}
+	})
+
+	t.Run("R21-M2 root-level static eval inside a tainted eval text is never skipped", func(t *testing.T) {
+		t.Setenv("TMPDIR", "/tmp")
+		t.Setenv("PATH", "/usr/bin:/bin")
+		// The outer eval carries a failing redirect, so its operand text is
+		// TAINTED rather than bound; inside that text the ROOT statement is
+		// itself a static eval whose write the pre-scan counts. Walking
+		// only st.Cmd's descendants matches no *syntax.Stmt root — the write
+		// must surface as pollution regardless.
+		script := `eval 'eval "PATH=/usr/local/sbin"' < /dev/null/missing; echo "$(mktemp -d)"`
+		p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+		f, err := p.Parse(strings.NewReader(script), "")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		writes, _ := preScanVarMutations(f, false)
+		if writes["PATH"] != 1 {
+			t.Fatalf("pre-scan PATH write count = %d, want 1 — the scanner descends the nested static eval of the inner text", writes["PATH"])
+		}
+		enc := lastOperand(t, script)
+		if strings.Contains(enc, "__ctx_abspath_dq__") {
+			t.Fatalf("tainted eval text with a root-level static eval encoding %q carries the abs-dq class — the counted PATH write must land as pollution even when the nested eval IS the root statement of its operand text", enc)
+		}
+	})
+
+	t.Run("R21-M2 direct printf -v PATH write outside eval revokes the proof", func(t *testing.T) {
+		t.Setenv("TMPDIR", "/tmp")
+		t.Setenv("PATH", "/usr/bin:/bin")
+		// The same unified write definition applies to direct statements:
+		// a counted printf -v write must never leave the parent's original
+		// PATH standing in the substitution success proof.
+		enc := lastOperand(t, `printf -v PATH %s /usr/local/sbin; echo "$(mktemp -d)"`)
+		if strings.Contains(enc, "__ctx_abspath_dq__") {
+			t.Fatalf("printf -v PATH substitution encoding %q carries the abs-dq class — the direct builtin write must replay as pollution exactly like the eval-hidden spelling", enc)
+		}
+	})
+
+	// ---- R21-M3: scope-aware environment accumulation ----
+
+	t.Run("R21-M3 subshell consumers see the exact snapshot sequence", func(t *testing.T) {
+		const pathA = "/usr/bin:/bin"
+		const pathB = "/usr/local/sbin"
+		envs, ok, _ := scriptAllowsLocalShellStdinPrepareDialect("(PATH="+pathB+"; /bin/bash); /bin/bash", false, envAssignments{}, pathA, callerIdentity{})
+		if ok {
+			if len(envs) != 2 {
+				t.Fatalf("rewrite granted with %d target envs, want 2 — one per same-dialect shell consumer", len(envs))
+			}
+			inner := envs[0].effectivePATHFrom(pathA)
+			outer := envs[1].effectivePATHFrom(pathA)
+			if inner != pathB || outer != pathA {
+				t.Fatalf("subshell snapshot sequence = [%q, %q], want [%q, %q] — the subshell assignment binds within the SAME subshell's consumers and dies with it; [A,A] drops the inner visibility, [B,B] leaks it to the parent", inner, outer, pathB, pathA)
+			}
+		}
+		// Refusing the rewrite is the other licensed outcome (the
+		// conservative direction), so an !ok verdict is accepted — the
+		// discrimination is only against a WRONG exact sequence.
+	})
+
+	t.Run("R21-M3 conditional writes never override outer consumers exactly", func(t *testing.T) {
+		const pathA = "/usr/bin:/bin"
+		const pathB = "/usr/local/sbin"
+		probe := func(script string) (string, bool) {
+			envs, ok, _ := scriptAllowsLocalShellStdinPrepareDialect(script, false, envAssignments{}, pathA, callerIdentity{})
+			if !ok || len(envs) == 0 {
+				return "", false
+			}
+			return envs[len(envs)-1].effectivePATHFrom(pathA), true
+		}
+		// Unconditional control: the exact override is the correct answer.
+		uncond, uncondOK := probe("PATH=" + pathB + "; /bin/bash")
+		if !uncondOK || uncond != pathB {
+			t.Fatalf("control broken: unconditional PATH=B; /bin/bash = (%q, %v), want (%q, true)", uncond, uncondOK, pathB)
+		}
+		for _, tc := range []struct {
+			name   string
+			script string
+		}{
+			{"if branch", "if x=1; then PATH=" + pathB + "; fi; /bin/bash"},
+			{"loop body", "for i in 1; do PATH=" + pathB + "; done; /bin/bash"},
+			{"case arm", "case x in x) PATH=" + pathB + ";; esac; /bin/bash"},
+			{"uncalled function body", "f() { PATH=" + pathB + "; }; /bin/bash"},
+		} {
+			got, ok := probe(tc.script)
+			if ok && got == pathB {
+				t.Fatalf("%s: consumer effective PATH = %q under a GRANTED rewrite — the conditional write may never execute, so an exact B override is unsound in BOTH directions; the rewrite must be refused or the consumer must keep an uncertain view", tc.name, got)
+			}
+		}
+	})
+
+	t.Run("R21-M3 background compound subtree keeps the parent scope", func(t *testing.T) {
+		const pathA = "/usr/bin:/bin"
+		const pathB = "/usr/local/sbin"
+		envs, ok, _ := scriptAllowsLocalShellStdinPrepareDialect("{ PATH="+pathB+"; } & /bin/bash", false, envAssignments{}, pathA, callerIdentity{})
+		if ok && len(envs) > 0 {
+			got := envs[len(envs)-1].effectivePATHFrom(pathA)
+			if got == pathB {
+				t.Fatalf("{ PATH=B; } & /bin/bash consumer effective PATH = %q — the backgrounded compound runs in its own child process: the assignment dies with it and the child-scope marker must propagate DOWNWARD through the whole subtree, not just ride the leaf statement's background bit", got)
+			}
+		}
+	})
+
+	// ---- R21-M5: depth exhaustion blocks at the final consumption point ----
+
+	// ---- R21-xargs: append-mode nested recursion keeps its verdict ----
+
+	t.Run("R21-xargs append-mode nested recursion verdict is stable", func(t *testing.T) {
+		// Behavior pin for the recursion merge: a chain of append-mode
+		// nested xargs feeding an inline-code target still reports the
+		// open feed (the merge must not drop the single necessary
+		// recursion), while a replace-token outer invocation closes it.
+		deep := []string{"sh", "-c"}
+		for i := 0; i < 6; i++ {
+			deep = append([]string{"xargs"}, deep...)
+		}
+		if !xargsFeedsCodeFlag(deep[1:], deep, "/usr/bin:/bin", callerIdentity{}) {
+			t.Fatalf("xargsFeedsCodeFlag(6-level append-mode chain feeding sh -c) = false — the merged recursion lost the single necessary descent: appended stdin words still reach the open -c slot of the innermost target")
+		}
+		replTarget := []string{"watch", "-x", "sh", "-c", "{}"}
+		repl := []string{"xargs", "-I", "{}"}
+		if !xargsFeedsCodeFlag(replTarget, repl, "/usr/bin:/bin", callerIdentity{}) {
+			t.Fatalf("xargsFeedsCodeFlag(replace-token chain landing in sh -c) = false — the replace-token branch shape must keep its independent descent")
+		}
+		// Append-mode negative control: a plain cat target has no open
+		// inline-code slot at all, so even a fully appended chain reports
+		// the feed CLOSED — the merged recursion must not manufacture a
+		// false positive by collapsing distinct recursion states.
+		catChain := []string{"cat"}
+		for i := 0; i < 6; i++ {
+			catChain = append([]string{"xargs"}, catChain...)
+		}
+		if xargsFeedsCodeFlag(catChain[1:], catChain, "/usr/bin:/bin", callerIdentity{}) {
+			t.Fatalf("xargsFeedsCodeFlag(6-level append-mode chain feeding plain cat) = true — cat carries no open inline-code slot; the memo/merge must not alias the sh -c descent")
+		}
+	})
+
+	// ---- R21-PATH-budget: chained self-reference expansion is bounded ----
+
+	t.Run("R21-PATH-budget chained self-reference expansion yields the untrusted verdict", func(t *testing.T) {
+		// One single small self-reference keeps its exact expansion (the
+		// order semantics of PATH=$PATH:/x must survive).
+		var small envAssignments
+		small.addAssign("PATH=" + envPathSelfPlaceholder + "/x")
+		smallPath := small.effectivePATHFrom("/usr/bin:/bin")
+		if smallPath != "/usr/bin:/bin/x" {
+			t.Fatalf("control broken: single self-reference expansion = %q, want /usr/bin:/bin/x — the budget gate must not disturb the ordinary single expansion", smallPath)
+		}
+		// A cross-statement doubling chain materializes the previous
+		// expansion repeatedly: 14 rounds of PATH=$PATH:$PATH replay to
+		// ~229 KB — beyond maxShellCommandBytes. The verdict must be the
+		// untrusted placeholder (no giant allocation, and NEVER a
+		// truncation that spells a different valid short PATH).
+		var chain envAssignments
+		for i := 0; i < 14; i++ {
+			chain.addAssign("PATH=" + envPathSelfPlaceholder + ":" + envPathSelfPlaceholder)
+		}
+		p := chain.effectivePATHFrom("/usr/bin:/bin")
+		if p != cmdSubPlaceholder {
+			t.Fatalf("chained self-reference expansion len=%d — want the untrusted placeholder verdict exactly: expanding further either allocates an attacker-sized string or truncates into a DIFFERENT valid short PATH the shell never computes", len(p))
+		}
+	})
+}
+
+func TestGuard_V622_OracleR22Probes(t *testing.T) {
+	// lastOperand encodes the last segment's second argv word of a script —
+	// the substitution/binding result the replication state decides.
+	lastOperand := func(t *testing.T, script string) string {
+		t.Helper()
+		segs, ok := parseSubagentShellASTEnv(script, 0, false, true, nil, callerIdentity{})
+		if !ok || len(segs) == 0 {
+			t.Fatalf("parse %q failed: ok=%v segs=%v", script, ok, segs)
+		}
+		last := segs[len(segs)-1]
+		if len(last.argv) < 2 {
+			t.Fatalf("parse %q: last seg argv=%v, want at least 2 words", script, last.argv)
+		}
+		return last.argv[1]
+	}
+
+	// ---- R22-M1a: readonly/special variables never mint the exact binding ----
+	t.Run("R22-M1 readonly special and declared-readonly variables never mint the static binding", func(t *testing.T) {
+		plain := lastOperand(t, `eval 'R22_V=/after'; echo "$R22_V"`)
+		if plain != "/after" {
+			t.Fatalf("control broken: builtin eval binding query = %q, want /after — the eval replication itself regressed", plain)
+		}
+		for _, tc := range []struct {
+			name   string
+			script string
+		}{
+			// Bash/POSIX readonly or dynamic special variables: the write
+			// can NEVER establish the spelled value at runtime.
+			{"UID special", `eval 'UID=/after'; echo "$UID"`},
+			{"RANDOM dynamic special", `eval 'RANDOM=/after'; echo "$RANDOM"`},
+			{"EPOCHSECONDS dynamic special", `eval 'EPOCHSECONDS=/after'; echo "$EPOCHSECONDS"`},
+			// Script-declared readonly: the write fails outright at runtime.
+			{"readonly bare then assign", `readonly R22_RO; eval 'R22_RO=/after'; echo "$R22_RO"`},
+			{"declare -r then assign", `declare -r R22_RO=1; eval 'R22_RO=/after'; echo "$R22_RO"`},
+		} {
+			got := lastOperand(t, tc.script)
+			if got == "/after" {
+				t.Fatalf("%s: binding query = %q — the runtime can never establish this value (readonly/special variable), so no exact /after bind may stand; the replication must treat the write as pollution/unknown", tc.name, got)
+			}
+		}
+		// Positive control: the declaration's OWN inline write succeeds at
+		// runtime, so it keeps its exact bind — the exclusion applies only
+		// to writes AFTER the attribute took effect.
+		kept := lastOperand(t, `readonly R22_RO=/kept; echo "$R22_RO"`)
+		if kept != "/kept" {
+			t.Fatalf("control broken: readonly R22_RO=/kept binding query = %q, want /kept — the declaration's own inline write succeeds exactly like a plain assignment", kept)
+		}
+	})
+
+	// ---- R22-M1b: a same-named shell function shadows the eval builtin ----
+	t.Run("R22-M1 shell function shadowing refuses the exact eval binding", func(t *testing.T) {
+		shadowed := lastOperand(t, `eval() { :; }; eval 'R22_V=/after'; echo "$R22_V"`)
+		if shadowed == "/after" {
+			t.Fatalf("eval() { :; }; eval binding query = %q — shell name resolution picks the FUNCTION before the builtin, so eval never re-parses the operand in the same shell and no exact /after bind may stand", shadowed)
+		}
+		shadowedWrapper := lastOperand(t, `command() { :; }; command eval 'R22_V=/after'; echo "$R22_V"`)
+		if shadowedWrapper == "/after" {
+			t.Fatalf("command() { :; }; command eval binding query = %q — the shadowed first word IS the function, so the chain never reaches any builtin", shadowedWrapper)
+		}
+		// Positive controls: an unshadowed `command` prefix bypasses the
+		// function lookup for eval, and a definition AFTER the call cannot
+		// shadow a call that already ran.
+		viaCommand := lastOperand(t, `eval() { :; }; command eval 'R22_V=/after'; echo "$R22_V"`)
+		if viaCommand != "/after" {
+			t.Fatalf("control broken: command eval under an eval-shadowing function = %q, want /after — the real command builtin bypasses function lookup exactly like POSIX specifies", viaCommand)
+		}
+		definedLater := lastOperand(t, `eval 'R22_V=/after'; eval() { :; }; echo "$R22_V"`)
+		if definedLater != "/after" {
+			t.Fatalf("control broken: eval before its shadowing definition = %q, want /after — the invocation ran when no function existed, so the builtin binding is sound", definedLater)
+		}
+	})
+
+	// ---- R22-M2: tainted eval chains never lose the counted writes ----
+	t.Run("R22-M2 an unknown-option eval chain revokes the single-write PATH proof", func(t *testing.T) {
+		t.Setenv("TMPDIR", "/tmp")
+		t.Setenv("PATH", "/usr/bin:/bin")
+		script := `command -x eval 'PATH=/usr/local/sbin'; echo "$(mktemp -d)"`
+		p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+		f, err := p.Parse(strings.NewReader(script), "")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		writes, _ := preScanVarMutations(f, false)
+		if writes["PATH"] != 1 {
+			t.Fatalf("pre-scan PATH write count = %d, want 1 — the scanner counts the operand write of the tainted chain exactly like any static eval (this assertion pins the scanner half of the invariant)", writes["PATH"])
+		}
+		enc := lastOperand(t, script)
+		if strings.Contains(enc, "__ctx_abspath_dq__") {
+			t.Fatalf("command -x eval 'PATH=...' substitution encoding %q carries the abs-dq class — the counted write must land as pollution (tainting PATH), never vanish between the eval replication and the statement write scan", enc)
+		}
+	})
+	t.Run("R22-M2 a function-shadowed eval revokes the single-write PATH proof", func(t *testing.T) {
+		t.Setenv("TMPDIR", "/tmp")
+		t.Setenv("PATH", "/usr/bin:/bin")
+		// PATH=/usr/bin is the discriminator: a wrongly-minted exact bind
+		// resolves mktemp (it exists there), so the abs-dq grant appears
+		// iff the replication ignored the shadowing; the correct taint
+		// verdict revokes the proof either way.
+		script := `eval() { :; }; eval 'PATH=/usr/bin'; echo "$(mktemp -d)"`
+		p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+		f, err := p.Parse(strings.NewReader(script), "")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		writes, _ := preScanVarMutations(f, false)
+		if writes["PATH"] != 1 {
+			t.Fatalf("pre-scan PATH write count = %d, want 1 — the scanner counts the shadowed invocation's operand writes", writes["PATH"])
+		}
+		enc := lastOperand(t, script)
+		if strings.Contains(enc, "__ctx_abspath_dq__") {
+			t.Fatalf("shadowed eval 'PATH=...' substitution encoding %q carries the abs-dq class — the counted write must land as pollution, never silently skipped because no binding was minted", enc)
+		}
+	})
+
+	// ---- R22-M3: elif conditions are conditional; self-referencing
+	// overwrites preserve uncertainty; AST real assignments only ----
+	t.Run("R22-M3 an elif condition write never lands as an exact override", func(t *testing.T) {
+		const pathA = "/usr/bin:/bin"
+		const pathB = "/usr/local/sbin"
+		probe := func(script string) (string, bool) {
+			envs, ok, _ := scriptAllowsLocalShellStdinPrepareDialect(script, false, envAssignments{}, pathA, callerIdentity{})
+			if !ok || len(envs) == 0 {
+				return "", false
+			}
+			return envs[len(envs)-1].effectivePATHFrom(pathA), true
+		}
+		uncond, uncondOK := probe("PATH=" + pathB + "; /bin/bash")
+		if !uncondOK || uncond != pathB {
+			t.Fatalf("control broken: unconditional PATH=B; /bin/bash = (%q, %v), want (%q, true)", uncond, uncondOK, pathB)
+		}
+		// `x=1` always succeeds, so the elif condition NEVER executes at
+		// runtime — its PATH=B write is conditional across the merge.
+		// Refusing the rewrite is the licensed conservative outcome; an
+		// exact B is unsound in both directions. (The branch bodies are
+		// pure assignments as well — a real command head in the branch
+		// would be a data consumer and refuse the rewrite for an
+		// unrelated reason, vacating the discrimination.)
+		got, ok := probe("if x=1; then y=1; elif PATH=" + pathB + "; then z=1; fi; /bin/bash")
+		if ok && got == pathB {
+			t.Fatalf("elif-condition consumer effective PATH = %q under a GRANTED rewrite — the elif condition runs only when the first branch missed, so its write is conditional: never an exact override", got)
+		}
+	})
+	t.Run("R22-M3 a self-referencing overwrite preserves the conditional uncertainty", func(t *testing.T) {
+		const pathA = "/usr/bin:/bin"
+		const pathB = "/usr/local/sbin"
+		probe := func(script string) (string, bool) {
+			envs, ok, _ := scriptAllowsLocalShellStdinPrepareDialect(script, false, envAssignments{}, pathA, callerIdentity{})
+			if !ok || len(envs) == 0 {
+				return "", false
+			}
+			return envs[len(envs)-1].effectivePATHFrom(pathA), true
+		}
+		// The conditional write may not execute; the UNCONDITIONAL
+		// self-referencing overwrite depends on the old value, so the
+		// merged PATH stays unknowable — the rewrite must be refused (or
+		// the consumer keep an uncertain view), never exact. (`x=1` is
+		// the always-true guard assignment: a real command head there
+		// would be a data consumer and refuse the rewrite for an
+		// unrelated reason.)
+		got, ok := probe("x=1 && PATH=" + pathB + "; PATH=$PATH:/suffix; /bin/bash")
+		if ok {
+			if got == pathB+"/suffix" || got == pathB || got == pathA+"/suffix" {
+				t.Fatalf("self-referencing overwrite consumer PATH = %q under a GRANTED rewrite — the new value depends on the unknowable old value, so every exact spelling is unsound; the uncertainty must survive", got)
+			}
+			if !strings.Contains(got, "__ctx_cmdsub__") {
+				t.Fatalf("self-referencing overwrite consumer PATH = %q — the untrusted placeholder verdict is the only licensed exact answer here; a derivation from either candidate value is unsound", got)
+			}
+		}
+		// Positive control: a completely INDEPENDENT constant overwrite
+		// re-establishes the exact value — the taint clears.
+		indep, indepOK := probe("x=1 && PATH=" + pathB + "; PATH=/usr/bin:/bin; /bin/bash")
+		if indepOK && indep != "/usr/bin:/bin" && indep != "" {
+			t.Fatalf("control broken: independent constant overwrite PATH = %q, want /usr/bin:/bin — a constant overwrite does not depend on the old value", indep)
+		}
+	})
+	t.Run("R22-M3 a quoted command word spelling KEY=VAL is never folded as an assignment", func(t *testing.T) {
+		// AST real-assignment verdict: `"X22Q=1"` is a COMMAND word (an
+		// unknown/bogus head the shell resolves as a program invocation),
+		// not an assignment of the running shell — folding it into the
+		// scope environment model hands later consumers a variable the
+		// shell never installs. The discrimination rides the production
+		// fold/view pair directly so the file compiles on both trees.
+		segs, ok := parseSubagentShellASTEnv(`"X22Q=1"`, 0, false, true, nil, callerIdentity{})
+		if !ok || len(segs) != 1 {
+			t.Fatalf("parse failed: ok=%v segs=%v", ok, segs)
+		}
+		tracker := &scopeEnvTracker{}
+		tracker.foldSegment(segs[0], callerIdentity{})
+		for _, op := range tracker.view("").ops {
+			if op.key == "X22Q" {
+				t.Fatalf("quoted KEY=VAL command word folded op %v into the environment model — the AST assignment verdict must distinguish a bare assignment statement from a command word that merely SPELLS KEY=VAL after quote stripping", op)
+			}
+		}
+		// Positive control: the genuine bare assignment statement folds
+		// exactly like before.
+		segs2, ok2 := parseSubagentShellASTEnv(`X22Q=1`, 0, false, true, nil, callerIdentity{})
+		if !ok2 || len(segs2) != 1 {
+			t.Fatalf("parse failed: ok=%v segs=%v", ok2, segs2)
+		}
+		tracker2 := &scopeEnvTracker{}
+		tracker2.foldSegment(segs2[0], callerIdentity{})
+		found := false
+		for _, op := range tracker2.view("").ops {
+			if op.key == "X22Q" && op.value == "1" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("control broken: bare X22Q=1 assignment did not fold into the environment model — the real-assignment propagation regressed")
+		}
+	})
+
+	// ---- R22-M5: every unprojectable exit propagates the exhaustion state ----
+	t.Run("R22-M5 wrapper-peel exhaustion marks the target exhausted end to end", func(t *testing.T) {
+		// peelWrapperMaxSteps+ nested env wrappers exhaust the wrapper-peel
+		// budget: the consumer is UNIDENTIFIED, so the target must carry
+		// the exhaustion verdict exactly like the recursion-depth cutoff.
+		argv := []string{"cat"}
+		for i := 0; i < peelWrapperMaxSteps+4; i++ {
+			argv = append([]string{"env"}, argv...)
+		}
+		targets := stdinProgramTargetsDialect(argv, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+		hasExhausted := false
+		for _, tg := range targets {
+			if tg.exhausted {
+				hasExhausted = true
+			}
+		}
+		if !hasExhausted {
+			t.Fatalf("stdinProgramTargetsDialect(peel-exhausted argv) = %v targets with NO exhaustion marker — a wrapper-peel budget cutoff must propagate exactly like the recursion-depth exhaustion, never pose as a zero-value POSIX shell", targets)
+		}
+		// The exhaustion verdict must block at the final consumption point:
+		// the narrow rewrite projection refuses it exactly like the
+		// recursion-depth boundary.
+		if envs, ok, _ := stdinSingleShellTargetDialect(targets, false); ok || len(envs) > 0 {
+			t.Fatalf("stdinSingleShellTargetDialect(peel-exhausted target) = (envs=%d, ok=%v) — an unidentified consumer can never be rewritten as a known local shell", len(envs), ok)
+		}
+	})
+	t.Run("R22-M5 a nested parse failure marks the target exhausted", func(t *testing.T) {
+		targets := stdinProgramTargetsDialect([]string{"bash", "-c", "if x; then"}, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+		hasExhausted := false
+		for _, tg := range targets {
+			if tg.exhausted {
+				hasExhausted = true
+			}
+		}
+		if !hasExhausted {
+			t.Fatalf("stdinProgramTargetsDialect(bash -c parse-err script) = %v targets with NO exhaustion marker — an unparsable nested script's consumer is unidentified, never a confirmed POSIX shell", targets)
+		}
+	})
+	t.Run("R22-M5 the xargs inner wrapper exhaustion marks the target exhausted", func(t *testing.T) {
+		inner := []string{"sh", "-c"}
+		for i := 0; i < peelWrapperMaxSteps+4; i++ {
+			inner = append([]string{"env"}, inner...)
+		}
+		argv := append([]string{"xargs"}, inner...)
+		targets := stdinProgramTargetsDialect(argv, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+		hasExhausted := false
+		for _, tg := range targets {
+			if tg.exhausted {
+				hasExhausted = true
+			}
+		}
+		if !hasExhausted {
+			t.Fatalf("stdinProgramTargetsDialect(xargs peel-exhausted inner target) = %v targets with NO exhaustion marker — the xargs inner peel budget is an exhaustion verdict exactly like the recursion cutoff", targets)
+		}
+	})
+	t.Run("R22-M5 the remote pure-shell exemption never certifies an exhausted vehicle", func(t *testing.T) {
+		// An exhaustion-carrying vehicle must stay INELIGIBLE for the
+		// exemption (lang == "" on an exhausted target is the zero value
+		// of unknowable, not POSIX sh), while the plain `sh` vehicle
+		// control keeps its eligibility exactly like before.
+		if isPureRemoteStdinVehicleCwd("sh", "/tmp") != true {
+			t.Fatalf("control broken: isPureRemoteStdinVehicleCwd(sh) = false — the plain remote shell vehicle keeps its exemption eligibility")
+		}
+		long := "cat"
+		for i := 0; i < peelWrapperMaxSteps+4; i++ {
+			long = "env " + long
+		}
+		if isPureRemoteStdinVehicleCwd(long, "/tmp") {
+			t.Fatalf("isPureRemoteStdinVehicleCwd(wrapper-exhausted vehicle) = true — the narrow projection re-read the exhausted zero-value lang as a confirmed POSIX shell and certified an UNIDENTIFIED remote consumer")
+		}
+	})
+
+	// ---- R22-M6: untrusted PATH blocks identity-dependent resolution ----
+	t.Run("R22-M6 a bare unknown name under an untrusted PATH is an explicit unknown target", func(t *testing.T) {
+		var runEnv envAssignments
+		runEnv.ops = append(runEnv.ops, envOp{kind: 't', key: "PATH"})
+		targets := stdinProgramTargetsDialect([]string{"qzxunknownr22probe"}, 0, runEnv, "/usr/bin:/bin", callerIdentity{}, false)
+		if len(targets) == 0 {
+			t.Fatalf("stdinProgramTargetsDialect(bare name, untrusted PATH) = nil — the empty list rides the data-consumer fallback and lets the caller skip the stream as if a proven data consumer existed; an unknowable consumer must surface as an explicit unknown/exhausted target")
+		}
+		hasExhausted := false
+		for _, tg := range targets {
+			if tg.exhausted {
+				hasExhausted = true
+			}
+		}
+		if !hasExhausted {
+			t.Fatalf("untrusted-PATH bare name targets = %v with NO exhaustion marker — the consumer identity depends on PATH resolution the untrusted PATH cannot answer", targets)
+		}
+		// Controls: the same bare name under a TRUSTED PATH keeps the
+		// data-consumer nil fallback, and a path-spelled name never
+		// depends on PATH at all.
+		trusted := stdinProgramTargetsDialect([]string{"qzxunknownr22probe"}, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+		if len(trusted) != 0 {
+			t.Fatalf("control broken: trusted-PATH bare unknown name = %v targets, want nil data fallback — the untrusted interception must not fire on a resolvable PATH", trusted)
+		}
+		pathNamed := stdinProgramTargetsDialect([]string{"./qzxunknownr22probe"}, 0, runEnv, "/usr/bin:/bin", callerIdentity{}, false)
+		if len(pathNamed) != 0 {
+			t.Fatalf("control broken: path-spelled name under untrusted PATH = %v targets, want nil data fallback — a '/'-carrying head never depends on PATH resolution", pathNamed)
+		}
+	})
+
+	// ---- R22-1: the xargs memo/budget is per-request, keyed by context ----
+	t.Run("R22-1 parallel xargs analyses stay isolated and match their serial verdicts", func(t *testing.T) {
+		// Two resolution contexts over the SAME argv shape: with tmpA on
+		// PATH, myhc resolves to a symlink whose target basename is hc —
+		// the xargs analysis fails closed (true); without it the bare
+		// name resolves nothing and the append-mode analysis reports the
+		// feed closed (false). The serial verdicts are computed first and
+		// the parallel runs must match them exactly — a shared process
+		// memo cross-contaminates the two contexts whenever the
+		// computations overlap, and a shared budget lets one request's
+		// entries rewrite the other request's table.
+		tmpA := t.TempDir()
+		realDir := t.TempDir()
+		hcBin := realDir + string(os.PathSeparator) + "hc"
+		if err := os.WriteFile(hcBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("write hc stub: %v", err)
+		}
+		if err := os.Symlink(hcBin, tmpA+string(os.PathSeparator)+"myhc"); err != nil {
+			t.Fatalf("symlink myhc: %v", err)
+		}
+		// inner is the xargs TARGET argv exactly like the production call
+		// (xargsFeedsCodeFlag(head[k:], head, …)): one nested xargs layer
+		// so the hc resolution verdict lands at depth 1, where a resolved
+		// nested hc/herdr-core head fails closed.
+		inner := []string{"xargs", "myhc"}
+		// A long chain of nonexistent directories slows the per-context
+		// resolution so overlapping computations interleave instead of
+		// serializing — the contamination window the audit describes is
+		// inside the computation, not at the lock.
+		filler := strings.Repeat("/nonexistent-r22-x1:/nonexistent-r22-x2:/nonexistent-r22-x3:", 40)
+		pathTrue := tmpA + ":" + filler + "/usr/bin:/bin"
+		pathFalse := filler + "/usr/bin:/bin"
+		serialTrue := xargsFeedsCodeFlag(inner, []string{"xargs"}, pathTrue, callerIdentity{})
+		serialFalse := xargsFeedsCodeFlag(inner, []string{"xargs"}, pathFalse, callerIdentity{})
+		if !serialTrue {
+			t.Fatalf("control broken: serial verdict under tmpA PATH = false, want true — the hc-resolving xargs target analysis itself regressed (check depth/budget setup)")
+		}
+		if serialFalse {
+			t.Fatalf("control broken: serial verdict without tmpA on PATH = true, want false — the unresolvable bare name must not report an open code feed")
+		}
+		const iterations = 300
+		for round := 0; round < iterations; round++ {
+			start := make(chan struct{})
+			type res struct{ v bool }
+			chA, chB := make(chan res, 1), make(chan res, 1)
+			go func() {
+				<-start
+				chA <- res{xargsFeedsCodeFlag(inner, []string{"xargs"}, pathTrue, callerIdentity{})}
+			}()
+			go func() {
+				<-start
+				chB <- res{xargsFeedsCodeFlag(inner, []string{"xargs"}, pathFalse, callerIdentity{})}
+			}()
+			close(start)
+			ra, rb := <-chA, <-chB
+			if ra.v != serialTrue || rb.v != serialFalse {
+				t.Fatalf("round %d: parallel verdicts (%v, %v) != serial (%v, %v) — the two requests contaminated each other's memo or budget: a concurrent depth-0 entry reset the shared table underneath an in-flight computation, and the context-free memo key then served the WRONG resolution context's verdict", round, ra.v, rb.v, serialTrue, serialFalse)
+			}
+		}
+	})
+
+	// ---- R22-SF2: pure-assignment runs materialize no environment snapshots ----
+	t.Run("R22-SF2 the production subagent traversal copies zero snapshots for pure-assignment runs", func(t *testing.T) {
+		// Measure the production loop itself (guardShellSubagentDepthSegs):
+		// n consecutive pure-assignment segments fold their ops and copy
+		// NOTHING — the pre-R22 loop materialized a full prefix copy per
+		// segment (1+..+n ops) whether or not any stdin consumer existed.
+		// The byte thresholds sit between the two implementations'
+		// measured allocations (quadratic vs constant); doubling the
+		// assignment count must not multiply the view materialization
+		// cost either.
+		mkSegs := func(n int) []shellSegment {
+			var sb strings.Builder
+			for i := 0; i < n; i++ {
+				sb.WriteString("R22X")
+				sb.WriteByte(byte('a' + i%26))
+				sb.WriteByte(byte('a' + i/26))
+				sb.WriteString("=1; ")
+			}
+			return splitShellSegments(sb.String())
+		}
+		// The discriminating invariant is the marginal BYTE cost of a
+		// fixed-width window of pure-assignment segments as the prefix
+		// grows: a per-segment view materialization copies the accumulated
+		// prefix, so segments 57-64 copy a 56-op prefix and cost strictly
+		// more bytes than segments 1-8 copying up to 7 ops (measured on
+		// the pre-fix tree: 6672 vs 25424 bytes, ratio ≈ 3.8), while a
+		// zero-copy fold pays only the amortized-constant ops append and
+		// both windows stay flat (measured: 5216 vs 4320, ratio ≈ 0.83).
+		// Allocation COUNT cannot discriminate — the copy is one backing
+		// array per segment regardless of its size; slice-growth noise is
+		// why small windows are avoided.
+		measure := func(n int) uint64 {
+			segs := mkSegs(n)
+			if len(segs) != n {
+				t.Fatalf("fixture broken: %d segments for %d assignments", len(segs), n)
+			}
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			if hit := guardShellSubagentDepthSegs(segs, 0, callerIdentity{}); hit != "" {
+				t.Fatalf("control broken: pure-assignment run hit %q — inert assignments must screen clean", hit)
+			}
+			runtime.ReadMemStats(&after)
+			return after.TotalAlloc - before.TotalAlloc
+		}
+		b8, b56, b64 := measure(8), measure(56), measure(64)
+		early := b8       // segments 1-8
+		late := b64 - b56 // segments 57-64
+		if early == 0 {
+			t.Fatalf("fixture broken: zero marginal bytes for segments 1-8 (b8=%d)", b8)
+		}
+		if late > early*3/2 {
+			t.Fatalf("marginal allocation of a fixed-width pure-assignment window GROWS with the prefix length: %d bytes for segments 1-8 vs %d for segments 57-64 (ratio %.2f, want ≤ 1.5) — the production traversal still materializes one prefix-snapshot copy per segment even with no stdin consumer (quadratic copy cascade), instead of folding ops only", early, late, float64(late)/float64(early))
 		}
 	})
 }

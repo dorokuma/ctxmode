@@ -3389,22 +3389,47 @@ func xargsFeedsCodeFlag(inner, full []string, pathEnv string, caller callerIdent
 // append-mode merge in xargsNestedFeedsCodeSlot already removes the
 // per-level doubling, but replacement-token branch shapes can still fan
 // out, so the budget is the hard ceiling the depth cap alone never was.
-// The cache and counter live in package-level state because the recursion
-// signatures are frozen by existing callers; entries are evicted lazily
-// per request depth class so a long-lived process cannot grow the table
-// without bound.
-var xargsWorkState = struct {
-	sync.Mutex
+//
+// R22-Reviewer-#1 / R22-Oracle-M5: the cache and counter belong to ONE
+// analysis REQUEST, never to the process — the pre-R22 package-level
+// table let a concurrent second request reset the table underneath a
+// first request's in-flight computation, so the first request then
+// published verdicts into the second request's memo (and the key did
+// not even carry the resolution context). The state is minted once per
+// top-level guard entry and threaded through callerIdentity, so two
+// parallel requests are naturally isolated WITHOUT any cross-request
+// lock ordering; the mutex only defends the table against shared-caller
+// misuse. Every xargs descent of the same request shares the one
+// 512-node budget, exactly the single-request ceiling the audit asked
+// for.
+type xargsWorkState struct {
+	mu    sync.Mutex
 	memo  map[string]bool
 	steps int
-}{memo: map[string]bool{}}
+}
 
-// xargsWorkMemoKey normalizes one recursion state: the depth, the inner
-// argv and the replacement token the outer invocation carries (the ONLY
-// input outerXargs contributes to the recursion).
-func xargsWorkMemoKey(depth int, inner, outerXargs []string) string {
+// xargsWork returns the request-scoped memo/budget state of one caller
+// identity, allocating it lazily. A zero caller (direct unit screening
+// that never went through a guard entry) mints a FRESH state per call —
+// correct if occasionally under-shared, never cross-request.
+func xargsWork(c callerIdentity) *xargsWorkState {
+	if c.xw != nil {
+		return c.xw
+	}
+	return &xargsWorkState{}
+}
+
+// xargsWorkMemoKey normalizes one recursion state. R22-Reviewer-#1: the
+// key MUST disambiguate every input the verdict depends on — the depth,
+// the inner argv, the replacement token the outer invocation carries
+// (the ONLY input outerXargs contributes), PLUS the resolution context
+// the peel/LookPath cascade reads: the effective PATH of this layer and
+// the caller's cwd. Two descents that agree on argv but resolve under
+// different directories or search paths are different questions and must
+// never share a memo entry.
+func xargsWorkMemoKey(depth int, inner, outerXargs []string, pathEnv, cwd string) string {
 	return strconv.Itoa(depth) + "\x00" + strings.Join(inner, "\x01") +
-		"\x00" + xargsReplToken(outerXargs)
+		"\x00" + xargsReplToken(outerXargs) + "\x00" + pathEnv + "\x00" + cwd
 }
 
 const xargsWorkBudget = 512
@@ -3416,32 +3441,28 @@ func xargsFeedsCodeFlagDepth(inner, outerXargs []string, pathEnv string, caller 
 	if depth >= peelChainMaxDepth {
 		return true
 	}
-	key := xargsWorkMemoKey(depth, inner, outerXargs)
-	xargsWorkState.Lock()
-	if depth == 0 {
-		// A fresh request: reset the per-request work table — every
-		// top-level entry passes through depth 0, nested descents never
-		// do, so the memo and step counter are exactly one request's
-		// state and can never accumulate across the process lifetime.
-		xargsWorkState.memo = map[string]bool{}
-		xargsWorkState.steps = 0
+	ws := xargsWork(caller)
+	key := xargsWorkMemoKey(depth, inner, outerXargs, pathEnv, caller.cwd)
+	ws.mu.Lock()
+	if ws.memo == nil {
+		ws.memo = map[string]bool{}
 	}
-	if v, ok := xargsWorkState.memo[key]; ok {
-		xargsWorkState.Unlock()
+	if v, ok := ws.memo[key]; ok {
+		ws.mu.Unlock()
 		return v
 	}
-	if xargsWorkState.steps >= xargsWorkBudget {
+	if ws.steps >= xargsWorkBudget {
 		// Single-request budget ceiling: fail closed rather than pay an
 		// attacker-shaped re-peel cascade.
-		xargsWorkState.Unlock()
+		ws.mu.Unlock()
 		return true
 	}
-	xargsWorkState.steps++
-	xargsWorkState.Unlock()
+	ws.steps++
+	ws.mu.Unlock()
 	verdict := xargsFeedsCodeFlagWork(inner, outerXargs, pathEnv, caller, depth)
-	xargsWorkState.Lock()
-	xargsWorkState.memo[key] = verdict
-	xargsWorkState.Unlock()
+	ws.mu.Lock()
+	ws.memo[key] = verdict
+	ws.mu.Unlock()
 	return verdict
 }
 
@@ -3534,7 +3555,7 @@ func xargsSSHFeedsCodeSlot(h []string, repl string, outerXargs []string, outerCa
 		if len(rseg.argv) == 0 {
 			continue
 		}
-		if xargsFeedsCodeFlagDepth(rseg.argv, outerXargs, os.Getenv("PATH"), callerIdentity{cwd: outerCaller.cwd}, depth+1) {
+		if xargsFeedsCodeFlagDepth(rseg.argv, outerXargs, os.Getenv("PATH"), callerIdentity{cwd: outerCaller.cwd, xw: outerCaller.xw}, depth+1) {
 			return true
 		}
 	}

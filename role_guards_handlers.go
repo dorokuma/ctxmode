@@ -563,6 +563,24 @@ func stdinProgramHeadCwd(argv []string, cwd string) (lang string, isInterp bool)
 	return lang, isProg
 }
 
+// stdinProgramHeadCwdExh is stdinProgramHeadCwd plus the projection's
+// exhaustion state (R22-Oracle-M5 / R22-Reviewer-#5): the narrow
+// (lang,isProg) projection drops the exhausted bit, so callers that use
+// the verdict as a CONFIRMATION — the remote pure-shell exemption
+// certifies a known pure shell — must consult the explicit bit instead
+// of re-reading lang=="" as a POSIX shell. Rejection paths keep the
+// plain two-value projection: an exhausted consumer is never cleaner
+// than a shell there, so treating it as a program-shaped target is the
+// conservative direction already.
+func stdinProgramHeadCwdExh(argv []string, cwd string) (lang string, isInterp, exhausted bool) {
+	targets := stdinProgramTargetsWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"), callerIdentity{cwd: cwd})
+	t, has := firstProgramTarget(targets)
+	if !has {
+		return "", false, false
+	}
+	return t.lang, true, t.exhausted
+}
+
 // stdinProgramHeadWithEnv is stdinProgramHeadDepth carrying the env ops
 // accumulated above this recursion level: a peeled `PATH=...` prefix (or an
 // `env PATH=...` op) rewires name resolution for every wrapper the
@@ -767,19 +785,35 @@ func (g guardCall) guardCtxRunStdinForCommand(command, stdin string) (rule, deta
 			}
 			return "", ""
 		}
-		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
-			continue
-		}
-		runEnv := tracker.view(seg.scopePath)
-		targets := stdinProgramTargetsWithEnv(seg.argv, 0, runEnv, os.Getenv("PATH"), caller)
-		if len(targets) == 0 {
-			continue
-		}
-		if rule, detail := g.screenStdinTargets(targets, seg.argv, stdin, caller); rule != "" {
+		if rule, detail := g.stdinCommandSegRule(tracker, seg, stdin, caller); rule != "" {
 			return rule, detail
 		}
 	}
 	return "", ""
+}
+
+// stdinCommandSegRule screens one split segment of the stdin-fallback
+// command (extracted from guardCtxRunStdinForCommand so the pure-
+// assignment skip carries no extra nesting there): the stream-skip
+// shapes (empty argv, pipe/redirection-fed, heredoc/here-string
+// consumers) and — R22-Reviewer-#7 / R22-Oracle-SF2 — the AST's own
+// pure-assignment verdict carry the skip for free, so the environment
+// view materializes ONLY when the segment can actually consume the
+// shared stream and consecutive assignment runs pay zero snapshot
+// copies (and zero wrapper peels).
+func (g guardCall) stdinCommandSegRule(tracker *scopeEnvTracker, seg shellSegment, stdin string, caller callerIdentity) (rule, detail string) {
+	if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
+		return "", ""
+	}
+	if seg.pureAssign {
+		return "", ""
+	}
+	runEnv := tracker.view(seg.scopePath)
+	targets := stdinProgramTargetsWithEnv(seg.argv, 0, runEnv, os.Getenv("PATH"), caller)
+	if len(targets) == 0 {
+		return "", ""
+	}
+	return g.screenStdinTargets(targets, seg.argv, stdin, caller)
 }
 
 // guardCtxRunEnv screens caller-supplied env overrides (ctx_run env args):
@@ -1057,7 +1091,11 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 	head, _, ea, exhausted := peelWrappers(argv)
 	envAs := inherited.merged(ea)
 	if exhausted {
-		return []stdinTarget{{lang: "", envAs: envAs}}
+		// R22-Oracle-M5 / R22-Reviewer-#5: the wrapper-peel budget is an
+		// EXPLICIT exhaustion verdict exactly like the recursion-depth
+		// cutoff above — a zero-value lang:"" target would re-read as a
+		// KNOWN POSIX shell downstream, certifying bytes nobody identified.
+		return []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
 	}
 	if len(head) == 0 {
 		return nil
@@ -1108,24 +1146,7 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 		// markers instead of exact overrides.
 		tracker := &scopeEnvTracker{}
 		for _, seg := range segs {
-			if seg.depthExceeded || seg.parseErr != "" {
-				out = append(out, stdinTarget{lang: "", envAs: envAs})
-				continue
-			}
-			// R19-Oracle-M4: a pure-assignment segment consumes no stdin but
-			// DOES rewrite the running shell's environment — the binding
-			// happens regardless of the segment's own redirects, so its ops
-			// accumulate into the scope state BEFORE any stdin-consumption
-			// skip and before any later segment is scanned.
-			tracker.foldSegment(seg, subCaller)
-			if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
-				continue
-			}
-			if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv, subCaller); len(peeledHead) == 0 {
-				continue
-			}
-			runEnv := subEnv.merged(tracker.view(seg.scopePath))
-			out = append(out, collectStdinSegTargets(seg, depth, runEnv, envAs, subPath, mergeOuter, subCaller)...)
+			out = append(out, collectOneStdinSeg(tracker, seg, depth, subEnv, envAs, subPath, mergeOuter, subCaller)...)
 		}
 		return out
 	}
@@ -1154,7 +1175,63 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 	if lang, ok := heredocInterpLang(base); ok {
 		return stdinInterpTargetsScan(head, base, lang, envAs)
 	}
+	return stdinUnknownHeadTargets(head[0], envAs, basePath, caller)
+}
+
+// stdinUnknownHeadTargets is the tail verdict of
+// stdinProgramTargetsDialect for an unrecognized head (R22-Oracle-#6 /
+// R22-Reviewer-#6): an unrecognized BARE name carries no static
+// builtin-language classification, so its identity depends entirely on
+// PATH resolution. When the effective PATH is untrusted (a conditional
+// write marker or an expansion that exceeded the byte budget degenerated
+// it to the placeholder), the consumer is UNKNOWABLE — returning nil
+// would ride the data-consumer fallback (`stdinTargetsWithDataFallback`)
+// and let the caller skip the stream as if a plain data consumer were
+// proven. The verdict is the explicit exhaustion target instead: never
+// a rewrite candidate, never a data exemption. A name carrying '/' never
+// depends on PATH, and a fixed absolute spelling keeps its own
+// resolution path, so both stay on the nil/data fallback exactly like
+// before.
+func stdinUnknownHeadTargets(head string, envAs envAssignments, basePath string, caller callerIdentity) []stdinTarget {
+	if strings.ContainsRune(head, '/') {
+		return nil
+	}
+	// The caller's own replayed PATH counts exactly like the peeled
+	// env ops (R22-Oracle-#6): once any layer degenerated it to the
+	// unresolvable placeholder the verdict is sticky, and a bare name
+	// resolving through it is unknowable either way.
+	if envAs.pathUntrusted(basePath) || caller.pathUntrusted() {
+		return []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
+	}
 	return nil
+}
+
+// collectOneStdinSeg projects one nested segment inside the collectSegs
+// loop (extracted so the closure carries no per-segment branching — the
+// R22 complexity budget): an unparsed or depth-exhausted segment is an
+// UNIDENTIFIED consumer whose exhaustion verdict rides the target just
+// like the recursion cutoff (R22-Oracle-M5), never a zero-value
+// pseudo-POSIX-shell target; a pure-assignment segment consumes no stdin
+// but DOES rewrite the running shell's environment regardless of its own
+// redirects (R19-Oracle-M4), so its ops fold BEFORE any consumption
+// skip; and the AST's own pure-assignment verdict carries the view skip
+// for free (R22-Reviewer-#7) — the environment view materializes only
+// for segments that can consume the stream, never per folded assignment.
+func collectOneStdinSeg(tracker *scopeEnvTracker, seg shellSegment, depth int, subEnv, envAs envAssignments, subPath string, mergeOuter bool, subCaller callerIdentity) []stdinTarget {
+	if seg.depthExceeded || seg.parseErr != "" {
+		return []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
+	}
+	tracker.foldSegment(seg, subCaller)
+	if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
+		return nil
+	}
+	if !seg.pureAssign {
+		if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv, subCaller); len(peeledHead) == 0 {
+			return nil
+		}
+	}
+	runEnv := subEnv.merged(tracker.view(seg.scopePath))
+	return collectStdinSegTargets(seg, depth, runEnv, envAs, subPath, mergeOuter, subCaller)
 }
 
 // collectStdinSegTargets is the per-segment projection of the
@@ -1183,47 +1260,6 @@ func collectStdinSegTargets(seg shellSegment, depth int, runEnv, envAs envAssign
 		out = append(out, t)
 	}
 	return out
-}
-
-// accumulatePureAssignEnv folds one segment's pure-assignment ops into
-// the running stdin-scan environment (extracted for the v6.2.2 R19
-// complexity budget — R19-Oracle-M4): only a segment whose peeled head
-// is EMPTY carries nothing but prefix assignments (plus inert no-op
-// words the peel already skipped), and its ops re-bind the exported
-// variables the NEXT segments' children inherit exactly like the flat
-// prepare scan. Segments with a real head pass through unchanged.
-//
-// R20-Oracle-M3: the accumulation is licensed ONLY for assignments the
-// RUNNING PARENT SHELL really performs —
-//   - childScope segments (subshells, pipeline components, backgrounded
-//     subtrees, command/process substitutions) die with their child
-//     process: `(PATH=B)` never re-binds the parent's exported PATH;
-//   - the RAW argv must consist of nothing but KEY=VAL assignment words
-//     (and inert no-op fragments): `/usr/bin/env PATH=B` peels to the
-//     same empty head, but env spawns its OWN process — without a child
-//     command it merely prints its environment and can never modify the
-//     calling shell, so folding its operands into the parent state would
-//     hand a later consumer an environment it never runs with. PATH is
-//     an OVERRIDE, not a monotone pollution bit: the wrong-direction
-//     error is not conservative but simply false.
-func accumulatePureAssignEnv(runEnv envAssignments, argv []string, caller callerIdentity, childScope ...bool) envAssignments {
-	if len(childScope) > 0 && childScope[0] {
-		return runEnv
-	}
-	if peeledHead, _, _, _, _ := peelWrappersWithIndex(argv, caller); len(peeledHead) != 0 {
-		return runEnv
-	}
-	if !argvIsPlainAssignRun(argv) {
-		return runEnv
-	}
-	// R20-Oracle observation: consecutive pure assignments append directly
-	// onto the running accumulator — every snapshot already handed to a
-	// target is capacity-frozen by merged, so the in-place append can
-	// never clobber it, and n consecutive assignments cost O(n) instead of
-	// the quadratic copy cascade one full merge per assignment imposes.
-	pa := pureAssignEnv(argv)
-	runEnv.ops = append(runEnv.ops, pa.ops...)
-	return runEnv
 }
 
 // argvIsPlainAssignRun reports whether every word of argv is a literal
@@ -1329,26 +1365,6 @@ func stdinWatchTargets(head []string, depth int, envAs envAssignments, basePath 
 	return collectSegs(splitShellSegmentsCaller(text, caller.envTaint, caller), envAs, basePath, false, caller)
 }
 
-// pureAssignEnv converts the leading KEY=VAL assignment words of a
-// command argv into env ops (R19-Oracle-M4): a segment whose peeled head
-// is EMPTY consists of exactly these prefix assignments (plus inert
-// no-op words the peel already skipped) — in the running shell they
-// re-bind the exported variables the next segment's children inherit.
-// Words carrying dynamic placeholders stay in the op verbatim exactly
-// like peelWrappers' own addAssign path records them; taintedSentinelNames
-// treats any such assignment to a sentinel name as invalidating its
-// value either way.
-func pureAssignEnv(argv []string) envAssignments {
-	var out envAssignments
-	for _, a := range argv {
-		if !isAssignWord(a) {
-			continue
-		}
-		out.addAssign(a)
-	}
-	return out
-}
-
 // stdinTargetsWithDataFallback appends the R17-Oracle-M6 data-consumer
 // marker to a target-less recursion result ONLY when the segment really
 // consumes the shared stream (extracted for the v6.2.2 R18 complexity
@@ -1380,7 +1396,7 @@ func stdinSSHTargets(head []string, depth int, envAs envAssignments, caller call
 	if hit != "" {
 		return nil
 	}
-	remoteCaller := callerIdentity{cwd: caller.cwd}
+	remoteCaller := callerIdentity{cwd: caller.cwd, xw: caller.xw}
 	targets := collectSegs(splitShellSegmentsCaller(remoteCmd, nil, remoteCaller), envAssignments{}, os.Getenv("PATH"), true, remoteCaller)
 	// Every target of an ssh remote command runs OFF this host: the
 	// stream is forwarded verbatim, so mark it remote even when the
@@ -1429,7 +1445,15 @@ func stdinXargsTargets(head []string, depth int, envAs envAssignments, basePath,
 	}
 	innerHead, innerEnv, innerEffPath, innerExhausted := peelWrappersAndWrapperAliases(head[k:], effPath, caller)
 	envAs = envAs.merged(innerEnv)
-	if !innerExhausted && len(innerHead) > 0 {
+	if innerExhausted {
+		// R22-Oracle-M5 / R22-Reviewer-#5: the xargs inner target's own
+		// wrapper peel exhausted its budget — the consumer identity is
+		// UNKNOWABLE, so the target must carry the exhaustion verdict
+		// exactly like the recursion cutoff instead of posing as a known
+		// POSIX shell.
+		return []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
+	}
+	if len(innerHead) > 0 {
 		innerCaller := caller.seededWith(innerEnv)
 		ib := filepath.Base(innerHead[0])
 		if rb := canonicalResolvedBase(resolveHeadBase(innerHead[0], innerEffPath, innerCaller.screenCwd())); rb != "" {

@@ -1200,7 +1200,7 @@ func replTokenInSSH(h []string, token string, outerCaller callerIdentity, depth 
 		if len(rseg.argv) == 0 {
 			continue
 		}
-		if replTokenInExecSlotDepth(rseg.argv, token, os.Getenv("PATH"), callerIdentity{cwd: outerCaller.cwd}, depth+1, false) {
+		if replTokenInExecSlotDepth(rseg.argv, token, os.Getenv("PATH"), callerIdentity{cwd: outerCaller.cwd, xw: outerCaller.xw}, depth+1, false) {
 			return true
 		}
 	}

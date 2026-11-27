@@ -189,6 +189,15 @@ type shellSegment struct {
 	// touch as UNCERTAIN — never an exact environment override for later
 	// consumers (R21-Oracle-M3).
 	condAssign bool
+	// pureAssign marks a segment whose AST CallExpr is PROVABLY a bare
+	// assignment sequence of the shell itself (len(Args)==0 &&
+	// len(Assigns)>0 — R22-Oracle-M3 / R22-Reviewer-#2): the environment
+	// accumulation may fold exactly these segments. A plain command word
+	// that merely SPELLS KEY=VAL after quote stripping (a dynamic head
+	// resolving to `A=1` at runtime, or the operand of an echo-shaped
+	// command) is a command invocation, never an assignment of the
+	// running shell, so the argv shape alone must never mint this flag.
+	pureAssign bool
 }
 
 // shellSplitMaxDepth bounds recursion into $(...)/`...`/subshell text so a
@@ -514,17 +523,30 @@ func (e envAssignments) merged(o envAssignments) envAssignments {
 	return out
 }
 
-// scopeEnvState is one execution scope's accumulated environment view
+// scopeEnvState is one execution scope's accumulated environment state
 // (R21-Oracle-M3/R21-Reviewer-1): the pure-assignment ops performed
-// UNCONDITIONALLY inside the scope (in statement order, layered over the
-// fork-time parent clone) plus the variables whose post-merge value is
-// UNCERTAIN because a conditional region (`&&`/`||` right side, if/case
-// branch, loop body, possibly-uncalled function body) wrote them. Only
-// PATH and the sentinel trust variables are tracked — every other
-// variable is invisible to the environment model anyway.
+// UNCONDITIONALLY inside the scope itself (in statement order — NOT
+// including the inherited parent prefix) plus the variables whose
+// post-merge value is UNCERTAIN because a conditional region
+// (`&&`/`||` right side, if/case branch, loop body, possibly-uncalled
+// function body) wrote them. Only PATH and the sentinel trust variables
+// are tracked — every other variable is invisible to the environment
+// model anyway.
+//
+// R22-Reviewer-#7 / R22-Oracle-SF2: the fork-time parent environment is
+// shared by POINTER, never eagerly copied — parent links the scope state
+// it forked from and baseLen freezes the length of the parent's own op
+// list at fork time, so a later parent-side append can never leak into
+// this scope's inherited view (the parent's ops are append-only, so the
+// frozen prefix is immutable for the tracker's whole lifetime). The
+// full environment a consumer runs with is materialized only when a
+// real stdin consumer needs it (scopeEnvTracker.view) — a run of pure
+// assignments with no consumer pays exactly zero snapshot copies.
 type scopeEnvState struct {
-	ops   []envOp
-	taint map[string]bool
+	ops     []envOp
+	taint   map[string]bool
+	parent  *scopeEnvState
+	baseLen int
 }
 
 // scopeEnvTracker is the control-flow-aware environment accumulator of
@@ -549,10 +571,12 @@ func envTrackTaintedVar(name string) bool {
 }
 
 // stateFor returns the accumulated state of one scope path, materializing
-// it as a clone of the longest-prefix ancestor when the scope has not been
-// touched yet (the fork-time environment of a child scope is exactly its
-// parent's state at fork time — emission order guarantees the ancestor
-// rows already hold every op visible then).
+// it as a parent-linked fork of the longest-prefix ancestor when the scope
+// has not been touched yet (R22-Reviewer-#7: the fork-time environment of
+// a child scope is exactly its parent's state at fork time — emission
+// order guarantees the ancestor rows already hold every op visible then,
+// and the append-only op lists make the frozen prefix immutable without
+// any copy).
 func (t *scopeEnvTracker) stateFor(path string) *scopeEnvState {
 	if t.states == nil {
 		t.states = map[string]*scopeEnvState{}
@@ -567,27 +591,29 @@ func (t *scopeEnvTracker) stateFor(path string) *scopeEnvState {
 			best = p
 		}
 	}
-	if best != "" || len(path) > 0 {
-		if _, ok := t.states[best]; !ok && best == "" {
-			t.states[""] = &scopeEnvState{}
+	if path == "" {
+		st := &scopeEnvState{}
+		t.states[path] = st
+		return st
+	}
+	// A scope with no registered ancestor forks off the ROOT state, so
+	// even a detached path sees the root's accumulated unconditional ops
+	// exactly like the former eager clone did.
+	base := t.stateFor(best)
+	fork := &scopeEnvState{parent: base, baseLen: len(base.ops)}
+	if len(base.taint) > 0 {
+		// The uncertainty map is mutable on both sides (new conditional
+		// writes may land in either scope later), so the fork-time
+		// snapshot must be a real copy — it is small (PATH plus a handful
+		// of sentinel names) and only paid once per scope, never per
+		// segment.
+		fork.taint = map[string]bool{}
+		for k, v := range base.taint {
+			fork.taint[k] = v
 		}
 	}
-	base := t.states[best]
-	clone := &scopeEnvState{}
-	if base != nil {
-		clone.ops = append([]envOp(nil), base.ops...)
-		if len(base.taint) > 0 {
-			clone.taint = map[string]bool{}
-			for k, v := range base.taint {
-				clone.taint[k] = v
-			}
-		}
-	}
-	if clone.ops != nil {
-		clone.ops = clone.ops[:len(clone.ops):len(clone.ops)] // capacity-freeze the fork clone
-	}
-	t.states[path] = clone
-	return clone
+	t.states[path] = fork
+	return fork
 }
 
 // foldSegment folds one segment's pure-assignment writes into its own
@@ -601,6 +627,15 @@ func (t *scopeEnvTracker) foldSegment(seg shellSegment, caller callerIdentity) {
 	if len(seg.argv) == 0 {
 		return
 	}
+	// R22-Oracle-M3 / R22-Reviewer-#2: the fold license is the AST's own
+	// assignment verdict, never the argv word shape — a plain command
+	// word that merely SPELLS KEY=VAL after quote stripping is a command
+	// invocation (its runtime resolution may be a program or a builtin
+	// that performs no assignment at all), so the pre-R22 shape test
+	// folded writes the shell never performs.
+	if !seg.pureAssign {
+		return
+	}
 	if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv, caller); len(peeledHead) != 0 {
 		return
 	}
@@ -609,44 +644,114 @@ func (t *scopeEnvTracker) foldSegment(seg shellSegment, caller callerIdentity) {
 	}
 	st := t.stateFor(seg.scopePath)
 	for _, a := range seg.argv {
-		if !isAssignWord(a) {
-			continue
-		}
-		k := strings.IndexByte(a, '=')
-		if k <= 0 {
-			continue
-		}
-		name := a[:k]
-		if seg.condAssign {
-			if envTrackTaintedVar(name) {
-				if st.taint == nil {
-					st.taint = map[string]bool{}
-				}
-				st.taint[name] = true
-			}
-			continue
-		}
-		st.ops = append(st.ops, envOp{kind: 'a', key: name, value: a[k+1:]})
-		if st.taint != nil {
-			delete(st.taint, name)
-		}
+		t.foldAssignWord(st, a, seg.condAssign)
 	}
 }
 
+// foldAssignWord folds one assignment word into the scope state
+// (extracted from foldSegment so the taint-survival policy carries no
+// extra nesting): a conditional write taints every tracked variable it
+// touches, while an unconditional write appends its op and clears the
+// variable's uncertainty — UNLESS the new value depends on the
+// unknowable old one.
+func (t *scopeEnvTracker) foldAssignWord(st *scopeEnvState, a string, cond bool) {
+	if !isAssignWord(a) {
+		return
+	}
+	k := strings.IndexByte(a, '=')
+	if k <= 0 {
+		return
+	}
+	name := a[:k]
+	if cond {
+		if envTrackTaintedVar(name) {
+			if st.taint == nil {
+				st.taint = map[string]bool{}
+			}
+			st.taint[name] = true
+		}
+		return
+	}
+	value := a[k+1:]
+	st.ops = append(st.ops, envOp{kind: 'a', key: name, value: value})
+	if !st.taint[name] {
+		return
+	}
+	if strings.Contains(value, envPathSelfPlaceholder) || isDynamicArg(value) {
+		// R22-Oracle-M3 / R22-Reviewer-#2: the unconditional write
+		// DEPENDS on the old value of the very uncertainty it would
+		// clear — a self-reference (`PATH=$PATH:/suffix` expands the
+		// unknowable old value) or any other dynamic content. Because
+		// the old value is unknown the new value is unknown too, so
+		// the taint MUST survive the overwrite; only a completely
+		// independent constant re-establishes an exact value.
+		return
+	}
+	delete(st.taint, name)
+}
+
 // view returns the environment op view one consumer scope runs with:
-// the scope's exact unconditional ops followed by one uncertainty marker
-// op per tainted tracked variable (R21-Oracle-M3). The taint ops ride at
-// the tail because they shadow every earlier exact op of the same name —
-// a conditional write anywhere in the scope's history makes the merged
-// value unknowable unless a later unconditional write cleared it.
+// the scope's fork-time inherited chain plus its own exact unconditional
+// ops, followed by one uncertainty marker op per tainted tracked variable
+// (R21-Oracle-M3). The taint ops ride at the tail because they shadow
+// every earlier exact op of the same name — a conditional write anywhere
+// in the scope's history makes the merged value unknowable unless a
+// later unconditional write cleared it.
+//
+// R22-Reviewer-#7 / R22-Oracle-SF2: callers materialize this view ONLY
+// for segments that really consume stdin (heredoc/here-string/program
+// projection) — consecutive pure-assignment segments pay nothing beyond
+// the op append itself. The result is freshly allocated exactly once per
+// call and capacity-frozen, so the handed-out snapshot stays immutable
+// while the running accumulator keeps appending (the R20 observation's
+// contract, preserved).
 func (t *scopeEnvTracker) view(path string) envAssignments {
 	st := t.stateFor(path)
-	out := envAssignments{ops: append([]envOp(nil), st.ops...)}
-	for name := range st.taint {
-		out.ops = append(out.ops, envOp{kind: 't', key: name})
+	// Walk the parent chain leaf-to-root, then emit root-to-leaf. Each
+	// ancestor's contribution is truncated to the length its child froze
+	// at fork time — a parent-side op appended AFTER the fork is invisible
+	// to the child exactly like the fork-time process environment.
+	var chain []*scopeEnvState
+	for cur := st; cur != nil; cur = cur.parent {
+		chain = append(chain, cur)
 	}
+	return st.chainView(chain)
+}
+
+// chainView emits the root-to-leaf op view of one resolved chain
+// (extracted from view so the fork-chain walk carries no extra
+// nesting): each ancestor contributes the ops visible at fork time,
+// then the leaf's uncertainty markers ride at the tail, and the result
+// is freshly allocated exactly once and capacity-frozen.
+func (st *scopeEnvState) chainView(chain []*scopeEnvState) envAssignments {
+	total := len(st.taint)
+	for i := range chain {
+		total += scopeVisibleLen(chain, i)
+	}
+	ops := make([]envOp, 0, total)
+	for i := len(chain) - 1; i >= 0; i-- {
+		ops = append(ops, chain[i].ops[:scopeVisibleLen(chain, i)]...)
+	}
+	for name := range st.taint {
+		ops = append(ops, envOp{kind: 't', key: name})
+	}
+	out := envAssignments{ops: ops}
 	out.ops = out.ops[:len(out.ops):len(out.ops)]
 	return out
+}
+
+// scopeVisibleLen is the number of ops chain position i contributes to
+// a view: everything the state itself holds, truncated to the length
+// its direct child froze at fork time for every non-root position.
+func scopeVisibleLen(chain []*scopeEnvState, i int) int {
+	n := len(chain[i].ops)
+	if i == 0 {
+		return n
+	}
+	if lim := chain[i-1].baseLen; lim < n {
+		return lim
+	}
+	return n
 }
 
 // envHookVars are execution-hook environment variable names: assigning one a
