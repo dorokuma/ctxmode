@@ -1083,8 +1083,13 @@ func newWrapperPathTracker(basePath string, inherited envAssignments, caller cal
 // untrusted reports the tracker's current verdict (identical to
 // envAssignments.pathUntrusted(basePath) || caller.pathUntrusted() of
 // the ops applied so far).
+// R28-Oracle-M5 / Reviewer R28: the verdict keys on isDynamicArg, not
+// the bare cmdSubPlaceholder alone — a fully double-quoted dynamic
+// PATH value (`PATH="$(cmd)"` folding to cmdSubPlaceholderQuoted) is
+// every bit as unknowable a search list as the unquoted form: the
+// word boundary is known, the CONTENT never is.
 func (tk *wrapperPathTracker) untrusted() bool {
-	return tk.stickyT || strings.Contains(tk.cur, cmdSubPlaceholder) || tk.caller
+	return tk.stickyT || isDynamicArg(tk.cur) || tk.caller
 }
 
 // applyOps folds one batch of newly appended env ops into the running
@@ -1275,7 +1280,15 @@ func peelWrapperLayer(argv []string, i int, base string, envAs envAssignments) p
 // peelWrappersCore is the single shared wrapper-peel walk behind
 // peelWrappers and the R26 checked peel (R26-Oracle-M2/M4 /
 // R26-Reviewer-#1/#2/#3): a nil tracker reproduces the pre-R26 peel
-// byte-for-byte, while a non-nil tracker validates EVERY bare
+// for every input the pre-R26 scan completed — byte-for-byte except
+// the deliberate fail-closed repairs (R28-Oracle-S2 calibration: the
+// pre-R28 wording here promised byte-exact reproduction, which is
+// wrong in BOTH directions the audits pinned — a dynamic option VALUE
+// restores the pre-R26 residue index exactly like `abe543b` did
+// (R27-S2), while a truly-MISSING trailing operand like `taskset -p`
+// or `timeout -k` keeps the (len(argv), true) fail-closed clamp the
+// pre-R26 scan never produced; the clamp is the intended safety
+// repair, not an accident), while a non-nil tracker validates EVERY bare
 // slash-free external wrapper identity BEFORE that layer's options or
 // env operands are consumed — the wrapper's own resolution owes itself
 // to the environment in force when the kernel looked it up, never to
@@ -1371,7 +1384,7 @@ func peelCoreStep(argv []string, i int, envAs envAssignments, splitPayloads []st
 		// operands can rewrite it.
 		return peelCoreOutcome{head: argv[i:], split: splitPayloads, envAs: envAs, done: true, exhausted: true}
 	}
-	if tk != nil && wrapperIsExternalExecer(base) {
+	if tk != nil && wrapperFlipsDirectExec(base) {
 		// R27-Oracle-M3 / R27-Reviewer-#4: once ANY external wrapper
 		// layer peeled, every later layer is started by that program's
 		// own execve/execvp — never by a shell's builtin dispatch — so
@@ -1380,6 +1393,23 @@ func peelCoreStep(argv []string, i int, envAs envAssignments, splitPayloads []st
 		tk.directExec = true
 	}
 	return peelCoreLayerOutcome(argv, i, base, envAs, splitPayloads, tk)
+}
+
+// wrapperFlipsDirectExec reports whether peeling one wrapper layer
+// switches every LATER layer into direct-execution context (extracted
+// so peelCoreStep carries no disjunction — R28 zero-positive-delta
+// budget): every external execve/execvp wrapper does
+// (R27-Oracle-M3), and the shell's own `exec` builtin joins them
+// (R28-Oracle-M3 / Reviewer R28) — `exec` never dispatches a shell
+// builtin either: the word it launches is resolved through the OS
+// PATH lookup exactly like an external program's execvp target, so
+// a bare `command`/`builtin`/`exec` spelling behind a peeled `exec`
+// layer is an external lookup, never the builtin.
+func wrapperFlipsDirectExec(base string) bool {
+	if base == "exec" {
+		return true
+	}
+	return wrapperIsExternalExecer(base)
 }
 
 // peelCoreReservedWord reports the step-costing reserved/modifier words

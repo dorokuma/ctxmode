@@ -1296,7 +1296,11 @@ func (e envAssignments) pathUntrusted(base string) bool {
 			return true
 		}
 	}
-	return strings.Contains(e.effectivePATHFrom(base), cmdSubPlaceholder)
+	// R28-Oracle-M5 / Reviewer R28: isDynamicArg covers EVERY dynamic
+	// placeholder class — a fully double-quoted dynamic PATH value is an
+	// unknowable search list exactly like the unquoted form (the word
+	// boundary is known, the content never is).
+	return isDynamicArg(e.effectivePATHFrom(base))
 }
 
 // pathUntrusted reports whether this caller identity's effective PATH is
@@ -1304,7 +1308,10 @@ func (e envAssignments) pathUntrusted(base string) bool {
 // the untrusted verdict is sticky across every seeding replay, so once
 // any env layer failed the budget the identity carries it forward.
 func (c callerIdentity) pathUntrusted() bool {
-	return strings.Contains(c.pathEnv, cmdSubPlaceholder)
+	// R28-Oracle-M5 / Reviewer R28: same isDynamicArg coverage — the
+	// sticky verdict must not depend on WHICH placeholder spelling the
+	// dynamic content carried.
+	return isDynamicArg(c.pathEnv)
 }
 
 // expandPathSelfRefs substitutes the unforgeable $PATH sentinel with base
@@ -1318,7 +1325,10 @@ func (c callerIdentity) pathUntrusted() bool {
 // verdict is UNTRUSTED (ok=false) instead of a giant allocation or a
 // truncated short PATH the shell never computes.
 func expandPathSelfRefs(val, base string) (string, bool) {
-	if strings.Contains(base, cmdSubPlaceholder) {
+	if isDynamicArg(base) {
+		// R28-Oracle-M5 / Reviewer R28: ANY dynamic placeholder class in
+		// the accumulator — not just the bare cmdSubPlaceholder — marks
+		// the base as degenerated unknown content.
 		// The accumulator already degenerated to the untrusted marker:
 		// expanding further ops against it could materialize a
 		// VALID-looking short PATH (placeholder-shaped segments are not

@@ -1266,13 +1266,21 @@ func stdinTargetsPeelPrologue(argv []string, depth int, inherited envAssignments
 	// in directExec false — bare command/builtin/exec layers keep their
 	// shell builtin exemption exactly until an external wrapper layer
 	// peels and flips the tracker into direct execution context.
-	tk := newWrapperPathTracker(basePath, inherited, caller, false)
+	// R28-Oracle-M3 / Reviewer R28: the entry bit is the CALLER's own
+	// directExec — the xargs positional recursion, flock's argv form and
+	// watch's -x operands all launch their inner argv through the outer
+	// program's execvp, so their prologue validates in direct-execution
+	// context from the very first layer; the bit the first peel leaves
+	// behind (an external wrapper layer — or a peeled shell `exec`
+	// builtin, whose target is execvp'd rather than builtin-dispatched)
+	// then inherits into every deeper recursion of the same chain.
+	tk := newWrapperPathTracker(basePath, inherited, caller, caller.directExec)
 	head, _, ea, exhausted := peelWrappersCore(argv, tk, steps)
 	envAs := inherited.merged(ea)
 	if exhausted {
 		return nil, envAs, caller, []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
 	}
-	return head, envAs, caller.seededWith(ea), nil
+	return head, envAs, caller.seededWith(ea).withDirectExec(tk.directExec), nil
 }
 
 // stdinCanonRewrite is the recursion discharge of stdinCanonHeadRewrite:
@@ -1483,20 +1491,29 @@ func stdinIndirectionTargets(head []string, base string, depth int, envAs envAss
 		}
 		// R16-Oracle-M2: eval re-parses in the SAME shell — the enclosing
 		// script's dialect rides in on the bash parameter.
+		// R28-Oracle-M3 / Reviewer R28: the re-parsed commands are
+		// dispatched by that shell itself, so the execution context resets
+		// to shell dispatch exactly like a fresh `sh -c`.
 		if bash {
-			return collectSegs(splitShellSegmentsBashCaller(inner, caller.envTaint, caller), envAs, basePath, false, caller), true
+			return collectSegs(splitShellSegmentsBashCaller(inner, caller.envTaint, caller), envAs, basePath, false, caller.withDirectExec(false)), true
 		}
-		return collectSegs(splitShellSegmentsCaller(inner, caller.envTaint, caller), envAs, basePath, false, caller), true
+		return collectSegs(splitShellSegmentsCaller(inner, caller.envTaint, caller), envAs, basePath, false, caller.withDirectExec(false)), true
 	case "flock":
 		inner, cmdText := skipFlockArgs(head, 1)
 		if cmdText != "" {
 			if isDynamicArg(cmdText) {
 				return []stdinTarget{{lang: "", envAs: envAs}}, true
 			}
-			return collectSegs(splitShellSegmentsCaller(cmdText, caller.envTaint, caller), envAs, basePath, false, caller), true
+			// R28-Oracle-M3: flock -c re-parses in a fresh `sh -c` — shell
+			// dispatch context.
+			return collectSegs(splitShellSegmentsCaller(cmdText, caller.envTaint, caller), envAs, basePath, false, caller.withDirectExec(false)), true
 		}
 		if inner < len(head) {
-			return stdinProgramTargetsWithEnv(head[inner:], depth+1, envAs, basePath, caller), true
+			// R28-Oracle-M3 / Reviewer R28: flock's positional argv form
+			// execvps the inner command directly — never through a shell's
+			// builtin dispatch (the -c text form above re-parses in a fresh
+			// shell and resets the bit instead).
+			return stdinProgramTargetsWithEnv(head[inner:], depth+1, envAs, basePath, caller.withDirectExec(true)), true
 		}
 		return nil, true
 	case "script":
@@ -1504,7 +1521,9 @@ func stdinIndirectionTargets(head []string, base string, depth int, envAs envAss
 			if isDynamicArg(payload) {
 				return []stdinTarget{{lang: "", envAs: envAs}}, true
 			}
-			return collectSegs(splitShellSegmentsCaller(payload, caller.envTaint, caller), envAs, basePath, false, caller), true
+			// R28-Oracle-M3: script -c re-parses in a fresh `sh -c` — shell
+			// dispatch context.
+			return collectSegs(splitShellSegmentsCaller(payload, caller.envTaint, caller), envAs, basePath, false, caller.withDirectExec(false)), true
 		}
 		return []stdinTarget{{lang: "", envAs: envAs}}, true
 	case "watch":
@@ -1528,13 +1547,19 @@ func stdinWatchTargets(head []string, depth int, envAs envAssignments, basePath 
 		return nil
 	}
 	if execMode {
-		return stdinProgramTargetsWithEnv(head[k:], depth+1, envAs, basePath, caller)
+		// R28-Oracle-M3 / Reviewer R28: watch -x/--exec execvps its
+		// operands directly — the inner argv owes every bare spelling to
+		// the PATH lookup exactly like the xargs target.
+		return stdinProgramTargetsWithEnv(head[k:], depth+1, envAs, basePath, caller.withDirectExec(true))
 	}
 	text := strings.Join(head[k:], " ")
 	if isDynamicArg(text) {
 		return []stdinTarget{{lang: "", envAs: envAs}}
 	}
-	return collectSegs(splitShellSegmentsCaller(text, caller.envTaint, caller), envAs, basePath, false, caller)
+	// R28-Oracle-M3 / Reviewer R28: watch's default mode joins the
+	// operands into a `sh -c` string — the fresh shell dispatches the
+	// re-parsed commands itself.
+	return collectSegs(splitShellSegmentsCaller(text, caller.envTaint, caller), envAs, basePath, false, caller.withDirectExec(false))
 }
 
 // stdinTargetsWithDataFallback appends the R17-Oracle-M6 data-consumer
@@ -1593,7 +1618,11 @@ func stdinShellCTargets(innerText, base string, depth int, envAs envAssignments,
 	if isDynamicArg(innerText) {
 		return []stdinTarget{{lang: "", envAs: envAs}}
 	}
-	subCaller := caller
+	// R28-Oracle-M3 / Reviewer R28: the nested -c script is dispatched
+	// by the fresh shell that reads it — even when the shell binary
+	// itself was started through an outer execvp context, the commands
+	// INSIDE the script owe nothing to that execvp's PATH lookup.
+	subCaller := caller.withDirectExec(false)
 	subCaller.envTaint = mergeEnvTaint(subCaller.envTaint, envAs.taintedSentinelNames())
 	var segs []shellSegment
 	switch base {
@@ -1630,7 +1659,11 @@ func stdinXargsTargets(head []string, depth int, envAs envAssignments, basePath,
 		return []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
 	}
 	if !feedsCode {
-		return stdinProgramTargetsWithEnv(head[k:], depth+1, envAs, basePath, caller)
+		// R28-Oracle-M3 / Reviewer R28: even when the stdin words do not
+		// feed an open code slot, xargs still starts this target through
+		// its own execvp — the recursion validates in direct-execution
+		// context exactly like the open-slot inner projection below.
+		return stdinProgramTargetsWithEnv(head[k:], depth+1, envAs, basePath, caller.withDirectExec(true))
 	}
 	return stdinXargsInnerTarget(head[k:], depth+1, envAs, basePath, effPath, caller)
 }

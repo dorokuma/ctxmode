@@ -710,9 +710,32 @@ func peelWrappersWithIndex(argv []string, caller callerIdentity) (headArgv []str
 // non-exhausted peel whose residue is empty is the pure-assignment /
 // no-op shape; an EXHAUSTED peel never counts as the empty-head skip
 // because the consumer identity is unknowable rather than absent.
+// R28-Oracle-M4 / Reviewer R28: the index peel's empty residue is not
+// proof by itself — peelWrappersWithIndex surrenders provenance
+// (headIdx -1, exhausted=false) at shapes the guard-side checked peel
+// positively rejects, so a trailing `taskset -p`/`chrt -p` missing its
+// PID or a `timeout -k`/`env --unset` missing its option value emptied
+// the residue without ANY consumer verdict and slipped into the
+// empty-head skip. The checked peel must agree before the segment may
+// vanish from the summary.
 func peelProvesEmptyHead(argv []string, caller callerIdentity) bool {
 	peeledHead, _, _, _, peelExhausted := peelWrappersWithIndex(argv, caller)
-	return len(peeledHead) == 0 && !peelExhausted
+	return len(peeledHead) == 0 && !peelExhausted && peelCheckedEmptyProved(argv, caller)
+}
+
+// peelCheckedEmptyProved is the guard-side cross-check of
+// peelProvesEmptyHead (extracted so the entry keeps its single
+// conjunction — R28 zero-positive-delta budget): the same
+// untrusted-PATH-aware checked peel the stdin projection runs must
+// also complete to an empty head without exhaustion. A missing PID or
+// option value fails closed there (exhausted), so the helper answers
+// false and the unknowable consumer is kept; a static PID query
+// (/usr/bin/taskset -p 1) or a pure KEY=VAL prefix completes empty and
+// non-exhausted exactly like the index peel.
+func peelCheckedEmptyProved(argv []string, caller callerIdentity) bool {
+	tk := newWrapperPathTracker(caller.effectivePATH(), envAssignments{}, caller, caller.directExec)
+	checkedHead, _, _, checkedExhausted := peelWrappersAndWrapperAliasesChecked(argv, caller.effectivePATH(), caller, tk)
+	return len(checkedHead) == 0 && !checkedExhausted
 }
 
 // locateShellCSlot finds the argv index of the `shell -c` script operand,

@@ -689,10 +689,12 @@ func lookPathOneSeg(name, dir, cwd string) (string, bool, bool) {
 }
 
 // pathSegUnvettable reports whether a PATH segment can never be a real
-// lookup directory: the command-substitution placeholder anywhere in it
-// marks an unknowable PATH fragment (R22-Oracle-#6).
+// lookup directory: a dynamic placeholder anywhere in it marks an
+// unknowable PATH fragment (R22-Oracle-#6). R28-Oracle-M5 / Reviewer
+// R28: the verdict keys on isDynamicArg — every placeholder class, not
+// just the bare cmdSubPlaceholder, is unknowable content.
 func pathSegUnvettable(dir string) bool {
-	return strings.Contains(dir, cmdSubPlaceholder)
+	return isDynamicArg(dir)
 }
 
 // canonicalResolvedBase maps a symlink-resolved executable basename to the
@@ -1748,6 +1750,27 @@ type callerIdentity struct {
 	// request scope exists (direct unit screening) — xargsWork then
 	// mints a fresh table per entry.
 	xw *xargsWorkState
+	// directExec records whether the argv under projection is started by
+	// an external program's execve/execvp rather than a shell's own
+	// builtin dispatch (R28-Oracle-M3 / Reviewer R28): the xargs
+	// positional/recursive target, flock's argv form and watch's
+	// -x/--exec operands all launch their inner command directly, so a
+	// bare command/builtin/exec spelling there owes its identity to the
+	// PATH lookup exactly like any external executable — never the
+	// shell builtin exemption. Branches that re-enter SHELL TEXT
+	// (sh -c / eval / flock -c / script -c / watch's default mode)
+	// reset it: the fresh or same shell dispatches those commands
+	// itself again.
+	directExec bool
+}
+
+// withDirectExec returns a copy of the identity carrying the given
+// execution-context bit (R28-Oracle-M3 / Reviewer R28): the bit rides
+// every copy-based derivation exactly like cwd/xw, so only the
+// recursion edges that change WHO dispatches the next layer adjust it.
+func (c callerIdentity) withDirectExec(direct bool) callerIdentity {
+	c.directExec = direct
+	return c
 }
 
 // effectivePATH returns the PATH the identity resolves against: pathEnv
