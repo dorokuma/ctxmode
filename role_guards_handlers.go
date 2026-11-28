@@ -725,7 +725,10 @@ func (g guardCall) guardCtxRunStdin(argv []string, stdin string) (rule, detail s
 	if stdin == "" || (!g.subagent && !g.strictReadonly) {
 		return "", ""
 	}
-	caller := g.callerIdentity()
+	// R29-Oracle-M3 / Reviewer R29-#2: this is the NATIVE plain-argv
+	// entry — argv[0] is launched by exec.Command, so the projection
+	// validates in direct-execution context from the very first layer.
+	caller := g.argvCallerIdentity()
 	targets := stdinProgramTargetsWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"), caller)
 	if len(targets) == 0 {
 		return "", ""
@@ -1162,7 +1165,13 @@ func stdinProgramTargetsDialectSteps(argv []string, depth int, inherited envAssi
 	if !origHasSlash && bareHeadUntrustedPATH(head[0], envAs, basePath, caller) {
 		return []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
 	}
-	if rb := canonicalResolvedBase(resolveHeadBase(origHead, effPath, caller.screenCwd())); rb != "" && rb != base {
+	// R29-Oracle-M3 / Reviewer R29-#2: the direct-execution context
+	// exempts the shell builtin wrappers from the alias adoption — the
+	// OS lookup never dispatches a shell builtin, so a file resolving to
+	// an external `command`/`builtin`/`exec` names a program with no
+	// builtin semantics. The whole adoption test is extracted so the
+	// head classification keeps the R24 complexity budget.
+	if rb := canonicalResolvedBase(resolveHeadBase(origHead, effPath, caller.screenCwd())); stdinHeadAliasAdoptable(rb, base, caller.directExec) {
 		if isPeeledWrapperBase(rb) {
 			// R27-Oracle-M4 / R27-Reviewer-#5: the resolved-wrapper recursion
 			// threads the same shared wrapper-step budget.
@@ -1281,6 +1290,24 @@ func stdinTargetsPeelPrologue(argv []string, depth int, inherited envAssignments
 		return nil, envAs, caller, []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
 	}
 	return head, envAs, caller.seededWith(ea).withDirectExec(tk.directExec), nil
+}
+
+// stdinHeadAliasAdoptable reports whether the resolved basename rb may
+// rewrite the classified head base as a canonical/resolved wrapper or
+// structural alias (extracted for the R29 complexity budget): the
+// distinct-name test is the pre-R29 verdict exactly, and the
+// direct-execution context additionally refuses the shell builtin
+// wrappers command/builtin/exec — an external file of that name carries
+// no shell builtin semantics, so adopting the alias would re-certify a
+// builtin dispatch the execvp never performs.
+func stdinHeadAliasAdoptable(rb, base string, directExec bool) bool {
+	if rb == "" || rb == base {
+		return false
+	}
+	if directExec && isShellBuiltinWrapperBase(rb) {
+		return false
+	}
+	return true
 }
 
 // stdinCanonRewrite is the recursion discharge of stdinCanonHeadRewrite:
@@ -1404,13 +1431,21 @@ func collectOneStdinSeg(tracker *scopeEnvTracker, seg shellSegment, depth int, s
 	if seg.pureAssign {
 		return nil
 	}
+	// R29-Oracle-M4 / Reviewer R29-#3: the empty-head proof and the
+	// formal projection share the SAME scope environment — the view of
+	// the segment's own scope path materializes FIRST and the proof
+	// replays it exactly like the projection below. The pre-R29 proof
+	// validated against an EMPTY inherited environment: a scope whose
+	// conditional PATH write makes every bare resolution unknowable
+	// still "proved" the static-PID taskset query empty and vanished a
+	// consumer the projection itself exhausts.
+	runEnv := subEnv.merged(tracker.view(seg.scopePath))
 	// R27-Oracle-S2 / R27-Reviewer-#2: an EXHAUSTED peel is never an
 	// empty-head skip — the consumer identity is unknowable, not absent,
 	// and the real projection below owns the exhaustion verdict.
-	if peelProvesEmptyHead(seg.argv, subCaller) {
+	if peelSegProvesEmptyHead(seg, runEnv, subPath, subCaller) {
 		return nil
 	}
-	runEnv := subEnv.merged(tracker.view(seg.scopePath))
 	return collectStdinSegTargets(seg, depth, runEnv, envAs, subPath, mergeOuter, subCaller)
 }
 
@@ -1421,7 +1456,13 @@ func collectOneStdinSeg(tracker *scopeEnvTracker, seg shellSegment, depth int, s
 // pure-assignment segment's ops in statement order (R19-Oracle-M4).
 func collectStdinSegTargets(seg shellSegment, depth int, runEnv, envAs envAssignments, subPath string, mergeOuter bool, subCaller callerIdentity) []stdinTarget {
 	var out []stdinTarget
-	sub := stdinProgramTargetsDialect(seg.argv, depth+1, runEnv, subPath, subCaller, seg.bashDialect)
+	// R29-Oracle-M4 / Reviewer R29-#3: the quoted assignment-shaped
+	// command head mints its whole-segment verdict inside the shared
+	// projection helper — the argv serialization lost the quoting
+	// provenance the peel strips, so the data/exhausted verdict is
+	// minted BEFORE the projection can certify the trailing words as a
+	// peeled consumer.
+	sub := stdinSegProjectTargets(seg, depth+1, runEnv, subPath, subCaller)
 	// R17-Oracle-M6: a segment that can read the shared stream but
 	// resolves to NO program target is a plain data consumer (cat,
 	// jq .) — it must surface as such instead of silently dropping
@@ -1432,7 +1473,7 @@ func collectStdinSegTargets(seg shellSegment, depth int, runEnv, envAs envAssign
 	// like the flat scan in scriptAllowsLocalShellStdinPrepare skips
 	// it, so `bash -c 'X=1; bash'` keeps the same verdict as the flat
 	// spelling instead of inventing a data consumer.
-	sub = stdinTargetsWithDataFallback(sub, seg, envAs, subCaller)
+	sub = stdinTargetsWithDataFallback(sub, seg, runEnv, envAs, subPath, subCaller)
 	for _, t := range sub {
 		if mergeOuter {
 			t.envAs = envAs.merged(t.envAs)
@@ -1569,7 +1610,7 @@ func stdinWatchTargets(head []string, depth int, envAs envAssignments, basePath 
 // EMPTY command head, reads nothing and vanishes from the summary exactly
 // like the flat prepare scan already skips it. Any segment with a real
 // non-program head (cat, echo, jq .) stays a data consumer.
-func stdinTargetsWithDataFallback(sub []stdinTarget, seg shellSegment, envAs envAssignments, subCaller callerIdentity) []stdinTarget {
+func stdinTargetsWithDataFallback(sub []stdinTarget, seg shellSegment, runEnv, envAs envAssignments, subPath string, subCaller callerIdentity) []stdinTarget {
 	if len(sub) != 0 {
 		return sub
 	}
@@ -1577,7 +1618,11 @@ func stdinTargetsWithDataFallback(sub []stdinTarget, seg shellSegment, envAs env
 	// a proven empty head either — reaching here means the projection
 	// returned no target, so the segment keeps the data-consumer fallback
 	// only when the peel completed to a real empty head.
-	if peelProvesEmptyHead(seg.argv, subCaller) {
+	// R29-Oracle-M4 / Reviewer R29-#3: the proof replays the SAME scope
+	// environment the projection itself consumed (runEnv/subPath), never
+	// the empty inherited environment the pre-R29 helper validated
+	// against.
+	if peelSegProvesEmptyHead(seg, runEnv, subPath, subCaller) {
 		return sub
 	}
 	return append(sub, stdinTarget{data: true, envAs: envAs})

@@ -1916,7 +1916,12 @@ func (c *subCollector) taintEvalTextWrites(text string, depth int) {
 		// statement); the nested registration rides the hidden scan's
 		// lexical descent itself, and the batch pair here discharges
 		// whatever the scan shapes skip — for the NEXT statement only.
-		c.noteHiddenEvalStmtDirectRegsBoundary(st)
+		// R29-Oracle-M2 / Reviewer R29-#1: NO pre-registration happens
+		// here at all — even the statement's own direct facts register
+		// inside scanHiddenEvalStmtBody AFTER the redirection scan (the
+		// redirection words on the statement's own line evaluate before
+		// the command starts), so one shared positional ordering owns
+		// every registration.
 		c.taintStmtSharedWrites(st)
 		c.taintEvalOneStmt(st, depth)
 		c.noteHiddenEvalStmtBatchRegs(st)
@@ -2163,6 +2168,10 @@ func (c *subCollector) scanHiddenEvalChildFrame(node syntax.Node, scanWord func(
 	case *syntax.CoprocClause:
 		c.scanHiddenEvalCoprocFrame(x, scanWord, depth)
 		return true
+	case *syntax.ForClause, *syntax.WhileClause:
+		// R29-Oracle-M2-observation / Reviewer R29-#1: loops iterate.
+		c.scanHiddenEvalLoopNode(x, scanWord, depth)
+		return true
 	case *syntax.BinaryCmd:
 		if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
 			c.scanHiddenEvalPipeSiblings(x, scanWord, depth)
@@ -2170,6 +2179,27 @@ func (c *subCollector) scanHiddenEvalChildFrame(node syntax.Node, scanWord func(
 		}
 	}
 	return false
+}
+
+// scanHiddenEvalLoopNode scans one loop node of the hidden-eval scan
+// with its back-edge visibility (R29-Oracle-M2 observation / Reviewer
+// R29-#1): every iteration AFTER the first runs with the positional
+// facts the previous iterations already installed, so
+// `for x in 1 2; do eval; eval() { :; }; done` re-parses the shadowed
+// eval chain on iteration two even though the straight-line spelling
+// `{ eval; eval() { :; }; }` — scanned exactly once — re-parses
+// nothing. The scan therefore runs the node a SECOND time whenever the
+// first pass minted new function/readonly registrations; re-registering
+// the same names never grows the registry again, so a nested loop can
+// never cascade the double pass past the bounded two passes per loop
+// level. A loop body that registers nothing scans exactly once.
+func (c *subCollector) scanHiddenEvalLoopNode(node syntax.Node, scanWord func(*syntax.Word) (string, bool), depth int) {
+	prevFuncs, prevRO := len(c.funcNames), len(c.readonlyVars)
+	c.scanHiddenEvalNode(node, scanWord, depth)
+	if len(c.funcNames) == prevFuncs && len(c.readonlyVars) == prevRO {
+		return
+	}
+	c.scanHiddenEvalNode(node, scanWord, depth)
 }
 
 // scanHiddenEvalSubstFrame scans one substitution/proc-substitution/
@@ -2238,19 +2268,6 @@ func (c *subCollector) noteHiddenEvalStmtDirectRegs(cmd syntax.Command) {
 		// shape noteEvalStmtReadonlyDecls records.
 		c.noteReadonlyDecls(c.callArgsArgv(x))
 	}
-}
-
-// noteHiddenEvalStmtDirectRegsBoundary is the boundary-aware form of
-// noteHiddenEvalStmtDirectRegs for the replication loop heads
-// (extracted so both loop bodies stay branch-free — R28
-// zero-positive-delta budget): a backgrounded or coprocess statement
-// installs nothing in the PARENT process, so its direct facts register
-// only inside the child frame the scan itself opens.
-func (c *subCollector) noteHiddenEvalStmtDirectRegsBoundary(st *syntax.Stmt) {
-	if childProcStmtBoundary(st) {
-		return
-	}
-	c.noteHiddenEvalStmtDirectRegs(st.Cmd)
 }
 
 // noteHiddenEvalStmtBatchRegs is the post-scan batch registration pair
@@ -2378,14 +2395,21 @@ func (c *subCollector) scanHiddenEvalStmt(ist *syntax.Stmt, scanWord func(*synta
 // both the command subtree and every redirection word/heredoc of the
 // statement's Redirs list.
 func (c *subCollector) scanHiddenEvalStmtBody(ist *syntax.Stmt, scanWord func(*syntax.Word) (string, bool), depth int) {
-	// R28-Oracle-M2 / Reviewer R28: the statement's own direct positional
-	// facts register HERE, in lexical scan order — inside the
-	// child-process frame scanHiddenEvalStmt already opened for a
-	// backgrounded/coprocess statement, so a block behind a process bit
-	// (`$( { eval() { :; }; eval; } & )`) registers its definitions in
-	// the child registry exactly like the real shell, while a foreground
-	// block's later definitions can never hoist over the block's own
-	// earlier commands the way the pre-R28 pre-scan batch did.
+	// R29-Oracle-M2 / Reviewer R29-#1: the statement's redirection words
+	// scan FIRST, in EVALUATION order — a redirection spelled on the
+	// statement's own line applies when the statement STARTS, so the
+	// substitution inside `{ eval() { :; }; } >/dev/null/$(command -x
+	// eval)` runs BEFORE the block body ever executed its definition.
+	// The pre-R29 scan descended the command subtree first and let the
+	// block body's own definition shadow the substitution's eval chain
+	// retroactively, polluting PATH for a chain the real shell evaluates
+	// unshadowed. Only AFTER the redirection scan does the statement's
+	// own direct registration happen — inside the child-process frame
+	// scanHiddenEvalStmt already opened for a backgrounded/coprocess
+	// statement (R28-Oracle-M2) — and neither taintEvalTextWrites nor
+	// bindEvalOneStmtBody pre-registers any statement fact ahead of it:
+	// the replication loops share exactly this positional ordering.
+	c.scanHiddenEvalRedirs(ist, scanWord, depth)
 	c.noteHiddenEvalStmtDirectRegs(ist.Cmd)
 	if call, isCall := ist.Cmd.(*syntax.CallExpr); isCall {
 		c.taintOneEvalCallWrites(call, scanWord, depth+1)
@@ -2393,6 +2417,15 @@ func (c *subCollector) scanHiddenEvalStmtBody(ist *syntax.Stmt, scanWord func(*s
 	if ist.Cmd != nil {
 		c.scanHiddenEvalDispatch(ist.Cmd, scanWord, depth)
 	}
+}
+
+// scanHiddenEvalRedirs scans the redirection words/heredocs of one
+// statement of the hidden-eval scan (extracted for the R29 complexity
+// budget — R29-Oracle-M2): redirections apply when the statement starts,
+// so their substitutions evaluate with the registry state of BEFORE the
+// statement's own command — never with definitions the command subtree
+// executes later.
+func (c *subCollector) scanHiddenEvalRedirs(ist *syntax.Stmt, scanWord func(*syntax.Word) (string, bool), depth int) {
 	for _, r := range ist.Redirs {
 		if r == nil {
 			continue
@@ -2544,7 +2577,12 @@ func (c *subCollector) bindEvalOneStmtBody(st *syntax.Stmt, depth int) {
 	// nested compound-block registrations ride the hidden scan's lexical
 	// descent, and the cross-statement batch pair discharges after the
 	// replay in bindEvalOneStmt.
-	c.noteHiddenEvalStmtDirectRegsBoundary(st)
+	// R29-Oracle-M2 / Reviewer R29-#1: even that direct registration
+	// moved into scanHiddenEvalStmtBody AFTER the redirection scan — the
+	// redirection words on the statement's own line evaluate before the
+	// command starts, so the facts a statement installs can never shadow
+	// the substitutions its own redirections spell. No registration of
+	// any shape happens ahead of the replay here.
 	call, isCall := st.Cmd.(*syntax.CallExpr)
 	if isCall && !st.Background && !st.Negated && !st.Coprocess && len(st.Redirs) == 0 && len(call.Args) == 0 {
 		// R20-Oracle-M1: the statement must be a PROVABLY-executed bare
@@ -3965,18 +4003,10 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 		}
 		c.allowBind = prevBind
 	case *syntax.CoprocClause:
-		prevBind := c.allowBind
-		c.allowBind = false
-		// A coprocess runs in its own child process — assignments inside
-		// never reach the parent shell (R21-Oracle-M3).
-		restoreRegs := c.snapshotProcessRegs()
-		restoreScope := c.enterChildScope()
-		if cmd.Stmt != nil {
-			c.walkStmt(cmd.Stmt, stdinFeed{})
-		}
-		restoreScope()
-		restoreRegs()
-		c.allowBind = prevBind
+		// R29-Oracle-M2 observation: extracted so walkStmt carries no
+		// additional case-body complexity — the coprocess body walk plus
+		// the R29 Name-word emission live in walkCoprocStmt.
+		c.walkCoprocStmt(cmd)
 	case *syntax.DeclClause:
 		c.emitDecl(st, cmd, feed)
 	case *syntax.ArithmCmd:
@@ -3989,6 +4019,32 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 	default:
 		c.reject()
 	}
+}
+
+// walkCoprocStmt walks one coprocess statement of the main traversal
+// (extracted for the R29 complexity budget — R29-Oracle-M2 observation):
+// a coprocess runs in its own child process, so assignments inside
+// never reach the parent shell (R21-Oracle-M3), and the NAME word scans
+// exactly like the hidden-eval replication frame already covers it —
+// the pinned mvdan.cc/sh parser fills CoprocClause.Name whenever a
+// compound command follows a coproc word, bash expands that word, and
+// every other word position of the traversal produces its nested
+// substitution segments through emitNestedFromWord. Dropping it
+// silently lost an AST subtree the replication's pre-scan counts.
+func (c *subCollector) walkCoprocStmt(cmd *syntax.CoprocClause) {
+	prevBind := c.allowBind
+	c.allowBind = false
+	restoreRegs := c.snapshotProcessRegs()
+	restoreScope := c.enterChildScope()
+	if cmd.Name != nil {
+		c.emitNestedFromWord(cmd.Name, stdinFeed{})
+	}
+	if cmd.Stmt != nil {
+		c.walkStmt(cmd.Stmt, stdinFeed{})
+	}
+	restoreScope()
+	restoreRegs()
+	c.allowBind = prevBind
 }
 
 // noteDeclInlineAssign replays the inline bind of one declaration

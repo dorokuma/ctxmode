@@ -1899,6 +1899,20 @@ func (g guardCall) callerIdentity() callerIdentity {
 	return c
 }
 
+// argvCallerIdentity is the caller identity of the NATIVE plain-argv
+// entries (R29-Oracle-M3 / Reviewer R29-#2): ctx_run's argv is started
+// by exec.Command — the OS execve/execvp with NO shell anywhere in the
+// dispatch — so every word of it owes its identity to the PATH lookup
+// exactly like the xargs/flock/watch inner targets. Assignment-shaped,
+// reserved and no-op spellings are literal file names there, and a bare
+// command/builtin/exec is an external program, never the shell builtin.
+// Explicit shell TEXT entries (sh -c payloads, eval, flock -c) keep
+// callerIdentity() — the fresh or same shell dispatches those commands
+// itself again.
+func (g guardCall) argvCallerIdentity() callerIdentity {
+	return g.callerIdentity().withDirectExec(true)
+}
+
 // wrapperWriteOpHit scans the leading wrapper chain of argv for options
 // that WRITE: strace/ltrace -o FILE / --output=FILE, /usr/bin/time -o FILE
 // / --output=FILE, flock -o / --close. Peeling must not discard them — a

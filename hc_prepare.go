@@ -704,6 +704,76 @@ func peelWrappersWithIndex(argv []string, caller callerIdentity) (headArgv []str
 	return argv[i:], -1, nil, envAs, true
 }
 
+// segHasQuotedAssignHead reports whether the segment's command head is
+// a QUOTED word that merely SPELLS KEY=VAL (R29-Oracle-M4 / Reviewer
+// R29-#3): a pure-assignment statement carries no command word at all,
+// but an invocation like `'FOO=1' sh` serializes the quoted command word
+// to the same argv spelling a real assignment prefix carries — the
+// runtime resolves it as a PROGRAM named `FOO=1` (or fails the lookup),
+// never performs an assignment. argWords carries the AST word
+// provenance: assignment prefixes append nil, command words append the
+// real word, so the first non-nil entry is the command head and an
+// assignment-shaped serialization there is the quoted-command shape.
+func segHasQuotedAssignHead(seg shellSegment) bool {
+	if seg.pureAssign {
+		return false
+	}
+	for k, w := range seg.argWords {
+		if w == nil {
+			continue
+		}
+		return k < len(seg.argv) && isAssignWord(seg.argv[k])
+	}
+	return false
+}
+
+// segQuotedAssignHeadVerdict is the whole-segment verdict of the quoted
+// assignment-shaped command head (extracted so the collect/projection
+// sites carry one shape test — R29 zero-positive-delta budget): the
+// peel must NEVER strip the word as a shell assignment — the runtime
+// execs a program literally named KEY=VAL — so under a TRUSTED
+// effective PATH the consumer is a plain data target (never the peeled
+// shell the string-level strip would certify), and under an untrusted
+// one the unknowable consumer carries the exhaustion verdict exactly
+// like the projection's own bare-head interception. isQuoted reports
+// whether the segment carries the shape at all; the target's envAs is
+// filled by the caller.
+func segQuotedAssignHeadVerdict(seg shellSegment, runEnv envAssignments, subPath string, caller callerIdentity) (stdinTarget, bool) {
+	if !segHasQuotedAssignHead(seg) {
+		return stdinTarget{}, false
+	}
+	if runEnv.pathUntrusted(subPath) || caller.pathUntrusted() {
+		return stdinTarget{lang: "", exhausted: true}, true
+	}
+	return stdinTarget{data: true}, true
+}
+
+// peelSegProvesEmptyHead is the segment-aware form of
+// peelProvesEmptyHead (R29-Oracle-M4 / Reviewer R29-#3): a
+// pure-assignment segment consumes no stdin by construction; a quoted
+// assignment-shaped command head is NEVER an empty head (it runs a
+// program literally named KEY=VAL or fails the lookup); every other
+// segment's proof replays the SAME scope environment the formal
+// projection consumes — inherited ops and base path included — so the
+// proof can never validate a consumer empty under an environment the
+// projection itself would exhaust.
+func peelSegProvesEmptyHead(seg shellSegment, inherited envAssignments, basePath string, caller callerIdentity) bool {
+	if seg.pureAssign {
+		return true
+	}
+	if segHasQuotedAssignHead(seg) {
+		return false
+	}
+	tk := newWrapperPathTracker(basePath, inherited, caller, caller.directExec)
+	seeded := caller.seededWith(inherited)
+	peeledHead, _, _, _, peelExhausted := peelWrappersWithIndex(seg.argv, seeded)
+	if len(peeledHead) != 0 || peelExhausted {
+		return false
+	}
+	checkedHead, _, _, checkedExhausted := peelWrappersAndWrapperAliasesChecked(seg.argv, inherited.effectivePATHFrom(basePath), seeded, tk)
+	return len(checkedHead) == 0 && !checkedExhausted
+}
+
 // peelProvesEmptyHead reports whether the wrapper peel PROVES the
 // segment has no surviving command head (extracted for the R27
 // complexity budget — R27-Oracle-S2 / R27-Reviewer-#2): only a
@@ -1490,14 +1560,14 @@ func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv 
 		if len(seg.argv) == 0 || seg.pipedStdin || seg.stdinRedir || len(seg.heredocText) > 0 || seg.hereString != "" {
 			continue
 		}
-		// Pure-assignment / no-op segments consume no stdin; a segment whose
-		// head does not survive the wrapper peel is left to the caller's
-		// guard pass (which fails closed on the same condition). Its
-		// assignment ops already accumulated into runEnv above (R19-M4).
-		// R27-Oracle-S2 / R27-Reviewer-#2: an EXHAUSTED peel is never the
-		// empty-head skip — the consumer identity is unknowable rather than
-		// absent, and the projection below owns the exhaustion verdict.
-		if peelProvesEmptyHead(seg.argv, caller) {
+		// R29-Oracle-M4 / Reviewer R29-#3: the whole consumability verdict
+		// — pure-assignment fast path, lazy scope-view materialization and
+		// the environment-sharing empty-head proof — lives in one helper
+		// so the loop keeps the pre-R29 branch count; skip=true means the
+		// segment consumes no stdin (its assignment ops already folded
+		// above, R19-M4).
+		runEnv, skip := stdinConsumableSegView(tracker, seg, outerEnv, basePath, caller)
+		if skip {
 			continue
 		}
 		// A nested shell -c whose slot walk cannot pin a clean script word
@@ -1511,11 +1581,12 @@ func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv 
 		}
 		// R16-Oracle-M2: the segments carry their own dialect — an eval
 		// indirection inside the scan re-parses under seg.bashDialect.
-		// R19-Oracle-M4/R21-Oracle-M3: the inherited env is outerEnv plus
-		// the consumer's OWN scope view — the assignments in force when
-		// THAT scope runs.
-		runEnv := outerEnv.merged(tracker.view(seg.scopePath))
-		targets := stdinProgramTargetsDialect(seg.argv, 0, runEnv, basePath, caller, seg.bashDialect)
+		// R29-Oracle-M4 / Reviewer R29-#3: the quoted assignment-shaped
+		// command head mints its whole-segment verdict inside the shared
+		// projection helper (data under a trusted PATH, exhausted under an
+		// untrusted one) — either shape refuses the rewrite, never the
+		// stripped certified shell the string-level peel would certify.
+		targets := stdinSegProjectTargets(seg, 0, runEnv, basePath, caller)
 		if len(targets) == 0 {
 			// A plain data consumer (jq ., cat, git apply) reads the stream as
 			// DATA: rewriting it into `<selfExe> --hc-gate` would turn payload
@@ -1554,6 +1625,51 @@ func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv 
 	return out, true, segBash
 }
 
+// stdinConsumableSegView is the consumability verdict of one segment
+// of the flat-prepare scan (extracted for the R29 complexity budget):
+// the pure-assignment fast path skips BEFORE any view materialization
+// exactly like the nested collector (R22-Reviewer-#7 zero-copy
+// invariant), the environment view materializes only for segments that
+// can consume the stream, and the empty-head proof replays the SAME
+// scope environment the formal projection consumes (R29-Oracle-M4 /
+// Reviewer R29-#3) — an EXHAUSTED peel is never the empty-head skip
+// (R27-Oracle-S2): the consumer identity is unknowable rather than
+// absent, and the projection owns the exhaustion verdict.
+func stdinConsumableSegView(tracker *scopeEnvTracker, seg shellSegment, outerEnv envAssignments, basePath string, caller callerIdentity) (envAssignments, bool) {
+	if seg.pureAssign {
+		return envAssignments{}, true
+	}
+	// R19-Oracle-M4/R21-Oracle-M3: the inherited env is outerEnv plus the
+	// consumer's OWN scope view — the assignments in force when THAT
+	// scope runs. R29-Oracle-M4 / Reviewer R29-#3: the empty-head proof
+	// replays EXACTLY this environment — the pre-R29 proof validated
+	// against an empty inherited environment and let unknowable
+	// consumers vanish ahead of the projection.
+	runEnv := outerEnv.merged(tracker.view(seg.scopePath))
+	if peelSegProvesEmptyHead(seg, runEnv, basePath, caller) {
+		return runEnv, true
+	}
+	return runEnv, false
+}
+
+// stdinSegProjectTargets is the segment projection shared by the
+// flat-prepare scan and the nested collector (extracted for the R29
+// complexity budget): the quoted assignment-shaped command head
+// short-circuits with its own whole-segment verdict BEFORE the
+// string-level peel can strip the word as an assignment (R29-Oracle-M4
+// / Reviewer R29-#3), everything else projects through
+// stdinProgramTargetsDialect under the segment's own dialect.
+func stdinSegProjectTargets(seg shellSegment, depth int, runEnv envAssignments, basePath string, caller callerIdentity) []stdinTarget {
+	if qTarget, isQuoted := segQuotedAssignHeadVerdict(seg, runEnv, basePath, caller); isQuoted {
+		// The verdict target never participates in a rewrite (data
+		// refuses, exhausted is neither shell nor data), so it carries
+		// no environment slice — the mergeOuter overlay of the nested
+		// collector would double-merge one.
+		return []stdinTarget{qTarget}
+	}
+	return stdinProgramTargetsDialect(seg.argv, depth, runEnv, basePath, caller, seg.bashDialect)
+}
+
 // envsUntrustedForRewrite reports whether any per-target environment
 // slice carries a state the rewrite cannot prove (R21-Oracle-M3 /
 // R21-Reviewer-6): a control-flow uncertainty marker op ('t' — a
@@ -1568,7 +1684,11 @@ func envsUntrustedForRewrite(envs []envAssignments, basePath string) bool {
 				return true
 			}
 		}
-		if strings.Contains(env.effectivePATHFrom(basePath), cmdSubPlaceholder) {
+		// R29-Oracle-M5: the verdict keys on isDynamicArg exactly like the
+		// R28 trust verdicts — a fully double-quoted dynamic PATH value
+		// is unknowable content, never a trusted search list the rewrite
+		// may assume.
+		if isDynamicArg(env.effectivePATHFrom(basePath)) {
 			return true
 		}
 	}
@@ -1745,7 +1865,11 @@ func (g guardCall) prepareCtxRunArgv(argv []string, stdin string) preparedArgv {
 			}
 			out.execStdin = stdin
 		} else {
-			caller := g.callerIdentity()
+			// R29-Oracle-M3 / Reviewer R29-#2: the NATIVE plain-argv entry
+			// launches argv[0] through exec.Command — direct-execution
+			// context from the very first layer, exactly like the
+			// guardCtxRunStdin screening entry.
+			caller := g.argvCallerIdentity()
 			targets := stdinProgramTargetsWithEnv(argv, 0, envAssignments{}, os.Getenv("PATH"), caller)
 			if len(targets) > 0 {
 				// R22-Oracle-#6 / R22-Reviewer-#6: the plain-argv entry

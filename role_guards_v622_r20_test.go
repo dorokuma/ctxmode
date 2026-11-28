@@ -2673,8 +2673,19 @@ func TestGuard_V622_OracleR27Probes(t *testing.T) {
 			t.Fatalf("fixture symlink: %v", err)
 		}
 		ordTk := &wrapperPathTracker{cur: cmdSubPlaceholder}
-		if ordHead, _, _, ordExhausted := peelWrappersAndWrapperAliasesChecked([]string{"myenv", "/bin/sh"}, ordDir, callerIdentity{}, ordTk); !ordExhausted {
-			t.Fatalf("checked peel of [myenv /bin/sh] (symlink -> /usr/bin/env) under an untrusted tracker PATH exhausted = false (head=%v) — the bare head verdict must precede the alias rewrite adoption, or the PATH-segment hit launders the bare name into a slash-carrying wrapper the untrusted lookup never proved", ordHead)
+		ordHead, _, _, ordExhausted := peelWrappersAndWrapperAliasesChecked([]string{"myenv", "/bin/sh"}, ordDir, callerIdentity{}, ordTk)
+		// R29-Oracle-S1 / Reviewer R29-#4: exhaustion alone cannot
+		// distinguish the ordering — an implementation that adopts the
+		// alias FIRST and only then validates the rewritten bare `env`
+		// layer exhausts identically. The residue head pins the verdict:
+		// the correct implementation rejects BEFORE the rewrite and
+		// preserves the original spelling `myenv` verbatim, while the
+		// rewrite-first implementation can only exhaust at the rewritten
+		// `env` layer. (resolveHeadBase rewrites the bare `myenv` to the
+		// bare canonical `env` — never to the slashed path the pre-R29
+		// diagnostic claimed.)
+		if !ordExhausted || len(ordHead) == 0 || ordHead[0] != "myenv" {
+			t.Fatalf("checked peel of [myenv /bin/sh] (symlink -> /usr/bin/env) under an untrusted tracker PATH = exhausted %v head %v — the bare head verdict must precede the alias rewrite adoption and preserve the ORIGINAL bare spelling `myenv` in the residue; the rewrite-first implementation exhausts only after the head already became the canonical `env`, laundering the untrusted lookup into a PATH-segment adoption", ordExhausted, ordHead)
 		}
 	})
 
@@ -3083,6 +3094,232 @@ func TestGuard_V622_OracleR28Probes(t *testing.T) {
 		static.ops = append(static.ops, envOp{kind: 'a', key: "PATH", value: "/usr/bin:/bin"})
 		if static.pathUntrusted("/base") {
 			t.Fatalf("control broken: static PATH assignment reads untrusted")
+		}
+	})
+}
+
+// TestGuard_V622_OracleR29Probes pins the Oracle R29 / Reviewer R29
+// discriminating rows: the redirection-evaluation ordering plus loop
+// back-edge visibility of the hidden-eval scan, the direct-execution
+// context's refusal to peel shell grammar words and shell builtin
+// wrappers, the scope-environment sharing of the empty-head proof with
+// the formal projection (and the quoted assignment-shaped command head),
+// and the isDynamicArg-keyed rewrite-environment trust verdict. Every
+// subtest references ONLY symbols already present on the pre-fix tree
+// 8b4e3d5 (the collector replay entries, the peel surface, the segment
+// collector and the env op replay), so the complete file compiles there
+// verbatim.
+func TestGuard_V622_OracleR29Probes(t *testing.T) {
+
+	// ---- R29-1: redirection words evaluate BEFORE the block body ----
+	t.Run("R29-1 block entry redirections never see the block's own later definitions", func(t *testing.T) {
+		probe := func(text string) *subCollector {
+			t.Helper()
+			c := blankSubCollector()
+			c.allowBind = true
+			c.taintEvalTextWrites(text, 0)
+			return c
+		}
+		// The block's entry redirection is evaluated BEFORE the block
+		// body executes, so the definition inside the body can never
+		// shadow the eval chain the redirection word spawns. The pre-fix
+		// scan dispatched the command subtree first and the shadowing
+		// definition was already registered when the redirection word
+		// descended, misreading `command -x eval` as the user function's
+		// unbindable short-rest chain and polluting PATH.
+		if redir := probe(`{ eval() { :; }; } >/dev/null/$(eval)`); redir.taintedVars["PATH"] {
+			t.Fatalf("`{ eval() { :; }; } >/dev/null/$(eval)` polluted PATH (taintedVars=%v) — the block ENTRY redirection is evaluated before the body executes, so the body's own definition can never shadow the substitution's bare eval", redir.taintedVars)
+		}
+		// Negative control: the SAME substitution evaluated AFTER the
+		// definition executed (a later sibling statement of the same
+		// process) keeps the shadowed maximal-pollution verdict exactly.
+		if sib := probe(`{ eval() { :; }; }; : >/dev/null/$(eval)`); !sib.taintedVars["PATH"] {
+			t.Fatalf("control broken: `{ eval() { :; }; }; : >/dev/null/$(eval)` left PATH untainted (taintedVars=%v) — a substitution evaluated after the definition MUST keep the shadowed verdict", sib.taintedVars)
+		}
+		// The loop back-edge: every iteration AFTER the first runs with
+		// the definitions the first iteration already executed, so the
+		// call-then-definition pair inside a loop body re-parses the
+		// shadowed eval chain on iteration two exactly like the
+		// definition-first straight block — while the SAME pair in a
+		// straight block (scanned exactly once) re-parses nothing.
+		if loop := probe(`for x in 1 2; do eval; eval() { :; }; done`); !loop.taintedVars["PATH"] {
+			t.Errorf("`for x in 1 2; do eval; eval() { :; }; done` left PATH untainted (taintedVars=%v) — the second iteration's eval runs AFTER the first iteration's definition executed, so the shadowed chain must surface as pollution", loop.taintedVars)
+		}
+		if wloop := probe(`while :; do eval; eval() { :; }; done`); !wloop.taintedVars["PATH"] {
+			t.Errorf("`while :; do eval; eval() { :; }; done` left PATH untainted (taintedVars=%v) — the while loop shares the for loop's back-edge visibility exactly", wloop.taintedVars)
+		}
+		if straight := probe(`{ eval; eval() { :; }; }`); straight.taintedVars["PATH"] {
+			t.Errorf("control broken: `{ eval; eval() { :; }; }` polluted PATH (taintedVars=%v) — the straight block runs exactly once and the trailing definition never shadows the leading call", straight.taintedVars)
+		}
+		// The main traversal's coprocess branch must scan the Name word
+		// exactly like the hidden-eval replication frame already does:
+		// a substitution hiding in the coproc name is evaluation the
+		// segment list owes.
+		segs := splitShellSegmentsBashCaller(`coproc $(echo coprocnameprobe) { :; }`, nil, callerIdentity{})
+		foundName := false
+		for _, s := range segs {
+			for _, a := range s.argv {
+				if a == "coprocnameprobe" {
+					foundName = true
+				}
+			}
+		}
+		if !foundName {
+			t.Errorf("`coproc $(echo coprocnameprobe) { :; }` emitted no segment for the Name substitution (segs=%v) — the main walkStmt coprocess branch never descended into the Name word, dropping an AST subtree the hidden-eval replication covers", segs)
+		}
+	})
+
+	// ---- R29-2: direct-execution context owns its argv lexing ----
+	t.Run("R29-2 external direct-exec argvs never peel shell grammar or builtin wrappers", func(t *testing.T) {
+		emptyDir := t.TempDir()
+		targetsOf := func(argv []string) []stdinTarget {
+			t.Helper()
+			return stdinProgramTargetsDialect(argv, 0, envAssignments{}, emptyDir, callerIdentity{xw: &xargsWorkState{}}, false)
+		}
+		// Every one of these inner argvs is started by an external
+		// program's execvp under a TRUSTED search list containing no
+		// `command`/`builtin`/`exec` executable at all. The OS lookup
+		// can never dispatch a shell builtin, so the bare spelling is a
+		// failing external lookup — never the builtin exemption the
+		// shell-dispatch peel would adopt — and the inner /bin/sh can
+		// never be certified as the consumer of the stream. The pre-fix
+		// peel stripped the builtin spelling as shell grammar and
+		// certified /bin/sh.
+		for _, argv := range [][]string{
+			{"/usr/bin/xargs", "command", "/bin/sh"},
+			{"/usr/bin/flock", "/tmp/lk", "command", "/bin/sh"},
+			{"/usr/bin/watch", "-x", "command", "/bin/sh"},
+			{"exec", "command", "/bin/sh"},
+		} {
+			// Errorf rather than Fatalf: every direct-exec edge owes its
+			// own FAIL-first evidence on the parent tree.
+			if targets := targetsOf(argv); len(targets) != 0 {
+				t.Errorf("stdinProgramTargetsDialect(%v) under the trusted empty-dir PATH projected %v — the OS execvp never dispatches a shell builtin, so the nonexistent external `command` fails and NOTHING consumes the stream as a program", argv, targets)
+			}
+		}
+		// Assignment-shaped, reserved and no-op words at the direct-exec
+		// head position are literal FILE NAMES (the OS lookup carries no
+		// shell lexing), so none of them may be stripped as shell syntax
+		// either — the unknown consumer falls to the same nil projection
+		// instead of certifying a peeled /bin/sh.
+		for _, argv := range [][]string{
+			{"/usr/bin/xargs", "R29Q=1", "/bin/sh"},
+			{"/usr/bin/xargs", "fi", "/bin/sh"},
+		} {
+			if targets := targetsOf(argv); len(targets) != 0 {
+				t.Errorf("stdinProgramTargetsDialect(%v) under the trusted empty-dir PATH projected %v — a direct-exec argv carries no shell grammar, so the assignment/reserved/no-op spelling is a literal file name that never resolves in the empty search list", argv, targets)
+			}
+		}
+		// Positive controls: the TOP-LEVEL shell dispatch keeps the
+		// builtin exemption exactly — `command /bin/sh` re-dispatches
+		// inside the shell itself and certifies the fixed-path consumer.
+		pos := stdinProgramTargetsDialect([]string{"command", "/bin/sh"}, 0, envAssignments{}, emptyDir, callerIdentity{}, false)
+		first, ok := firstProgramTarget(pos)
+		if !ok || first.exhausted || first.data || first.lang != "" {
+			t.Fatalf("positive control broken: stdinProgramTargetsDialect([command /bin/sh]) under the trusted empty-dir PATH first=%+v ok=%v — the shell-dispatched builtin exemption must survive exactly", first, ok)
+		}
+		// The native plain-argv stdin entry launches argv[0] through
+		// exec.Command — no shell ever dispatches its words — so the
+		// entry-level identity carries the direct-execution bit exactly
+		// like the xargs/flock/watch inner recursions. Under the trusted
+		// empty-dir process PATH the bare command resolves nowhere, so
+		// the shell payload is never recognized as a program reading the
+		// stream and the write stays unscreened; the pre-fix entry
+		// passed the shell-dispatch identity and peeled the builtin.
+		t.Setenv("PATH", emptyDir)
+		t.Setenv(auditEnvRole, "verifier")
+		g := currentGuardCall()
+		if rule, detail := g.guardCtxRunStdin([]string{"command", "/bin/sh"}, "rm -rf /tmp/x"); rule != "" {
+			t.Errorf("guardCtxRunStdin([command /bin/sh], write) under the trusted empty-dir PATH = (%q, %q) — argv[0] is started by exec.Command, never a shell, so the bare command is a failing external lookup and no shell program target can be certified", rule, detail)
+		}
+	})
+
+	// ---- R29-3: the empty-head proof shares the projection's scope environment ----
+	t.Run("R29-3 the empty-head proof and the formal projection share one scope environment", func(t *testing.T) {
+		// A scope whose fork-time parent environment carries a conditional
+		// PATH write makes every BARE wrapper resolution unknowable. The
+		// static-PID taskset query consumes nothing, but its OWN bare
+		// resolution still owes itself to that PATH: the formal projection
+		// — which replays the scope view — reaches the exhaustion verdict,
+		// so the empty-head proof must never let the segment vanish first.
+		// The pre-fix proof validated against an EMPTY inherited
+		// environment and skipped the consumer the projection cannot
+		// identify.
+		cond := shellSegment{argv: []string{"PATH=/x"}, pureAssign: true, condAssign: true}
+		tracker := &scopeEnvTracker{}
+		tracker.foldSegment(cond, callerIdentity{})
+		consumer := shellSegment{argv: []string{"taskset", "-p", "1"}}
+		runEnv := envAssignments{}.merged(tracker.view(consumer.scopePath))
+		proj := stdinProgramTargetsDialect(consumer.argv, 0, runEnv, "/usr/bin:/bin", callerIdentity{}, false)
+		projExhausted := false
+		for _, tg := range proj {
+			if tg.exhausted {
+				projExhausted = true
+			}
+		}
+		if !projExhausted {
+			t.Fatalf("fixture broken: the formal projection of [taskset -p 1] under the conditional-PATH scope view did NOT exhaust (targets=%v) — the bare taskset owes its resolution to the unknowable PATH", proj)
+		}
+		if got := collectOneStdinSeg(tracker, consumer, 0, envAssignments{}, envAssignments{}, "/usr/bin:/bin", false, callerIdentity{}); len(got) == 0 {
+			t.Errorf("collectOneStdinSeg([taskset -p 1]) under the conditional-PATH scope view returned NO targets (got %v) — the unknowable consumer vanished from the summary even though the formal projection of the SAME segment and scope exhausts", got)
+		} else {
+			keptExhausted := false
+			for _, tg := range got {
+				if tg.exhausted {
+					keptExhausted = true
+				}
+			}
+			if !keptExhausted {
+				t.Errorf("collectOneStdinSeg([taskset -p 1]) kept the consumer without the exhaustion verdict (targets=%v) — proof and projection disagree on the same environment", got)
+			}
+		}
+		// A quoted assignment-shaped COMMAND HEAD is not an assignment at
+		// all: `'FOO=1' sh` runs the program literally named `FOO=1` (or
+		// fails the lookup), never assigns FOO. Under the untrusted view
+		// the unknowable consumer exhausts; under a clean environment it
+		// is a data consumer — NEVER the peeled /bin/sh shell target the
+		// string-level assignment strip certifies.
+		quoted := splitShellSegmentsBashCaller(`'FOO=1' sh`, nil, callerIdentity{})
+		if len(quoted) != 1 {
+			t.Fatalf("fixture broken: `'FOO=1' sh` split into %d segments", len(quoted))
+		}
+		untrustedTracker := &scopeEnvTracker{}
+		untrustedTracker.foldSegment(cond, callerIdentity{})
+		qUntrusted := collectOneStdinSeg(untrustedTracker, quoted[0], 0, envAssignments{}, envAssignments{}, "/usr/bin:/bin", false, callerIdentity{})
+		qUntrustedExhausted := false
+		for _, tg := range qUntrusted {
+			if tg.exhausted {
+				qUntrustedExhausted = true
+			}
+		}
+		if !qUntrustedExhausted {
+			t.Errorf("collectOneStdinSeg(`'FOO=1' sh`) under the untrusted scope view = %v — the quoted command head is not an assignment, so the bare unknowable consumer must carry the exhaustion verdict instead of stripping into a certified shell or an empty projection", qUntrusted)
+		}
+		cleanTracker := &scopeEnvTracker{}
+		qClean := collectOneStdinSeg(cleanTracker, quoted[0], 0, envAssignments{}, envAssignments{}, "/usr/bin:/bin", false, callerIdentity{})
+		if len(qClean) == 0 || len(qClean) != 0 && !qClean[0].data {
+			t.Errorf("collectOneStdinSeg(`'FOO=1' sh`) under a clean environment = %v — the quoted command head is not an assignment and never certifies the trailing sh as a shell target; it is a plain data consumer", qClean)
+		}
+	})
+
+	// ---- R29-4: the rewrite trust verdict keys on every dynamic placeholder ----
+	t.Run("R29-4 stdinRewriteableTarget refuses every dynamic PATH class", func(t *testing.T) {
+		// The fully double-quoted dynamic PATH value proves the word
+		// BOUNDARY but never the CONTENT — the rewrite admission keys on
+		// isDynamicArg exactly like the R28 trust verdicts, so the
+		// target whose peeled env carries it can never be rewritten
+		// under an exact environment the shell does not provably have.
+		// The pre-fix scan matched the bare cmdSubPlaceholder spelling
+		// alone and admitted the quoted fold.
+		targets := stdinProgramTargetsDialect([]string{"env", "PATH=" + cmdSubPlaceholderQuoted, "/bin/sh"}, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+		if _, ok, _ := stdinRewriteableTarget(targets, false, "/usr/bin:/bin"); ok {
+			t.Errorf("stdinRewriteableTarget(env PATH=<quoted> /bin/sh) ok = true — a fully double-quoted dynamic PATH value is unknowable content exactly like the unquoted form, so the rewrite admission must refuse it")
+		}
+		// Positive control: the static clean PATH keeps the exact
+		// environment and stays rewriteable.
+		clean := stdinProgramTargetsDialect([]string{"env", "PATH=/usr/bin:/bin", "/bin/sh"}, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+		if _, ok, _ := stdinRewriteableTarget(clean, false, "/usr/bin:/bin"); !ok {
+			t.Fatalf("positive control broken: stdinRewriteableTarget(env PATH=/usr/bin:/bin /bin/sh) ok = false — the exact static environment must keep its rewrite admission")
 		}
 	})
 }

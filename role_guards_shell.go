@@ -1279,16 +1279,24 @@ func peelWrapperLayer(argv []string, i int, base string, envAs envAssignments) p
 
 // peelWrappersCore is the single shared wrapper-peel walk behind
 // peelWrappers and the R26 checked peel (R26-Oracle-M2/M4 /
-// R26-Reviewer-#1/#2/#3): a nil tracker reproduces the pre-R26 peel
-// for every input the pre-R26 scan completed — byte-for-byte except
-// the deliberate fail-closed repairs (R28-Oracle-S2 calibration: the
-// pre-R28 wording here promised byte-exact reproduction, which is
-// wrong in BOTH directions the audits pinned — a dynamic option VALUE
-// restores the pre-R26 residue index exactly like `abe543b` did
-// (R27-S2), while a truly-MISSING trailing operand like `taskset -p`
-// or `timeout -k` keeps the (len(argv), true) fail-closed clamp the
-// pre-R26 scan never produced; the clamp is the intended safety
-// repair, not an accident), while a non-nil tracker validates EVERY bare
+// R26-Reviewer-#1/#2/#3): the nil-tracker walk versus `abe543b` splits
+// into THREE exact classes (R29-Oracle-S2 / Reviewer R29-#5
+// calibration — the R28 wording here promised byte-exact reproduction,
+// which is wrong in BOTH directions). First, an EXISTING dynamic
+// option value (`timeout -k $DYN`): the new walk returns
+// (argv[i:], true) — the residue index restores byte-for-byte what
+// `abe543b` produced. Second, a truly-MISSING trailing option value
+// (`timeout -k` at the slice end): `abe543b` already advanced the
+// index past the end and its loop-tail clamp returned ([], true), so
+// the new walk answers (len(argv), true) at the skipper boundary and
+// the top-level result is the SAME ([], true) — no behavior change at
+// all, only the fail-closed boundary moved earlier. Third, the
+// `taskset -p`/`chrt -p` PID zone: a static PID query is ([], false)
+// in BOTH trees; a MISSING trailing PID flips `abe543b`'s ([], false)
+// into ([], true) — the intended fail-closed repair — and a DYNAMIC
+// PID operand flips `abe543b`'s ([], false) into (["-p", $DYN], true),
+// restoring the residue index instead of the silent empty peel.
+// Meanwhile a non-nil tracker validates EVERY bare
 // slash-free external wrapper identity BEFORE that layer's options or
 // env operands are consumed — the wrapper's own resolution owes itself
 // to the environment in force when the kernel looked it up, never to
@@ -1353,22 +1361,12 @@ type peelCoreOutcome struct {
 // to the pre-extraction loop body.
 func peelCoreStep(argv []string, i int, envAs envAssignments, splitPayloads []string, tk *wrapperPathTracker) peelCoreOutcome {
 	a := argv[i]
-	if isAssignWord(a) {
-		before := len(envAs.ops)
-		envAs.addAssign(a)
-		if tk != nil {
-			tk.applyOps(envAs.ops[before:])
+	if !peelDirectExecLexing(tk) {
+		// Shell-dispatch context: the assignment/noop/reserved words ARE
+		// shell grammar and strip exactly like the pre-R29 walk.
+		if out, hit := peelCoreGrammarStep(argv, i, a, envAs, splitPayloads, tk); hit {
+			return out
 		}
-		return peelCoreOutcome{argv: argv, ni: i + 1, envAs: envAs, split: splitPayloads, stepDelta: -1}
-	}
-	if shellNoopWords[a] {
-		if i+1 >= len(argv) {
-			return peelCoreOutcome{head: argv[len(argv):], split: splitPayloads, envAs: envAs, done: true}
-		}
-		return peelCoreOutcome{argv: argv, ni: i + 1, envAs: envAs, split: splitPayloads, stepDelta: -1}
-	}
-	if peelCoreReservedWord(a) {
-		return peelCoreOutcome{argv: argv, ni: i + 1, envAs: envAs, split: splitPayloads}
 	}
 	if isDynamicArg(a) {
 		return peelCoreOutcome{head: argv[i:], split: splitPayloads, envAs: envAs, done: true}
@@ -1381,8 +1379,15 @@ func peelCoreStep(argv []string, i int, envAs envAssignments, splitPayloads []st
 		// R26-Oracle-M2 / R26-Reviewer-#1: the bare external wrapper's
 		// own resolution depended on an untrusted PATH — validated
 		// against the environment in force BEFORE this layer's
-		// operands can rewrite it.
+		// operands can rewrite it. Slash-carrying spellings carry
+		// their own resolution and never owe anything to PATH, so
+		// this branch must fire before peelCoreDirectBuiltinVerdict:
+		// a fixed-path /usr/bin/command keeps the plain stop verdict
+		// even under an untrusted PATH.
 		return peelCoreOutcome{head: argv[i:], split: splitPayloads, envAs: envAs, done: true, exhausted: true}
+	}
+	if out, hit := peelCoreDirectBuiltinVerdict(argv, i, base, envAs, splitPayloads, tk); hit {
+		return out
 	}
 	if tk != nil && wrapperFlipsDirectExec(base) {
 		// R27-Oracle-M3 / R27-Reviewer-#4: once ANY external wrapper
@@ -1393,6 +1398,60 @@ func peelCoreStep(argv []string, i int, envAs envAssignments, splitPayloads []st
 		tk.directExec = true
 	}
 	return peelCoreLayerOutcome(argv, i, base, envAs, splitPayloads, tk)
+}
+
+// peelDirectExecLexing reports whether the argv under projection is
+// lexed by an external program's execvp rather than a shell (R29-Oracle
+// M3 / Reviewer R29-#2): a nil tracker reproduces the pre-R26 shell
+// grammar walk exactly, and only the checked projection can carry the
+// direct-execution bit at all.
+func peelDirectExecLexing(tk *wrapperPathTracker) bool {
+	return tk != nil && tk.directExec
+}
+
+// peelCoreGrammarStep is the shell-grammar word stripping of
+// peelCoreStep (extracted for the R29 complexity budget — R29
+// zero-positive-delta requirement): pure KEY=VAL assignments fold their
+// ops step-free, shellNoopWords step through exempt (except at the argv
+// end, where the empty residue completes), and the reserved/modifier
+// words cost one step — byte-identical to the pre-R29 loop head.
+func peelCoreGrammarStep(argv []string, i int, a string, envAs envAssignments, splitPayloads []string, tk *wrapperPathTracker) (peelCoreOutcome, bool) {
+	if isAssignWord(a) {
+		before := len(envAs.ops)
+		envAs.addAssign(a)
+		if tk != nil {
+			tk.applyOps(envAs.ops[before:])
+		}
+		return peelCoreOutcome{argv: argv, ni: i + 1, envAs: envAs, split: splitPayloads, stepDelta: -1}, true
+	}
+	if shellNoopWords[a] {
+		if i+1 >= len(argv) {
+			return peelCoreOutcome{head: argv[len(argv):], split: splitPayloads, envAs: envAs, done: true}, true
+		}
+		return peelCoreOutcome{argv: argv, ni: i + 1, envAs: envAs, split: splitPayloads, stepDelta: -1}, true
+	}
+	if peelCoreReservedWord(a) {
+		return peelCoreOutcome{argv: argv, ni: i + 1, envAs: envAs, split: splitPayloads}, true
+	}
+	return peelCoreOutcome{}, false
+}
+
+// peelCoreDirectBuiltinVerdict is the direct-execution verdict for the
+// shell builtin wrappers command/builtin/exec (R29-Oracle-M3 / Reviewer
+// R29-#2): under an external program's execvp these spellings are NEVER
+// shell builtins — the OS lookup either fails outright or resolves an
+// external file that owes its identity to PATH alone. An untrusted
+// search list makes the consumer unknowable (the exhaustion verdict the
+// R26 validation already owns); a TRUSTED one simply cannot certify
+// shell builtin semantics, so the peel STOPS with the builtin spelling
+// as the residue head — never peeled, never re-dispatched as the
+// shell builtin it cannot be. Shell-dispatch context (directExec false)
+// keeps the builtin exemption exactly.
+func peelCoreDirectBuiltinVerdict(argv []string, i int, base string, envAs envAssignments, splitPayloads []string, tk *wrapperPathTracker) (peelCoreOutcome, bool) {
+	if !peelDirectExecLexing(tk) || !isShellBuiltinWrapperBase(base) {
+		return peelCoreOutcome{}, false
+	}
+	return peelCoreOutcome{head: argv[i:], split: splitPayloads, envAs: envAs, done: true}, true
 }
 
 // wrapperFlipsDirectExec reports whether peeling one wrapper layer
@@ -1582,13 +1641,48 @@ func peelWrappersAndWrapperAliasesChecked(argv []string, pathEnv string, caller 
 		// A PATH alias whose typed name is not a wrapper but resolves to
 		// one (myenv -> env, mytimeout -> timeout) needs its options peeled
 		// too: rewrite the head to the resolved wrapper and loop.
-		if rb := canonicalResolvedBase(resolveHeadBase(h[0], effPath, caller.screenCwd())); rb != "" && rb != hb && isPeeledWrapperBase(rb) {
+		// R29-Oracle-M3 / Reviewer R29-#2: under direct execution the
+		// shell builtin wrappers are exempt from the adoption exactly like
+		// the peel itself — the OS lookup of a file resolving to an
+		// external `command`/`builtin`/`exec` names a program with no
+		// shell builtin semantics, so adopting the alias would re-certify
+		// a builtin dispatch the execvp never performs.
+		if rb := canonicalResolvedBase(resolveHeadBase(h[0], effPath, caller.screenCwd())); peelWrapperAliasAdoptable(rb, hb, tk) {
 			cur = append([]string{rewriteKeepSlashIdentity(h[0], rb)}, h[1:]...)
 			continue
 		}
 		return h, envAs, effPath, false
 	}
 	return cur, envAs, effPath, true
+}
+
+// isShellBuiltinWrapperBase reports whether base is one of the shell
+// builtin wrappers command/builtin/exec (R29-Oracle-M3 / Reviewer
+// R29-#2): only these three owe their peeling to the shell's own
+// builtin dispatch, so only they are exempt from stripping and alias
+// adoption under an external program's direct execvp.
+func isShellBuiltinWrapperBase(base string) bool {
+	switch base {
+	case "command", "builtin", "exec":
+		return true
+	}
+	return false
+}
+
+// peelWrapperAliasAdoptable reports whether the resolved basename rb
+// may rewrite the peeled head hb as a wrapper alias (extracted for the
+// R29 complexity budget): the rb != hb wrapper-shape test is the
+// pre-R29 verdict exactly, and the direct-execution context
+// additionally refuses the shell builtin wrappers — the OS lookup of
+// such a file names an external program with no builtin semantics.
+func peelWrapperAliasAdoptable(rb, hb string, tk *wrapperPathTracker) bool {
+	if rb == "" || rb == hb || !isPeeledWrapperBase(rb) {
+		return false
+	}
+	if peelDirectExecLexing(tk) && isShellBuiltinWrapperBase(rb) {
+		return false
+	}
+	return true
 }
 
 // rewriteKeepSlashIdentity preserves the fixed-path identity of an

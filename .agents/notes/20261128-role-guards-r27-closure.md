@@ -39,7 +39,7 @@ Oracle R27（7 Must-Fix / 2 Should-Fix）与 Reviewer R27（7 Must-Fix / 3 Shoul
 - 对比 `abe543b`：**665 共享、31 新增、7 删除、0 正增长**；
 - 对比 `f8cd003`：**638 共享、58 新增、4 删除、0 正增长**。
 
-全部新增函数/闭包 cognitive < 35（最大 `stdinProgramTargetsDialectSteps` 20）。`shared + added == 696` 逐对照成立（680+16=665+31=638+58=696）。
+全部新增函数/闭包 cognitive < 35（R29 勘误（Oracle R29-S3 / Reviewer R29-#5）：原文的「最大 20」仅限**直接父基线** `0d907a8` 的新增最大；跨基线 `abe543b`/`f8cd003` 新增最大为 **23**（`peelFlagZone`、`noteEnumHeadBuiltin`）——两个数字均低于 35，不改变门限通过结论。直接父基线口径下最大 `stdinProgramTargetsDialectSteps` 20）。`shared + added == 696` 逐对照成立（680+16=665+31=638+58=696）。
 
 ## 验证归档
 
