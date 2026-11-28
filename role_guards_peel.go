@@ -889,7 +889,7 @@ func wrapperChainEnvSplitHasToken(argv []string, pathEnv string, caller callerId
 func peelSingleWrapperArgs(argv []string, base string) (int, bool) {
 	switch base {
 	case "nice":
-		return skipNiceSingleArgs(argv, 1), true
+		return skipNiceSingleArgs(argv, 1)
 	case "timeout":
 		i, fc := skipTimeoutArgs(argv, 1)
 		return i, !fc
@@ -925,29 +925,21 @@ func peelSingleWrapperArgs(argv []string, base string) (int, bool) {
 		i, fc := skipExecArgs(argv, 1)
 		return i, !fc
 	case "time":
-		return skipTimeSingleArgs(argv, 1), true
+		return skipTimeSingleArgs(argv, 1)
 	}
 	return 0, false
 }
 
 // skipNiceSingleArgs consumes nice's option words: -n/--adjustment carry a
-// separate value operand, everything else is boolean.
-func skipNiceSingleArgs(argv []string, i int) int {
-	for i < len(argv) {
-		a := argv[i]
-		if a == "--" {
-			return i + 1
-		}
-		if !strings.HasPrefix(a, "-") || a == "-" {
-			return i
-		}
-		if a == "-n" || a == "--adjustment" {
-			i += 2
-			continue
-		}
-		i++
-	}
-	return i
+// separate value operand, everything else is boolean. The second return
+// reports the fail-closed arity verdict (dynamic zone word or a trailing
+// valued option missing its operand, stopping at exactly len(argv) —
+// R26-Oracle-M4: the pre-R26 i+=2 overflowed the slice bound). The scan
+// shares peelWrappers' option-zone consumer exactly so the single-pass
+// peel and the one-layer walk can never drift apart.
+func skipNiceSingleArgs(argv []string, i int) (int, bool) {
+	ni, fc := peelFlagZone(argv, i, true, true, niceValuedOpt)
+	return ni, !fc
 }
 
 // skipPlainFlagZone consumes a boolean-only wrapper option zone (setsid):
@@ -967,23 +959,12 @@ func skipPlainFlagZone(argv []string, i int) int {
 }
 
 // skipTimeSingleArgs consumes time's option words: -o/--output/-f/--format
-// carry a separate value operand, everything else is boolean.
-func skipTimeSingleArgs(argv []string, i int) int {
-	for i < len(argv) {
-		a := argv[i]
-		if a == "--" {
-			return i + 1
-		}
-		if !strings.HasPrefix(a, "-") || a == "-" {
-			return i
-		}
-		if a == "-o" || a == "--output" || a == "-f" || a == "--format" {
-			i += 2
-			continue
-		}
-		i++
-	}
-	return i
+// carry a separate value operand, everything else is boolean. The second
+// return reports the fail-closed arity verdict exactly like
+// skipNiceSingleArgs (R26-Oracle-M4).
+func skipTimeSingleArgs(argv []string, i int) (int, bool) {
+	ni, fc := peelFlagZone(argv, i, true, true, timeValuedOpt)
+	return ni, !fc
 }
 
 // peelExecSlotHead peels wrappers off an exec-slot argv and produces the

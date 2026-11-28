@@ -1910,8 +1910,28 @@ func (c *subCollector) taintEvalTextWrites(text string, depth int) {
 		c.noteEvalStmtFuncDefs(st)
 		c.noteEvalStmtReadonlyDecls(st)
 		c.taintStmtSharedWrites(st)
-		c.taintHiddenEvalWrites(st, depth)
+		c.taintEvalOneStmt(st, depth)
 	}
+}
+
+// taintEvalOneStmt replays the hidden-eval writes of ONE statement of
+// a tainted eval operand text inside the statement's own process
+// boundary (extracted for the R26 fix — R26-Oracle-M1 /
+// R26-Reviewer-#5): the re-parsed text no longer carries the
+// background/coprocess bits of the statements it spells, so a
+// child-process statement replays inside a snapshotProcessRegs frame
+// whose restore rolls back every function/readonly registration the
+// nested replay mints — exactly like bindEvalOneStmt's frame — while
+// the conservative variable TAINT of the same writes deliberately
+// survives: pollution belongs to the possibility, never the process
+// ownership.
+func (c *subCollector) taintEvalOneStmt(st *syntax.Stmt, depth int) {
+	if st.Background || st.Coprocess {
+		defer c.snapshotProcessRegs()()
+		c.taintHiddenEvalWrites(st, depth)
+		return
+	}
+	c.taintHiddenEvalWrites(st, depth)
 }
 
 // noteEvalStmtFuncDefs registers the same-process function definitions
@@ -2082,20 +2102,18 @@ func (c *subCollector) taintStmtSharedWrites(st *syntax.Stmt) {
 // subshell or a coprocess) install their positional facts inside a
 // registry frame the subtree exit rolls back, because the re-parsed
 // text no longer carries the bits of the process it runs in.
+// R26-Oracle-M1 / R26-Reviewer-#5: the statement ITSELF is dispatched
+// through scanHiddenEvalStmt — the boundary-aware root owner — instead
+// of replaying the root call unframed here: the pre-R26 shape checked
+// st.Background/st.Coprocess only AFTER the root eval call had already
+// re-entered the text replay, leaking the child process's positional
+// registrations into the parent collector.
 func (c *subCollector) taintHiddenEvalWrites(st *syntax.Stmt, depth int) {
 	scanWord := wordToArg
 	if c.posixNoBraces {
 		scanWord = wordToArgPosix
 	}
-	// R21-Reviewer-3: the statement itself IS a statement node — walking
-	// only from st.Cmd matches descendant *syntax.Stmt nodes but silently
-	// skips a ROOT static eval call (`eval 'X=1'` as the whole compound
-	// operand). The root call is checked from the statement itself first,
-	// then the descendants share the same depth-limited taint walk.
-	if call, isCall := st.Cmd.(*syntax.CallExpr); isCall {
-		c.taintOneEvalCallWrites(call, scanWord, depth+1)
-	}
-	c.scanHiddenEvalDispatch(st.Cmd, scanWord, depth)
+	c.scanHiddenEvalStmt(st, scanWord, depth)
 }
 
 // scanHiddenEvalDispatch routes one AST node of the hidden-eval scan
@@ -2110,20 +2128,52 @@ func (c *subCollector) scanHiddenEvalDispatch(node syntax.Node, scanWord func(*s
 	if node == nil {
 		return
 	}
-	child := false
-	switch x := node.(type) {
-	case *syntax.CmdSubst, *syntax.ProcSubst, *syntax.Subshell, *syntax.CoprocClause:
-		child = true
-	case *syntax.BinaryCmd:
-		child = x.Op == syntax.Pipe || x.Op == syntax.PipeAll
-	}
-	if child {
-		restore := c.snapshotProcessRegs()
-		c.scanHiddenEvalNode(node, scanWord, depth)
-		restore()
+	if c.scanHiddenEvalChildFrame(node, scanWord, depth) {
 		return
 	}
 	c.scanHiddenEvalNode(node, scanWord, depth)
+}
+
+// scanHiddenEvalChildFrame handles the child-process shapes of
+// scanHiddenEvalDispatch (extracted for the R26 complexity budget):
+// substitutions, subshells and coprocesses scan inside one registry
+// frame, pipeline components scan in independent sibling frames
+// through scanHiddenEvalPipeSiblings. Returns true when the node was
+// a child-process shape and the scan completed here.
+func (c *subCollector) scanHiddenEvalChildFrame(node syntax.Node, scanWord func(*syntax.Word) (string, bool), depth int) bool {
+	switch x := node.(type) {
+	case *syntax.CmdSubst, *syntax.ProcSubst, *syntax.Subshell, *syntax.CoprocClause:
+		restore := c.snapshotProcessRegs()
+		c.scanHiddenEvalNode(node, scanWord, depth)
+		restore()
+		return true
+	case *syntax.BinaryCmd:
+		if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
+			c.scanHiddenEvalPipeSiblings(x, scanWord, depth)
+			return true
+		}
+	}
+	return false
+}
+
+// scanHiddenEvalPipeSiblings scans the two components of one pipeline
+// in independent sibling frames (extracted for the R26 complexity
+// budget — R26-Oracle-M1 / R26-Reviewer-#5): EVERY pipeline component
+// is its own child process exactly like walkStmt's pipe case — each
+// side derives its registry boundary from the SAME parent state
+// independently: the left component's nested-eval registrations
+// (eval 'eval() { :; }') restore BEFORE the right component starts,
+// never shadowing its name resolution, and neither side leaks into
+// the parent. Same-process statements inside ONE component still see
+// each other's registrations because the frame spans the component's
+// whole subtree scan.
+func (c *subCollector) scanHiddenEvalPipeSiblings(x *syntax.BinaryCmd, scanWord func(*syntax.Word) (string, bool), depth int) {
+	restoreX := c.snapshotProcessRegs()
+	c.scanHiddenEvalDispatch(x.X, scanWord, depth)
+	restoreX()
+	restoreY := c.snapshotProcessRegs()
+	c.scanHiddenEvalDispatch(x.Y, scanWord, depth)
+	restoreY()
 }
 
 // scanHiddenEvalNode walks one AST node for nested eval invocations: a
@@ -2158,27 +2208,52 @@ func (c *subCollector) scanHiddenEvalChild(n syntax.Node, scanWord func(*syntax.
 	c.scanHiddenEvalDispatch(n, scanWord, depth)
 }
 
-// scanHiddenEvalStmt checks one statement node of the hidden-eval scan:
-// a backgrounded or coprocess statement scans its subtree inside a
-// registry frame (its eval replays install child-process-only facts),
-// while a same-process statement's root call is checked directly and
-// its subtree descends normally.
+// scanHiddenEvalStmt checks one statement node of the hidden-eval scan
+// (R26-Reviewer-#6): a backgrounded or coprocess statement scans its
+// subtree inside a registry frame (its eval replays install
+// child-process-only facts), while a same-process statement's root
+// call is checked directly. The scan covers the WHOLE statement —
+// ist.Cmd AND every redirection word/heredoc of ist.Redirs: the
+// pre-R26 walk returned early on a nil command and never descended
+// into the redirection subtree at all, so a command substitution
+// hiding a nested eval inside `: >/dev/null/$(command -x eval)`
+// escaped the replay the pre-scan counts.
 func (c *subCollector) scanHiddenEvalStmt(ist *syntax.Stmt, scanWord func(*syntax.Word) (string, bool), depth int) {
-	if ist.Cmd == nil {
+	if ist == nil {
 		return
 	}
 	if ist.Background || ist.Coprocess {
 		defer c.snapshotProcessRegs()()
-		if call, isCall := ist.Cmd.(*syntax.CallExpr); isCall {
-			c.taintOneEvalCallWrites(call, scanWord, depth+1)
-		}
-		c.scanHiddenEvalDispatch(ist.Cmd, scanWord, depth)
+		c.scanHiddenEvalStmtBody(ist, scanWord, depth)
 		return
 	}
+	c.scanHiddenEvalStmtBody(ist, scanWord, depth)
+}
+
+// scanHiddenEvalStmtBody is the root-check plus subtree descent of
+// scanHiddenEvalStmt (extracted for the R26 complexity budget — the
+// process-boundary frame carries no node branching): the statement's
+// own root eval call is checked exactly once, and the descent covers
+// both the command subtree and every redirection word/heredoc of the
+// statement's Redirs list.
+func (c *subCollector) scanHiddenEvalStmtBody(ist *syntax.Stmt, scanWord func(*syntax.Word) (string, bool), depth int) {
 	if call, isCall := ist.Cmd.(*syntax.CallExpr); isCall {
 		c.taintOneEvalCallWrites(call, scanWord, depth+1)
 	}
-	c.scanHiddenEvalDispatch(ist.Cmd, scanWord, depth)
+	if ist.Cmd != nil {
+		c.scanHiddenEvalDispatch(ist.Cmd, scanWord, depth)
+	}
+	for _, r := range ist.Redirs {
+		if r == nil {
+			continue
+		}
+		if r.Word != nil {
+			c.scanHiddenEvalDispatch(r.Word, scanWord, depth)
+		}
+		if r.Hdoc != nil {
+			c.scanHiddenEvalDispatch(r.Hdoc, scanWord, depth)
+		}
+	}
 }
 
 // taintEvalBoundary applies the maximal pollution verdict for an

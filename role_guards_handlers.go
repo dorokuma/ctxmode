@@ -1107,7 +1107,7 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 // R16 M2); heads that spawn a FRESH shell (flock -c / script -c / watch /
 // `sh -c` unwrapping) pick their own dialect below and never inherit it.
 func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity, bash bool) []stdinTarget {
-	head, envAs, caller, prologue := stdinTargetsPeelPrologue(argv, depth, inherited, caller)
+	head, envAs, caller, prologue := stdinTargetsPeelPrologue(argv, depth, inherited, basePath, caller)
 	if prologue != nil {
 		return prologue
 	}
@@ -1150,7 +1150,7 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 	}
 	if rb := canonicalResolvedBase(resolveHeadBase(origHead, effPath, caller.screenCwd())); rb != "" && rb != base {
 		if isPeeledWrapperBase(rb) {
-			return stdinProgramTargetsDialect(append([]string{rb}, head[1:]...), depth+1, envAs, basePath, caller, bash)
+			return stdinProgramTargetsDialect(append([]string{rewriteKeepSlashIdentity(origHead, rb)}, head[1:]...), depth+1, envAs, basePath, caller, bash)
 		}
 		if !isStructuralGuardHead(base) {
 			head = append([]string{rb}, head[1:]...)
@@ -1225,17 +1225,24 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 // op stays visible to the caller; seeding also covers envTaint/pathEnv
 // — a canon-rewritten recursion (`env -C sub genv ./mysh`) must keep
 // the -C re-anchor and the `u`/`a` taints it peeled (R5 MF-4).
-func stdinTargetsPeelPrologue(argv []string, depth int, inherited envAssignments, caller callerIdentity) ([]string, envAssignments, callerIdentity, []stdinTarget) {
+func stdinTargetsPeelPrologue(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity) ([]string, envAssignments, callerIdentity, []stdinTarget) {
 	if len(argv) == 0 {
 		return nil, inherited, caller, nil
 	}
 	if depth >= shellSplitMaxDepth {
 		return nil, inherited, caller, []stdinTarget{{lang: "", envAs: inherited, exhausted: true}}
 	}
-	if stdinWrapperPeelUntrusted(argv, inherited, caller) {
-		return nil, inherited, caller, []stdinTarget{{lang: "", envAs: inherited, exhausted: true}}
-	}
-	head, _, ea, exhausted := peelWrappers(argv)
+	// R26-Oracle-M2/M4 / R26-Reviewer-#1/#2/#3: the validation and the
+	// peel are ONE bounded single pass sharing the peelWrapperMaxSteps
+	// budget (the pre-R26 pre-scan ran unbounded before the peel and
+	// rescanned the whole accumulated op list at every bare layer),
+	// every bare external wrapper identity faces the environment in
+	// force BEFORE its own operands are consumed (the pre-R26 scan
+	// judged env against the POST-layer environment its operands
+	// install for the NEXT layer), and the trailing missing-operand
+	// zones clamp at exactly len(argv) instead of slicing past it.
+	tk := newWrapperPathTracker(basePath, inherited, caller)
+	head, _, ea, exhausted := peelWrappersCore(argv, tk)
 	envAs := inherited.merged(ea)
 	if exhausted {
 		return nil, envAs, caller, []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
@@ -1262,219 +1269,30 @@ func stdinCanonHeadRewrite(head []string, base string, depth int, envAs envAssig
 	if canon == base {
 		return head, base, stdinCanonRewrite{}
 	}
-	// R25-Oracle-MF6 / R25-Reviewer-#1: a spelled-with-slashes GNU/alias
-	// name (/usr/bin/genv) keeps its directory prefix across the
-	// canonical rewrite — rewriting to the bare canon word would
-	// re-resolve the alias through PATH and lose the fixed-path
-	// identity the original spelling carries. Bare spellings join onto
-	// the current directory exactly like before (filepath.Join(".", x)
-	// cleans to x).
-	rewritten := append([]string{filepath.Join(filepath.Dir(head[0]), canon)}, head[1:]...)
+	// R26-Oracle-M3 / R26-Reviewer-#4: a spelled-with-slashes GNU/alias
+	// name keeps its directory prefix across the canonical rewrite —
+	// rewriting to the bare canon word would re-resolve the alias
+	// through PATH and lose the fixed-path identity the original
+	// spelling carries. rewriteKeepSlashIdentity additionally restores
+	// the explicit "./" prefix when filepath.Join cleans the slash away
+	// (the directory is "." or cancels out like "sub/.."), so a
+	// slash-carrying input NEVER degrades into a bare name.
+	rewritten := append([]string{rewriteKeepSlashIdentity(head[0], canon)}, head[1:]...)
 	if isPeeledWrapperBase(canon) {
 		return head, base, stdinCanonRewrite{fired: true, targets: stdinProgramTargetsDialect(rewritten, depth+1, envAs, basePath, caller, bash)}
 	}
 	return rewritten, canon, stdinCanonRewrite{}
 }
 
-// stdinWrapperPeelUntrusted is the pre-adoption validation owner of
-// stdinTargetsPeelPrologue (extracted for the R24 complexity budget —
-// R24-Reviewer-#6 / R24-Oracle-M6): it validates the EXTERNAL wrapper
-// identities BEFORE peelWrappers adopts them. A bare slash-free external
-// wrapper (env/nice/nohup/timeout/stdbuf/setsid/…) owes its own
-// resolution to PATH exactly like the final head does; once the peel
-// strips it, only the inner command spelling remains and the
-// bareHeadUntrustedPATH check can never see the identity that actually
-// depended on the untrusted search list. Shell builtins
-// (command/builtin/exec) resolve inside the shell itself — never through
-// PATH — so they are deliberately exempt. The scan is intentionally
-// shallow: it walks past KEY=VAL prefixes, inert compound fragments and
-// `--` exactly like the peel does, checks the FIRST external wrapper
-// layer, and each canonical alias recursion re-enters the prologue so
-// later layers are validated when they are adopted too. The wrapper's
-// own PATH dependency is judged against the SAME base the final head
-// resolves under: the caller's effective PATH (depth-0 basePath is
-// exactly that — see stdinProgramTargetsDialect — and recursion layers
-// inherit it through caller.seededWith).
-func stdinWrapperPeelUntrusted(argv []string, inherited envAssignments, caller callerIdentity) bool {
-	return externalWrapperUntrustedPATH(argv, inherited, caller, caller.effectivePATH())
-}
-
-// externalWrapperUntrustedPATH reports whether ANY external wrapper
-// layer the peel will adopt is a bare slash-free name whose own
-// resolution depends on an untrusted PATH (R24-Reviewer-#6 /
-// R24-Oracle-M6, extracted so stdinTargetsPeelPrologue carries no
-// chain-scan nesting). R25-Oracle-MF6 / R25-Reviewer-#1: the pre-R25
-// scan validated only the FIRST external word — it returned clean at
-// the first shell builtin or fixed-path wrapper while peelWrappers kept
-// stripping further bare external layers underneath, and it skipped
-// assignment words without ever folding them, so even the first layer's
-// own environment was the pre-assignment one. The scan now mirrors
-// peelWrappers layer by layer: assignment words fold into the running
-// environment exactly like the peel's own accounting, and BEFORE each
-// bare slash-free external wrapper identity is adopted the CURRENT
-// layer environment faces the untrusted-PATH verdict. Shell builtins
-// (command/builtin/exec) are exempt — they resolve inside the shell
-// process, never through PATH — and fixed-path wrappers carry their own
-// resolution; a non-wrapper word, a dynamic word or the end of the argv
-// stops the scan exactly like the peel itself.
-func externalWrapperUntrustedPATH(argv []string, envAs envAssignments, caller callerIdentity, basePath string) bool {
-	for {
-		var adv wrapperLayerAdvance
-		argv, envAs, adv = peelOneWrapperLayer(argv, envAs)
-		if !adv.advanced {
-			return false
-		}
-		if adv.external && adv.bare {
-			if envAs.pathUntrusted(basePath) || caller.pathUntrusted() {
-				return true
-			}
-		}
-	}
-}
-
-// wrapperLayerAdvance is peelOneWrapperLayer's outcome: advanced reports
-// whether one wrapper/no-op layer was consumed, external marks a layer
-// the kernel resolves as an external program (never a shell builtin),
-// and bare marks a slash-free spelling that owes its identity to PATH.
-type wrapperLayerAdvance struct {
-	advanced bool
-	external bool
-	bare     bool
-}
-
-// peelOneWrapperLayer advances the validation scan past exactly one
-// no-op fragment or wrapper layer of argv, mirroring peelWrappers'
-// own prologue layer for layer (extracted for the R25 complexity
-// budget): KEY=VAL assignments fold into the running environment,
-// inert fragments/keywords/`--` skip without touching the environment,
-// shell builtins and fixed-path or bare wrappers consume their option
-// zones through the same skip helpers the peel itself uses, and a
-// non-wrapper word stops the scan. The env layer rewrites the remaining
-// argv exactly like peelWrappers (skipEnvOperands returns the
-// spliced remainder).
-func peelOneWrapperLayer(argv []string, envAs envAssignments) ([]string, envAssignments, wrapperLayerAdvance) {
-	if len(argv) == 0 {
-		return argv, envAs, wrapperLayerAdvance{}
-	}
-	a := argv[0]
-	if isAssignWord(a) {
-		envAs.addAssign(a)
-		return argv[1:], envAs, wrapperLayerAdvance{advanced: true}
-	}
-	if shellNoopWords[a] || a == "--" {
-		return argv[1:], envAs, wrapperLayerAdvance{advanced: len(argv) > 1}
-	}
-	switch a {
-	case "if", "then", "elif", "else", "while", "until", "do", "!", "coproc":
-		return argv[1:], envAs, wrapperLayerAdvance{advanced: true}
-	}
-	if isDynamicArg(a) {
-		return argv, envAs, wrapperLayerAdvance{}
-	}
-	base := filepath.Base(a)
-	if !isPeeledWrapperBase(base) {
-		return argv, envAs, wrapperLayerAdvance{}
-	}
-	adv := wrapperLayerAdvance{advanced: true, bare: !strings.ContainsRune(a, '/')}
-	if base == "command" && isCommandQuery(argv[1:]) {
-		// A command -v/-V query executes nothing after it — peelWrappers
-		// stops the peel at exactly this point, so the scan stops too.
-		return argv, envAs, wrapperLayerAdvance{}
-	}
-	switch base {
-	case "command", "builtin", "exec":
-		// Shell builtins: resolved inside the shell process, never through
-		// PATH — they adopt no external identity, but the peel strips their
-		// option zones exactly like any other layer.
-		return argv[skipTransparentBuiltinArgs(argv, base):], envAs, adv
-	}
-	adv.external = true
-	rest, nextEnv := skipExternalWrapperLayer(argv, base, envAs)
-	return rest, nextEnv, adv
-}
-
-// skipTransparentBuiltinArgs consumes the option zone of one
-// command/builtin/exec layer exactly like peelWrappers (extracted for
-// the R25 complexity budget): command stops at its own query shape
-// (nothing further is peeled there), builtin consumes bare option
-// words, and exec uses its own skip helper for the -cl/-a cluster.
-func skipTransparentBuiltinArgs(argv []string, base string) int {
-	if base == "exec" {
-		ni, _ := skipExecArgs(argv, 1)
-		return ni
-	}
-	i := 1
-	for i < len(argv) && strings.HasPrefix(argv[i], "-") && argv[i] != "--" {
-		i++
-	}
-	return skipDashDash(argv, i)
-}
-
-// skipExternalWrapperLayer consumes one external wrapper layer exactly
-// like peelWrappers' own per-base case (extracted for the R25 complexity
-// budget): env rewrites the remaining argv through skipEnvOperands and
-// folds its ops into the running environment, timeout/stdbuf/ionice/
-// taskset/chrt/strace use their dedicated option-zone skippers, and the
-// plain flag zones (time/nohup/setsid/nice/busybox) consume their option
-// words. The fail-closed dynamic-word verdicts of the peel itself are
-// irrelevant here — the scan only validates adoption identities, and
-// peelWrappers applies its own fail-closed verdicts when it runs.
-func skipExternalWrapperLayer(argv []string, base string, envAs envAssignments) ([]string, envAssignments) {
-	switch base {
-	case "env":
-		rest, _, nextEnv := skipEnvOperands(argv, 1, envAs)
-		return rest, nextEnv
-	case "timeout":
-		ni, _ := skipTimeoutArgs(argv, 1)
-		return argv[ni:], envAs
-	case "stdbuf":
-		ni, _ := skipStdbufArgs(argv, 1)
-		return argv[ni:], envAs
-	case "ionice":
-		ni, _ := skipIoniceArgs(argv, 1)
-		return argv[ni:], envAs
-	case "taskset":
-		ni, _ := skipTasksetArgs(argv, 1)
-		return argv[ni:], envAs
-	case "chrt":
-		ni, _ := skipChrtArgs(argv, 1)
-		return argv[ni:], envAs
-	case "strace", "ltrace":
-		ni, _ := skipStraceArgs(argv, 1)
-		return argv[ni:], envAs
-	case "time":
-		return argv[skipTimeSingleArgs(argv, 1):], envAs
-	case "setsid":
-		return argv[skipPlainFlagZone(argv, 1):], envAs
-	case "nice":
-		return argv[skipNiceWrapperArgs(argv, 1):], envAs
-	}
-	// nohup, busybox: no option operands beyond `--`.
-	return argv[skipDashDash(argv, 1):], envAs
-}
-
-// skipNiceWrapperArgs consumes nice's option zone exactly like
-// peelWrappers' nice case (extracted so skipExternalWrapperLayer carries
-// no per-base operand branching): -n/--adjustment carries a separate
-// value operand, everything else is a boolean flag.
-func skipNiceWrapperArgs(argv []string, i int) int {
-	for i < len(argv) {
-		a := argv[i]
-		if a == "--" {
-			return i + 1
-		}
-		if !strings.HasPrefix(a, "-") || a == "-" {
-			return i
-		}
-		if a == "-n" || a == "--adjustment" {
-			i += 2
-			continue
-		}
-		i++
-	}
-	return i
-}
-
+// R26-Oracle-M2/M4 / R26-Reviewer-#1/#2/#3: the pre-R26 pre-scan
+// family (stdinWrapperPeelUntrusted / externalWrapperUntrustedPATH /
+// peelOneWrapperLayer / skipTransparentBuiltinArgs /
+// skipExternalWrapperLayer / skipNiceWrapperArgs) is REPLACED by the
+// single-pass bounded checked peel inside stdinTargetsPeelPrologue —
+// the separate unbounded scan judged bare external wrappers against
+// the environment their own operands install for the NEXT layer,
+// overflowed slice bounds on trailing missing operands, and rescanned
+// the accumulated op list quadratically outside the step budget.
 // stdinUnknownHeadTargets is the tail verdict of
 // stdinProgramTargetsDialect for an unrecognized head (R22-Oracle-#6 /
 // R22-Reviewer-#6): an unrecognized BARE name carries no static
@@ -1778,7 +1596,7 @@ func stdinXargsTargets(head []string, depth int, envAs envAssignments, basePath,
 	if !feedsCode {
 		return stdinProgramTargetsWithEnv(head[k:], depth+1, envAs, basePath, caller)
 	}
-	return stdinXargsInnerTarget(head[k:], depth+1, envAs, effPath, caller)
+	return stdinXargsInnerTarget(head[k:], depth+1, envAs, basePath, effPath, caller)
 }
 
 // stdinXargsInnerTarget projects the inner target of an xargs invocation
@@ -1790,8 +1608,17 @@ func stdinXargsTargets(head []string, depth int, envAs envAssignments, basePath,
 // wrapper-peel budget is an exhaustion verdict exactly like the
 // recursion cutoff (R22-Oracle-M5 / R22-Reviewer-#5) — the consumer
 // identity is UNKNOWABLE, never a known POSIX shell.
-func stdinXargsInnerTarget(argv []string, depth int, envAs envAssignments, effPath string, caller callerIdentity) []stdinTarget {
-	innerHead, innerEnv, innerEffPath, innerExhausted := peelWrappersAndWrapperAliases(argv, effPath, caller)
+func stdinXargsInnerTarget(argv []string, depth int, envAs envAssignments, basePath, effPath string, caller callerIdentity) []stdinTarget {
+	// R26-Oracle-M2 / R26-Reviewer-#1: the open-code-slot inner target
+	// runs the SAME single-pass checked peel as the main prologue —
+	// bare external wrapper layers (xargs -I{} env /bin/sh -c {})
+	// AND the final peeled bare head (xargs -I{} sh -c {}) both owe
+	// their resolution to the untrusted PATH, and fixed-path wrapper
+	// aliases keep their slash identity across the rewrite
+	// (R26-Oracle-M3 / R26-Reviewer-#4) so /usr/bin/xargs -I{}
+	// /usr/bin/env /bin/bash -c {} stays a confirmed consumer.
+	tk := newWrapperPathTracker(basePath, envAs, caller)
+	innerHead, innerEnv, innerEffPath, innerExhausted := peelWrappersAndWrapperAliasesChecked(argv, effPath, caller, tk)
 	envAs = envAs.merged(innerEnv)
 	if innerExhausted {
 		return []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}

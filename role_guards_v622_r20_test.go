@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -2007,27 +2008,15 @@ func TestGuard_V622_OracleR25Probes(t *testing.T) {
 			t.Fatalf("control broken: xargs dash -c inner target bash=%v — dash is never the brace-expanding dialect", got.bash)
 		}
 	})
-	t.Run("R25-5 the legacy pure-vehicle spelling delegates to the production entry", func(t *testing.T) {
-		// The delegation proof is behavioral identity at the shared tail:
-		// both spellings must agree on the four legacy vehicle shapes —
-		// a parallel implementation could diverge on any of them while
-		// the shared stdinTargetsAllPureShell tail stays green.
-		for _, tc := range []struct {
-			name string
-			cmd  string
-		}{
-			{"plain shell", "sh"},
-			{"nested inner shell", "sh -c 'cat; sh'"},
-			{"assignment mutation", "X=1 sh"},
-			{"redirect mutation", "sh > /tmp/r25v"},
-		} {
-			cwd := isPureRemoteStdinVehicleCwd(tc.cmd, "/tmp")
-			caller := isPureRemoteStdinVehicleCaller(tc.cmd, stdinEntryCaller("/tmp"))
-			if cwd != caller {
-				t.Fatalf("%s: isPureRemoteStdinVehicleCwd=%v vs production isPureRemoteStdinVehicleCaller=%v — the legacy spelling is a parallel implementation that can diverge while the tests stay green", tc.name, cwd, caller)
-			}
-		}
-	})
+	// R26-Reviewer-#9: the tautological legacy pure-vehicle delegation
+	// comparison row is REMOVED — both spellings called the same production
+	// entry with equivalent arguments, so it passed on BOTH trees even if
+	// the certification degenerated to a constant; the five independent
+	// behavioral assertions at the shared tail (lines 827/834/1254/1266/
+	// 1270 of this file's R20-R24 rows) already pin the delegation's
+	// behavior, and cognitive-complexity-0 pure delegation earns no new
+	// behavioral case. TestGuard_V622_OracleR25Probes therefore holds 10
+	// discriminating subtests after this removal.
 
 	// ---- R25-6: per-layer wrapper validation; fixed-path GNU aliases ----
 	t.Run("R25-6 bare external wrappers are validated at every peel layer", func(t *testing.T) {
@@ -2088,6 +2077,315 @@ func TestGuard_V622_OracleR25Probes(t *testing.T) {
 		}
 		if first.lang != "" || first.data {
 			t.Fatalf("control broken: /usr/bin/genv /bin/sh projected (%+v) — the peeled fixed-path shell target itself regressed", first)
+		}
+	})
+}
+
+// TestGuard_V622_OracleR26Probes pins the Oracle R26 / Reviewer R26
+// discriminating rows: the taint-entry background-root eval process
+// boundary, the hidden-eval pipeline sibling isolation, the nested
+// statement redirection subtree scan, the wrapper entry-environment
+// validation order, the xargs inner-target untrusted-PATH validation,
+// the trailing missing-operand wrapper zones, the bounded single-pass
+// wrapper budget, and the explicit relative-path slash identity. Every
+// subtest references ONLY symbols already present on the pre-fix tree
+// (the production entries are validated through their public internal
+// surface), so the complete file compiles there verbatim.
+func TestGuard_V622_OracleR26Probes(t *testing.T) {
+
+	// ---- R26-1: taint-entry background root eval isolation ----
+	t.Run("R26-1 the taint-entry background root eval replays inside its own process frame", func(t *testing.T) {
+		probe := func(text string) *subCollector {
+			t.Helper()
+			c := blankSubCollector()
+			c.allowBind = true
+			c.taintEvalTextWrites(text, 0)
+			return c
+		}
+		bg := probe(`eval "readonly AUDIT_CHILD; r26fn() { :; }" &`)
+		if bg.readonlyVars["AUDIT_CHILD"] || bg.funcNames["r26fn"] {
+			t.Fatalf("taint-entry backgrounded nested eval registered child-process facts into the parent (readonly=%v funcs=%v) — the root statement's background bit must frame the whole hidden-eval replay exactly like the bind entry", bg.readonlyVars, bg.funcNames)
+		}
+		fg := probe(`eval "readonly AUDIT_FG26; r26fg() { :; }"`)
+		if !fg.readonlyVars["AUDIT_FG26"] || !fg.funcNames["r26fg"] {
+			t.Fatalf("control broken: foreground taint-entry nested eval lost its positional facts (readonly=%v funcs=%v) — a same-process re-parse registers exactly like the certain replication", fg.readonlyVars, fg.funcNames)
+		}
+		vt := probe(`AUDIT_V26=/x &`)
+		if !vt.taintedVars["AUDIT_V26"] {
+			t.Fatalf("control broken: the child-process frame rolled back the conservative variable TAINT of the same writes (taintedVars=%v) — pollution belongs to the possibility, never the process ownership", vt.taintedVars)
+		}
+		// The redirected eval spelling reaches the taint replay through
+		// bindEvalCallWrites (a possibly-failing redirection never mints a
+		// bind): the nested background root inside the tainted text must
+		// face the same process frame.
+		p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+		f, err := p.Parse(strings.NewReader(`eval 'eval "readonly AUDIT_R26R; r26rf() { :; }" &' </dev/null`), "")
+		if err != nil || len(f.Stmts) != 1 {
+			t.Fatalf("parse redirected eval fixture: err=%v stmts=%d", err, len(f.Stmts))
+		}
+		call, isCall := f.Stmts[0].Cmd.(*syntax.CallExpr)
+		if !isCall {
+			t.Fatalf("fixture broken: redirected eval root cmd is %T, want CallExpr", f.Stmts[0].Cmd)
+		}
+		c := blankSubCollector()
+		c.allowBind = true
+		c.bindEvalCallWrites(f.Stmts[0], call)
+		if c.readonlyVars["AUDIT_R26R"] || c.funcNames["r26rf"] {
+			t.Fatalf("redirected eval's nested background root registered child-process facts into the parent (readonly=%v funcs=%v) — the taint replay of the redirected eval must frame the backgrounded statement it re-parses", c.readonlyVars, c.funcNames)
+		}
+	})
+
+	// ---- R26-2: hidden-eval pipeline sibling isolation ----
+	t.Run("R26-2 hidden-eval pipeline components scan in independent sibling frames", func(t *testing.T) {
+		probe := func(text string) *subCollector {
+			t.Helper()
+			c := blankSubCollector()
+			c.allowBind = true
+			c.taintEvalTextWrites(text, 0)
+			return c
+		}
+		sib := probe(`eval 'eval() { :; }' | eval`)
+		if sib.taintedVars["PATH"] {
+			t.Fatalf("right-side bare eval was shadowed by the LEFT pipeline component's nested definition (taintedVars=%v) — the two components must scan in independent registry frames derived from the same parent state", sib.taintedVars)
+		}
+		if sib.funcNames["eval"] {
+			t.Fatalf("pipeline nested function definition leaked into the parent registry (funcNames=%v) — both components are child processes whose registrations die with them", sib.funcNames)
+		}
+		ctrl := probe(`{ eval 'eval() { :; }'; eval; } | cat`)
+		if !ctrl.taintedVars["PATH"] {
+			t.Fatalf("control broken: same-component nested eval shadowing left PATH untainted (taintedVars=%v) — registrations inside ONE pipeline component must stay visible to that component's own later statements before the frame rolls back", ctrl.taintedVars)
+		}
+	})
+
+	// ---- R26-3: nested statement redirection subtrees ----
+	t.Run("R26-3 the hidden-eval scan walks nested statement redirection subtrees", func(t *testing.T) {
+		probe := func(text string) *subCollector {
+			t.Helper()
+			c := blankSubCollector()
+			c.allowBind = true
+			c.taintEvalTextWrites(text, 0)
+			return c
+		}
+		ifHit := probe(`if true; then : >/dev/null/$(command -x eval); fi`)
+		if !ifHit.taintedVars["PATH"] {
+			t.Fatalf("nested if-body redirection substitution `$(command -x eval)` left PATH untainted (taintedVars=%v) — the hidden-eval scan never descended into the statement's redirection subtree, silently dropping the tainted short-rest chain the pre-scan counts", ifHit.taintedVars)
+		}
+		blockHit := probe(`{ >/dev/null/$(command -x eval); }`)
+		if !blockHit.taintedVars["PATH"] {
+			t.Fatalf("empty-command redirection substitution `$(command -x eval)` left PATH untainted (taintedVars=%v) — a nil command must never skip the statement's own redirection words", blockHit.taintedVars)
+		}
+		ctrl := probe(`>/dev/null/$(eval 'readonly AUDIT_NR26; r26nrfn() { :; }')`)
+		if ctrl.readonlyVars["AUDIT_NR26"] || ctrl.funcNames["r26nrfn"] {
+			t.Fatalf("control broken: redirection command substitution registered substitution-local facts into the parent (readonly=%v funcs=%v) — the substitution frame must roll back exactly like before", ctrl.readonlyVars, ctrl.funcNames)
+		}
+	})
+
+	// ---- R26-4: wrapper entry-environment validation order ----
+	t.Run("R26-4 bare wrapper validation uses the entry environment, not the post-layer one", func(t *testing.T) {
+		probe := func(inherited envAssignments, argv []string) bool {
+			t.Helper()
+			targets := stdinProgramTargetsDialect(argv, 0, inherited, "/usr/bin:/bin", callerIdentity{}, false)
+			for _, tg := range targets {
+				if tg.exhausted {
+					return true
+				}
+			}
+			return false
+		}
+		assertExh := func(inherited envAssignments, argv []string, want bool) {
+			t.Helper()
+			if got := probe(inherited, argv); got != want {
+				t.Fatalf("stdinProgramTargetsDialect(%v) exhaustion = %v, want %v — a wrapper's own resolution must face the environment in force when the kernel looked it up, never the operands only the next layer inherits", argv, got, want)
+			}
+		}
+		var trusted envAssignments
+		// A bare env validated under the trusted ENTRY environment stays a
+		// confirmed consumer even though its own operands poison the NEXT
+		// layer's PATH: the pre-fix scan judged env against the post-layer
+		// environment and falsely exhausted it.
+		assertExh(trusted, []string{"env", "PATH=" + cmdSubPlaceholder, "/bin/sh"}, false)
+		// Non-sticky placeholder entry environments: env -i / -u PATH clear
+		// PATH only AFTER the bare env itself already resolved through the
+		// untrusted entry search list — the pre-fix scan validated against
+		// the cleared post-layer environment and missed both.
+		var phInherited envAssignments
+		phInherited.ops = append(phInherited.ops, envOp{kind: 'a', key: "PATH", value: cmdSubPlaceholder})
+		assertExh(phInherited, []string{"env", "-i", "/bin/sh"}, true)
+		assertExh(phInherited, []string{"env", "-u", "PATH", "/bin/sh"}, true)
+		// A clean env -i under a TRUSTED entry environment resolves the bare
+		// env fine — the inner /bin/sh carries its own slash either way.
+		assertExh(trusted, []string{"env", "-i", "/bin/sh"}, false)
+		// The untrusted verdict propagates layer by layer: once env's
+		// operands poison the PATH, the NEXT bare external wrapper faces it.
+		assertExh(trusted, []string{"env", "PATH=" + cmdSubPlaceholder, "nice", "/bin/sh"}, true)
+	})
+
+	// ---- R26-5: xargs inner-target untrusted-PATH validation ----
+	t.Run("R26-5 the xargs open-code-slot inner target validates bare wrappers and bare heads", func(t *testing.T) {
+		var untrusted envAssignments
+		untrusted.ops = append(untrusted.ops, envOp{kind: 't', key: "PATH"})
+		probe := func(argv []string) (stdinTarget, bool) {
+			t.Helper()
+			targets := stdinProgramTargetsDialect(argv, 0, untrusted, "/usr/bin:/bin", callerIdentity{xw: &xargsWorkState{}}, false)
+			return firstProgramTarget(targets)
+		}
+		assertExhausted := func(argv []string, want bool) {
+			t.Helper()
+			first, ok := probe(argv)
+			got := ok && first.exhausted
+			if got != want {
+				t.Fatalf("stdinProgramTargetsDialect(%v) inner-target exhaustion = %v, want %v (first=%+v ok=%v) — the open-code-slot inner target owes its resolution to the same untrusted PATH", argv, got, want, first, ok)
+			}
+		}
+		assertExhausted([]string{"/usr/bin/xargs", "-I{}", "env", "/bin/sh", "-c", "{}"}, true)
+		assertExhausted([]string{"/usr/bin/xargs", "-I{}", "sh", "-c", "{}"}, true)
+		first, ok := probe([]string{"/usr/bin/xargs", "-I{}", "/usr/bin/env", "/bin/bash", "-c", "{}"})
+		if !ok || first.exhausted {
+			t.Fatalf("control broken: /usr/bin/xargs -I{} /usr/bin/env /bin/bash -c {} under untrusted PATH became exhausted (first=%+v ok=%v) — slash-carrying wrapper and shell spellings carry their own resolution", first, ok)
+		}
+		if !first.bash {
+			t.Fatalf("control broken: /usr/bin/xargs -I{} /usr/bin/env /bin/bash -c {} inner target bash=%v — the fixed-path bash keeps its dialect exactly like the direct spelling", first.bash)
+		}
+	})
+
+	// ---- R26-6: trailing missing-operand wrapper zones ----
+	t.Run("R26-6 trailing missing-operand wrapper options clamp at the slice bound", func(t *testing.T) {
+		for _, tc := range []struct {
+			argv []string
+			base string
+		}{
+			{[]string{"nice", "-n"}, "nice"},
+			{[]string{"nice", "--adjustment"}, "nice"},
+			{[]string{"timeout", "-k"}, "timeout"},
+			{[]string{"timeout", "-s"}, "timeout"},
+			{[]string{"stdbuf", "-o"}, "stdbuf"},
+			{[]string{"ionice", "-c"}, "ionice"},
+			{[]string{"taskset", "-c"}, "taskset"},
+			{[]string{"strace", "-e"}, "strace"},
+			{[]string{"time", "-o"}, "time"},
+			{[]string{"exec", "-a"}, "exec"},
+		} {
+			next, ok := peelSingleWrapperArgs(tc.argv, tc.base)
+			if next < 0 || next > len(tc.argv) {
+				t.Fatalf("peelSingleWrapperArgs(%v, %q) = (%d, %v) — the returned index escapes the slice bound and argv[ni:] panics in every consumer", tc.argv, tc.base, next, ok)
+			}
+			if next != len(tc.argv) || ok {
+				t.Fatalf("peelSingleWrapperArgs(%v, %q) = (%d, %v), want (%d, false) — a trailing valued option missing its operand fails closed exactly at the slice bound", tc.argv, tc.base, next, ok, len(tc.argv))
+			}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("stdinProgramTargetsDialect(%v) panicked: %v — an incomplete trailing wrapper option must yield the exhaustion verdict, never a slice-bounds panic", tc.argv, r)
+					}
+				}()
+				targets := stdinProgramTargetsDialect(tc.argv, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+				hasExh := false
+				for _, tg := range targets {
+					if tg.exhausted {
+						hasExh = true
+					}
+				}
+				if !hasExh {
+					t.Fatalf("stdinProgramTargetsDialect(%v) = %v targets with NO exhaustion marker — the incomplete trailing option zone is an unprovable arity, never a confirmed empty command", tc.argv, targets)
+				}
+			}()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("remoteStdinProgramTargets projection of %v panicked: %v — screenSSHHead hands incomplete remote segments to the same peel path", tc.argv, r)
+					}
+				}()
+				_, _, ex := remoteStdinProgramTargets(strings.Join(tc.argv, " "), stdinEntryCaller("/tmp"))
+				if !ex {
+					t.Fatalf("remoteStdinProgramTargets projection of %v exhausted=false — the incomplete trailing option zone must surface the exhaustion verdict end to end", tc.argv)
+				}
+			}()
+		}
+	})
+
+	// ---- R26-7: bounded single-pass wrapper budget ----
+	t.Run("R26-7 the wrapper validation shares the bounded 32-step peel budget", func(t *testing.T) {
+		build := func(layers int) []string {
+			argv := []string{}
+			for i := 0; i < layers; i++ {
+				argv = append(argv, "env", "K=1")
+			}
+			return append(argv, "/bin/sh")
+		}
+		measure := func(argv []string) uint64 {
+			t.Helper()
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			for n := 0; n < 4; n++ {
+				stdinProgramTargetsDialect(argv, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+			}
+			runtime.ReadMemStats(&after)
+			return after.TotalAlloc - before.TotalAlloc
+		}
+		small := measure(build(64))
+		large := measure(build(512))
+		if small == 0 {
+			t.Fatalf("fixture broken: zero allocation for the 64-layer chain measurement")
+		}
+		if large > small*3/2 {
+			t.Fatalf("wrapper-chain validation allocation scales with the chain length: %d bytes at L=64 vs %d at L=512 (ratio %.2f, want <= 1.5) — the validation must share peelWrapperMaxSteps' bounded single pass instead of pre-scanning every layer outside the budget", small, large, float64(large)/float64(small))
+		}
+		// Control: pure KEY=VAL assignments never consume wrapper steps —
+		// a 40-assignment prefix ahead of a fixed-path env resolves the
+		// confirmed fixed-path consumer without any exhaustion verdict.
+		ctrl := []string{}
+		for i := 0; i < 40; i++ {
+			ctrl = append(ctrl, fmt.Sprintf("A%d=1", i))
+		}
+		ctrl = append(ctrl, "/usr/bin/env", "/bin/sh")
+		targets := stdinProgramTargetsDialect(ctrl, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+		for _, tg := range targets {
+			if tg.exhausted {
+				t.Fatalf("control broken: 40 pure assignments ahead of /usr/bin/env /bin/sh became exhausted (%+v) — pure assignments are step-exempt exactly like the pre-fix peel", tg)
+			}
+		}
+	})
+
+	// ---- R26-8: explicit relative-path slash identity ----
+	t.Run("R26-8 explicit relative-path wrapper aliases never degrade into bare names", func(t *testing.T) {
+		var untrusted envAssignments
+		untrusted.ops = append(untrusted.ops, envOp{kind: 't', key: "PATH"})
+		probe := func(argv []string) bool {
+			t.Helper()
+			targets := stdinProgramTargetsDialect(argv, 0, untrusted, "/usr/bin:/bin", callerIdentity{}, false)
+			for _, tg := range targets {
+				if tg.exhausted {
+					return true
+				}
+			}
+			return false
+		}
+		// Explicit relative spellings keep their fixed-path identity across
+		// the canonical GNU-alias rewrite even when filepath.Join would
+		// clean the slash away — the pre-fix rewrite degraded both into the
+		// bare canon word and re-validated them through the untrusted PATH.
+		if probe([]string{"./genv", "/bin/sh"}) {
+			t.Fatalf("./genv /bin/sh under untrusted PATH became exhausted — an explicit relative spelling carries its own resolution and must never degrade into a PATH-dependent bare name")
+		}
+		if probe([]string{"sub/../genv", "/bin/sh"}) {
+			t.Fatalf("sub/../genv /bin/sh under untrusted PATH became exhausted — a slash-carrying directory that cancels out still carries its own resolution")
+		}
+		if !probe([]string{"genv", "/bin/sh"}) {
+			t.Fatalf("control broken: bare genv /bin/sh under untrusted PATH did NOT exhaust — a genuinely slash-free GNU alias owes its resolution to PATH exactly like the canonical env")
+		}
+		// A symlinked fixed-path wrapper alias preserves its slash identity
+		// through the resolved-wrapper recursion as well.
+		dir := t.TempDir()
+		if err := os.Symlink("/usr/bin/env", filepath.Join(dir, "myenv")); err != nil {
+			t.Fatalf("fixture symlink: %v", err)
+		}
+		t.Chdir(dir)
+		if probe([]string{"./myenv", "/bin/sh"}) {
+			t.Fatalf("./myenv (-> /usr/bin/env) /bin/sh under untrusted PATH became exhausted — the resolved-wrapper recursion dropped the fixed-path slash identity and re-validated the alias as a bare name")
+		}
+		if !probe([]string{"myenv", "/bin/sh"}) {
+			t.Fatalf("control broken: bare myenv /bin/sh under untrusted PATH did NOT exhaust — a genuinely slash-free wrapper alias owes its resolution to PATH")
 		}
 	})
 }

@@ -6,7 +6,7 @@ status: active
 
 ## 背景
 
-Oracle R25（Must-Fix 7 + Should-Fix 2）与 Reviewer R25（Must-Fix 8 + Should-Fix 2）两份对抗审计在 `028ac50` 上检出 6 项生产交集 + 1 项文档校准。本轮在 worktree `feat-v622-guard-hardening` 一次性闭环；R25 套件 10 个判别子测试 FAIL-first 于父树 `028ac50`（第 11 行 legacy 纯载体委托在两树同 PASS——两份实现当时对四形状取值一致，属回归控制非判别行）。
+Oracle R25（Must-Fix 7 + Should-Fix 2）与 Reviewer R25（Must-Fix 8 + Should-Fix 2）两份对抗审计在 `028ac50` 上检出 6 项生产交集 + 1 项文档校准。本轮在 worktree `feat-v622-guard-hardening` 一次性闭环；R25 套件 10 个判别子测试 FAIL-first 于父树 `028ac50`（闭环时第 11 行 legacy 纯载体委托在两树同 PASS——两份实现当时对四形状取值一致，属回归控制非判别行）。（R26 勘误：Reviewer R26-#9 判定该第 11 行与生产入口等价参数调用同一函数、不具判别力，R26 已删除该同义反复控制行；`TestGuard_V622_OracleR25Probes` 此后保持 10 个判别子测试。）
 
 ## 根因与修复要点（留痕口径）
 
@@ -20,7 +20,7 @@ Oracle R25（Must-Fix 7 + Should-Fix 2）与 Reviewer R25（Must-Fix 8 + Should-
 
 ## 验证归档
 
-- FAIL-first（父树 `028ac50` overlay 最终测试文件，`/tmp/r27-parent` 已删）：`go vet` rc=0；R25 套件 10 FAIL / 1 PASS（PASS 行 = legacy 纯载体委托回归控制）。修复树同套件 11/11 PASS。
+- FAIL-first（父树 `028ac50` overlay 闭环时测试文件，`/tmp/r27-parent` 已删）：`go vet` rc=0；R25 套件 10 FAIL / 1 PASS（PASS 行 = legacy 纯载体委托回归控制，该行后于 R26 按 Reviewer R26-#9 删除）。修复树同套件闭环时 11/11 PASS（R26 删除该控制行后 10/10 PASS）。
 - cccc 全量前后对照：0 正增长、新增 < 35（明细见上节）。
 - `make check` 与 3 轮 `-race -count=10` 记录见交付报告。
 
