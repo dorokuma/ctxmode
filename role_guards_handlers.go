@@ -1126,6 +1126,13 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 	// is the extracted owner so the head classification carries no
 	// canonical-alias branching (R24 complexity budget).
 	origHasSlash := strings.ContainsRune(head[0], '/')
+	// R25-Oracle-MF6 / R25-Reviewer-#1: remember the ORIGINAL spelling
+	// before any canonical rewrite — the file resolution below must
+	// consult the path the user actually typed (a canon-normalized
+	// slash-free GNU/alias rewrite would otherwise resolve the wrong
+	// file or lose the fixed-path identity); the canonical name is for
+	// branch classification only.
+	origHead := head[0]
 	head, base, recursed := stdinCanonHeadRewrite(head, base, depth, envAs, basePath, caller, bash)
 	if recursed.fired {
 		return recursed.targets
@@ -1141,7 +1148,7 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 	if !origHasSlash && bareHeadUntrustedPATH(head[0], envAs, basePath, caller) {
 		return []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
 	}
-	if rb := canonicalResolvedBase(resolveHeadBase(head[0], effPath, caller.screenCwd())); rb != "" && rb != base {
+	if rb := canonicalResolvedBase(resolveHeadBase(origHead, effPath, caller.screenCwd())); rb != "" && rb != base {
 		if isPeeledWrapperBase(rb) {
 			return stdinProgramTargetsDialect(append([]string{rb}, head[1:]...), depth+1, envAs, basePath, caller, bash)
 		}
@@ -1255,10 +1262,18 @@ func stdinCanonHeadRewrite(head []string, base string, depth int, envAs envAssig
 	if canon == base {
 		return head, base, stdinCanonRewrite{}
 	}
+	// R25-Oracle-MF6 / R25-Reviewer-#1: a spelled-with-slashes GNU/alias
+	// name (/usr/bin/genv) keeps its directory prefix across the
+	// canonical rewrite — rewriting to the bare canon word would
+	// re-resolve the alias through PATH and lose the fixed-path
+	// identity the original spelling carries. Bare spellings join onto
+	// the current directory exactly like before (filepath.Join(".", x)
+	// cleans to x).
+	rewritten := append([]string{filepath.Join(filepath.Dir(head[0]), canon)}, head[1:]...)
 	if isPeeledWrapperBase(canon) {
-		return head, base, stdinCanonRewrite{fired: true, targets: stdinProgramTargetsDialect(append([]string{canon}, head[1:]...), depth+1, envAs, basePath, caller, bash)}
+		return head, base, stdinCanonRewrite{fired: true, targets: stdinProgramTargetsDialect(rewritten, depth+1, envAs, basePath, caller, bash)}
 	}
-	return append([]string{canon}, head[1:]...), canon, stdinCanonRewrite{}
+	return rewritten, canon, stdinCanonRewrite{}
 }
 
 // stdinWrapperPeelUntrusted is the pre-adoption validation owner of
@@ -1284,43 +1299,180 @@ func stdinWrapperPeelUntrusted(argv []string, inherited envAssignments, caller c
 	return externalWrapperUntrustedPATH(argv, inherited, caller, caller.effectivePATH())
 }
 
-// externalWrapperUntrustedPATH reports whether the leading external
-// wrapper layer of argv is a bare slash-free name whose own resolution
-// depends on an untrusted PATH (R24-Reviewer-#6 / R24-Oracle-M6,
-// extracted so stdinTargetsPeelPrologue carries no chain-scan nesting).
-// Only EXTERNAL wrappers count: command/builtin/exec are shell builtins
-// the kernel never resolves through PATH, and shell syntax words are
-// not programs at all. Assignment words, inert fragments and `--` skip
-// exactly like peelWrappers' own prologue so the checked word is the
-// same one the peel would adopt.
+// externalWrapperUntrustedPATH reports whether ANY external wrapper
+// layer the peel will adopt is a bare slash-free name whose own
+// resolution depends on an untrusted PATH (R24-Reviewer-#6 /
+// R24-Oracle-M6, extracted so stdinTargetsPeelPrologue carries no
+// chain-scan nesting). R25-Oracle-MF6 / R25-Reviewer-#1: the pre-R25
+// scan validated only the FIRST external word — it returned clean at
+// the first shell builtin or fixed-path wrapper while peelWrappers kept
+// stripping further bare external layers underneath, and it skipped
+// assignment words without ever folding them, so even the first layer's
+// own environment was the pre-assignment one. The scan now mirrors
+// peelWrappers layer by layer: assignment words fold into the running
+// environment exactly like the peel's own accounting, and BEFORE each
+// bare slash-free external wrapper identity is adopted the CURRENT
+// layer environment faces the untrusted-PATH verdict. Shell builtins
+// (command/builtin/exec) are exempt — they resolve inside the shell
+// process, never through PATH — and fixed-path wrappers carry their own
+// resolution; a non-wrapper word, a dynamic word or the end of the argv
+// stops the scan exactly like the peel itself.
 func externalWrapperUntrustedPATH(argv []string, envAs envAssignments, caller callerIdentity, basePath string) bool {
-	for _, a := range argv {
-		if isAssignWord(a) || shellNoopWords[a] || a == "--" {
-			continue
-		}
-		switch a {
-		case "if", "then", "elif", "else", "while", "until", "do", "!", "coproc":
-			continue
-		}
-		base := filepath.Base(a)
-		switch base {
-		case "command", "builtin", "exec":
-			// Shell builtins: resolved inside the shell process, never
-			// through PATH. `command`/`builtin` may still launch an external
-			// command in the NEXT position, but the peel adopts that next
-			// word itself — its own PATH dependency is validated when this
-			// prologue re-enters or when the final head is classified.
+	for {
+		var adv wrapperLayerAdvance
+		argv, envAs, adv = peelOneWrapperLayer(argv, envAs)
+		if !adv.advanced {
 			return false
 		}
-		if !isPeeledWrapperBase(base) {
-			return false
+		if adv.external && adv.bare {
+			if envAs.pathUntrusted(basePath) || caller.pathUntrusted() {
+				return true
+			}
 		}
-		if strings.ContainsRune(a, '/') {
-			return false
-		}
-		return envAs.pathUntrusted(basePath) || caller.pathUntrusted()
 	}
-	return false
+}
+
+// wrapperLayerAdvance is peelOneWrapperLayer's outcome: advanced reports
+// whether one wrapper/no-op layer was consumed, external marks a layer
+// the kernel resolves as an external program (never a shell builtin),
+// and bare marks a slash-free spelling that owes its identity to PATH.
+type wrapperLayerAdvance struct {
+	advanced bool
+	external bool
+	bare     bool
+}
+
+// peelOneWrapperLayer advances the validation scan past exactly one
+// no-op fragment or wrapper layer of argv, mirroring peelWrappers'
+// own prologue layer for layer (extracted for the R25 complexity
+// budget): KEY=VAL assignments fold into the running environment,
+// inert fragments/keywords/`--` skip without touching the environment,
+// shell builtins and fixed-path or bare wrappers consume their option
+// zones through the same skip helpers the peel itself uses, and a
+// non-wrapper word stops the scan. The env layer rewrites the remaining
+// argv exactly like peelWrappers (skipEnvOperands returns the
+// spliced remainder).
+func peelOneWrapperLayer(argv []string, envAs envAssignments) ([]string, envAssignments, wrapperLayerAdvance) {
+	if len(argv) == 0 {
+		return argv, envAs, wrapperLayerAdvance{}
+	}
+	a := argv[0]
+	if isAssignWord(a) {
+		envAs.addAssign(a)
+		return argv[1:], envAs, wrapperLayerAdvance{advanced: true}
+	}
+	if shellNoopWords[a] || a == "--" {
+		return argv[1:], envAs, wrapperLayerAdvance{advanced: len(argv) > 1}
+	}
+	switch a {
+	case "if", "then", "elif", "else", "while", "until", "do", "!", "coproc":
+		return argv[1:], envAs, wrapperLayerAdvance{advanced: true}
+	}
+	if isDynamicArg(a) {
+		return argv, envAs, wrapperLayerAdvance{}
+	}
+	base := filepath.Base(a)
+	if !isPeeledWrapperBase(base) {
+		return argv, envAs, wrapperLayerAdvance{}
+	}
+	adv := wrapperLayerAdvance{advanced: true, bare: !strings.ContainsRune(a, '/')}
+	if base == "command" && isCommandQuery(argv[1:]) {
+		// A command -v/-V query executes nothing after it — peelWrappers
+		// stops the peel at exactly this point, so the scan stops too.
+		return argv, envAs, wrapperLayerAdvance{}
+	}
+	switch base {
+	case "command", "builtin", "exec":
+		// Shell builtins: resolved inside the shell process, never through
+		// PATH — they adopt no external identity, but the peel strips their
+		// option zones exactly like any other layer.
+		return argv[skipTransparentBuiltinArgs(argv, base):], envAs, adv
+	}
+	adv.external = true
+	rest, nextEnv := skipExternalWrapperLayer(argv, base, envAs)
+	return rest, nextEnv, adv
+}
+
+// skipTransparentBuiltinArgs consumes the option zone of one
+// command/builtin/exec layer exactly like peelWrappers (extracted for
+// the R25 complexity budget): command stops at its own query shape
+// (nothing further is peeled there), builtin consumes bare option
+// words, and exec uses its own skip helper for the -cl/-a cluster.
+func skipTransparentBuiltinArgs(argv []string, base string) int {
+	if base == "exec" {
+		ni, _ := skipExecArgs(argv, 1)
+		return ni
+	}
+	i := 1
+	for i < len(argv) && strings.HasPrefix(argv[i], "-") && argv[i] != "--" {
+		i++
+	}
+	return skipDashDash(argv, i)
+}
+
+// skipExternalWrapperLayer consumes one external wrapper layer exactly
+// like peelWrappers' own per-base case (extracted for the R25 complexity
+// budget): env rewrites the remaining argv through skipEnvOperands and
+// folds its ops into the running environment, timeout/stdbuf/ionice/
+// taskset/chrt/strace use their dedicated option-zone skippers, and the
+// plain flag zones (time/nohup/setsid/nice/busybox) consume their option
+// words. The fail-closed dynamic-word verdicts of the peel itself are
+// irrelevant here — the scan only validates adoption identities, and
+// peelWrappers applies its own fail-closed verdicts when it runs.
+func skipExternalWrapperLayer(argv []string, base string, envAs envAssignments) ([]string, envAssignments) {
+	switch base {
+	case "env":
+		rest, _, nextEnv := skipEnvOperands(argv, 1, envAs)
+		return rest, nextEnv
+	case "timeout":
+		ni, _ := skipTimeoutArgs(argv, 1)
+		return argv[ni:], envAs
+	case "stdbuf":
+		ni, _ := skipStdbufArgs(argv, 1)
+		return argv[ni:], envAs
+	case "ionice":
+		ni, _ := skipIoniceArgs(argv, 1)
+		return argv[ni:], envAs
+	case "taskset":
+		ni, _ := skipTasksetArgs(argv, 1)
+		return argv[ni:], envAs
+	case "chrt":
+		ni, _ := skipChrtArgs(argv, 1)
+		return argv[ni:], envAs
+	case "strace", "ltrace":
+		ni, _ := skipStraceArgs(argv, 1)
+		return argv[ni:], envAs
+	case "time":
+		return argv[skipTimeSingleArgs(argv, 1):], envAs
+	case "setsid":
+		return argv[skipPlainFlagZone(argv, 1):], envAs
+	case "nice":
+		return argv[skipNiceWrapperArgs(argv, 1):], envAs
+	}
+	// nohup, busybox: no option operands beyond `--`.
+	return argv[skipDashDash(argv, 1):], envAs
+}
+
+// skipNiceWrapperArgs consumes nice's option zone exactly like
+// peelWrappers' nice case (extracted so skipExternalWrapperLayer carries
+// no per-base operand branching): -n/--adjustment carries a separate
+// value operand, everything else is a boolean flag.
+func skipNiceWrapperArgs(argv []string, i int) int {
+	for i < len(argv) {
+		a := argv[i]
+		if a == "--" {
+			return i + 1
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			return i
+		}
+		if a == "-n" || a == "--adjustment" {
+			i += 2
+			continue
+		}
+		i++
+	}
+	return i
 }
 
 // stdinUnknownHeadTargets is the tail verdict of
@@ -1647,7 +1799,24 @@ func stdinXargsInnerTarget(argv []string, depth int, envAs envAssignments, effPa
 	if lang, hit := stdinInnerHeadLang(innerHead, innerEffPath, caller.seededWith(innerEnv)); hit {
 		return []stdinTarget{{lang: lang, envAs: envAs}}
 	}
-	return []stdinTarget{{lang: "", envAs: envAs}}
+	// R25-Oracle-MF5 / R25-Reviewer-#6: the empty-language shell target
+	// must carry the consuming shell's dialect exactly like the explicit
+	// shell-head branch of stdinProgramTargetsDialect — a remote bash
+	// reading stdin brace-expands exactly like a local one, and the
+	// pre-R25 fallback never wrote the bash bit.
+	return []stdinTarget{{lang: "", envAs: envAs, bash: stdinInnerShellBashDialect(innerHead, innerEffPath, caller.seededWith(innerEnv))}}
+}
+
+// stdinInnerShellBashDialect reports whether the peeled inner xargs
+// target head belongs to the bash shell family (extracted so
+// stdinXargsInnerTarget carries no head-shape branching): an empty head
+// or a non-shell resolution is dash-shaped false exactly like the
+// explicit shell-head branch's fallback.
+func stdinInnerShellBashDialect(head []string, effPath string, caller callerIdentity) bool {
+	if len(head) == 0 {
+		return false
+	}
+	return hcShellDialectBash(head[0], effPath, caller)
 }
 
 // stdinInnerHeadLang classifies one peeled inner target head by its

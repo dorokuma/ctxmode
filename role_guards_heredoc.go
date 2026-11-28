@@ -110,7 +110,15 @@ func sshStdinProgramBodiesHit(targets []stdinTarget, seg shellSegment, kind byte
 			// survives the remote projection — a remote bash reading stdin
 			// brace-expands exactly like a local one, so the body review must
 			// not collapse every shell target to the dash default.
-			if h := screenStdinProgram(body, target.lang, bodyKind, depth, caller, target.bash); h != "" {
+			// R25-Oracle-MF5 / R25-Reviewer-#6: the body runs inside the
+			// REMOTE shell whose environment the projection already folded
+			// into target.envAs — the review re-seeds the remote caller
+			// identity (role/envTaint/pathEnv reset to the remote login,
+			// cwd/xw preserved) with exactly those ops instead of re-using
+			// the local caller's environment, or a remote conditional HOME
+			// write never reaches the body's placeholder grants.
+			bodyCaller := sshRemoteCallerIdentity(caller).seededWith(target.envAs)
+			if h := screenStdinProgram(body, target.lang, bodyKind, depth, bodyCaller, target.bash); h != "" {
 				if kind == 'r' || callerReadonlyRole(caller) {
 					return roSSHWriteHit
 				}
@@ -183,43 +191,12 @@ func sshExhaustedStdinHit(seg shellSegment, kind byte, stdinIsProg, remoteExhaus
 // unit-screening semantics: resolution falls back to the process working
 // directory, the same base the empty screenCwd had.
 func isPureRemoteStdinVehicleCwd(remoteCmd, cwd string) bool {
-	roSegs, hit := parseReadonlyShellSegments(remoteCmd)
-	if hit != "" || len(roSegs) != 1 {
-		return false
-	}
-	s := roSegs[0]
-	if s.pipedStdin || s.redirectFile != "" || len(s.heredocText) > 0 || len(s.argv) == 0 {
-		return false
-	}
-	if wrapperWriteOpHit(s.argv) != "" {
-		return false
-	}
-	// Any env op (KEY=VAL prefix or env -i/-u/assign) mutates the remote
-	// vehicle's environment — not pure. `env FOO=1 sh` would otherwise
-	// smuggle an unscreened override through the exemption (R7).
-	if _, _, envAs, _ := peelWrappers(s.argv); len(envAs.ops) > 0 {
-		return false
-	}
-	// The head must be EXACTLY a bare stdin-program SHELL: `node -`,
-	// `python3 -` and friends hand the already-screened body to an
-	// interpreter whose OWN code primitives (open/write/exec) are far
-	// wider than the shell grammar the body was screened under, so only
-	// a lang == "" head qualifies for the exemption (A-1).
-	// A lang == "" verdict resolves the remote vehicle head under the
-	// same screen cwd the outer caller used (process-cwd fallback when
-	// unset): the old shared screenCwd reached this recursion too.
-	// R22-Oracle-M5 / R22-Reviewer-#5: the exemption CERTIFIES a known
-	// pure shell, so an exhausted projection (the analysis gave up before
-	// identifying the consumer) must never qualify — lang == "" on an
-	// exhausted target is the zero value of unknowable, not POSIX sh.
-	// R23-Reviewer-#5 / R23-Oracle-M5: the certification must consult the
-	// ENTIRE projection, not the first non-data target — one outer segment
-	// can project several targets (a nested `bash -c` script inside the
-	// vehicle shape), and whichever target sits first must never launder
-	// an exhausted sibling: certification iterates every non-data target
-	// and requires EACH one to be a positively identified pure shell.
-	targets := stdinProgramTargetsWithEnv(s.argv, 0, envAssignments{}, os.Getenv("PATH"), stdinEntryCaller(cwd))
-	return stdinTargetsAllPureShell(targets)
+	// R25-Oracle-SF2 / R25-Reviewer-#10: the no-cwd spelling is a pure
+	// delegation to the caller-carrying production entry — a parallel
+	// certification implementation would silently diverge the moment the
+	// production path's preconditions evolve while the five legacy
+	// assertions stay green.
+	return isPureRemoteStdinVehicleCaller(remoteCmd, stdinEntryCaller(cwd))
 }
 
 // isPureRemoteStdinVehicleCaller is isPureRemoteStdinVehicleCwd under an

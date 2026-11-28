@@ -1070,6 +1070,14 @@ func replTokenInExecSlotDepth(innerArgv []string, token, pathEnv string, caller 
 		return false
 	}
 	if depth >= peelChainMaxDepth {
+		// R25-Oracle-MF4 / R25-Reviewer-#2: the replacement-slot recursion's
+		// own depth cutoff is an ANALYSIS cutoff exactly like the enclosing
+		// xargs scan's — returning the hit verdict without recording the
+		// sticky exhaustion bit let the outer projection mint a confirmed
+		// empty-language target for a consumer nobody identified. When the
+		// caller carries a shared request table the cutoff is recorded on
+		// it exactly like the xargsFeedsCodeFlagDepth boundary.
+		xargsMarkSharedWorkExhausted(caller)
 		return true
 	}
 	p := peelExecSlotHead(innerArgv, pathEnv, caller, token)

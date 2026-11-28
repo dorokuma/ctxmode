@@ -3442,6 +3442,23 @@ func xargsBudgetSpent(ws *xargsWorkState) bool {
 	return spent
 }
 
+// xargsMarkSharedWorkExhausted records the sticky analysis-cutoff bit
+// on the shared request table when the caller carries one (R25-Oracle-MF4):
+// the replacement-slot token scan's own recursion-depth cutoff is an
+// analysis cutoff exactly like the xargs scan's depth boundary — the
+// consumer identity is unknowable, so the verdict must survive as
+// exhaustion for the target projection rather than only as the
+// fail-closed boolean the analysis itself consumes. A caller without a
+// table has no projection stage to protect, so nothing is minted here.
+func xargsMarkSharedWorkExhausted(caller callerIdentity) {
+	if caller.xw == nil {
+		return
+	}
+	caller.xw.mu.Lock()
+	caller.xw.exhausted = true
+	caller.xw.mu.Unlock()
+}
+
 // xargsWorkMemoKey normalizes one recursion state. R22-Reviewer-#1: the
 // key MUST disambiguate every input the verdict depends on — the depth,
 // the inner argv, the replacement token the outer invocation carries

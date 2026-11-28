@@ -1669,36 +1669,47 @@ func (c *subCollector) taintOperandParamAssigns(words []*syntax.Word) {
 		if w == nil {
 			continue
 		}
-		syntax.Walk(w, func(node syntax.Node) bool {
-			if node == nil {
-				return false
-			}
-			if pe, isPe := node.(*syntax.ParamExp); isPe && pe.Param != nil && pe.Exp != nil &&
-				(pe.Exp.Op == syntax.AssignUnset || pe.Exp.Op == syntax.AssignUnsetOrNull) {
-				c.taintVar(pe.Param.Value)
-			}
-			// R24-Reviewer-#4 / R24-Oracle-M4: the pre-scan counts arithmetic
-			// writes inside the operand words too — a `$((X=1))` BinaryArithm
-			// assignment or a `$((X++))` UnaryArithm increment expands when
-			// the shell evaluates the operand, before eval re-parses
-			// anything. The truncated root-call scan drops exactly these
-			// nodes for a bind verdict, so the replication owns them here
-			// under the same pollution verdict as the parameter-expansion
-			// assignments: the counted write may never vanish between the
-			// two owners.
-			switch x := node.(type) {
-			case *syntax.BinaryArithm:
-				if isArithAssignOp(x.Op) {
-					c.taintVar(arithmTargetName(x.X))
-				}
-			case *syntax.UnaryArithm:
-				if x.Op == syntax.Inc || x.Op == syntax.Dec {
-					c.taintVar(arithmTargetName(x.X))
-				}
-			}
-			return true
-		})
+		// R25: the walk callback is a single-line delegation so the
+		// operand-write scan carries its branching inside one named method
+		// (complexity budget).
+		syntax.Walk(w, func(node syntax.Node) bool { return c.taintOperandWalkNode(node) })
 	}
+}
+
+// taintOperandWalkNode is the per-node scan of taintOperandParamAssigns
+// (extracted for the R25 complexity budget): parameter-expansion
+// assignment operators (`${X=v}`, `${X:=v}`) and arithmetic assignment
+// or increment/decrement writes both land as pollution, because the
+// counted write may never vanish between the truncated root scan and
+// the operand replication.
+func (c *subCollector) taintOperandWalkNode(node syntax.Node) bool {
+	if node == nil {
+		return false
+	}
+	if pe, isPe := node.(*syntax.ParamExp); isPe && pe.Param != nil && pe.Exp != nil &&
+		(pe.Exp.Op == syntax.AssignUnset || pe.Exp.Op == syntax.AssignUnsetOrNull) {
+		c.taintVar(pe.Param.Value)
+	}
+	// R24-Reviewer-#4 / R24-Oracle-M4: the pre-scan counts arithmetic
+	// writes inside the operand words too — a `$((X=1))` BinaryArithm
+	// assignment or a `$((X++))` UnaryArithm increment expands when
+	// the shell evaluates the operand, before eval re-parses
+	// anything. The truncated root-call scan drops exactly these
+	// nodes for a bind verdict, so the replication owns them here
+	// under the same pollution verdict as the parameter-expansion
+	// assignments: the counted write may never vanish between the
+	// two owners.
+	switch x := node.(type) {
+	case *syntax.BinaryArithm:
+		if isArithAssignOp(x.Op) {
+			c.taintVar(arithmTargetName(x.X))
+		}
+	case *syntax.UnaryArithm:
+		if x.Op == syntax.Inc || x.Op == syntax.Dec {
+			c.taintVar(arithmTargetName(x.X))
+		}
+	}
+	return true
 }
 
 // bindEvalCallWrites replicates the variable BINDINGS of a static eval
@@ -1726,6 +1737,31 @@ func (c *subCollector) taintOperandParamAssigns(words []*syntax.Word) {
 // trusting values the runtime may have rewritten (pollution is always the
 // fail-closed direction).
 func (c *subCollector) bindEvalCallWrites(st *syntax.Stmt, call *syntax.CallExpr) {
+	if len(call.Args) == 0 {
+		return
+	}
+	// R25-Oracle-MF3 / R25-Reviewer-#4: a backgrounded or coprocess eval
+	// statement runs in its OWN child process — the replicated re-parse
+	// no longer carries the statement's process bits, so the replay must
+	// never mint parent bindings, and every function/readonly registration
+	// it produces dies with the child. The frame also covers the nested
+	// hidden-eval replays the taint scan re-enters, because the same
+	// boundary verdict spans the whole child process.
+	if st != nil && (st.Background || st.Coprocess) {
+		defer c.snapshotProcessRegs()()
+		c.bindEvalCallChain(st, call, true)
+		return
+	}
+	c.bindEvalCallChain(st, call, len(st.Redirs) > 0)
+}
+
+// bindEvalCallChain is the chain-analysis body of bindEvalCallWrites
+// (extracted for the R25 complexity budget — the process-boundary wrap
+// must carry no chain-verdict branching): mustTaint forces the
+// conservative pollution replay for an invocation whose execution is
+// not provably-exactly-once-in-this-process (failing redirections or a
+// child-process execution shape).
+func (c *subCollector) bindEvalCallChain(st *syntax.Stmt, call *syntax.CallExpr, mustTaint bool) {
 	if len(call.Args) == 0 {
 		return
 	}
@@ -1762,7 +1798,7 @@ func (c *subCollector) bindEvalCallWrites(st *syntax.Stmt, call *syntax.CallExpr
 		c.taintShortRestBoundary(verdict, call.Args)
 		return
 	}
-	c.replayEvalOperandTail(verdict, rest, len(st.Redirs) > 0)
+	c.replayEvalOperandTail(verdict, rest, mustTaint)
 }
 
 // replayEvalOperandTail is the static-operand decode and replay
@@ -1925,6 +1961,13 @@ func (c *subCollector) noteEvalStmtReadonlyDecls(st *syntax.Stmt) {
 	if d, isDecl := st.Cmd.(*syntax.DeclClause); isDecl {
 		c.noteReadonlyDecls(c.declClauseArgv(d))
 	}
+	if call, isCall := st.Cmd.(*syntax.CallExpr); isCall {
+		// R25-Oracle-MF2: the POSIX dialect parses `readonly NAME` as a
+		// CallExpr, not a DeclClause — the main traversal registers it
+		// through emitCall, and the replication must share exactly the
+		// same process state.
+		c.noteReadonlyDecls(c.callArgsArgv(call))
+	}
 	syntax.Walk(st.Cmd, func(node syntax.Node) bool {
 		if node == nil {
 			return false
@@ -1938,6 +1981,12 @@ func (c *subCollector) noteEvalStmtReadonlyDecls(st *syntax.Stmt) {
 		case *syntax.DeclClause:
 			c.noteReadonlyDecls(c.declClauseArgv(x))
 			return true
+		case *syntax.CallExpr:
+			// R25-Oracle-MF2: POSIX parses `readonly NAME` as a call — the
+			// attribute it installs is a positional fact exactly like the
+			// DeclClause shape.
+			c.noteReadonlyDecls(c.callArgsArgv(x))
+			return true
 		case *syntax.BinaryCmd:
 			if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
 				return false
@@ -1948,6 +1997,26 @@ func (c *subCollector) noteEvalStmtReadonlyDecls(st *syntax.Stmt) {
 		}
 		return true
 	})
+}
+
+// callArgsArgv serializes the static positional operands of one CallExpr
+// into the argv shape noteReadonlyDecls/noteDeclCallBinds consume
+// (extracted for the R25 readonly-replay fix): the POSIX dialect parses
+// `readonly NAME` as a plain command invocation, so the replication must
+// decode its words exactly like emitCall does — dynamic words encode
+// through the collector's own wordToArg, assignment prefixes never
+// appear here because the declare family is a DeclClause in the bash
+// dialect and readonly-export POSIX words carry no prefix assigns.
+func (c *subCollector) callArgsArgv(call *syntax.CallExpr) []string {
+	if call == nil {
+		return nil
+	}
+	argv := make([]string, 0, len(call.Args))
+	for _, w := range call.Args {
+		s, _ := c.wordToArg(w)
+		argv = append(argv, s)
+	}
+	return argv
 }
 
 // declClauseArgv serializes the positional operands of one declare/
@@ -1966,6 +2035,16 @@ func (c *subCollector) declClauseArgv(d *syntax.DeclClause) []string {
 		argv = append(argv, d.Variant.Value)
 	}
 	for _, a := range d.Args {
+		if a.Naked && a.Name == nil && a.Value != nil {
+			// R25-Oracle-MF2 / R25-Reviewer-#3: a bash declaration flag word
+			// (`declare -r`, `-xr`, `--`) is Naked=true with NO name —
+			// assignToPrefix serializes that shape to the empty string and
+			// the readonly scan never sees the -r cluster. Serialize the
+			// flag word itself exactly like emitDecl does.
+			s, _ := c.wordToArg(a.Value)
+			argv = append(argv, s)
+			continue
+		}
 		argv = append(argv, c.assignToPrefix(a))
 	}
 	return argv
@@ -1997,6 +2076,12 @@ func (c *subCollector) taintStmtSharedWrites(st *syntax.Stmt) {
 // in the substitution success proofs. Walked nested eval texts recurse
 // through the same budgeted scan-and-taint path; every other write shape
 // inside the compound is already covered by writtenNamesInNode.
+// R25-Oracle-MF3 / R25-Reviewer-#4: the scan is process-BOUNDARY aware —
+// eval texts re-parsed inside a child-process subtree (a backgrounded
+// statement, a pipeline component, a command/process substitution, a
+// subshell or a coprocess) install their positional facts inside a
+// registry frame the subtree exit rolls back, because the re-parsed
+// text no longer carries the bits of the process it runs in.
 func (c *subCollector) taintHiddenEvalWrites(st *syntax.Stmt, depth int) {
 	scanWord := wordToArg
 	if c.posixNoBraces {
@@ -2010,21 +2095,90 @@ func (c *subCollector) taintHiddenEvalWrites(st *syntax.Stmt, depth int) {
 	if call, isCall := st.Cmd.(*syntax.CallExpr); isCall {
 		c.taintOneEvalCallWrites(call, scanWord, depth+1)
 	}
-	syntax.Walk(st.Cmd, func(node syntax.Node) bool {
-		if node == nil {
-			return false
+	c.scanHiddenEvalDispatch(st.Cmd, scanWord, depth)
+}
+
+// scanHiddenEvalDispatch routes one AST node of the hidden-eval scan
+// either into a framed child-process subtree scan or into the plain
+// same-process descent (extracted for the R25 complexity budget):
+// pipeline components, substitutions, subshells and coprocesses run in
+// their own child processes, so every positional registration inside
+// them belongs to a registry frame that closes when the subtree scan
+// completes. The conservative variable taint the replays produce is
+// unaffected — pollution belongs to the possibility, never the process.
+func (c *subCollector) scanHiddenEvalDispatch(node syntax.Node, scanWord func(*syntax.Word) (string, bool), depth int) {
+	if node == nil {
+		return
+	}
+	child := false
+	switch x := node.(type) {
+	case *syntax.CmdSubst, *syntax.ProcSubst, *syntax.Subshell, *syntax.CoprocClause:
+		child = true
+	case *syntax.BinaryCmd:
+		child = x.Op == syntax.Pipe || x.Op == syntax.PipeAll
+	}
+	if child {
+		restore := c.snapshotProcessRegs()
+		c.scanHiddenEvalNode(node, scanWord, depth)
+		restore()
+		return
+	}
+	c.scanHiddenEvalNode(node, scanWord, depth)
+}
+
+// scanHiddenEvalNode walks one AST node for nested eval invocations: a
+// statement node is dispatched through the boundary-aware check (a
+// backgrounded or coprocess statement is a child process exactly like
+// the outer spelling), and every other node recurses into its immediate
+// children so the scan visits the whole subtree exactly once —
+// syntax.Walk lacks an exit hook, so the process-boundary frames are
+// driven by explicit recursion instead.
+func (c *subCollector) scanHiddenEvalNode(node syntax.Node, scanWord func(*syntax.Word) (string, bool), depth int) {
+	if node == nil {
+		return
+	}
+	syntax.Walk(node, func(n syntax.Node) bool {
+		if n == node {
+			return true // descend into the children; the root itself was already dispatched
 		}
-		ist, isStmt := node.(*syntax.Stmt)
-		if !isStmt || ist.Cmd == nil {
-			return true
-		}
-		call, isCall := ist.Cmd.(*syntax.CallExpr)
-		if !isCall {
-			return true
-		}
-		c.taintOneEvalCallWrites(call, scanWord, depth+1)
-		return true
+		c.scanHiddenEvalChild(n, scanWord, depth)
+		return false
 	})
+}
+
+// scanHiddenEvalChild is the per-child dispatch of scanHiddenEvalNode
+// (extracted so the recursion closure carries no branching): statement
+// nodes check the hidden eval call or enter their own boundary frame,
+// everything else descends through the boundary dispatcher.
+func (c *subCollector) scanHiddenEvalChild(n syntax.Node, scanWord func(*syntax.Word) (string, bool), depth int) {
+	if ist, isStmt := n.(*syntax.Stmt); isStmt {
+		c.scanHiddenEvalStmt(ist, scanWord, depth)
+		return
+	}
+	c.scanHiddenEvalDispatch(n, scanWord, depth)
+}
+
+// scanHiddenEvalStmt checks one statement node of the hidden-eval scan:
+// a backgrounded or coprocess statement scans its subtree inside a
+// registry frame (its eval replays install child-process-only facts),
+// while a same-process statement's root call is checked directly and
+// its subtree descends normally.
+func (c *subCollector) scanHiddenEvalStmt(ist *syntax.Stmt, scanWord func(*syntax.Word) (string, bool), depth int) {
+	if ist.Cmd == nil {
+		return
+	}
+	if ist.Background || ist.Coprocess {
+		defer c.snapshotProcessRegs()()
+		if call, isCall := ist.Cmd.(*syntax.CallExpr); isCall {
+			c.taintOneEvalCallWrites(call, scanWord, depth+1)
+		}
+		c.scanHiddenEvalDispatch(ist.Cmd, scanWord, depth)
+		return
+	}
+	if call, isCall := ist.Cmd.(*syntax.CallExpr); isCall {
+		c.taintOneEvalCallWrites(call, scanWord, depth+1)
+	}
+	c.scanHiddenEvalDispatch(ist.Cmd, scanWord, depth)
 }
 
 // taintEvalBoundary applies the maximal pollution verdict for an
@@ -2116,6 +2270,28 @@ func (c *subCollector) bindEvalStmtWrites(stmts []*syntax.Stmt, depth int) {
 // eval text (extracted from bindEvalStmtWrites so the shadowing
 // registration carries no extra nesting — R22 complexity budget).
 func (c *subCollector) bindEvalOneStmt(st *syntax.Stmt, depth int) {
+	// R25-Oracle-MF3 / R25-Reviewer-#4: a backgrounded or coprocess
+	// statement inside the eval text runs in its own child process —
+	// every positional registration the nested replay produces inside
+	// it (including static eval texts re-parsed deeper down) dies with
+	// the child, so the whole statement replays inside one registry
+	// frame. The conservative variable TAINT of the same writes is
+	// deliberately unaffected: pollution belongs to the possibility,
+	// never the process ownership.
+	if st.Background || st.Coprocess {
+		defer c.snapshotProcessRegs()()
+		c.bindEvalOneStmtBody(st, depth)
+		return
+	}
+	c.bindEvalOneStmtBody(st, depth)
+}
+
+// bindEvalOneStmtBody is the replay body of bindEvalOneStmt (extracted
+// for the R25 complexity budget — the process-boundary frame carries no
+// statement-shape branching): the nesting below is exactly the pre-R25
+// replay, now guaranteed to run under the boundary frame the child
+// process requires.
+func (c *subCollector) bindEvalOneStmtBody(st *syntax.Stmt, depth int) {
 	// R22-Oracle-M1 / R22-Reviewer-#3: the nested replay shares the
 	// shadowing premise with the outer walk — a shell function
 	// definition inside the eval text takes effect for every LATER
@@ -2574,6 +2750,10 @@ type subCollector struct {
 type processRegFrame struct {
 	funcs    map[string]bool
 	readonly map[string]bool
+	// restored latches the frame closed exactly once (R25): a double
+	// restore of the same frame must never delete keys a LATER child
+	// legitimately re-registered.
+	restored bool
 }
 
 // shellNonBindableVars are the Bash/POSIX special variables whose value
@@ -2640,32 +2820,40 @@ func (c *subCollector) enterConditional() func() {
 // deletes exactly those additions. The maps themselves never move, the
 // parent's entries are immutable at runtime (registrations only ever
 // write true), and a child that defines or declares nothing pays O(1).
+// R25: the closure is a single-line delegation so the undo bookkeeping
+// carries its complexity budget inside one named method.
 func (c *subCollector) snapshotProcessRegs() func() {
 	frame := &processRegFrame{}
 	c.regUndo = append(c.regUndo, frame)
-	restored := false
-	return func() {
-		if restored {
-			return
+	return func() { c.restoreProcessRegFrame(frame) }
+}
+
+// restoreProcessRegFrame is the single-owner undo of one
+// snapshotProcessRegs frame (extracted for the R25 complexity budget —
+// the closure must carry no scan branching): restoring once deletes
+// exactly the additions the frame recorded while it was innermost, and
+// a stale or already-restored frame is a no-op.
+func (c *subCollector) restoreProcessRegFrame(frame *processRegFrame) {
+	if frame.restored {
+		return
+	}
+	frame.restored = true
+	idx := -1
+	for i := len(c.regUndo) - 1; i >= 0; i-- {
+		if c.regUndo[i] == frame {
+			idx = i
+			break
 		}
-		restored = true
-		idx := -1
-		for i := len(c.regUndo) - 1; i >= 0; i-- {
-			if c.regUndo[i] == frame {
-				idx = i
-				break
-			}
-		}
-		if idx < 0 {
-			return
-		}
-		c.regUndo = append(c.regUndo[:idx], c.regUndo[idx+1:]...)
-		for name := range frame.funcs {
-			delete(c.funcNames, name)
-		}
-		for name := range frame.readonly {
-			delete(c.readonlyVars, name)
-		}
+	}
+	if idx < 0 {
+		return
+	}
+	c.regUndo = append(c.regUndo[:idx], c.regUndo[idx+1:]...)
+	for name := range frame.funcs {
+		delete(c.funcNames, name)
+	}
+	for name := range frame.readonly {
+		delete(c.readonlyVars, name)
 	}
 }
 
@@ -2715,32 +2903,43 @@ func (c *subCollector) noteSameProcessFuncDefs(st *syntax.Stmt) {
 	if childProcStmtBoundary(st) {
 		return
 	}
-	syntax.Walk(st.Cmd, func(node syntax.Node) bool {
-		if node == nil {
+	// R25: the walk callback is a single-line delegation so the
+	// function-definition scan carries its boundary branching inside one
+	// named method (complexity budget).
+	syntax.Walk(st.Cmd, func(node syntax.Node) bool { return c.visitSameProcessFuncDefNode(node) })
+}
+
+// visitSameProcessFuncDefNode is the per-node scan of
+// noteSameProcessFuncDefs (extracted for the R25 complexity budget):
+// nested statements carry their own process bits (a backgrounded brace
+// group is a child process exactly like the outer spelling), same-process
+// compound blocks register their definitions, and definitions inside
+// child-process shapes die with the child.
+func (c *subCollector) visitSameProcessFuncDefNode(node syntax.Node) bool {
+	if node == nil {
+		return false
+	}
+	switch x := node.(type) {
+	case *syntax.Stmt:
+		// Nested statements carry their own process bits: a pipeline
+		// component or brace group followed by `&` inside the eval text
+		// is a child process exactly like the outer spelling.
+		if x.Background || x.Coprocess {
 			return false
 		}
-		switch x := node.(type) {
-		case *syntax.Stmt:
-			// Nested statements carry their own process bits: a pipeline
-			// component or brace group followed by `&` inside the eval text
-			// is a child process exactly like the outer spelling.
-			if x.Background || x.Coprocess {
-				return false
-			}
-			return true
-		case *syntax.FuncDecl:
-			c.noteFuncDef(x)
-			return true
-		case *syntax.BinaryCmd:
-			if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
-				return false // pipeline components are child processes
-			}
-			return true
-		case *syntax.CmdSubst, *syntax.ProcSubst, *syntax.Subshell, *syntax.CoprocClause:
-			return false // child processes: definitions die with them
+		return true
+	case *syntax.FuncDecl:
+		c.noteFuncDef(x)
+		return true
+	case *syntax.BinaryCmd:
+		if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
+			return false // pipeline components are child processes
 		}
 		return true
-	})
+	case *syntax.CmdSubst, *syntax.ProcSubst, *syntax.Subshell, *syntax.CoprocClause:
+		return false // child processes: definitions die with them
+	}
+	return true
 }
 
 // noteFuncDef records a shell function definition (R22-Oracle-M1 /
@@ -3555,6 +3754,23 @@ func (c *subCollector) walkStmt(st *syntax.Stmt, feed stdinFeed) {
 	}
 }
 
+// noteDeclInlineAssign replays the inline bind of one declaration
+// assignment word (extracted for the R25 complexity budget —
+// R25-Oracle-MF1 / R25-Reviewer-#2-alignment): the declaration entry
+// mirrors the pure-assignment path at emitCall — bash's `+=`
+// concatenates onto the unknowable inherited value and an
+// array-subscript write leaves every other element intact, so neither
+// operator can mint the literal RHS as the scalar binding; the
+// conservative verdict is pollution, never the exact value.
+func (c *subCollector) noteDeclInlineAssign(a *syntax.Assign) {
+	if a.Append || a.Index != nil {
+		c.noteShellAssign(a.Name.Value, "", false)
+		return
+	}
+	val, stOk := c.staticAssignVal(a.Value)
+	c.noteShellAssign(a.Name.Value, val, stOk)
+}
+
 func (c *subCollector) emitDecl(st *syntax.Stmt, d *syntax.DeclClause, feed stdinFeed) {
 	c.emitNestedFromNode(d, feed)
 	argv := make([]string, 0, 1+len(d.Args))
@@ -3567,8 +3783,7 @@ func (c *subCollector) emitDecl(st *syntax.Stmt, d *syntax.DeclClause, feed stdi
 	for _, a := range d.Args {
 		if a.Name != nil && !a.Naked {
 			argv = append(argv, c.assignToPrefix(a))
-			val, stOk := c.staticAssignVal(a.Value)
-			c.noteStaticAssign(a.Name.Value, val, stOk)
+			c.noteDeclInlineAssign(a)
 			continue
 		}
 		if a.Name != nil && a.Naked {
@@ -4262,10 +4477,17 @@ func (c *subCollector) newSub() *subCollector {
 		// the parent's map can never mutate underneath because the walk
 		// is single-threaded and the substitution collector is discarded
 		// before the walk resumes.
-		readonlyVars:       c.readonlyVars,
-		funcNames:          c.funcNames,
-		readonlyVarsShared: len(c.readonlyVars) > 0,
-		funcNamesShared:    len(c.funcNames) > 0,
+		readonlyVars: c.readonlyVars,
+		funcNames:    c.funcNames,
+		// R25-Oracle-MF3 / R25-Reviewer-#5: the sharing verdict keys on the
+		// map REFERENCE itself, never its element count — an incremental
+		// undo restore that deleted the last key leaves a non-nil empty
+		// map, and a substitution writing into that aliased reference
+		// would mutate the parent's table in place. nil means the child
+		// may mint its own table; any non-nil reference is shared state
+		// whose first write must clone.
+		readonlyVarsShared: c.readonlyVars != nil,
+		funcNamesShared:    c.funcNames != nil,
 		allowBind:          false,
 		childScope:         true,           // $(...) / <(...) run in their own child process (R20-Oracle-M3)
 		scopeCounter:       c.scopeCounter, // R21-Oracle-M3: share the unique scope id space

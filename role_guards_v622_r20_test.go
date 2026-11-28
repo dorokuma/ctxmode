@@ -1787,3 +1787,307 @@ func TestGuard_V622_OracleR24Probes(t *testing.T) {
 		}
 	})
 }
+
+// TestGuard_V622_OracleR25Probes pins the Oracle R25 / Reviewer R25
+// closure — one discriminating subtest per intersecting finding:
+//
+//	R25-1: the declare-family emission path never mints a scalar static
+//	  binding for an array-subscript or `+=` assignment either (the
+//	  R24 fix covered only emitCall), while a plain declare bind stays
+//	  exact (Oracle MF1).
+//	R25-2: the static eval readonly replay covers the POSIX CallExpr
+//	  shape and bash's `declare -r` flag word, not only the bash bare
+//	  readonly DeclClause (Oracle MF2 / Reviewer #3).
+//	R25-3: a non-nil but EMPTY registry map still counts as shared for
+//	  the substitution collector's copy-on-write, and positional facts
+//	  replayed inside child-process eval shapes roll back with the
+//	  child while the foreground equivalents register (Oracle MF3 /
+//	  Reviewer #4/#5).
+//	R25-4: the xargs replacement-mode recursion-depth cutoff records
+//	  the sticky exhaustion bit exactly like the append-mode cutoff
+//	  (Oracle MF4 / Reviewer #2).
+//	R25-5: the SSH stdin-program body review consumes the target's
+//	  folded remote environment exactly like the heredoc entry, the
+//	  xargs inner shell target carries the consuming shell's dialect,
+//	  and the legacy pure-vehicle spelling delegates to the production
+//	  entry (Oracle MF5 + SF2 / Reviewer #6/#10).
+//	R25-6: bare external wrapper adoption is validated at EVERY peel
+//	  layer with the layer-folded environment, while fixed-path GNU
+//	  aliases keep their slash identity (Oracle MF6 / Reviewer #1).
+//
+// Every discriminating row is FAIL-first on the pre-fix tree 028ac50:
+// the probes reference only symbols that already exist there (the
+// collectors, the stdin projection helpers, the xargs budget table and
+// the ssh screen entries), so the file compiles verbatim on the parent
+// tree and the failures reproduce the audit findings directly.
+func TestGuard_V622_OracleR25Probes(t *testing.T) {
+	// ---- R25-1: the declare-family path shares the operator verdict ----
+	t.Run("R25-1 declare-family append and subscript assignments never mint scalar static bindings", func(t *testing.T) {
+		emitDeclAssign := func(src string) *subCollector {
+			t.Helper()
+			p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+			f, err := p.Parse(strings.NewReader(src), "")
+			if err != nil || len(f.Stmts) != 1 {
+				t.Fatalf("parse %q: err=%v stmts=%d", src, err, len(f.Stmts))
+			}
+			decl, isDecl := f.Stmts[0].Cmd.(*syntax.DeclClause)
+			if !isDecl {
+				t.Fatalf("fixture broken: %q root cmd is %T, want DeclClause", src, f.Stmts[0].Cmd)
+			}
+			c := blankSubCollector()
+			c.allowBind = true
+			c.emitDecl(f.Stmts[0], decl, stdinFeed{})
+			return c
+		}
+		if got := emitDeclAssign(`declare ARR[1]=/marker`).staticVars["ARR"]; got == "/marker" {
+			t.Fatalf("declare ARR[1]=/marker minted staticVars[ARR]=%q — a subscript write touches one array element and can never establish the scalar value later expansion reads; the declare path must share emitCall's operator verdict", got)
+		}
+		if got := emitDeclAssign(`declare VAR+=/marker`).staticVars["VAR"]; got == "/marker" {
+			t.Fatalf("declare VAR+=/marker minted staticVars[VAR]=%q — bash concatenates the suffix onto the inherited value, so the literal suffix is never the exact scalar binding; the declare path must share emitCall's operator verdict", got)
+		}
+		if got := emitDeclAssign(`declare VAR=/marker`).staticVars["VAR"]; got != "/marker" {
+			t.Fatalf("control broken: plain declare VAR=/marker staticVars[VAR]=%q, want /marker — the independent plain declaration assignment must keep its exact binding", got)
+		}
+	})
+
+	// ---- R25-2: readonly replay covers POSIX calls and declare -r ----
+	t.Run("R25-2 eval readonly replay covers the POSIX CallExpr and the declare -r flag word", func(t *testing.T) {
+		replay := func(posix bool, text string) *subCollector {
+			t.Helper()
+			c := blankSubCollector()
+			c.allowBind = true
+			c.posixNoBraces = posix
+			c.bindEvalTextWrites(text, 0)
+			return c
+		}
+		if !replay(true, "readonly AUDIT_MARK").readonlyVars["AUDIT_MARK"] {
+			t.Fatalf("POSIX-mode eval replay of 'readonly AUDIT_MARK' left readonlyVars empty — POSIX parses readonly as a CallExpr, and the replication must record the attribute exactly like the main traversal's emitCall")
+		}
+		if !replay(false, "declare -r AUDIT_MARK").readonlyVars["AUDIT_MARK"] {
+			t.Fatalf("bash-mode eval replay of 'declare -r AUDIT_MARK' left readonlyVars empty — the declaration's -r flag word is Naked=true with no name, and serializing it as an empty string loses the readonly cluster")
+		}
+		if !replay(false, "readonly AUDIT_MARK").readonlyVars["AUDIT_MARK"] {
+			t.Fatalf("control broken: bash-mode eval replay of bare 'readonly AUDIT_MARK' left readonlyVars empty — the R24 DeclClause replay itself regressed")
+		}
+	})
+
+	// ---- R25-3: empty-but-aliased registries stay copy-on-write ----
+	t.Run("R25-3 an emptied parent registry map never aliases substitution writes", func(t *testing.T) {
+		parent := blankSubCollector()
+		// Open a child-process frame, register one throwaway function and
+		// restore it: the undo deletes the key but the map OBJECT stays
+		// non-nil — exactly the state a finished child shell leaves behind.
+		restore := parent.snapshotProcessRegs()
+		parent.noteFuncDef(&syntax.FuncDecl{Name: &syntax.Lit{Value: "r25tmpfn"}})
+		restore()
+		if parent.funcNames == nil || len(parent.funcNames) != 0 {
+			t.Fatalf("fixture broken: after the insert/restore cycle funcNames=%v (nil=%v) — the audit's premise is a non-nil empty map", parent.funcNames, parent.funcNames == nil)
+		}
+		sub := parent.newSub()
+		sub.noteFuncDef(&syntax.FuncDecl{Name: &syntax.Lit{Value: "r25subfn"}})
+		if parent.funcNames["r25subfn"] {
+			t.Fatalf("substitution function write leaked into the parent registry — a non-nil empty map is still a shared reference whose first write must clone, never an element-count verdict")
+		}
+		restoreRO := parent.snapshotProcessRegs()
+		parent.noteReadonlyDecls([]string{"readonly", "R25TMPRO"})
+		restoreRO()
+		if parent.readonlyVars == nil || len(parent.readonlyVars) != 0 {
+			t.Fatalf("fixture broken: after the readonly insert/restore cycle readonlyVars=%v — the audit's premise is a non-nil empty map", parent.readonlyVars)
+		}
+		sub2 := parent.newSub()
+		sub2.noteReadonlyDecls([]string{"readonly", "R25SUBRO"})
+		if parent.readonlyVars["R25SUBRO"] {
+			t.Fatalf("substitution readonly write leaked into the parent registry — the empty aliased map was mutated in place")
+		}
+	})
+	t.Run("R25-3 child-process eval replay registrations die with the child", func(t *testing.T) {
+		probe := func(script string) *subCollector {
+			t.Helper()
+			p := syntax.NewParser(syntax.Variant(syntax.LangBash))
+			f, err := p.Parse(strings.NewReader(script), "")
+			if err != nil || len(f.Stmts) != 1 {
+				t.Fatalf("parse %q: err=%v stmts=%d", script, err, len(f.Stmts))
+			}
+			call, isCall := f.Stmts[0].Cmd.(*syntax.CallExpr)
+			if !isCall {
+				t.Fatalf("fixture broken: %q root cmd is %T, want CallExpr", script, f.Stmts[0].Cmd)
+			}
+			c := blankSubCollector()
+			c.allowBind = true
+			c.bindEvalCallWrites(f.Stmts[0], call)
+			return c
+		}
+		bg := probe(`eval 'readonly AUDIT_CHILD; r25child() { :; }' &`)
+		if bg.readonlyVars["AUDIT_CHILD"] || bg.funcNames["r25child"] {
+			t.Fatalf("backgrounded static eval replay registered child-process facts into the parent (readonly=%v funcs=%v) — the re-parse text carries no process bits, so the replay must frame the whole child-process statement", bg.readonlyVars, bg.funcNames)
+		}
+		nestedBg := probe(`eval "eval 'readonly AUDIT_NESTED; r25nested() { :; }' &"`)
+		if nestedBg.readonlyVars["AUDIT_NESTED"] || nestedBg.funcNames["r25nested"] {
+			t.Fatalf("nested backgrounded eval replay registered child-process facts into the parent (readonly=%v funcs=%v) — the inner eval statement's background bit must survive the re-parse through the boundary frame", nestedBg.readonlyVars, nestedBg.funcNames)
+		}
+		fg := probe(`eval 'readonly AUDIT_FG; r25fg() { :; }'`)
+		if !fg.readonlyVars["AUDIT_FG"] || !fg.funcNames["r25fg"] {
+			t.Fatalf("control broken: foreground static eval replay lost its positional facts (readonly=%v funcs=%v) — a same-process eval re-parse registers exactly like the direct spelling", fg.readonlyVars, fg.funcNames)
+		}
+		nestedFg := probe(`eval "eval 'readonly AUDIT_NFG'"`)
+		if !nestedFg.readonlyVars["AUDIT_NFG"] {
+			t.Fatalf("control broken: foreground nested eval replay lost its readonly registration — the frame must roll back ONLY the child-process shapes")
+		}
+	})
+
+	// ---- R25-4: replacement-mode depth cutoff records exhaustion ----
+	t.Run("R25-4 replacement-mode recursion-depth cutoff is sticky exhaustion", func(t *testing.T) {
+		argv := []string{"cat"}
+		for i := 0; i < peelChainMaxDepth+2; i++ {
+			argv = append([]string{"xargs"}, argv...)
+		}
+		// Switch the OUTERMOST xargs to replacement mode with one token the
+		// tree never carries: the replacement-slot scan descends the same
+		// chain independently of the append analysis, and its own depth
+		// cutoff must record the same exhaustion verdict.
+		argv = append([]string{"xargs", "-I{}"}, argv...)
+		fresh := &xargsWorkState{}
+		targets := stdinProgramTargetsDialect(argv, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{xw: fresh}, false)
+		if !xargsBudgetSpent(fresh) {
+			t.Fatalf("replacement-mode deeply nested xargs projection did not mark the caller's request table exhausted — the replacement-slot scan's depth cutoff returned a bare hit verdict and the projection re-read it as a confirmed consumer")
+		}
+		hasExhausted := false
+		for _, tg := range targets {
+			if tg.exhausted {
+				hasExhausted = true
+			}
+		}
+		if !hasExhausted {
+			t.Fatalf("replacement-mode deeply nested xargs projection = %v targets with NO exhaustion marker — an analysis cutoff can never pose as a confirmed empty-language target", targets)
+		}
+		first, okFirst := firstProgramTarget(targets)
+		if okFirst && stdinShellTargetRewriteable(first, false) {
+			t.Fatalf("replacement-mode depth-cutoff projection remained rewrite-eligible (%+v) — an unidentified consumer is never a certified shell program", first)
+		}
+	})
+
+	// ---- R25-5: SSH body environment, xargs inner dialect, vehicle delegation ----
+	t.Run("R25-5 the SSH stdin body review consumes the target's folded remote environment", func(t *testing.T) {
+		t.Setenv("HOME", "/home/r25parent")
+		// A conditional remote HOME write marks the variable uncertain in
+		// the target's folded envAs: the body's $HOME expansion must face
+		// the taint exactly like the heredoc entry, never re-read the
+		// parent process HOME.
+		var folded envAssignments
+		folded.ops = append(folded.ops, envOp{kind: 't', key: "HOME"})
+		targets := []stdinTarget{{lang: "", envAs: folded}}
+		seg := shellSegment{heredocText: []heredocBody{{text: "\"$HOME/bin/hc\""}}}
+		sshHit := sshStdinProgramBodiesHit(targets, seg, 's', 0, true, callerIdentity{})
+		hdHit := screenHeredocBodyTargetsDepth("\"$HOME/bin/hc\"", targets, 's', 0, callerIdentity{})
+		if hdHit == "" {
+			t.Fatalf("control broken: the heredoc body entry screens the HOME-tainted $HOME/bin/hc body clean — the tainted-HOME verdict fixture itself regressed")
+		}
+		if sshHit != hdHit {
+			t.Fatalf("SSH stdin body review verdict %q vs heredoc entry %q — the SSH path re-uses the local caller instead of seeding the remote identity with the target's folded environment, so the same body faces two different environments", sshHit, hdHit)
+		}
+	})
+	t.Run("R25-5 the xargs inner shell target carries the consuming shell dialect", func(t *testing.T) {
+		probe := func(shell string) stdinTarget {
+			t.Helper()
+			xw := &xargsWorkState{}
+			targets := stdinProgramTargetsDialect([]string{"xargs", "-I{}", shell, "-c", "{}"}, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{xw: xw}, false)
+			first, okFirst := firstProgramTarget(targets)
+			if !okFirst {
+				t.Fatalf("xargs -I{} %s -c {} projected no program target (%v)", shell, targets)
+			}
+			if first.exhausted {
+				t.Fatalf("xargs -I{} %s -c {} projected an exhausted target (%+v) — the confirmed open code slot is a definite consumer", shell, first)
+			}
+			return first
+		}
+		if got := probe("bash"); !got.bash {
+			t.Fatalf("xargs bash -c inner target bash=%v — a remote bash reading stdin brace-expands exactly like a local one, and the open-code-slot projection never wrote the dialect bit", got.bash)
+		}
+		if got := probe("dash"); got.bash {
+			t.Fatalf("control broken: xargs dash -c inner target bash=%v — dash is never the brace-expanding dialect", got.bash)
+		}
+	})
+	t.Run("R25-5 the legacy pure-vehicle spelling delegates to the production entry", func(t *testing.T) {
+		// The delegation proof is behavioral identity at the shared tail:
+		// both spellings must agree on the four legacy vehicle shapes —
+		// a parallel implementation could diverge on any of them while
+		// the shared stdinTargetsAllPureShell tail stays green.
+		for _, tc := range []struct {
+			name string
+			cmd  string
+		}{
+			{"plain shell", "sh"},
+			{"nested inner shell", "sh -c 'cat; sh'"},
+			{"assignment mutation", "X=1 sh"},
+			{"redirect mutation", "sh > /tmp/r25v"},
+		} {
+			cwd := isPureRemoteStdinVehicleCwd(tc.cmd, "/tmp")
+			caller := isPureRemoteStdinVehicleCaller(tc.cmd, stdinEntryCaller("/tmp"))
+			if cwd != caller {
+				t.Fatalf("%s: isPureRemoteStdinVehicleCwd=%v vs production isPureRemoteStdinVehicleCaller=%v — the legacy spelling is a parallel implementation that can diverge while the tests stay green", tc.name, cwd, caller)
+			}
+		}
+	})
+
+	// ---- R25-6: per-layer wrapper validation; fixed-path GNU aliases ----
+	t.Run("R25-6 bare external wrappers are validated at every peel layer", func(t *testing.T) {
+		var untrusted envAssignments
+		untrusted.ops = append(untrusted.ops, envOp{kind: 't', key: "PATH"})
+		assertExhaustion := func(argv []string, want bool) {
+			t.Helper()
+			targets := stdinProgramTargetsDialect(argv, 0, untrusted, "/usr/bin:/bin", callerIdentity{}, false)
+			got := false
+			for _, tg := range targets {
+				if tg.exhausted {
+					got = true
+				}
+			}
+			if got != want {
+				t.Fatalf("stdinProgramTargetsDialect(%v) exhaustion = %v, want %v (targets=%v) — every bare external wrapper layer owes its own resolution to the untrusted PATH, no matter how many transparent or fixed-path layers precede it", argv, got, want, targets)
+			}
+		}
+		// The R24 single-layer rows must survive unchanged.
+		assertExhaustion([]string{"env", "/bin/sh"}, true)
+		assertExhaustion([]string{"nice", "/bin/sh"}, true)
+		assertExhaustion([]string{"/usr/bin/env", "/bin/sh"}, false)
+		assertExhaustion([]string{"exec", "/bin/sh"}, false)
+		// The discriminating rows: a transparent shell builtin or a
+		// fixed-path env layer in front of the bare external wrapper must
+		// not shield it — the peel adopts the inner identity in the same
+		// invocation, so the validation must follow layer by layer.
+		assertExhaustion([]string{"command", "env", "/bin/sh"}, true)
+		assertExhaustion([]string{"/usr/bin/env", "nice", "/bin/sh"}, true)
+	})
+	t.Run("R25-6 a polluting PATH assignment folds before the bare wrapper validation", func(t *testing.T) {
+		// No inherited taint: the prefix assignment itself carries the
+		// unresolvable placeholder, so only a validator that FOLDS the
+		// assignment words can see the untrusted PATH the bare env layer
+		// resolves under.
+		polluted := []string{"PATH=" + cmdSubPlaceholder + ":/evil", "env", "/bin/sh"}
+		targets := stdinProgramTargetsDialect(polluted, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+		got := false
+		for _, tg := range targets {
+			if tg.exhausted {
+				got = true
+			}
+		}
+		if !got {
+			t.Fatalf("stdinProgramTargetsDialect(%v) exhaustion = false (targets=%v) — the bare env wrapper resolves under the PATH the prefix assignment itself polluted; skipping the assignment word without folding it validates the wrong environment", polluted, targets)
+		}
+	})
+	t.Run("R25-6 a fixed-path GNU wrapper alias keeps its slash identity across the canon rewrite", func(t *testing.T) {
+		var untrusted envAssignments
+		untrusted.ops = append(untrusted.ops, envOp{kind: 't', key: "PATH"})
+		targets := stdinProgramTargetsDialect([]string{"/usr/bin/genv", "/bin/sh"}, 0, untrusted, "/usr/bin:/bin", callerIdentity{}, false)
+		first, okFirst := firstProgramTarget(targets)
+		if !okFirst {
+			t.Fatalf("/usr/bin/genv /bin/sh projected no program target (%v) — the fixed-path alias strips to /bin/sh exactly like the directly spelled env", targets)
+		}
+		if first.exhausted {
+			t.Fatalf("/usr/bin/genv /bin/sh under untrusted PATH became exhausted (%+v) — the canonical rewrite dropped the directory prefix and the bare canon word was misread as PATH-dependent even though the original spelling carries its own resolution", first)
+		}
+		if first.lang != "" || first.data {
+			t.Fatalf("control broken: /usr/bin/genv /bin/sh projected (%+v) — the peeled fixed-path shell target itself regressed", first)
+		}
+	})
+}
