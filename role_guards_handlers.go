@@ -1107,7 +1107,21 @@ func stdinProgramTargetsWithEnv(argv []string, depth int, inherited envAssignmen
 // R16 M2); heads that spawn a FRESH shell (flock -c / script -c / watch /
 // `sh -c` unwrapping) pick their own dialect below and never inherit it.
 func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity, bash bool) []stdinTarget {
-	head, envAs, caller, prologue := stdinTargetsPeelPrologue(argv, depth, inherited, basePath, caller)
+	return stdinProgramTargetsDialectSteps(argv, depth, inherited, basePath, caller, bash, nil)
+}
+
+// stdinProgramTargetsDialectSteps is stdinProgramTargetsDialect plus the
+// shared wrapper-step budget (R27-Oracle-M4 / R27-Reviewer-#5): a nil
+// steps mints a fresh per-projection budget exactly like the pre-R27
+// shape; a non-nil one is threaded through the canonical-alias and
+// resolved-wrapper recursion so the WHOLE projection chain shares one
+// peelWrapperMaxSteps budget.
+func stdinProgramTargetsDialectSteps(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity, bash bool, steps *int) []stdinTarget {
+	if steps == nil {
+		fresh := 0
+		steps = &fresh
+	}
+	head, envAs, caller, prologue := stdinTargetsPeelPrologue(argv, depth, inherited, basePath, caller, steps)
 	if prologue != nil {
 		return prologue
 	}
@@ -1133,7 +1147,7 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 	// file or lose the fixed-path identity); the canonical name is for
 	// branch classification only.
 	origHead := head[0]
-	head, base, recursed := stdinCanonHeadRewrite(head, base, depth, envAs, basePath, caller, bash)
+	head, base, recursed := stdinCanonHeadRewrite(head, base, depth, envAs, basePath, caller, bash, steps)
 	if recursed.fired {
 		return recursed.targets
 	}
@@ -1150,7 +1164,9 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 	}
 	if rb := canonicalResolvedBase(resolveHeadBase(origHead, effPath, caller.screenCwd())); rb != "" && rb != base {
 		if isPeeledWrapperBase(rb) {
-			return stdinProgramTargetsDialect(append([]string{rewriteKeepSlashIdentity(origHead, rb)}, head[1:]...), depth+1, envAs, basePath, caller, bash)
+			// R27-Oracle-M4 / R27-Reviewer-#5: the resolved-wrapper recursion
+			// threads the same shared wrapper-step budget.
+			return stdinProgramTargetsDialectSteps(append([]string{rewriteKeepSlashIdentity(origHead, rb)}, head[1:]...), depth+1, envAs, basePath, caller, bash, steps)
 		}
 		if !isStructuralGuardHead(base) {
 			head = append([]string{rb}, head[1:]...)
@@ -1225,7 +1241,12 @@ func stdinProgramTargetsDialect(argv []string, depth int, inherited envAssignmen
 // op stays visible to the caller; seeding also covers envTaint/pathEnv
 // — a canon-rewritten recursion (`env -C sub genv ./mysh`) must keep
 // the -C re-anchor and the `u`/`a` taints it peeled (R5 MF-4).
-func stdinTargetsPeelPrologue(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity) ([]string, envAssignments, callerIdentity, []stdinTarget) {
+// stdinTargetsPeelPrologue carries the shared wrapper-step budget
+// (R27-Oracle-M4 / R27-Reviewer-#5): steps threads the SAME counter the
+// canonical-alias and resolved-wrapper recursion of
+// stdinProgramTargetsDialect shares, so a fixed-path wrapper alias can
+// never launder a deep wrapper chain into two under-budget halves.
+func stdinTargetsPeelPrologue(argv []string, depth int, inherited envAssignments, basePath string, caller callerIdentity, steps *int) ([]string, envAssignments, callerIdentity, []stdinTarget) {
 	if len(argv) == 0 {
 		return nil, inherited, caller, nil
 	}
@@ -1241,8 +1262,12 @@ func stdinTargetsPeelPrologue(argv []string, depth int, inherited envAssignments
 	// judged env against the POST-layer environment its operands
 	// install for the NEXT layer), and the trailing missing-operand
 	// zones clamp at exactly len(argv) instead of slicing past it.
-	tk := newWrapperPathTracker(basePath, inherited, caller)
-	head, _, ea, exhausted := peelWrappersCore(argv, tk)
+	// R27-Oracle-M3 / R27-Reviewer-#4: the shell-dispatched prologue runs
+	// in directExec false — bare command/builtin/exec layers keep their
+	// shell builtin exemption exactly until an external wrapper layer
+	// peels and flips the tracker into direct execution context.
+	tk := newWrapperPathTracker(basePath, inherited, caller, false)
+	head, _, ea, exhausted := peelWrappersCore(argv, tk, steps)
 	envAs := inherited.merged(ea)
 	if exhausted {
 		return nil, envAs, caller, []stdinTarget{{lang: "", envAs: envAs, exhausted: true}}
@@ -1264,7 +1289,7 @@ type stdinCanonRewrite struct {
 // a recognized wrapper alias recursion discharges the whole head
 // classification, while an ordinary canonical spelling simply replaces
 // the head word and the caller proceeds with the classification.
-func stdinCanonHeadRewrite(head []string, base string, depth int, envAs envAssignments, basePath string, caller callerIdentity, bash bool) ([]string, string, stdinCanonRewrite) {
+func stdinCanonHeadRewrite(head []string, base string, depth int, envAs envAssignments, basePath string, caller callerIdentity, bash bool, steps *int) ([]string, string, stdinCanonRewrite) {
 	canon := canonicalResolvedBase(base)
 	if canon == base {
 		return head, base, stdinCanonRewrite{}
@@ -1279,7 +1304,11 @@ func stdinCanonHeadRewrite(head []string, base string, depth int, envAs envAssig
 	// slash-carrying input NEVER degrades into a bare name.
 	rewritten := append([]string{rewriteKeepSlashIdentity(head[0], canon)}, head[1:]...)
 	if isPeeledWrapperBase(canon) {
-		return head, base, stdinCanonRewrite{fired: true, targets: stdinProgramTargetsDialect(rewritten, depth+1, envAs, basePath, caller, bash)}
+		// R27-Oracle-M4 / R27-Reviewer-#5: the canonical-alias recursion
+		// threads the shared wrapper-step budget — the rewritten wrapper
+		// layers continue spending the SAME 32 steps the pre-rewrite peel
+		// already consumed.
+		return head, base, stdinCanonRewrite{fired: true, targets: stdinProgramTargetsDialectSteps(rewritten, depth+1, envAs, basePath, caller, bash, steps)}
 	}
 	return rewritten, canon, stdinCanonRewrite{}
 }
@@ -1367,7 +1396,10 @@ func collectOneStdinSeg(tracker *scopeEnvTracker, seg shellSegment, depth int, s
 	if seg.pureAssign {
 		return nil
 	}
-	if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv, subCaller); len(peeledHead) == 0 {
+	// R27-Oracle-S2 / R27-Reviewer-#2: an EXHAUSTED peel is never an
+	// empty-head skip — the consumer identity is unknowable, not absent,
+	// and the real projection below owns the exhaustion verdict.
+	if peelProvesEmptyHead(seg.argv, subCaller) {
 		return nil
 	}
 	runEnv := subEnv.merged(tracker.view(seg.scopePath))
@@ -1516,7 +1548,11 @@ func stdinTargetsWithDataFallback(sub []stdinTarget, seg shellSegment, envAs env
 	if len(sub) != 0 {
 		return sub
 	}
-	if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv, subCaller); len(peeledHead) == 0 {
+	// R27-Oracle-S2 / R27-Reviewer-#2: the exhausted peel never counts as
+	// a proven empty head either — reaching here means the projection
+	// returned no target, so the segment keeps the data-consumer fallback
+	// only when the peel completed to a real empty head.
+	if peelProvesEmptyHead(seg.argv, subCaller) {
 		return sub
 	}
 	return append(sub, stdinTarget{data: true, envAs: envAs})
@@ -1617,7 +1653,12 @@ func stdinXargsInnerTarget(argv []string, depth int, envAs envAssignments, baseP
 	// aliases keep their slash identity across the rewrite
 	// (R26-Oracle-M3 / R26-Reviewer-#4) so /usr/bin/xargs -I{}
 	// /usr/bin/env /bin/bash -c {} stays a confirmed consumer.
-	tk := newWrapperPathTracker(basePath, envAs, caller)
+	// R27-Oracle-M3 / R27-Reviewer-#4: xargs starts its inner target
+	// through its own execvp — NEVER through a shell's builtin dispatch —
+	// so the tracker validates in direct-execution context: bare
+	// command/builtin/exec spellings owe their identity to PATH exactly
+	// like any external executable and enjoy no shell builtin exemption.
+	tk := newWrapperPathTracker(basePath, envAs, caller, true)
 	innerHead, innerEnv, innerEffPath, innerExhausted := peelWrappersAndWrapperAliasesChecked(argv, effPath, caller, tk)
 	envAs = envAs.merged(innerEnv)
 	if innerExhausted {

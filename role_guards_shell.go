@@ -964,14 +964,18 @@ func skipExecArgs(argv []string, i int) (int, bool) {
 			return i, false
 		}
 		if a == "-a" {
-			if i+1 < len(argv) && !isDynamicArg(argv[i+1]) {
-				i += 2 // -a name
-				continue
+			// R27-Oracle-S2 / R27-Reviewer-#2: same flat dynamic-vs-missing
+			// verdict split as the external skippers — the dynamic operand
+			// keeps the pre-R26 residue index, the missing one clamps at the
+			// slice bound.
+			switch optValueVerdict(argv, i) {
+			case 'd':
+				return i, true
+			case 'm':
+				return len(argv), true
 			}
-			// R26-Oracle-M4 / R26-Reviewer-#2: a trailing -a whose name
-			// operand never arrived fails closed exactly at the slice bound
-			// (merged with the dynamic-operand verdict).
-			return len(argv), true
+			i += 2 // -a name
+			continue
 		}
 		if a == "-c" || a == "-l" {
 			i++
@@ -986,14 +990,11 @@ func skipExecArgs(argv []string, i int) (int, bool) {
 				// boolean
 			case 'a':
 				if cluster[ci+1:] == "" {
-					if i < len(argv) && !isDynamicArg(argv[i]) {
-						i++ // name is the next argv
-						break
+					var end bool
+					i, end = execClusterNameOperand(argv, i)
+					if end {
+						return i, true
 					}
-					// R26-Oracle-M4: a bare cluster-trailing -a never received
-					// its name operand — fail closed exactly at the slice
-					// bound (merged with the dynamic verdict).
-					return len(argv), true
 				}
 				// else name is the glued remainder; either way cluster is done
 				ci = len(cluster)
@@ -1005,27 +1006,76 @@ func skipExecArgs(argv []string, i int) (int, bool) {
 	return i, false
 }
 
+// pidOperandVerdict is the shared trailing -p/--pid verdict of
+// taskset/chrt (extracted for the R27 complexity budget —
+// R27-Oracle-M5 / R27-Reviewer-#6): a static PID operand is the
+// legitimate no-inner-command query (len(argv), false), a truly-missing
+// operand clamps fail-closed at the slice bound, and a dynamic PID word
+// keeps the pre-R26-style residue index i with the fail-closed bit.
+func pidOperandVerdict(argv []string, i int) (int, bool) {
+	switch optValueVerdict(argv, i) {
+	case 'd':
+		return i, true
+	case 'm':
+		return len(argv), true
+	}
+	return len(argv), false
+}
+
+// execClusterNameOperand consumes the separate name operand of a
+// cluster-trailing exec -a (extracted so skipExecArgs' cluster walk
+// carries the dynamic-vs-missing split as one flat delegation —
+// R27-Oracle-S2 / R27-Reviewer-#2): i is already past the cluster word.
+// end reports the fail-closed boundary — a dynamic name keeps the
+// pre-R26 residue index i and a truly-absent name clamps at the slice
+// bound (R26-Oracle-M4); both end the scan with the fail-closed verdict
+// at exactly the returned index. A static name simply advances past it.
+func execClusterNameOperand(argv []string, i int) (int, bool) {
+	if i >= len(argv) {
+		return len(argv), true
+	}
+	if isDynamicArg(argv[i]) {
+		return i, true
+	}
+	return i + 1, false
+}
+
 // wrapperPathTracker is the O(1)-per-op incremental untrusted-PATH
 // tracker of the single-pass checked wrapper peel (R26-Oracle-M2 /
 // R26-Reviewer-#1/#3): it mirrors effectivePATHFrom + pathUntrusted
 // exactly — the control-flow uncertainty marker op ('t') is sticky
 // across every later op, while the unresolvable placeholder an
 // over-budget self-reference expansion or a placeholder-carrying value
-// installs can be cleared by a later env -i/-u PATH or overwritten by
-// a constant assignment — but applies each op ONCE as it is appended
-// instead of rescanning the whole accumulated op list at every layer
-// (the pre-R26 scan re-ran pathUntrusted per bare wrapper layer,
-// scaling quadratically on deep env chains).
+// installs can be cleared by a later env -i/-u PATH and only THEN
+// overwritten by a constant assignment (expandPathSelfRefs rejects any
+// expansion against a placeholder-carrying base outright, so a constant
+// assignment can never overwrite the placeholder directly — the clear
+// op is the only way back to a trusted state) — but applies each op
+// ONCE as it is appended instead of rescanning the whole accumulated op
+// list at every layer (the pre-R26 scan re-ran pathUntrusted per bare
+// wrapper layer, scaling quadratically on deep env chains).
+// R27-Oracle-M3 / R27-Reviewer-#4: the tracker additionally carries
+// the execution-context bit (directExec — the next layer is started by
+// an external program's execve/execvp, never by a shell's own builtin
+// dispatch, so bare command/builtin/exec spellings owe their identity
+// to PATH exactly like any external name). The cross-layer shared
+// wrapper step budget (R27-Oracle-M4 / R27-Reviewer-#5) is the
+// separate sharedSteps pointer of peelWrappersCore so even the
+// tracker-less alias loop shares one 32-step budget across its rewrites.
 type wrapperPathTracker struct {
-	cur     string // running effective PATH value (never materializes expansions twice)
-	stickyT bool   // a 't' op on PATH was seen — pathUntrusted's first loop arm
-	caller  bool   // caller.pathUntrusted() captured at construction
+	cur        string // running effective PATH value (never materializes expansions twice)
+	stickyT    bool   // a 't' op on PATH was seen — pathUntrusted's first loop arm
+	caller     bool   // caller.pathUntrusted() captured at construction
+	directExec bool   // next layers are exec'd by an external program, never shell-dispatched
 }
 
 // newWrapperPathTracker seeds the tracker with the inherited op list
 // replayed over basePath plus the caller identity's own sticky verdict.
-func newWrapperPathTracker(basePath string, inherited envAssignments, caller callerIdentity) *wrapperPathTracker {
-	tk := &wrapperPathTracker{cur: basePath, caller: caller.pathUntrusted()}
+// directExec records whether the argv this tracker validates is started
+// by an external program directly (the xargs open-code-slot target —
+// R27-Oracle-M3 / R27-Reviewer-#4) instead of the shell's own dispatch.
+func newWrapperPathTracker(basePath string, inherited envAssignments, caller callerIdentity, directExec bool) *wrapperPathTracker {
+	tk := &wrapperPathTracker{cur: basePath, caller: caller.pathUntrusted(), directExec: directExec}
 	tk.applyOps(inherited.ops)
 	return tk
 }
@@ -1111,6 +1161,23 @@ func peelFlagZone(argv []string, i int, dynOperandFC, breakBareDash bool, valued
 	return i, false
 }
 
+// optValueVerdict classifies the value operand of one two-slot wrapper
+// option (R27-Oracle-S2 / R27-Reviewer-#2 — extracted so every skipper
+// carries the dynamic-vs-missing split as one flat call instead of two
+// nested branches): 'd' when the operand EXISTS but is a dynamic word
+// (the caller keeps the pre-R26 residue index i), 'm' when the operand
+// is truly absent at the slice end (the caller clamps at len(argv)),
+// 's' when a static operand is present.
+func optValueVerdict(argv []string, i int) byte {
+	if i+1 >= len(argv) {
+		return 'm'
+	}
+	if isDynamicArg(argv[i+1]) {
+		return 'd'
+	}
+	return 's'
+}
+
 func timeValuedOpt(a string) bool {
 	return a == "-o" || a == "--output" || a == "-f" || a == "--format"
 }
@@ -1120,7 +1187,7 @@ func niceValuedOpt(a string) bool {
 }
 
 func peelWrappers(argv []string) (headArgv []string, splitPayloads []string, envAs envAssignments, exhausted bool) {
-	return peelWrappersCore(argv, nil)
+	return peelWrappersCore(argv, nil, nil)
 }
 
 // peelLayerOutcome carries one consumed wrapper layer back into
@@ -1160,11 +1227,16 @@ func peelWrapperLayer(argv []string, i int, base string, envAs envAssignments) p
 		if isCommandQuery(argv[i+1:]) {
 			return peelLayerOutcome{rest: argv, i: i, stop: true}
 		}
+		// R27-Oracle-M4 / R27-Reviewer-#5: peelFlagZone already consumes
+		// the SINGLE `--` option terminator when the zone ends at it —
+		// the pre-R27 extra skipDashDash consumed a SECOND `--` for free,
+		// diverging from the pre-R26 boundary accounting exactly.
 		ni, fc := peelFlagZone(argv, i+1, false, false, nil)
-		return peelLayerOutcome{rest: argv, i: skipDashDash(argv, ni), fc: fc}
+		return peelLayerOutcome{rest: argv, i: ni, fc: fc}
 	case "builtin":
+		// Same single-terminator ownership as the command case.
 		ni, fc := peelFlagZone(argv, i+1, false, false, nil)
-		return peelLayerOutcome{rest: argv, i: skipDashDash(argv, ni), fc: fc}
+		return peelLayerOutcome{rest: argv, i: ni, fc: fc}
 	case "exec":
 		ni, fc := skipExecArgs(argv, i+1)
 		return peelLayerOutcome{rest: argv, i: ni, fc: fc}
@@ -1213,99 +1285,202 @@ func peelWrapperLayer(argv []string, i int, base string, envAs envAssignments) p
 // validation never rescans the accumulated environment. A validation
 // failure IS the exhaustion verdict: the consumer identity is
 // unknowable, never a confirmed shell.
-func peelWrappersCore(argv []string, tk *wrapperPathTracker) (headArgv []string, splitPayloads []string, envAs envAssignments, exhausted bool) {
+func peelWrappersCore(argv []string, tk *wrapperPathTracker, sharedSteps *int) (headArgv []string, splitPayloads []string, envAs envAssignments, exhausted bool) {
+	// R27-Oracle-M4 / R27-Reviewer-#5: a non-nil sharedSteps carries the
+	// SHARED step budget across every peelWrappersCore call of one
+	// projection — alias rewrites and canonical/resolved-wrapper
+	// recursion re-enter the core with the steps already consumed, so a
+	// fixed-path wrapper alias can never launder a 33-layer chain into
+	// two under-budget halves. A nil sharedSteps reproduces the pre-R26
+	// per-call budget exactly (steps starts at 0 and dies with the call).
+	steps := 0
+	if sharedSteps != nil {
+		steps = *sharedSteps
+		defer func() { *sharedSteps = steps }()
+	}
 	i := 0
-	depth := 0
-	for ; depth < peelWrapperMaxSteps && i < len(argv); depth++ {
-		a := argv[i]
-		if isAssignWord(a) {
-			before := len(envAs.ops)
-			envAs.addAssign(a)
-			if tk != nil {
-				tk.applyOps(envAs.ops[before:])
-			}
-			i++
-			depth--
-			continue
+	for ; steps < peelWrapperMaxSteps && i < len(argv); steps++ {
+		res := peelCoreStep(argv, i, envAs, splitPayloads, tk)
+		steps += res.stepDelta
+		if res.done {
+			return res.head, res.split, res.envAs, res.exhausted
 		}
-		if shellNoopWords[a] {
-			if i+1 >= len(argv) {
-				return argv[len(argv):], splitPayloads, envAs, false
-			}
-			i++
-			depth--
-			continue
-		}
-		switch a {
-		case "if", "then", "elif", "else", "while", "until", "do", "!", "coproc":
-			i++
-			continue
-		case "--":
-			i++
-			continue
-		}
-		if isDynamicArg(a) {
-			return argv[i:], splitPayloads, envAs, false
-		}
-		base := filepath.Base(a)
-		if !isPeeledWrapperBase(base) {
-			return argv[i:], splitPayloads, envAs, false
-		}
-		if tk != nil && wrapperNeedsPathValidation(base, a) && tk.untrusted() {
-			// R26-Oracle-M2 / R26-Reviewer-#1: the bare external wrapper's
-			// own resolution depended on an untrusted PATH — validated
-			// against the environment in force BEFORE this layer's
-			// operands can rewrite it.
-			return argv[i:], splitPayloads, envAs, true
-		}
-		before := len(envAs.ops)
-		out := peelWrapperLayer(argv, i, base, envAs)
-		switch {
-		case out.stop:
-			return argv[out.i:], splitPayloads, envAs, false
-		case out.fc:
-			if out.i > len(argv) {
-				out.i = len(argv)
-			}
-			return argv[out.i:], splitPayloads, envAs, true
-		case base == "env":
-			envAs = out.env
-			if tk != nil {
-				tk.applyOps(envAs.ops[before:])
-			}
-			splitPayloads = append(splitPayloads, out.split...)
-			// env rewrites the operand stream wholesale: rest replaces the
-			// argv exactly like the pre-R26 splice — reassignment only,
-			// never a copy or write-through of the caller's backing array
-			// (skipEnvOperands either re-slices the input or builds its own
-			// backing for -S payloads).
-			argv = out.rest
-			i = 0
-		default:
-			i = out.i
-		}
+		argv, i, envAs, splitPayloads = res.argv, res.ni, res.envAs, res.split
 	}
 	if i > len(argv) {
 		i = len(argv)
 		return argv[i:], splitPayloads, envAs, true
 	}
-	return argv[i:], splitPayloads, envAs, depth >= peelWrapperMaxSteps
+	return argv[i:], splitPayloads, envAs, steps >= peelWrapperMaxSteps
+}
+
+// peelCoreOutcome carries one loop iteration of peelWrappersCore back to
+// the walk (extracted for the R27 complexity budget — R27 zero-positive-
+// delta requirement): done ends the walk with the returned head/split/
+// envAs/exhausted tuple, stepDelta is the exemption refund for
+// step-exempt words (-1 cancels the loop's own +1 exactly like the
+// pre-R27 depth-- trick), and argv/ni/envAs/split are the continuing
+// walk state otherwise.
+type peelCoreOutcome struct {
+	head      []string
+	split     []string
+	envAs     envAssignments
+	argv      []string
+	ni        int
+	stepDelta int
+	done      bool
+	exhausted bool
+}
+
+// peelCoreStep runs one iteration of the peelWrappersCore walk
+// (extracted for the R27 complexity budget): the KEY=VAL / noop /
+// reserved-word exemptions, the dynamic-head boundary, the wrapper
+// adoption with its checked validation and direct-execution flip, and
+// the layer outcome discharge. The state transitions are byte-identical
+// to the pre-extraction loop body.
+func peelCoreStep(argv []string, i int, envAs envAssignments, splitPayloads []string, tk *wrapperPathTracker) peelCoreOutcome {
+	a := argv[i]
+	if isAssignWord(a) {
+		before := len(envAs.ops)
+		envAs.addAssign(a)
+		if tk != nil {
+			tk.applyOps(envAs.ops[before:])
+		}
+		return peelCoreOutcome{argv: argv, ni: i + 1, envAs: envAs, split: splitPayloads, stepDelta: -1}
+	}
+	if shellNoopWords[a] {
+		if i+1 >= len(argv) {
+			return peelCoreOutcome{head: argv[len(argv):], split: splitPayloads, envAs: envAs, done: true}
+		}
+		return peelCoreOutcome{argv: argv, ni: i + 1, envAs: envAs, split: splitPayloads, stepDelta: -1}
+	}
+	if peelCoreReservedWord(a) {
+		return peelCoreOutcome{argv: argv, ni: i + 1, envAs: envAs, split: splitPayloads}
+	}
+	if isDynamicArg(a) {
+		return peelCoreOutcome{head: argv[i:], split: splitPayloads, envAs: envAs, done: true}
+	}
+	base := filepath.Base(a)
+	if !isPeeledWrapperBase(base) {
+		return peelCoreOutcome{head: argv[i:], split: splitPayloads, envAs: envAs, done: true}
+	}
+	if tk != nil && wrapperNeedsPathValidation(base, a, tk.directExec) && tk.untrusted() {
+		// R26-Oracle-M2 / R26-Reviewer-#1: the bare external wrapper's
+		// own resolution depended on an untrusted PATH — validated
+		// against the environment in force BEFORE this layer's
+		// operands can rewrite it.
+		return peelCoreOutcome{head: argv[i:], split: splitPayloads, envAs: envAs, done: true, exhausted: true}
+	}
+	if tk != nil && wrapperIsExternalExecer(base) {
+		// R27-Oracle-M3 / R27-Reviewer-#4: once ANY external wrapper
+		// layer peeled, every later layer is started by that program's
+		// own execve/execvp — never by a shell's builtin dispatch — so
+		// bare command/builtin/exec spellings beyond this point owe
+		// their identity to PATH exactly like any external name.
+		tk.directExec = true
+	}
+	return peelCoreLayerOutcome(argv, i, base, envAs, splitPayloads, tk)
+}
+
+// peelCoreReservedWord reports the step-costing reserved/modifier words
+// and the `--` terminator of peelCoreStep (extracted so the iteration
+// carries no keyword table branching).
+func peelCoreReservedWord(a string) bool {
+	switch a {
+	case "if", "then", "elif", "else", "while", "until", "do", "!", "coproc", "--":
+		return true
+	}
+	return false
+}
+
+// peelCoreLayerOutcome discharges one adopted wrapper layer of
+// peelCoreStep (extracted for the R27 complexity budget): the early
+// stop / fail-closed ends, the env operand-stream splice with the
+// tracker fold and the unknown-payload exhaustion verdict, and the
+// plain index advance.
+func peelCoreLayerOutcome(argv []string, i int, base string, envAs envAssignments, splitPayloads []string, tk *wrapperPathTracker) peelCoreOutcome {
+	before := len(envAs.ops)
+	out := peelWrapperLayer(argv, i, base, envAs)
+	switch {
+	case out.stop:
+		return peelCoreOutcome{head: argv[out.i:], split: splitPayloads, envAs: envAs, done: true}
+	case out.fc:
+		if out.i > len(argv) {
+			out.i = len(argv)
+		}
+		return peelCoreOutcome{head: argv[out.i:], split: splitPayloads, envAs: envAs, done: true, exhausted: true}
+	case base == "env":
+		envAs = out.env
+		if tk != nil {
+			tk.applyOps(envAs.ops[before:])
+		}
+		splitPayloads = append(splitPayloads, out.split...)
+		if tk != nil && envSplitHasUnknown(out.split) {
+			// R27-Oracle-M5 / R27-Reviewer-#6: env's missing-operand,
+			// unknown-option or malformed -S diagnostics ride the payload
+			// channel — the checked projection must never re-read that
+			// fail-closed scan as a normally completed empty peel.
+			return peelCoreOutcome{head: argv[out.i:], split: splitPayloads, envAs: envAs, done: true, exhausted: true}
+		}
+		// env rewrites the operand stream wholesale: rest replaces the
+		// argv exactly like the pre-R26 splice — reassignment only,
+		// never a copy or write-through of the caller's backing array
+		// (skipEnvOperands either re-slices the input or builds its own
+		// backing for -S payloads).
+		return peelCoreOutcome{argv: out.rest, ni: 0, envAs: envAs, split: splitPayloads}
+	default:
+		return peelCoreOutcome{argv: argv, ni: out.i, envAs: envAs, split: splitPayloads}
+	}
+}
+
+// envSplitHasUnknown reports whether env's operand scan emitted any
+// fail-closed diagnostic (missing operand, unknown option, malformed or
+// over-depth -S payload — R27-Oracle-M5 / R27-Reviewer-#6).
+func envSplitHasUnknown(payloads []string) bool {
+	for _, p := range payloads {
+		if strings.HasPrefix(p, envUnknownLongPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// wrapperIsExternalExecer reports whether one adopted wrapper layer is
+// an EXTERNAL program that starts its inner command through execve/
+// execvp (R27-Oracle-M3 / R27-Reviewer-#4) — every later layer of the
+// chain then resolves through the kernel/execvp PATH lookup, never the
+// shell's own builtin dispatch. The shell builtins command/builtin/exec
+// are NOT in this set: layers behind them (and only them) still enjoy
+// the shell dispatch context.
+func wrapperIsExternalExecer(base string) bool {
+	switch base {
+	case "env", "nohup", "setsid", "nice", "timeout", "stdbuf", "busybox",
+		"ionice", "taskset", "chrt", "strace", "ltrace", "time":
+		return true
+	}
+	return false
 }
 
 // wrapperNeedsPathValidation reports whether one adopted wrapper layer
 // owes its own resolution to PATH (R26-Oracle-M2 / R26-Reviewer-#1):
 // every EXTERNAL wrapper (env/nice/nohup/timeout/stdbuf/setsid/busybox/
-// ionice/taskset/chrt/strace/ltrace/time) spelled without a slash. Shell
-// builtins (command/builtin/exec) resolve inside the shell process
-// itself — never through PATH — and slash-carrying spellings carry
-// their own resolution, so both are exempt.
-func wrapperNeedsPathValidation(base, word string) bool {
+// ionice/taskset/chrt/strace/ltrace/time) spelled without a slash.
+// Slash-carrying spellings carry their own resolution, so they are
+// exempt either way. Shell builtins (command/builtin/exec) resolve
+// inside the shell process itself — never through PATH — but ONLY when
+// the shell itself dispatches the layer (directExec false): once an
+// external program starts the next layer through execve/execvp
+// (R27-Oracle-M3 / R27-Reviewer-#4 — the xargs open-code-slot target,
+// or any layer behind env/nice/timeout/…), a bare command/builtin/exec
+// spelling is looked up in PATH exactly like any other external
+// executable and enjoys no builtin exemption.
+func wrapperNeedsPathValidation(base, word string, directExec bool) bool {
 	if strings.ContainsRune(word, '/') {
 		return false
 	}
 	switch base {
 	case "command", "builtin", "exec":
-		return false
+		return directExec
 	}
 	return true
 }
@@ -1338,17 +1513,40 @@ func peelWrappersAndWrapperAliases(argv []string, pathEnv string, caller callerI
 func peelWrappersAndWrapperAliasesChecked(argv []string, pathEnv string, caller callerIdentity, tk *wrapperPathTracker) (head []string, envAs envAssignments, effPath string, exhausted bool) {
 	cur := argv
 	effPath = pathEnv
+	// R27-Oracle-M4 / R27-Reviewer-#5: one shared counter spans the whole
+	// alias loop — every rewrite re-enters the core with the steps the
+	// previous rounds already consumed.
+	shared := 0
 	for steps := 0; steps < peelWrapperMaxSteps; steps++ {
-		before := len(envAs.ops)
-		h, _, ea, ex := peelWrappersCore(cur, tk)
+		h, sp, ea, ex := peelWrappersCore(cur, tk, &shared)
 		envAs = envAs.merged(ea)
 		effPath = ea.effectivePATHFrom(effPath)
 		caller = caller.seededWith(ea)
-		if tk != nil {
-			tk.applyOps(envAs.ops[before:])
+		// R27-Oracle-M2 / R27-Reviewer-#3: the core already applied every
+		// freshly merged op batch to the tracker IN PLACE as it peeled —
+		// the pre-R27 loop re-applied the same batch here, expanding a
+		// self-referencing PATH assignment twice (PATH=$PATH:/x against
+		// /base materialized /base/x/x instead of /base/x and could push a
+		// legal single expansion past the byte budget).
+		// R27-Oracle-M5 / R27-Reviewer-#6: env's fail-closed payload
+		// diagnostics (missing operand, unknown option, malformed -S) are
+		// an exhaustion verdict for the checked projection exactly like
+		// the in-core tk != nil verdict — never a normally completed empty
+		// peel the caller re-reads as no consumer at all.
+		if ex || envSplitHasUnknown(sp) {
+			return h, envAs, effPath, true
 		}
-		if ex || len(h) == 0 {
-			return h, envAs, effPath, ex
+		if len(h) == 0 {
+			return h, envAs, effPath, false
+		}
+		// R27-Oracle-M3 / R27-Reviewer-#4: the bare-head untrusted verdict
+		// precedes ANY alias resolution or file lookup — the original
+		// slash-free spelling owes its identity to PATH BEFORE
+		// resolveHeadBase may substitute a PATH-segment hit for it (the
+		// same ordering stdinProgramTargetsDialect already enforces with
+		// bareHeadUntrustedPATH).
+		if tk != nil && !strings.ContainsRune(h[0], '/') && tk.untrusted() {
+			return h, envAs, effPath, true
 		}
 		hb := filepath.Base(h[0])
 		// A PATH alias whose typed name is not a wrapper but resolves to
@@ -1357,13 +1555,6 @@ func peelWrappersAndWrapperAliasesChecked(argv []string, pathEnv string, caller 
 		if rb := canonicalResolvedBase(resolveHeadBase(h[0], effPath, caller.screenCwd())); rb != "" && rb != hb && isPeeledWrapperBase(rb) {
 			cur = append([]string{rewriteKeepSlashIdentity(h[0], rb)}, h[1:]...)
 			continue
-		}
-		// R26-Oracle-M2 / R26-Reviewer-#1: the FINAL peeled head owes its
-		// identity to the same untrusted PATH when it carries no slash —
-		// the xargs inner open-code-slot target must never re-read it as
-		// a confirmed consumer.
-		if tk != nil && !strings.ContainsRune(h[0], '/') && tk.untrusted() {
-			return h, envAs, effPath, true
 		}
 		return h, envAs, effPath, false
 	}
@@ -1408,12 +1599,14 @@ func skipTimeoutArgs(argv []string, i int) (int, bool) {
 			break
 		}
 		if a == "-k" || a == "--kill-after" || a == "-s" || a == "--signal" {
-			// R26-Oracle-M4 / R26-Reviewer-#2: the trailing valued option
-			// missing its operand fails closed exactly at the slice bound
-			// (the pre-R26 unclamped i+=2 overflowed it). The fail-closed
-			// index is irrelevant to every consumer, so the trailing and
-			// dynamic verdicts merge into one return.
-			if i+1 >= len(argv) || isDynamicArg(argv[i+1]) {
+			// R27-Oracle-S2 / R27-Reviewer-#2: the dynamic-vs-missing split
+			// is one flat verdict — the dynamic operand keeps the pre-R26
+			// residue index i exactly, the truly-missing operand clamps at
+			// the slice bound (R26-Oracle-M4).
+			switch optValueVerdict(argv, i) {
+			case 'd':
+				return i, true
+			case 'm':
 				return len(argv), true
 			}
 			i += 2
@@ -1444,9 +1637,12 @@ func skipStdbufArgs(argv []string, i int) (int, bool) {
 			break
 		}
 		if a == "-i" || a == "-o" || a == "-e" {
-			// R26-Oracle-M4 / R26-Reviewer-#2: trailing valued option missing
-			// its operand fails closed at the bound (merged return).
-			if i+1 >= len(argv) || isDynamicArg(argv[i+1]) {
+			// R27-Oracle-S2 / R27-Reviewer-#2: same flat dynamic-vs-missing
+			// verdict split as skipTimeoutArgs.
+			switch optValueVerdict(argv, i) {
+			case 'd':
+				return i, true
+			case 'm':
 				return len(argv), true
 			}
 			i += 2
@@ -1468,9 +1664,11 @@ func skipIoniceArgs(argv []string, i int) (int, bool) {
 		case a == "--":
 			return i + 1, false
 		case a == "-c" || a == "-n" || a == "-p":
-			// R26-Oracle-M4 / R26-Reviewer-#2: trailing valued option missing
-			// its operand fails closed at the bound (merged return).
-			if i+1 >= len(argv) || isDynamicArg(argv[i+1]) {
+			// R27-Oracle-S2 / R27-Reviewer-#2: same flat verdict split.
+			switch optValueVerdict(argv, i) {
+			case 'd':
+				return i, true
+			case 'm':
 				return len(argv), true
 			}
 			i += 2
@@ -1510,14 +1708,21 @@ func skipTasksetArgs(argv []string, i int) (int, bool) {
 			return i, false
 		case a == "-c" || a == "--cpu-list":
 			sawList = true
-			// R26-Oracle-M4 / R26-Reviewer-#2: trailing valued option missing
-			// its operand fails closed at the bound (merged return).
-			if i+1 >= len(argv) || isDynamicArg(argv[i+1]) {
+			// R27-Oracle-S2 / R27-Reviewer-#2: same flat verdict split.
+			switch optValueVerdict(argv, i) {
+			case 'd':
+				return i, true
+			case 'm':
 				return len(argv), true
 			}
 			i += 2 // -c LIST operand
 		case a == "-p" || a == "--pid":
-			return len(argv), false // pid operand, no inner command
+			// R27-Oracle-M5 / R27-Reviewer-#6: the PID query is a legitimate
+			// no-inner-command shape ONLY when the static PID operand actually
+			// arrived — a trailing -p/--pid missing its operand (or a dynamic
+			// PID word) fails closed instead of masquerading as the query.
+			ni, fc := pidOperandVerdict(argv, i)
+			return ni, fc
 		case strings.HasPrefix(a, "--cpu-list="):
 			sawList = true
 			i++
@@ -1551,7 +1756,11 @@ func skipChrtArgs(argv []string, i int) (int, bool) {
 			}
 			return i, false
 		case a == "-p" || a == "--pid":
-			return len(argv), false // pid operand, no inner command
+			// R27-Oracle-M5 / R27-Reviewer-#6: same missing/dynamic PID
+			// distinction as taskset — only a real static PID operand is the
+			// legitimate no-inner-command query shape.
+			ni, fc := pidOperandVerdict(argv, i)
+			return ni, fc
 		case strings.HasPrefix(a, "-"):
 			i++
 		default:
@@ -1850,15 +2059,14 @@ func skipStraceArgs(argv []string, i int) (int, bool) {
 			"--trace", "--output", "--attach", "--string-limit", "--user",
 			"--env", "--columns", "--const-print-style", "--summary-columns",
 			"--trace-path", "--signal":
-			if i+1 < len(argv) && !isDynamicArg(argv[i+1]) {
-				i += 2 // separate value operand
-				continue
+			// R27-Oracle-S2 / R27-Reviewer-#2: same flat verdict split.
+			switch optValueVerdict(argv, i) {
+			case 'd':
+				return i, true
+			case 'm':
+				return len(argv), true
 			}
-			// R26-Oracle-M4 / R26-Reviewer-#2: the trailing valued option
-			// missing its operand fails closed exactly at the slice bound
-			// (merged with the dynamic-operand verdict — the fail-closed
-			// index is irrelevant to every consumer).
-			return len(argv), true
+			i += 2 // separate value operand
 		default:
 			i++ // boolean (-f/-ff/-c/-C/-t/-tt/-ttt/-T/-r/-v/-q/-y) or glued value
 		}

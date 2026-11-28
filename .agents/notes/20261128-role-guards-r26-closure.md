@@ -28,7 +28,7 @@ R22 closure note 依两份审计明确要求**未触碰**。
    - (a) `taintEvalTextWrites` 顶层循环改为经 `taintEvalOneStmt` 调度——后台/协进程语句的隐藏 eval 重放整体包进 `snapshotProcessRegs` 帧（回滚 `funcNames`/`readonlyVars`，保守变量污染 `taintedVars` 不回滚）；`taintHiddenEvalWrites` 直接委托 `scanHiddenEvalStmt`（删除未建帧的根 CallExpr 调用）。
    - (b) 管道兄弟隔离：`scanHiddenEvalDispatch` 对 `Pipe/PipeAll` 走 `scanHiddenEvalPipeSiblings`——X、Y 各自独立建帧（镜像 `walkStmt`），同一分量内部的同进程声明/定义对该分量的后续语句仍然可见。
    - (c) `scanHiddenEvalStmt` 改查 `ist == nil`（非 `ist.Cmd == nil`），遍历 `ist.Redirs` 的 `r.Word`/`r.Hdoc` 经 `scanHiddenEvalDispatch`（typed-nil 单独守卫），嵌套语句重定向子树内的 `$(command -x eval)` 回到重放覆盖。
-2. **单趟有界校验 peel**（Oracle R26-M2/M4 / Reviewer R26-#1/#2/#3）：删除无界预扫描家族（`stdinWrapperPeelUntrusted`/`externalWrapperUntrustedPATH`/`peelOneWrapperLayer`/`skipTransparentBuiltinArgs`/`skipExternalWrapperLayer`/`skipNiceWrapperArgs`），`peelWrappers` 重构为 `peelWrappersCore`（nil tracker 时逐字节复现原行为）：共享 `peelWrapperMaxSteps=32` 步数（纯 KEY=VAL 与 shellNoopWords 依旧 `depth--` 免步）、`wrapperPathTracker` 以 O(1)/op 增量镜像 `effectivePATHFrom`+`pathUntrusted`（'t' 粘性、占位符可被 `env -i`/`-u PATH` 清除、常量赋值可覆盖），每个**裸外部** wrapper 在消费其选项/`env` 操作数**之前**按入层环境校验（command/builtin/exec 内建豁免、带斜杠拼写豁免）。九个选项 skipper 的尾部缺操作数全部钳到 `len(argv)` 且 fail-closed（返回值永不超界）；`peelSingleWrapperArgs` 对 `nice -n`/`time -o` 尾缺返回 `(len(argv), false)`。
+2. **单趟有界校验 peel**（Oracle R26-M2/M4 / Reviewer R26-#1/#2/#3）：删除无界预扫描家族（`stdinWrapperPeelUntrusted`/`externalWrapperUntrustedPATH`/`peelOneWrapperLayer`/`skipTransparentBuiltinArgs`/`skipExternalWrapperLayer`/`skipNiceWrapperArgs`），`peelWrappers` 重构为 `peelWrappersCore`（nil tracker 时逐字节复现原行为）：共享 `peelWrapperMaxSteps=32` 步数（纯 KEY=VAL 与 shellNoopWords 依旧 `depth--` 免步）、`wrapperPathTracker` 以 O(1)/op 增量镜像 `effectivePATHFrom`+`pathUntrusted`（'t' 粘性、占位符可被 `env -i`/`-u PATH` 清除后再由常量赋值恢复；R27 勘误：`expandPathSelfRefs` 对含占位符的 base 直接拒绝，常量赋值**不能**直接覆盖占位符），每个**裸外部** wrapper 在消费其选项/`env` 操作数**之前**按入层环境校验（command/builtin/exec 内建豁免、带斜杠拼写豁免）。九个选项 skipper 的尾部缺操作数全部钳到 `len(argv)` 且 fail-closed（返回值永不超界）；`peelSingleWrapperArgs` 对 `nice -n`/`time -o` 尾缺返回 `(len(argv), false)`。
 3. **xargs 内层校验**（Oracle R26-M2 / Reviewer R26-#1）：`stdinXargsInnerTarget` 经 `peelWrappersAndWrapperAliasesChecked` 跑同一校验 peel 与别名循环，并对剥后裸头补 `tk.untrusted()` 判定——`/usr/bin/xargs -I{} env /bin/sh -c {}` 与 `/usr/bin/xargs -I{} sh -c {}` 在不可信 PATH 下 exhausted，固定路径 `/usr/bin/env /bin/bash` 保持确认消费者且 `bash` 位准确。
 4. **斜杠身份保持**（Oracle R26-M3 / Reviewer R26-#4）：共享 `rewriteKeepSlashIdentity`——原始拼写无斜杠时用规范名；有斜杠时 `filepath.Join(Dir, canon)`，清洗后丢斜杠（`.` 或 `sub/..`）则补 `./` 前缀，canonical 改写、解析后 wrapper 递归、`peelWrappersAndWrapperAliases*` 三处共用，`./genv`、`sub/../genv` 与 symlink `./myenv -> /usr/bin/env` 不再降级为裸名。
 5. **文档校准**（Oracle R26-M5 / Reviewer R26-#7）：CHANGELOG R25 首行文件清单改 `r24-closure.md`（去掉从未在 `028ac50..abe543b` 修改的 r22）、R24 首行改 `r23-closure.md`（去掉从未在 `f8cd003..028ac50` 修改的 r22）；R24/R25 note 各条加内联勘误括注；R24 复杂度表述限定为「5 个受影响生产文件上的具名顶层函数」口径。R22 note 未动。
@@ -36,10 +36,10 @@ R22 closure note 依两份审计明确要求**未触碰**。
 
 ## 复杂度多重集核对（file+kind+parent+name+occurrence_index，`cccc --no-config --no-cache`）
 
-- 对比 `f8cd003`：638 共享、42 新增、3 删除、**0 正增长**。
-- 对比 `abe543b`：665 共享、15 新增、6 删除、**0 正增长**。
+- 对比 `f8cd003`：**639** 共享、42 新增、3 删除、**0 正增长**（R27 勘误：原文写 638，但 `shared + added == 681` 总实例不变式两边均只得 680；R27 以同一口径复测为 639/666）。
+- 对比 `abe543b`：**666** 共享、15 新增、6 删除、**0 正增长**（同上勘误：原文 665）。
 - 新增函数全部 cognitive < 35：最大 `peelWrappersCore` 30、`peelFlagZone` 23、`applyOps` 16、`peelWrappersAndWrapperAliasesChecked` 12、`scanHiddenEvalStmtBody` 9、`scanHiddenEvalChildFrame` 4、`peelWrapperLayer` 3、`taintEvalOneStmt`/`rewriteKeepSlashIdentity`/`wrapperNeedsPathValidation` 2、`niceValuedOpt`/`timeValuedOpt`/`untrusted`/`scanHiddenEvalPipeSiblings`/`newWrapperPathTracker` 0-1。
-- 被修改既有函数无一正增长（`skipExecArgs` 34 持平、`scanHiddenEvalDispatch` 4 持平、各 `(int,bool)` skipper 持平或下降、`peelWrappers` 129→0 单行委托）。删除的预扫描家族 6 个函数（`externalWrapperUntrustedPATH`/`peelOneWrapperLayer`/`skipTransparentBuiltinArgs`/`skipExternalWrapperLayer`/`skipNiceWrapperArgs`/`stdinWrapperPeelUntrusted`）无生产调用方残留。
+- 被修改既有函数无一正增长（`skipExecArgs` 34 持平、`scanHiddenEvalDispatch` **4→2 下降**（R27 勘误：原文误记 4 持平）、各 `(int,bool)` skipper 持平或下降、`peelWrappers` 129→0 单行委托）。删除的预扫描家族 6 个函数（`externalWrapperUntrustedPATH`/`peelOneWrapperLayer`/`skipTransparentBuiltinArgs`/`skipExternalWrapperLayer`/`skipNiceWrapperArgs`/`stdinWrapperPeelUntrusted`）无生产调用方残留。
 
 ## 验证归档
 

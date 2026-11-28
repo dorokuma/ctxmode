@@ -704,6 +704,17 @@ func peelWrappersWithIndex(argv []string, caller callerIdentity) (headArgv []str
 	return argv[i:], -1, nil, envAs, true
 }
 
+// peelProvesEmptyHead reports whether the wrapper peel PROVES the
+// segment has no surviving command head (extracted for the R27
+// complexity budget — R27-Oracle-S2 / R27-Reviewer-#2): only a
+// non-exhausted peel whose residue is empty is the pure-assignment /
+// no-op shape; an EXHAUSTED peel never counts as the empty-head skip
+// because the consumer identity is unknowable rather than absent.
+func peelProvesEmptyHead(argv []string, caller callerIdentity) bool {
+	peeledHead, _, _, _, peelExhausted := peelWrappersWithIndex(argv, caller)
+	return len(peeledHead) == 0 && !peelExhausted
+}
+
 // locateShellCSlot finds the argv index of the `shell -c` script operand,
 // mirroring unwrapShellArgv's option-zone walk word for word: the bare
 // terminators `--` / `-` (and the dash-only `+` after a pending -c) end
@@ -1460,7 +1471,10 @@ func scriptAllowsLocalShellStdinPrepareDialect(code string, bash bool, outerEnv 
 		// head does not survive the wrapper peel is left to the caller's
 		// guard pass (which fails closed on the same condition). Its
 		// assignment ops already accumulated into runEnv above (R19-M4).
-		if peeledHead, _, _, _, _ := peelWrappersWithIndex(seg.argv, caller); len(peeledHead) == 0 {
+		// R27-Oracle-S2 / R27-Reviewer-#2: an EXHAUSTED peel is never the
+		// empty-head skip — the consumer identity is unknowable rather than
+		// absent, and the projection below owns the exhaustion verdict.
+		if peelProvesEmptyHead(seg.argv, caller) {
 			continue
 		}
 		// A nested shell -c whose slot walk cannot pin a clean script word

@@ -2142,10 +2142,17 @@ func (c *subCollector) scanHiddenEvalDispatch(node syntax.Node, scanWord func(*s
 // a child-process shape and the scan completed here.
 func (c *subCollector) scanHiddenEvalChildFrame(node syntax.Node, scanWord func(*syntax.Word) (string, bool), depth int) bool {
 	switch x := node.(type) {
-	case *syntax.CmdSubst, *syntax.ProcSubst, *syntax.Subshell, *syntax.CoprocClause:
-		restore := c.snapshotProcessRegs()
-		c.scanHiddenEvalNode(node, scanWord, depth)
-		restore()
+	case *syntax.CmdSubst:
+		c.scanHiddenEvalSubstFrame(x.Stmts, scanWord, depth)
+		return true
+	case *syntax.ProcSubst:
+		c.scanHiddenEvalSubstFrame(x.Stmts, scanWord, depth)
+		return true
+	case *syntax.Subshell:
+		c.scanHiddenEvalSubstFrame(x.Stmts, scanWord, depth)
+		return true
+	case *syntax.CoprocClause:
+		c.scanHiddenEvalCoprocFrame(x, scanWord, depth)
 		return true
 	case *syntax.BinaryCmd:
 		if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
@@ -2154,6 +2161,65 @@ func (c *subCollector) scanHiddenEvalChildFrame(node syntax.Node, scanWord func(
 		}
 	}
 	return false
+}
+
+// scanHiddenEvalSubstFrame scans one substitution/proc-substitution/
+// subshell statement list inside its own registry frame (extracted for
+// the R27 complexity budget — R27-Oracle-M1 / R27-Reviewer-#1):
+// scanning the statement list through scanHiddenEvalFramedStmt covers
+// the WHOLE subtree (every statement's root call, command subtree and
+// redirections), so the pre-R27 scanHiddenEvalNode descent would
+// double-scan it — and the per-statement registration makes the
+// same-process definitions visible to the list's later statements
+// before the frame restores.
+func (c *subCollector) scanHiddenEvalSubstFrame(stmts []*syntax.Stmt, scanWord func(*syntax.Word) (string, bool), depth int) {
+	defer c.snapshotProcessRegs()()
+	c.scanHiddenEvalStmtList(stmts, scanWord, depth)
+}
+
+// scanHiddenEvalCoprocFrame scans the coprocess body inside its own
+// registry frame (extracted for the R27 complexity budget): the body's
+// same-process registrations are visible to the body's own later
+// statements exactly like the substitution shapes.
+func (c *subCollector) scanHiddenEvalCoprocFrame(x *syntax.CoprocClause, scanWord func(*syntax.Word) (string, bool), depth int) {
+	if x.Stmt == nil {
+		return
+	}
+	defer c.snapshotProcessRegs()()
+	c.scanHiddenEvalFramedStmt(x.Stmt, scanWord, depth)
+}
+
+// scanHiddenEvalFramedStmt scans one same-process statement inside its
+// OWN child-process frame (extracted for the R27 fix — R27-Oracle-M1 /
+// R27-Reviewer-#1): the statement's same-process function definitions
+// and readonly declarations register BEFORE the scan so they are
+// visible to the eval replay the frame scans, while the enclosing
+// frame's restore rolls them back when the child process exits. The
+// registration is deliberately statement-order-blind inside one
+// statement's subtree (definitions hoist over the statement's own
+// earlier commands) — over-registration taints extra writes, never the
+// reverse, and matches the pre-existing batch registration discipline
+// of the eval replication loop.
+func (c *subCollector) scanHiddenEvalFramedStmt(st *syntax.Stmt, scanWord func(*syntax.Word) (string, bool), depth int) {
+	c.noteEvalStmtFuncDefs(st)
+	c.noteEvalStmtReadonlyDecls(st)
+	c.scanHiddenEvalStmt(st, scanWord, depth)
+}
+
+// scanHiddenEvalStmtList registers and scans a statement list of one
+// child-process subtree (substitution, proc substitution or subshell —
+// R27-Oracle-M1 / R27-Reviewer-#1): same-process definitions and
+// declarations of earlier statements are visible to the LATER
+// statements of the same list exactly like the real child shell's own
+// sequential execution, so each statement registers before it scans
+// inside the single frame the caller already opened.
+func (c *subCollector) scanHiddenEvalStmtList(stmts []*syntax.Stmt, scanWord func(*syntax.Word) (string, bool), depth int) {
+	for _, st := range stmts {
+		if st == nil {
+			continue
+		}
+		c.scanHiddenEvalFramedStmt(st, scanWord, depth)
+	}
 }
 
 // scanHiddenEvalPipeSiblings scans the two components of one pipeline
@@ -2168,11 +2234,24 @@ func (c *subCollector) scanHiddenEvalChildFrame(node syntax.Node, scanWord func(
 // each other's registrations because the frame spans the component's
 // whole subtree scan.
 func (c *subCollector) scanHiddenEvalPipeSiblings(x *syntax.BinaryCmd, scanWord func(*syntax.Word) (string, bool), depth int) {
+	// R27-Oracle-M1 / R27-Reviewer-#1: x.X and x.Y are *syntax.Stmt, so
+	// the pre-R27 scanHiddenEvalDispatch routed them into
+	// scanHiddenEvalNode — whose walk returns true at the root node and
+	// whose CallExpr children never pass scanHiddenEvalStmtBody, silently
+	// skipping the component's own root eval call (`eval 'eval() { :; }'
+	// | command -x eval`) and every redirection scan of the root. Each
+	// sibling now enters through scanHiddenEvalFramedStmt: the root call
+	// check plus redirection descent of scanHiddenEvalStmt apply, AND
+	// the component's directly-written same-process function definitions
+	// / readonly declarations (the AST FuncDecl of
+	// `{ eval() { :; }; eval; } | cat`, not an eval-text re-parse)
+	// register inside the sibling's own frame — visible to the eval
+	// replay the frame scans, rolled back when the child process exits.
 	restoreX := c.snapshotProcessRegs()
-	c.scanHiddenEvalDispatch(x.X, scanWord, depth)
+	c.scanHiddenEvalFramedStmt(x.X, scanWord, depth)
 	restoreX()
 	restoreY := c.snapshotProcessRegs()
-	c.scanHiddenEvalDispatch(x.Y, scanWord, depth)
+	c.scanHiddenEvalFramedStmt(x.Y, scanWord, depth)
 	restoreY()
 }
 

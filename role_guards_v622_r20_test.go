@@ -2199,11 +2199,46 @@ func TestGuard_V622_OracleR26Probes(t *testing.T) {
 			}
 		}
 		var trusted envAssignments
+		// R27-Reviewer-#7: the positive rows must pin the CONFIRMED shell
+		// target itself — a nil/data/exhausted projection or a wrong
+		// language must never satisfy them. The env operand is a STATIC
+		// clean PATH assignment (a bare cmdSubPlaceholder word is not
+		// single-word-safe and skipEnvOperandsToken rightly stops the env
+		// scan on it as a dynamic option, so it can never serve as the
+		// fold fixture), and the target's envAs must PROVE the fold by
+		// carrying the exact 'a' op the peel recorded.
+		assertShell := func(inherited envAssignments, argv []string, wantPathOp string) {
+			t.Helper()
+			targets := stdinProgramTargetsDialect(argv, 0, inherited, "/usr/bin:/bin", callerIdentity{}, false)
+			first, ok := firstProgramTarget(targets)
+			if !ok {
+				t.Fatalf("stdinProgramTargetsDialect(%v) projected NO program target (%v) — the confirmed shell consumer itself regressed, not just its exhaustion bit", argv, targets)
+			}
+			if first.exhausted || first.data || first.lang != "" {
+				t.Fatalf("stdinProgramTargetsDialect(%v) first target = %+v — want a non-exhausted, non-data, empty-language confirmed POSIX shell target", argv, first)
+			}
+			if wantPathOp != "" {
+				found := false
+				for _, op := range first.envAs.ops {
+					if op.kind == 'a' && op.key == "PATH" && op.value == wantPathOp {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("stdinProgramTargetsDialect(%v) target envAs.ops = %v — the env operand PATH assignment never folded into the target environment, so the entry/post-layer ordering verdict is unproven", argv, first.envAs.ops)
+				}
+			}
+		}
 		// A bare env validated under the trusted ENTRY environment stays a
 		// confirmed consumer even though its own operands poison the NEXT
 		// layer's PATH: the pre-fix scan judged env against the post-layer
-		// environment and falsely exhausted it.
-		assertExh(trusted, []string{"env", "PATH=" + cmdSubPlaceholder, "/bin/sh"}, false)
+		// environment and falsely exhausted it. The fold is pinned both
+		// for a static clean PATH value and for a single-word-safe quoted
+		// dynamic value (the quoted placeholder folds exactly like a static
+		// operand because it can never field-split).
+		assertShell(trusted, []string{"env", "PATH=/usr/bin:/bin", "/bin/sh"}, "/usr/bin:/bin")
+		assertShell(trusted, []string{"env", "PATH=" + cmdSubPlaceholderQuoted, "/bin/sh"}, cmdSubPlaceholderQuoted)
+		assertExh(trusted, []string{"env", "PATH=/usr/bin:/bin", "/bin/sh"}, false)
 		// Non-sticky placeholder entry environments: env -i / -u PATH clear
 		// PATH only AFTER the bare env itself already resolved through the
 		// untrusted entry search list — the pre-fix scan validated against
@@ -2340,10 +2375,11 @@ func TestGuard_V622_OracleR26Probes(t *testing.T) {
 		}
 		ctrl = append(ctrl, "/usr/bin/env", "/bin/sh")
 		targets := stdinProgramTargetsDialect(ctrl, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
-		for _, tg := range targets {
-			if tg.exhausted {
-				t.Fatalf("control broken: 40 pure assignments ahead of /usr/bin/env /bin/sh became exhausted (%+v) — pure assignments are step-exempt exactly like the pre-fix peel", tg)
-			}
+		first, okFirst := firstProgramTarget(targets)
+		// R27-Reviewer-#7: the positive control pins the confirmed shell
+		// target itself, never merely the absence of an exhaustion bit.
+		if !okFirst || first.exhausted || first.data || first.lang != "" {
+			t.Fatalf("control broken: 40 pure assignments ahead of /usr/bin/env /bin/sh projected first=%+v ok=%v (targets=%v) — want a non-exhausted, non-data, empty-language confirmed POSIX shell target; pure assignments are step-exempt exactly like the pre-fix peel", first, okFirst, targets)
 		}
 	})
 
@@ -2361,16 +2397,23 @@ func TestGuard_V622_OracleR26Probes(t *testing.T) {
 			}
 			return false
 		}
+		// R27-Reviewer-#7: the positive rows pin the CONFIRMED shell target
+		// itself — degenerating every slash target into no target at all
+		// must never satisfy them.
+		assertConfirmedShell := func(argv []string, desc string) {
+			t.Helper()
+			targets := stdinProgramTargetsDialect(argv, 0, untrusted, "/usr/bin:/bin", callerIdentity{}, false)
+			first, ok := firstProgramTarget(targets)
+			if !ok || first.exhausted || first.data || first.lang != "" {
+				t.Fatalf("%s under untrusted PATH projected first=%+v ok=%v (targets=%v) — want a non-exhausted, non-data, empty-language confirmed POSIX shell target: an explicit relative spelling carries its own resolution and must never degrade into a PATH-dependent bare name", desc, first, ok, targets)
+			}
+		}
 		// Explicit relative spellings keep their fixed-path identity across
 		// the canonical GNU-alias rewrite even when filepath.Join would
 		// clean the slash away — the pre-fix rewrite degraded both into the
 		// bare canon word and re-validated them through the untrusted PATH.
-		if probe([]string{"./genv", "/bin/sh"}) {
-			t.Fatalf("./genv /bin/sh under untrusted PATH became exhausted — an explicit relative spelling carries its own resolution and must never degrade into a PATH-dependent bare name")
-		}
-		if probe([]string{"sub/../genv", "/bin/sh"}) {
-			t.Fatalf("sub/../genv /bin/sh under untrusted PATH became exhausted — a slash-carrying directory that cancels out still carries its own resolution")
-		}
+		assertConfirmedShell([]string{"./genv", "/bin/sh"}, "./genv /bin/sh")
+		assertConfirmedShell([]string{"sub/../genv", "/bin/sh"}, "sub/../genv /bin/sh")
 		if !probe([]string{"genv", "/bin/sh"}) {
 			t.Fatalf("control broken: bare genv /bin/sh under untrusted PATH did NOT exhaust — a genuinely slash-free GNU alias owes its resolution to PATH exactly like the canonical env")
 		}
@@ -2381,11 +2424,400 @@ func TestGuard_V622_OracleR26Probes(t *testing.T) {
 			t.Fatalf("fixture symlink: %v", err)
 		}
 		t.Chdir(dir)
-		if probe([]string{"./myenv", "/bin/sh"}) {
-			t.Fatalf("./myenv (-> /usr/bin/env) /bin/sh under untrusted PATH became exhausted — the resolved-wrapper recursion dropped the fixed-path slash identity and re-validated the alias as a bare name")
-		}
+		assertConfirmedShell([]string{"./myenv", "/bin/sh"}, "./myenv (-> /usr/bin/env) /bin/sh")
 		if !probe([]string{"myenv", "/bin/sh"}) {
 			t.Fatalf("control broken: bare myenv /bin/sh under untrusted PATH did NOT exhaust — a genuinely slash-free wrapper alias owes its resolution to PATH")
+		}
+	})
+}
+
+// TestGuard_V622_OracleR27Probes pins the Oracle R27 / Reviewer R27
+// discriminating rows: the pipeline component root-call scan plus the
+// same-component direct AST registrations, the dynamic-vs-missing
+// operand residue indices, the xargs checked-peel single application
+// of the env ops, the execution-context-sensitive builtin exemption
+// with the bare-name-before-alias ordering, the cross-alias shared
+// 32-step budget with the single `--` consumption, and the env/
+// taskset/chrt missing-operand fail-closed verdicts. Every subtest
+// references ONLY symbols already present on the pre-fix tree
+// 0d907a8 (the collectors, peel helpers, the tracker constructor is
+// intentionally NOT referenced — the checked path is exercised through
+// stdinProgramTargetsDialect end to end), so the complete file compiles
+// there verbatim.
+func TestGuard_V622_OracleR27Probes(t *testing.T) {
+
+	// ---- R27-1: pipeline component root calls scan through the
+	// statement entry, and same-component direct AST registrations are
+	// visible inside the component's own frame ----
+	t.Run("R27-1 pipeline component root eval chains scan exactly like their block-wrapped twins", func(t *testing.T) {
+		probe := func(text string) *subCollector {
+			t.Helper()
+			c := blankSubCollector()
+			c.allowBind = true
+			c.taintEvalTextWrites(text, 0)
+			return c
+		}
+		// The direct pipe component root `command -x eval` is a tainted
+		// short-rest eval chain — exactly the R26-3 fixture shape. Wrapped
+		// in a single-statement Block the nested Stmt already reached
+		// scanHiddenEvalStmt; unwrapped, the pre-R27 scan dispatched the
+		// root statement into scanHiddenEvalNode whose walk returns true
+		// at the root and never runs the root call check.
+		if direct := probe(`command -x eval | cat`); !direct.taintedVars["PATH"] {
+			t.Fatalf("direct pipe component root `command -x eval | cat` left PATH untainted (taintedVars=%v) — the component root statement entered through scanHiddenEvalDispatch/scanHiddenEvalNode skips scanHiddenEvalStmtBody's root call check entirely", direct.taintedVars)
+		}
+		if wrapped := probe(`{ command -x eval; } | cat`); !wrapped.taintedVars["PATH"] {
+			t.Fatalf("control broken: block-wrapped `{ command -x eval; } | cat` left PATH untainted (taintedVars=%v) — the nested Stmt reference case must stay on the same verdict", wrapped.taintedVars)
+		}
+		// Root redirection descent: the substitution hiding a nested eval
+		// inside the pipe component's own redirection word must reach the
+		// scan exactly like the block-wrapped spelling.
+		if directRedir := probe(`: >/dev/null/$(command -x eval) | cat`); !directRedir.taintedVars["PATH"] {
+			t.Fatalf("direct pipe component root redirection substitution `: >/dev/null/$(command -x eval) | cat` left PATH untainted (taintedVars=%v) — the component root statement's Redirs list never scanned", directRedir.taintedVars)
+		}
+		// Negative control: a non-eval-shaped direct root keeps the stream
+		// clean — the scan must stay precise, never blanket-tainted.
+		if neg := probe(`command cat | cat`); neg.taintedVars["PATH"] {
+			t.Fatalf("control broken: non-eval-shaped direct root `command cat | cat` polluted PATH (taintedVars=%v) — the root call check must stay verdict-precise", neg.taintedVars)
+		}
+	})
+
+	t.Run("R27-1 same-component direct AST function definitions register inside the component frame", func(t *testing.T) {
+		probe := func(text string) *subCollector {
+			t.Helper()
+			c := blankSubCollector()
+			c.allowBind = true
+			c.taintEvalTextWrites(text, 0)
+			return c
+		}
+		// The directly-written AST FuncDecl (NOT an eval-text re-parse)
+		// shadows the later bare eval inside the SAME pipeline component:
+		// the shadowed invocation is eval-shaped but never the builtin, so
+		// its short rest carries the uniform maximal pollution verdict.
+		shadowed := probe(`{ eval() { :; }; eval; } | cat`)
+		if !shadowed.taintedVars["PATH"] {
+			t.Fatalf("`{ eval() { :; }; eval; } | cat` left PATH untainted (taintedVars=%v) — the direct AST FuncDecl inside the pipe component never registered, so the shadowed bare eval was misread as a no-op builtin invocation", shadowed.taintedVars)
+		}
+		if shadowed.funcNames["eval"] {
+			t.Fatalf("pipe component function definition leaked into the parent registry (funcNames=%v) — the component is a child process whose registrations die with it when the frame restores", shadowed.funcNames)
+		}
+		// Negative control: without the definition the bare eval is the
+		// no-operand builtin — genuinely re-parsing nothing.
+		if plain := probe(`{ eval; } | cat`); plain.taintedVars["PATH"] {
+			t.Fatalf("control broken: `{ eval; } | cat` polluted PATH (taintedVars=%v) — a no-operand unshadowed eval chain re-parses nothing", plain.taintedVars)
+		}
+		// Sibling isolation: the definition inside the LEFT component must
+		// never shadow the right component's name resolution.
+		if sib := probe(`{ eval() { :; }; } | cat`); sib.taintedVars["PATH"] {
+			t.Fatalf("control broken: `{ eval() { :; }; } | cat` polluted PATH (taintedVars=%v) — a definition without any shadowed invocation must stay inert", sib.taintedVars)
+		}
+	})
+
+	// ---- R27-2: dynamic option values keep the pre-R26 residue index ----
+	t.Run("R27-2 dynamic option values keep the pre-R26 non-empty residue", func(t *testing.T) {
+		// peelWrappers([timeout,-k,cmdSubPlaceholder]) — pre-R26 abe543b
+		// returned the non-empty residue argv[1:] (the dynamic -k value
+		// stops the scan AT the option) with the fail-closed bit; merging
+		// the dynamic-value and missing-operand verdicts into len(argv)
+		// empties the residue and the downstream prepare/nested-collect
+		// empty-head skips drop the unknowable consumer from the summary.
+		head, _, _, exhausted := peelWrappers([]string{"timeout", "-k", cmdSubPlaceholder})
+		if len(head) != 2 {
+			t.Fatalf("peelWrappers([timeout -k %q]) residue length = %d (head=%v exhausted=%v), want 2 — the dynamic -k value EXISTS, so the residue starts at the option exactly like pre-R26, never at len(argv)", cmdSubPlaceholder, len(head), head, exhausted)
+		}
+		if !exhausted {
+			t.Fatalf("peelWrappers([timeout -k %q]) exhausted = false — the fail-closed verdict itself must survive exactly like the merged form", cmdSubPlaceholder)
+		}
+		// peelWrappersWithIndex must not collapse the dynamic-valued zone
+		// into an empty head either — the nested collect / flat prepare
+		// empty-head skip fires only for a truly consumed argv.
+		if peeledHead, _, _, _, _ := peelWrappersWithIndex([]string{"timeout", "-k", cmdSubPlaceholder}, callerIdentity{}); len(peeledHead) == 0 {
+			t.Fatalf("peelWrappersWithIndex([timeout -k %q]) returned an EMPTY head — the dynamic option value is residue, not absence", cmdSubPlaceholder)
+		}
+		// Regression pin: the truly-missing trailing operand still clamps
+		// at the slice bound with the fail-closed verdict (R26-6).
+		missing, _, _, missExhausted := peelWrappers([]string{"timeout", "-k"})
+		if len(missing) != 0 || !missExhausted {
+			t.Fatalf("control broken: peelWrappers([timeout -k]) residue length = %d exhausted = %v — the missing-operand clamp regressed", len(missing), missExhausted)
+		}
+	})
+
+	// ---- R27-3: the xargs checked peel applies every env op exactly once ----
+	t.Run("R27-3 the xargs checked peel applies a self-referencing PATH op exactly once", func(t *testing.T) {
+		// A PATH assignment carrying the unforgeable self-reference
+		// sentinel is NOT idempotent: applying it once against /base yields
+		// /base/x, applying the SAME op again yields /base/x/x. The core
+		// already folds every op batch in place as it peels — the checked
+		// alias loop must never re-apply the merged batch.
+		target := []string{"env", "PATH=" + envPathSelfPlaceholder + "/x", "/bin/sh"}
+		caller := callerIdentity{}
+		// The tracker literal carries only the pre-R27 shared fields, so
+		// the file compiles verbatim on the parent tree 0d907a8.
+		tk := &wrapperPathTracker{cur: "/base"}
+		_, _, _, exhausted := peelWrappersAndWrapperAliasesChecked(target, "/base", caller, tk)
+		if exhausted {
+			t.Fatalf("xargs inner checked peel of %v exhausted — a single legal PATH expansion must stay trusted", target)
+		}
+		if tk.cur != "/base/x" {
+			t.Fatalf("xargs inner checked peel tracker cur = %q, want %q — the merged env op batch was applied TWICE (the pre-R27 double application materialized /base/x/x)", tk.cur, "/base/x")
+		}
+		// Byte budget discrimination: a single expansion exactly at the
+		// maxShellCommandBytes ceiling is legal; the double application
+		// overflows it and degenerates the tracker to the unresolvable
+		// placeholder, wrongly rejecting the fixed-path consumer.
+		base := strings.Repeat("d", maxShellCommandBytes-4) // +len("/x") == ceiling after one expansion
+		tk2 := &wrapperPathTracker{cur: base}
+		_, _, _, exhausted2 := peelWrappersAndWrapperAliasesChecked(target, base, callerIdentity{}, tk2)
+		if exhausted2 {
+			t.Fatalf("xargs inner checked peel at the exact byte ceiling exhausted — the double application pushed the single legal expansion past maxShellCommandBytes")
+		}
+		if strings.Contains(tk2.cur, cmdSubPlaceholder) {
+			t.Fatalf("xargs inner checked peel tracker degenerated to the unresolvable placeholder at the exact byte ceiling (len(cur)=%d) — the ops were applied twice", len(tk2.cur))
+		}
+	})
+
+	// ---- R27-4: execution-context-sensitive builtin exemption ----
+	t.Run("R27-4 bare command/builtin/exec behind external execve contexts owe their identity to PATH", func(t *testing.T) {
+		var untrusted envAssignments
+		untrusted.ops = append(untrusted.ops, envOp{kind: 't', key: "PATH"})
+		xargsProbe := func(argv []string) (stdinTarget, bool) {
+			t.Helper()
+			targets := stdinProgramTargetsDialect(argv, 0, untrusted, "/usr/bin:/bin", callerIdentity{xw: &xargsWorkState{}}, false)
+			return firstProgramTarget(targets)
+		}
+		// xargs starts its open-code-slot target through its own execvp —
+		// bare command/exec spellings there are PATH lookups of external
+		// executables, NEVER the shell builtins, so under the untrusted
+		// PATH the consumer identity is unknowable.
+		for _, argv := range [][]string{
+			{"/usr/bin/xargs", "-I{}", "command", "/bin/sh", "-c", "{}"},
+			{"/usr/bin/xargs", "-I{}", "exec", "/bin/sh", "-c", "{}"},
+			{"/usr/bin/xargs", "-I{}", "builtin", "/bin/sh", "-c", "{}"},
+		} {
+			first, ok := xargsProbe(argv)
+			if !ok || !first.exhausted {
+				t.Fatalf("stdinProgramTargetsDialect(%v) inner target exhaustion = %v (first=%+v ok=%v) — xargs execvps its target directly, so a bare %q spelling is a PATH lookup of an external executable and never the shell builtin", argv, ok && first.exhausted, first, ok, argv[2])
+			}
+		}
+		// The same direct-execution context arises INSIDE one shell-
+		// dispatched chain the moment an external wrapper peeled: env
+		// starts command through execvp, so the bare command behind it is
+		// no longer the shell builtin.
+		targets := stdinProgramTargetsDialect([]string{"env", "command", "/bin/sh"}, 0, untrusted, "/usr/bin:/bin", callerIdentity{}, false)
+		exh := false
+		for _, tg := range targets {
+			if tg.exhausted {
+				exh = true
+			}
+		}
+		if !exh {
+			t.Fatalf("stdinProgramTargetsDialect([env command /bin/sh]) under untrusted PATH not exhausted (targets=%v) — the bare command behind env resolves through execvp PATH lookup, never the shell builtin dispatch", targets)
+		}
+		// Positive controls: the TOP-LEVEL shell dispatch keeps the
+		// builtin exemption exactly — command/exec are shell builtins
+		// there and /bin/sh carries its own resolution.
+		for _, argv := range [][]string{
+			{"command", "/bin/sh"},
+			{"exec", "/bin/sh"},
+		} {
+			pos := stdinProgramTargetsDialect(argv, 0, untrusted, "/usr/bin:/bin", callerIdentity{}, false)
+			first, ok := firstProgramTarget(pos)
+			if !ok || first.exhausted || first.data || first.lang != "" {
+				t.Fatalf("positive control broken: stdinProgramTargetsDialect(%v) under untrusted PATH first=%+v ok=%v — the shell-dispatched %q builtin exemption must survive exactly", argv, first, ok, argv[0])
+			}
+		}
+		// Ordering pin: the bare-head untrusted verdict precedes any alias
+		// resolution — a bare name under an untrusted PATH must be refused
+		// BEFORE resolveHeadBase may substitute a PATH hit for it.
+		ordTk := &wrapperPathTracker{cur: cmdSubPlaceholder}
+		if _, _, _, ordExhausted := peelWrappersAndWrapperAliasesChecked([]string{"env", "/bin/sh"}, cmdSubPlaceholder, callerIdentity{}, ordTk); !ordExhausted {
+			t.Fatalf("checked peel of [env /bin/sh] under an untrusted tracker PATH not exhausted — the bare head verdict must precede the alias rewrite adoption")
+		}
+	})
+
+	// ---- R27-5: cross-alias shared 32-step budget; single `--` ----
+	t.Run("R27-5 wrapper aliases share the projection-wide 32-step budget", func(t *testing.T) {
+		chain := func(layers int, final string) []string {
+			argv := []string{}
+			for i := 0; i < layers; i++ {
+				argv = append(argv, "/usr/bin/env")
+			}
+			return append(argv, final)
+		}
+		exhaustedOf := func(argv []string) bool {
+			t.Helper()
+			targets := stdinProgramTargetsDialect(argv, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+			for _, tg := range targets {
+				if tg.exhausted {
+					return true
+				}
+			}
+			return false
+		}
+		// 33 canonical /usr/bin/env layers ahead of /bin/sh exhaust the
+		// 32-step budget.
+		canon := append(chain(32, "/usr/bin/env"), "/bin/sh")
+		if !exhaustedOf(canon) {
+			t.Fatalf("control broken: 33 canonical /usr/bin/env wrapper layers before /bin/sh did NOT exhaust the 32-step budget")
+		}
+		// The SAME total layer count with a fixed-path GNU alias at layer
+		// 32 must face the identical verdict — the canonical rewrite
+		// recursion continues spending the pre-rewrite steps instead of
+		// restarting the budget.
+		alias := append(chain(31, "./genv"), "/usr/bin/env")
+		alias = append(alias, "/bin/sh")
+		if !exhaustedOf(alias) {
+			t.Fatalf("31 /usr/bin/env layers + ./genv + /usr/bin/env + /bin/sh did NOT exhaust (same 33 total layers) — the canonical rewrite recursion restarted the step budget and laundered the chain into two under-budget halves")
+		}
+		// A symlinked fixed-path wrapper alias exercises the resolved-
+		// wrapper recursion with the same shared budget.
+		dir := t.TempDir()
+		if err := os.Symlink("/usr/bin/env", filepath.Join(dir, "myenv")); err != nil {
+			t.Fatalf("fixture symlink: %v", err)
+		}
+		t.Chdir(dir)
+		res := append(chain(31, "./myenv"), "/usr/bin/env")
+		res = append(res, "/bin/sh")
+		if !exhaustedOf(res) {
+			t.Fatalf("31 /usr/bin/env layers + ./myenv + /usr/bin/env + /bin/sh did NOT exhaust — the resolved-wrapper recursion restarted the step budget")
+		}
+		// Positive control: 29 + alias + 1 = 31 total layers stays INSIDE
+		// the budget (the head must be discovered before the 32nd step
+		// boundary) and confirms the fixed-path shell target.
+		inside := append(chain(29, "./myenv"), "/usr/bin/env")
+		inside = append(inside, "/bin/sh")
+		if exhaustedOf(inside) {
+			t.Fatalf("positive control broken: 29 /usr/bin/env + ./myenv + /usr/bin/env + /bin/sh (31 total layers) exhausted — the shared budget must still admit a chain the canonical spelling of the same length confirms")
+		}
+	})
+
+	t.Run("R27-5 command consumes exactly one `--` option terminator", func(t *testing.T) {
+		// `command -- -- /bin/sh`: the FIRST `--` is command's own option
+		// terminator; the second `--` is a core-level reserved word that
+		// costs one more wrapper step. The pre-R27 double consumption let
+		// command swallow both for free. The discrimination rides the step
+		// budget: command + `--` + 30 /usr/bin/env layers totals 32 steps
+		// (exhausted) while the double-consumed shape fits 31.
+		argv := []string{"command", "--", "--"}
+		for i := 0; i < 30; i++ {
+			argv = append(argv, "/usr/bin/env")
+		}
+		argv = append(argv, "/bin/sh")
+		targets := stdinProgramTargetsDialect(argv, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+		exh := false
+		for _, tg := range targets {
+			if tg.exhausted {
+				exh = true
+			}
+		}
+		if !exh {
+			t.Fatalf("`command -- --` + 30 /usr/bin/env layers + /bin/sh did NOT exhaust — command swallowed BOTH `--` words, so only 31 of the 32 budgeted steps were ever spent")
+		}
+		// Positive control: a single `--` ahead of the same 30-layer chain
+		// keeps one spare step and confirms the shell target.
+		one := []string{"command", "--"}
+		for i := 0; i < 30; i++ {
+			one = append(one, "/usr/bin/env")
+		}
+		one = append(one, "/bin/sh")
+		pos := stdinProgramTargetsDialect(one, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+		first, ok := firstProgramTarget(pos)
+		if !ok || first.exhausted || first.data || first.lang != "" {
+			t.Fatalf("positive control broken: `command --` + 30 /usr/bin/env layers + /bin/sh first=%+v ok=%v — 31 peeled layers stay inside the budget", first, ok)
+		}
+	})
+
+	// ---- R27-6: missing env/taskset/chrt operands fail closed ----
+	t.Run("R27-6 trailing -p PID queries distinguish present/missing operands", func(t *testing.T) {
+		// peelSingleWrapperArgs indexes are one past the option word in
+		// every case — the arities mirror real taskset/chrt exactly.
+		if next, ok := peelSingleWrapperArgs([]string{"chrt", "-p"}, "chrt"); next != 2 || ok {
+			t.Fatalf("peelSingleWrapperArgs([chrt -p], chrt) = (%d, %v), want (2, false) — a trailing -p missing its PID operand is an unprovable arity, never the legitimate PID query", next, ok)
+		}
+		if next, ok := peelSingleWrapperArgs([]string{"taskset", "-p"}, "taskset"); next != 2 || ok {
+			t.Fatalf("peelSingleWrapperArgs([taskset -p], taskset) = (%d, %v), want (2, false) — same missing-PID fail-closed verdict", next, ok)
+		}
+		if next, ok := peelSingleWrapperArgs([]string{"chrt", "-p", "1"}, "chrt"); next != 3 || !ok {
+			t.Fatalf("control broken: peelSingleWrapperArgs([chrt -p 1], chrt) = (%d, %v), want (3, true) — the legitimate static-PID query keeps its exact no-inner-command shape", next, ok)
+		}
+		if next, ok := peelSingleWrapperArgs([]string{"taskset", "-p", "1"}, "taskset"); next != 3 || !ok {
+			t.Fatalf("control broken: peelSingleWrapperArgs([taskset -p 1], taskset) = (%d, %v), want (3, true)", next, ok)
+		}
+		exhaustedOf := func(argv []string) bool {
+			t.Helper()
+			targets := stdinProgramTargetsDialect(argv, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+			for _, tg := range targets {
+				if tg.exhausted {
+					return true
+				}
+			}
+			return false
+		}
+		for _, argv := range [][]string{
+			{"chrt", "-p"},
+			{"taskset", "-p"},
+		} {
+			if !exhaustedOf(argv) {
+				t.Fatalf("stdinProgramTargetsDialect(%v) projected NO exhaustion verdict — the missing PID operand is an unprovable arity, never a nil data consumer", argv)
+			}
+		}
+		// Positive control: the static-PID query remains a clean
+		// no-inner-command projection (nil targets, no exhaustion).
+		if exhaustedOf([]string{"chrt", "-p", "1"}) {
+			t.Fatalf("control broken: stdinProgramTargetsDialect([chrt -p 1]) exhausted — the legitimate PID query must survive exactly")
+		}
+		if targets := stdinProgramTargetsDialect([]string{"chrt", "-p", "1"}, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false); len(targets) != 0 {
+			t.Fatalf("control broken: stdinProgramTargetsDialect([chrt -p 1]) targets = %v — a PID query consumes no stream and projects no program target", targets)
+		}
+	})
+
+	t.Run("R27-6 env missing operands and unknown options exhaust the checked projection", func(t *testing.T) {
+		exhaustedOf := func(argv []string) bool {
+			t.Helper()
+			targets := stdinProgramTargetsDialect(argv, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+			for _, tg := range targets {
+				if tg.exhausted {
+					return true
+				}
+			}
+			return false
+		}
+		for _, argv := range [][]string{
+			{"/usr/bin/env", "--unset"},
+			{"/usr/bin/env", "-u"},
+			{"/usr/bin/env", "-C"},
+			{"/usr/bin/env", "--bogus"},
+			{"env", "--bogus"},
+		} {
+			if !exhaustedOf(argv) {
+				t.Fatalf("stdinProgramTargetsDialect(%v) projected NO exhaustion verdict — env's missing-operand/unknown-option diagnostics ride the payload channel the pre-R27 checked projection discarded", argv)
+			}
+		}
+		// The xargs inner target is the second checked entry: the same
+		// truncated env must exhaust instead of falling into the default
+		// empty-language shell fallback.
+		xargsTargets := stdinProgramTargetsDialect([]string{"/usr/bin/xargs", "-I{}", "env", "--unset"}, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{xw: &xargsWorkState{}}, false)
+		xExh := false
+		for _, tg := range xargsTargets {
+			if tg.exhausted {
+				xExh = true
+			}
+		}
+		if !xExh {
+			t.Fatalf("stdinProgramTargetsDialect([/usr/bin/xargs -I{} env --unset]) inner targets = %v — the truncated env must never fall into the default empty-language shell fallback", xargsTargets)
+		}
+		// Positive control: a COMPLETE env --unset operand keeps the
+		// confirmed fixed-path shell target.
+		pos := stdinProgramTargetsDialect([]string{"env", "--unset", "HOME", "/bin/sh"}, 0, envAssignments{}, "/usr/bin:/bin", callerIdentity{}, false)
+		first, ok := firstProgramTarget(pos)
+		if !ok || first.exhausted || first.data || first.lang != "" {
+			t.Fatalf("positive control broken: stdinProgramTargetsDialect([env --unset HOME /bin/sh]) first=%+v ok=%v — a complete env operand zone must keep the confirmed consumer", first, ok)
+		}
+		// Regression guard: the peelResolvedSegDepth error message for the
+		// unknown option must survive — the nil-tracker peel keeps the
+		// payload channel instead of preempting it with the exhaustion bit.
+		if hit := peelResolvedDepth([]string{"env", "--bogus", "pig"}, 's', 0, callerIdentity{}); !strings.Contains(hit, "env unknown option") {
+			t.Fatalf("control broken: peelResolvedDepth([env --bogus pig]) hit = %q — the precise env unknown-option diagnostic regressed", hit)
 		}
 	})
 }
